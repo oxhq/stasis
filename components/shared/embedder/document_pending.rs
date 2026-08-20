@@ -50,6 +50,41 @@ impl PendingNavigationRevision {
     }
 }
 
+/// Checked Constellation revision for the complete target pipeline membership.
+///
+/// This is deliberately distinct from [`PendingNavigationRevision`]: a pipeline can enter or
+/// leave the event-loop-owned target without changing active or pending top-level navigation
+/// membership. Advance authority must bind both revisions to prevent an identical-looking target
+/// assembled after a remove-and-reinsert cycle from aliasing an older observation.
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct PendingPipelineMembershipRevision(u64);
+
+impl PendingPipelineMembershipRevision {
+    /// The revision before Constellation has recorded a target-membership change.
+    pub const ZERO: Self = Self(0);
+
+    /// Construct a revision from a checked Constellation sequence.
+    #[doc(hidden)]
+    pub const fn new(sequence: u64) -> Self {
+        Self(sequence)
+    }
+
+    /// Return the underlying Constellation sequence.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Advance without allowing a revision to wrap and alias older target membership.
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
+    }
+}
+
 /// Active top-level pipeline and the exact Constellation epoch that selected it.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PendingActiveTopLevelPipeline {
@@ -70,18 +105,28 @@ pub struct PendingTargetObservation {
     pub active_top_level: Option<PendingActiveTopLevelPipeline>,
     /// Checked revision covering active and pending top-level navigation membership.
     pub navigation_revision: PendingNavigationRevision,
+    /// Checked revision covering every pipeline in this event-loop-owned target.
+    pub pipeline_membership_revision: PendingPipelineMembershipRevision,
+    /// First target-authority time surface which is not controlled by the shared clock.
+    ///
+    /// This is independently sticky from the event-loop clock observation. The complete raw
+    /// snapshot duplicates it in an owner-bound target-time terminal so guarded advance admission
+    /// cannot overlook an unsupported surface discovered while routing.
+    pub unsupported_time_surface: Option<DocumentTimeSurface>,
     pipelines: Vec<PipelineId>,
     fully_active_pipelines: Vec<PipelineId>,
     pending_top_level_pipelines: Vec<PipelineId>,
 }
 
 impl PendingTargetObservation {
-    /// Canonicalize pipeline membership and validate the active top-level authority.
-    pub fn new(
+    /// Canonicalize pipeline membership and validate complete target authority.
+    pub fn new_with_authority(
         webview_id: WebViewId,
         event_loop_id: ScriptEventLoopId,
         active_top_level: Option<PendingActiveTopLevelPipeline>,
         navigation_revision: PendingNavigationRevision,
+        pipeline_membership_revision: PendingPipelineMembershipRevision,
+        unsupported_time_surface: Option<DocumentTimeSurface>,
         mut pipelines: Vec<PipelineId>,
         mut fully_active_pipelines: Vec<PipelineId>,
         mut pending_top_level_pipelines: Vec<PipelineId>,
@@ -94,12 +139,41 @@ impl PendingTargetObservation {
             event_loop_id,
             active_top_level,
             navigation_revision,
+            pipeline_membership_revision,
+            unsupported_time_surface,
             pipelines,
             fully_active_pipelines,
             pending_top_level_pipelines,
         };
         target.validate()?;
         Ok(target)
+    }
+
+    /// Test-only shorthand for fixtures which do not exercise target-authority revisions.
+    ///
+    /// Production integrations must call [`Self::new_with_authority`] and supply owner-captured
+    /// membership and unsupported-surface authority rather than fabricating defaults.
+    #[cfg(test)]
+    pub(crate) fn new(
+        webview_id: WebViewId,
+        event_loop_id: ScriptEventLoopId,
+        active_top_level: Option<PendingActiveTopLevelPipeline>,
+        navigation_revision: PendingNavigationRevision,
+        pipelines: Vec<PipelineId>,
+        fully_active_pipelines: Vec<PipelineId>,
+        pending_top_level_pipelines: Vec<PipelineId>,
+    ) -> Result<Self, PendingSnapshotInvariantError> {
+        Self::new_with_authority(
+            webview_id,
+            event_loop_id,
+            active_top_level,
+            navigation_revision,
+            PendingPipelineMembershipRevision::ZERO,
+            None,
+            pipelines,
+            fully_active_pipelines,
+            pending_top_level_pipelines,
+        )
     }
 
     /// Return all pipelines bound to this exact event-loop target in canonical order.
@@ -434,11 +508,11 @@ pub struct PendingImageTimerTerminalObservation {
     pub error: TimerControlError,
 }
 
-/// Sticky failure of a checked state or DOM generation counter.
+/// Sticky failure of a checked generation, revision, epoch, or identity counter.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum PendingGenerationTerminal {
-    /// The generation cannot represent another distinct value.
+    /// The counter cannot represent another distinct value.
     Exhausted = 0,
 }
 
@@ -451,6 +525,35 @@ pub struct PendingGenerationTerminalObservation {
     pub error: PendingGenerationTerminal,
 }
 
+/// Sticky unsupported-time authority bound to the routed WebView target.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PendingTargetTimeTerminalObservation {
+    /// WebView whose target authority latched the unsupported surface.
+    pub webview_id: WebViewId,
+    /// First unsupported time surface observed while routing this target.
+    pub unsupported_surface: DocumentTimeSurface,
+}
+
+/// Event-loop-owned checked-counter terminal.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PendingEventLoopGenerationTerminalObservation {
+    /// Script event loop whose counter latched the failure.
+    pub event_loop_id: ScriptEventLoopId,
+    /// First sticky checked-counter failure.
+    pub error: PendingGenerationTerminal,
+}
+
+/// Exhausted source-identity allocator bound to its owning event loop.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PendingSourceIdTerminalObservation {
+    /// Script event loop which owns this source-identity sequence.
+    pub event_loop_id: ScriptEventLoopId,
+    /// Last identity issued before the sequence could no longer advance.
+    pub last_issued: PendingSourceId,
+    /// First sticky checked-counter failure.
+    pub error: PendingGenerationTerminal,
+}
+
 /// Additive sticky failures retained by every independent runtime owner.
 ///
 /// Fixed owner slots and canonical per-pipeline vectors prevent one later failure from erasing a
@@ -459,12 +562,18 @@ pub struct PendingGenerationTerminalObservation {
 pub struct PendingRuntimeTerminals {
     /// Shared document-clock terminal.
     pub clock: Option<PendingClockTerminalObservation>,
+    /// Constellation target-time authority terminal.
+    pub target_time: Option<PendingTargetTimeTerminalObservation>,
     /// ScriptThread outer-scheduler terminal.
     pub outer_scheduler: Option<PendingOuterSchedulerTerminalObservation>,
     /// Producer-fence terminal.
     pub producer: Option<PendingProducerTerminalObservation>,
     /// Event-loop microtask-checkpoint terminal.
     pub microtask: Option<PendingMicrotaskTerminalObservation>,
+    /// Event-loop ordinary-input revision terminal.
+    pub input_revision: Option<PendingEventLoopGenerationTerminalObservation>,
+    /// Event-loop source-identity allocator terminal.
+    pub source_id: Option<PendingSourceIdTerminalObservation>,
     logical_timers: Vec<PendingLogicalTimerTerminalObservation>,
     image_timers: Vec<PendingImageTimerTerminalObservation>,
     /// Semantic DOM-generation terminal.
@@ -473,6 +582,10 @@ pub struct PendingRuntimeTerminals {
     pub state_generation: Option<PendingGenerationTerminalObservation>,
     /// Constellation navigation-revision terminal.
     pub navigation_revision: Option<PendingGenerationTerminalObservation>,
+    /// Constellation all-pipeline membership-revision terminal.
+    pub pipeline_membership_revision: Option<PendingGenerationTerminalObservation>,
+    /// Canonical source-inventory epoch terminal.
+    pub source_epoch: Option<PendingGenerationTerminalObservation>,
 }
 
 impl PendingRuntimeTerminals {
@@ -513,14 +626,19 @@ impl PendingRuntimeTerminals {
     /// Return whether no independent runtime owner has latched a terminal.
     pub fn is_empty(&self) -> bool {
         self.clock.is_none()
+            && self.target_time.is_none()
             && self.outer_scheduler.is_none()
             && self.producer.is_none()
             && self.microtask.is_none()
+            && self.input_revision.is_none()
+            && self.source_id.is_none()
             && self.logical_timers.is_empty()
             && self.image_timers.is_empty()
             && self.dom_generation.is_none()
             && self.state_generation.is_none()
             && self.navigation_revision.is_none()
+            && self.pipeline_membership_revision.is_none()
+            && self.source_epoch.is_none()
     }
 
     fn validate(&self) -> Result<(), PendingSnapshotInvariantError> {
@@ -689,6 +807,12 @@ pub enum PendingProducerStability {
     FirstEmpty = 2,
     /// Two fresh checkpoints observed this exact empty producer revision.
     StableEmpty = 3,
+    /// A checkpoint completed, but it does not qualify this exact producer snapshot.
+    ///
+    /// This includes observations captured after the producer revision changed and observations
+    /// for which the integration cannot prove that the snapshot was taken at the checkpoint
+    /// boundary. It intentionally makes no emptiness claim.
+    Unqualified = 4,
 }
 
 /// Earlier empty qualification required to prove a second stable-empty boundary.
@@ -841,6 +965,17 @@ impl PendingProducerObservation {
                     });
                 }
             },
+            PendingProducerStability::Unqualified => {
+                if self.checkpoint == DocumentProducerCheckpoint::ZERO
+                    || self.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
+                {
+                    return Err(PendingSnapshotInvariantError::ProducerCheckpointMismatch {
+                        microtask_checkpoint: self.microtask_checkpoint,
+                        checkpoint: self.checkpoint,
+                        stability: self.stability,
+                    });
+                }
+            },
             PendingProducerStability::FirstEmpty | PendingProducerStability::StableEmpty => {
                 if self.checkpoint == DocumentProducerCheckpoint::ZERO
                     || self.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
@@ -959,6 +1094,10 @@ pub enum PendingParserPhase {
     AwaitingExternalInput = 1,
     /// Response/parser work is complete and a navigation commit remains runnable.
     AwaitingCommit = 2,
+    /// A script-created parser has no buffered input and awaits a later script write or close.
+    AwaitingScriptInput = 3,
+    /// A parsing-blocking script has suspended this parser until a separate owner resumes it.
+    Suspended = 4,
 }
 
 /// One identity-bearing authoritative parser or top-level navigation source.
@@ -986,6 +1125,18 @@ impl PendingParserSourceObservation {
                 self.disposition,
                 PendingSourceDisposition::AwaitingExternalIo(_)
             ),
+            PendingParserPhase::AwaitingScriptInput => {
+                self.disposition
+                    == PendingSourceDisposition::Unsupported(
+                        PendingUnsupportedSourceReason::ScriptCreatedParserInput,
+                    )
+            },
+            PendingParserPhase::Suspended => {
+                self.disposition
+                    == PendingSourceDisposition::Unsupported(
+                        PendingUnsupportedSourceReason::SuspendedParser,
+                    )
+            },
         };
         if !disposition_matches {
             return Err(
@@ -1069,6 +1220,9 @@ impl PendingParserObservation {
 pub struct PendingSourceId(u64);
 
 impl PendingSourceId {
+    /// Identity before the event loop has allocated its first source.
+    pub const ZERO: Self = Self(0);
+
     /// Construct an identity from a checked event-loop-owned sequence.
     #[doc(hidden)]
     pub const fn new(sequence: u64) -> Self {
@@ -1078,6 +1232,14 @@ impl PendingSourceId {
     /// Return the event-loop-owned sequence.
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    /// Advance without allowing an identity to wrap and alias an older source.
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
     }
 }
 
@@ -1628,6 +1790,10 @@ pub enum PendingUnsupportedSourceReason {
     ExternalSubscription,
     /// A callback source exists but is not yet covered by the producer fence.
     UntrackedCallback,
+    /// A script-created parser awaits future `document.write()` or `document.close()` input.
+    ScriptCreatedParserInput,
+    /// A parser is suspended and this observation cannot prove its separate resumer lifecycle.
+    SuspendedParser,
 }
 
 /// Mechanical disposition of one exact source at the observation instant.
@@ -2030,6 +2196,16 @@ impl RawPendingSnapshot {
         {
             return Err(PendingSnapshotInvariantError::ClockTerminalIdentityMismatch);
         }
+        match (
+            self.target.unsupported_time_surface,
+            self.terminals.target_time,
+        ) {
+            (Some(surface), Some(terminal))
+                if terminal.webview_id == self.target.webview_id
+                    && terminal.unsupported_surface == surface => {},
+            (None, None) => {},
+            _ => return Err(PendingSnapshotInvariantError::TargetTimeTerminalMismatch),
+        }
         if self.terminals.outer_scheduler.is_some_and(|terminal| {
             terminal.event_loop_id != self.target.event_loop_id
                 || terminal.scheduler_id != self.scheduler.scheduler_id
@@ -2049,6 +2225,20 @@ impl RawPendingSnapshot {
                     && terminal.error == error => {},
             (None, None) => {},
             _ => return Err(PendingSnapshotInvariantError::MicrotaskTerminalMismatch),
+        }
+        if self
+            .terminals
+            .input_revision
+            .is_some_and(|terminal| terminal.event_loop_id != self.target.event_loop_id)
+        {
+            return Err(PendingSnapshotInvariantError::EventLoopTerminalIdentityMismatch);
+        }
+        if self
+            .terminals
+            .source_id
+            .is_some_and(|terminal| terminal.event_loop_id != self.target.event_loop_id)
+        {
+            return Err(PendingSnapshotInvariantError::EventLoopTerminalIdentityMismatch);
         }
         for terminal in self
             .terminals
@@ -2070,6 +2260,8 @@ impl RawPendingSnapshot {
             self.terminals.dom_generation,
             self.terminals.state_generation,
             self.terminals.navigation_revision,
+            self.terminals.pipeline_membership_revision,
+            self.terminals.source_epoch,
         ]
         .into_iter()
         .flatten()
@@ -2088,6 +2280,24 @@ impl RawPendingSnapshot {
             && self.target.navigation_revision.get() != u64::MAX
         {
             return Err(PendingSnapshotInvariantError::GenerationTerminalBeforeExhaustion);
+        }
+        if self.terminals.pipeline_membership_revision.is_some()
+            && self.target.pipeline_membership_revision.get() != u64::MAX
+        {
+            return Err(PendingSnapshotInvariantError::GenerationTerminalBeforeExhaustion);
+        }
+        if self.terminals.input_revision.is_some() && self.input.revision.get() != u64::MAX {
+            return Err(PendingSnapshotInvariantError::GenerationTerminalBeforeExhaustion);
+        }
+        if self.terminals.source_epoch.is_some() && self.sources.epoch().get() != u64::MAX {
+            return Err(PendingSnapshotInvariantError::GenerationTerminalBeforeExhaustion);
+        }
+        if self
+            .terminals
+            .source_id
+            .is_some_and(|terminal| terminal.last_issued.get() != u64::MAX)
+        {
+            return Err(PendingSnapshotInvariantError::SourceIdTerminalBeforeExhaustion);
         }
         Ok(())
     }
@@ -2328,6 +2538,8 @@ pub enum PendingSnapshotInvariantError {
     NonCanonicalImageTimerTerminals,
     /// Clock terminal identity did not match the observed clock.
     ClockTerminalIdentityMismatch,
+    /// Target-time terminal did not exactly match routed WebView authority.
+    TargetTimeTerminalMismatch,
     /// Outer-scheduler terminal identity did not match the observed event loop and scheduler.
     SchedulerTerminalIdentityMismatch,
     /// Producer terminal did not exactly match the producer-fence snapshot.
@@ -2338,8 +2550,12 @@ pub enum PendingSnapshotInvariantError {
     TerminalPipelineOutsideTarget(PipelineId),
     /// A generation terminal named a different WebView.
     GenerationTerminalIdentityMismatch,
+    /// An event-loop-owned checked terminal named a different event loop.
+    EventLoopTerminalIdentityMismatch,
     /// A generation terminal was present before its checked counter reached exhaustion.
     GenerationTerminalBeforeExhaustion,
+    /// A source-identity terminal appeared before its checked allocator reached exhaustion.
+    SourceIdTerminalBeforeExhaustion,
 }
 
 #[cfg(test)]
@@ -2468,7 +2684,7 @@ mod tests {
             namespace_id: PipelineNamespaceId(42),
             index: Index::<BrowsingContextIndex>::new(1).unwrap(),
         };
-        PendingTargetObservation::new(
+        PendingTargetObservation::new_with_authority(
             WebViewId::mock_for_testing(browsing_context_id),
             ScriptEventLoopId::new(),
             Some(PendingActiveTopLevelPipeline {
@@ -2476,6 +2692,8 @@ mod tests {
                 epoch: Epoch(7),
             }),
             PendingNavigationRevision::new(3),
+            PendingPipelineMembershipRevision::new(9),
+            None,
             vec![pending_pipeline, active_pipeline],
             vec![active_pipeline],
             vec![pending_pipeline],
@@ -2661,7 +2879,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let target = pending_target();
+        let mut target = pending_target();
+        target.unsupported_time_surface = Some(DocumentTimeSurface::SameEventLoopIframe);
         let active_pipeline = target.active_top_level.unwrap().pipeline_id;
         let pending_pipeline = pipeline_id(2);
         let event_loop_id = target.event_loop_id;
@@ -2700,6 +2919,10 @@ mod tests {
         terminals.clock = Some(PendingClockTerminalObservation {
             clock_id: clock.id(),
             error: PendingClockTerminal::Overflow,
+        });
+        terminals.target_time = Some(PendingTargetTimeTerminalObservation {
+            webview_id: target.webview_id,
+            unsupported_surface: DocumentTimeSurface::SameEventLoopIframe,
         });
         terminals.outer_scheduler = Some(PendingOuterSchedulerTerminalObservation {
             event_loop_id: target.event_loop_id,
@@ -2756,6 +2979,7 @@ mod tests {
         assert_eq!(PendingProducerStability::Busy as u8, 1);
         assert_eq!(PendingProducerStability::FirstEmpty as u8, 2);
         assert_eq!(PendingProducerStability::StableEmpty as u8, 3);
+        assert_eq!(PendingProducerStability::Unqualified as u8, 4);
 
         let dispositions = [
             PendingSourceDisposition::Inert,
@@ -2778,6 +3002,10 @@ mod tests {
         assert_eq!(PendingExternalIoLoadBlocking::Blocking as u8, 0);
         assert_eq!(PendingParserSourceKind::DocumentParser as u8, 0);
         assert_eq!(PendingParserPhase::Ready as u8, 0);
+        assert_eq!(PendingParserPhase::AwaitingExternalInput as u8, 1);
+        assert_eq!(PendingParserPhase::AwaitingCommit as u8, 2);
+        assert_eq!(PendingParserPhase::AwaitingScriptInput as u8, 3);
+        assert_eq!(PendingParserPhase::Suspended as u8, 4);
         assert_eq!(PendingGenerationTerminal::Exhausted as u8, 0);
         assert_eq!(
             PendingAnimatedImageUnsupportedReason::LoopCountUnavailable as u8,
@@ -2841,6 +3069,40 @@ mod tests {
             Err(PendingSnapshotInvariantError::ProducerEmptinessMismatch {
                 stability: PendingProducerStability::Busy,
                 pending: 0,
+            }),
+        );
+
+        PendingProducerObservation::new(
+            event_loop_id,
+            microtask_checkpoint,
+            checkpoint,
+            empty,
+            PendingProducerStability::Unqualified,
+            None,
+        )
+        .unwrap();
+        PendingProducerObservation::new(
+            event_loop_id,
+            microtask_checkpoint,
+            checkpoint,
+            busy,
+            PendingProducerStability::Unqualified,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            PendingProducerObservation::new(
+                event_loop_id,
+                PendingMicrotaskCheckpoint::ZERO,
+                DocumentProducerCheckpoint::ZERO,
+                empty,
+                PendingProducerStability::Unqualified,
+                None,
+            ),
+            Err(PendingSnapshotInvariantError::ProducerCheckpointMismatch {
+                microtask_checkpoint: PendingMicrotaskCheckpoint::ZERO,
+                checkpoint: DocumentProducerCheckpoint::ZERO,
+                stability: PendingProducerStability::Unqualified,
             }),
         );
 
@@ -3120,9 +3382,15 @@ mod tests {
         assert_eq!(target.pipelines(), &[active, pending]);
         assert_eq!(target.fully_active_pipelines(), &[active]);
         assert_eq!(target.pending_top_level_pipelines(), &[pending]);
+        assert_eq!(target.pipeline_membership_revision.get(), 9);
+
+        let mut same_membership_after_aba = target.clone();
+        same_membership_after_aba.pipeline_membership_revision =
+            target.pipeline_membership_revision.checked_next().unwrap();
+        assert_ne!(target, same_membership_after_aba);
 
         assert_eq!(
-            PendingTargetObservation::new(
+            PendingTargetObservation::new_with_authority(
                 target.webview_id,
                 target.event_loop_id,
                 Some(PendingActiveTopLevelPipeline {
@@ -3130,6 +3398,8 @@ mod tests {
                     epoch: Epoch(7),
                 }),
                 target.navigation_revision,
+                target.pipeline_membership_revision,
+                target.unsupported_time_surface,
                 vec![pending],
                 vec![active],
                 Vec::new(),
@@ -3139,7 +3409,7 @@ mod tests {
             )),
         );
         assert_eq!(
-            PendingTargetObservation::new(
+            PendingTargetObservation::new_with_authority(
                 target.webview_id,
                 target.event_loop_id,
                 Some(PendingActiveTopLevelPipeline {
@@ -3147,6 +3417,8 @@ mod tests {
                     epoch: Epoch(7),
                 }),
                 target.navigation_revision,
+                target.pipeline_membership_revision,
+                target.unsupported_time_surface,
                 vec![active, pending],
                 vec![active, pending, pending],
                 vec![pending],
@@ -3156,17 +3428,48 @@ mod tests {
             )),
         );
 
-        let before_first_activation = PendingTargetObservation::new(
+        let before_first_activation = PendingTargetObservation::new_with_authority(
             target.webview_id,
             target.event_loop_id,
             None,
             PendingNavigationRevision::new(4),
+            target.pipeline_membership_revision.checked_next().unwrap(),
+            None,
             vec![pending],
             Vec::new(),
             vec![pending],
         )
         .unwrap();
         assert_eq!(before_first_activation.active_top_level, None);
+    }
+
+    #[test]
+    fn raw_snapshot_keeps_target_and_clock_unsupported_time_authority_independent() {
+        let mut snapshot = minimal_raw_snapshot();
+        snapshot.target.unsupported_time_surface = Some(DocumentTimeSurface::SameEventLoopIframe);
+        assert_eq!(
+            snapshot.validate(),
+            Err(PendingSnapshotInvariantError::TargetTimeTerminalMismatch),
+        );
+
+        snapshot.terminals.target_time = Some(PendingTargetTimeTerminalObservation {
+            webview_id: snapshot.target.webview_id,
+            unsupported_surface: DocumentTimeSurface::SameEventLoopIframe,
+        });
+        snapshot.validate().unwrap();
+        assert!(!snapshot.terminals.is_empty());
+
+        snapshot.clock.unsupported_surface = Some(DocumentTimeSurface::Worker);
+        snapshot.validate().unwrap();
+
+        snapshot.terminals.target_time = Some(PendingTargetTimeTerminalObservation {
+            webview_id: snapshot.target.webview_id,
+            unsupported_surface: DocumentTimeSurface::AuxiliaryWebView,
+        });
+        assert_eq!(
+            snapshot.validate(),
+            Err(PendingSnapshotInvariantError::TargetTimeTerminalMismatch),
+        );
     }
 
     #[test]
@@ -3273,6 +3576,100 @@ mod tests {
     }
 
     #[test]
+    fn checked_input_source_and_membership_terminals_bind_owner_and_exhaustion() {
+        let error = PendingGenerationTerminal::Exhausted;
+
+        let mut snapshot = minimal_raw_snapshot();
+        snapshot.input.revision = PendingInputRevision::new(u64::MAX);
+        snapshot.terminals.input_revision = Some(PendingEventLoopGenerationTerminalObservation {
+            event_loop_id: snapshot.target.event_loop_id,
+            error,
+        });
+        snapshot.validate().unwrap();
+        assert!(!snapshot.terminals.is_empty());
+        snapshot.terminals.input_revision = Some(PendingEventLoopGenerationTerminalObservation {
+            event_loop_id: ScriptEventLoopId::new(),
+            error,
+        });
+        assert_eq!(
+            snapshot.validate(),
+            Err(PendingSnapshotInvariantError::EventLoopTerminalIdentityMismatch),
+        );
+        snapshot.terminals.input_revision = Some(PendingEventLoopGenerationTerminalObservation {
+            event_loop_id: snapshot.target.event_loop_id,
+            error,
+        });
+        snapshot.input.revision = PendingInputRevision::new(u64::MAX - 1);
+        assert_eq!(
+            snapshot.validate(),
+            Err(PendingSnapshotInvariantError::GenerationTerminalBeforeExhaustion),
+        );
+
+        let mut snapshot = minimal_raw_snapshot();
+        snapshot.terminals.source_id = Some(PendingSourceIdTerminalObservation {
+            event_loop_id: snapshot.target.event_loop_id,
+            last_issued: PendingSourceId::new(u64::MAX),
+            error,
+        });
+        snapshot.validate().unwrap();
+        snapshot.terminals.source_id = Some(PendingSourceIdTerminalObservation {
+            event_loop_id: ScriptEventLoopId::new(),
+            last_issued: PendingSourceId::new(u64::MAX),
+            error,
+        });
+        assert_eq!(
+            snapshot.validate(),
+            Err(PendingSnapshotInvariantError::EventLoopTerminalIdentityMismatch),
+        );
+        snapshot.terminals.source_id = Some(PendingSourceIdTerminalObservation {
+            event_loop_id: snapshot.target.event_loop_id,
+            last_issued: PendingSourceId::new(u64::MAX - 1),
+            error,
+        });
+        assert_eq!(
+            snapshot.validate(),
+            Err(PendingSnapshotInvariantError::SourceIdTerminalBeforeExhaustion),
+        );
+
+        let mut snapshot = minimal_raw_snapshot();
+        snapshot.sources = PendingSourceSnapshot::new(
+            PendingSourceEpoch::new(u64::MAX),
+            snapshot.sources.sources().to_vec(),
+        )
+        .unwrap();
+        snapshot.terminals.source_epoch = Some(PendingGenerationTerminalObservation {
+            webview_id: snapshot.target.webview_id,
+            error,
+        });
+        snapshot.validate().unwrap();
+        snapshot.sources = PendingSourceSnapshot::new(
+            PendingSourceEpoch::new(u64::MAX - 1),
+            snapshot.sources.sources().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.validate(),
+            Err(PendingSnapshotInvariantError::GenerationTerminalBeforeExhaustion),
+        );
+
+        let mut snapshot = minimal_raw_snapshot();
+        snapshot.target.pipeline_membership_revision =
+            PendingPipelineMembershipRevision::new(u64::MAX);
+        snapshot.terminals.pipeline_membership_revision =
+            Some(PendingGenerationTerminalObservation {
+                webview_id: snapshot.target.webview_id,
+                error,
+            });
+        snapshot.validate().unwrap();
+        snapshot.target.pipeline_membership_revision =
+            PendingPipelineMembershipRevision::new(u64::MAX - 1);
+        assert_eq!(
+            snapshot.validate(),
+            Err(PendingSnapshotInvariantError::GenerationTerminalBeforeExhaustion),
+        );
+    }
+
+    #[test]
     fn canonical_inventories_sort_and_reject_duplicate_identities() {
         let first = source(1, PendingSourceKind::Timer, PendingSourceDisposition::Ready);
         let second = source(
@@ -3316,6 +3713,60 @@ mod tests {
             }]),
             Err(PendingSnapshotInvariantError::ParserPhaseDispositionMismatch(parser_id,)),
         );
+    }
+
+    #[test]
+    fn parser_phases_preserve_external_script_and_suspended_input_authority() {
+        let pipeline_id = pending_target().active_top_level.unwrap().pipeline_id;
+        let parser = |sequence, phase, disposition| PendingParserSourceObservation {
+            source_id: PendingSourceId::new(sequence),
+            pipeline_id,
+            kind: PendingParserSourceKind::DocumentParser,
+            phase,
+            disposition,
+        };
+        let external = PendingSourceDisposition::AwaitingExternalIo(external_io_evidence());
+        let script = PendingSourceDisposition::Unsupported(
+            PendingUnsupportedSourceReason::ScriptCreatedParserInput,
+        );
+        let suspended =
+            PendingSourceDisposition::Unsupported(PendingUnsupportedSourceReason::SuspendedParser);
+
+        PendingParserObservation::new(vec![
+            parser(
+                1,
+                PendingParserPhase::Ready,
+                PendingSourceDisposition::Ready,
+            ),
+            parser(2, PendingParserPhase::AwaitingExternalInput, external),
+            parser(
+                3,
+                PendingParserPhase::AwaitingCommit,
+                PendingSourceDisposition::Ready,
+            ),
+            parser(4, PendingParserPhase::AwaitingScriptInput, script),
+            parser(5, PendingParserPhase::Suspended, suspended),
+        ])
+        .unwrap();
+
+        for (sequence, phase, wrong_disposition) in [
+            (
+                6,
+                PendingParserPhase::AwaitingScriptInput,
+                PendingSourceDisposition::Inert,
+            ),
+            (
+                7,
+                PendingParserPhase::Suspended,
+                PendingSourceDisposition::Inert,
+            ),
+        ] {
+            let source_id = PendingSourceId::new(sequence);
+            assert_eq!(
+                PendingParserObservation::new(vec![parser(sequence, phase, wrong_disposition,)]),
+                Err(PendingSnapshotInvariantError::ParserPhaseDispositionMismatch(source_id,)),
+            );
+        }
     }
 
     #[test]
@@ -3597,10 +4048,15 @@ mod tests {
             None,
         );
         assert_eq!(
+            PendingPipelineMembershipRevision::new(u64::MAX).checked_next(),
+            None,
+        );
+        assert_eq!(
             PendingMicrotaskCheckpoint::new(u64::MAX).checked_next(),
             None,
         );
         assert_eq!(PendingSourceEpoch::new(u64::MAX).checked_next(), None);
+        assert_eq!(PendingSourceId::new(u64::MAX).checked_next(), None);
         assert_eq!(
             PendingTaskObservation {
                 ready: u64::MAX,
