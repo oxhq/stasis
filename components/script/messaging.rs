@@ -24,7 +24,8 @@ use servo_bluetooth_traits::BluetoothRequest;
 use servo_constellation_traits::ScriptToConstellationMessage;
 use stylo_atoms::Atom;
 use timers::{
-    DocumentProducerFence, DocumentProducerFenceError, DocumentProducerKind, TimerScheduler,
+    DocumentProducerFence, DocumentProducerFenceError, DocumentProducerGuard, DocumentProducerKind,
+    TimerScheduler,
 };
 #[cfg(feature = "webgpu")]
 use webgpu_traits::WebGPUMsg;
@@ -257,6 +258,27 @@ pub(crate) enum ScriptEventLoopSender {
 }
 
 impl ScriptEventLoopSender {
+    /// Begin an externally owned callback that will eventually hand work back to this event loop.
+    ///
+    /// Only a controlled main-thread event loop installs producer tracking. Realtime and worker
+    /// senders preserve their ordinary transport path and therefore return no guard. Admission is
+    /// checked so an exhausted producer fence remains a typed terminal condition.
+    pub(crate) fn begin_external_callback(
+        &self,
+    ) -> Result<Option<DocumentProducerGuard>, DocumentProducerFenceError> {
+        let Self::MainThread {
+            producer_fence: Some(producer_fence),
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+
+        producer_fence
+            .begin(DocumentProducerKind::ExternalCallback)
+            .map(Some)
+    }
+
     /// Send a message to the event loop, which might be a main thread event loop or a worker event loop.
     pub(crate) fn send(
         &self,
@@ -599,6 +621,187 @@ mod producer_fence_tests {
     }
 
     #[test]
+    fn external_callback_is_visible_before_it_hands_off_a_task() {
+        let (raw_sender, _receiver) = crossbeam_channel::unbounded();
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender, &producer_fence);
+
+        let callback = event_loop_sender
+            .begin_external_callback()
+            .unwrap()
+            .unwrap();
+        let during_callback = producer_fence.snapshot();
+        assert_eq!(
+            during_callback
+                .for_kind(DocumentProducerKind::ExternalCallback)
+                .pending(),
+            1
+        );
+        assert_eq!(
+            during_callback
+                .for_kind(DocumentProducerKind::Task)
+                .pending(),
+            0
+        );
+
+        drop(callback);
+        let complete = producer_fence.snapshot();
+        assert!(complete.is_empty());
+        assert_eq!(
+            complete
+                .for_kind(DocumentProducerKind::ExternalCallback)
+                .completed(),
+            1
+        );
+    }
+
+    #[test]
+    fn external_callback_handoff_overlaps_then_leaves_only_the_queued_task() {
+        let _script_thread_state = ScriptThreadStateGuard::enter();
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender.clone(), &producer_fence);
+        let task_queue = TaskQueue::new_with_producer_tracking(receiver, raw_sender, true);
+
+        let callback = event_loop_sender
+            .begin_external_callback()
+            .unwrap()
+            .unwrap();
+        event_loop_sender
+            .send(task_message(None, TaskSourceName::Networking))
+            .unwrap();
+
+        let during_handoff = producer_fence.snapshot();
+        assert_eq!(during_handoff.pending(), 2);
+        assert_eq!(
+            during_handoff
+                .for_kind(DocumentProducerKind::ExternalCallback)
+                .pending(),
+            1
+        );
+        assert_eq!(
+            during_handoff
+                .for_kind(DocumentProducerKind::Task)
+                .pending(),
+            1
+        );
+
+        drop(callback);
+        let after_handoff = producer_fence.snapshot();
+        assert_eq!(after_handoff.pending(), 1);
+        assert_eq!(
+            after_handoff
+                .for_kind(DocumentProducerKind::ExternalCallback)
+                .pending(),
+            0
+        );
+        assert_eq!(
+            after_handoff.for_kind(DocumentProducerKind::Task).pending(),
+            1
+        );
+
+        let queued_task = task_queue
+            .take_tasks_and_recv(&FxHashSet::default())
+            .unwrap();
+        assert_eq!(
+            producer_fence
+                .snapshot()
+                .for_kind(DocumentProducerKind::Task)
+                .pending(),
+            1
+        );
+        drop(queued_task);
+        assert!(producer_fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn failed_external_callback_handoff_releases_the_attempted_task_ticket() {
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        drop(receiver);
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender, &producer_fence);
+
+        let callback = event_loop_sender
+            .begin_external_callback()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            event_loop_sender.send(task_message(None, TaskSourceName::Networking)),
+            Err(ScriptEventLoopSendError::ChannelClosed)
+        );
+
+        let after_failed_send = producer_fence.snapshot();
+        assert_eq!(after_failed_send.pending(), 1);
+        assert_eq!(
+            after_failed_send
+                .for_kind(DocumentProducerKind::ExternalCallback)
+                .pending(),
+            1
+        );
+        assert_eq!(
+            after_failed_send
+                .for_kind(DocumentProducerKind::Task)
+                .pending(),
+            0
+        );
+        assert_eq!(
+            after_failed_send
+                .for_kind(DocumentProducerKind::Task)
+                .completed(),
+            1
+        );
+
+        drop(callback);
+        let complete = producer_fence.snapshot();
+        assert!(complete.is_empty());
+        assert_eq!(
+            complete
+                .for_kind(DocumentProducerKind::ExternalCallback)
+                .completed(),
+            1
+        );
+    }
+
+    #[test]
+    fn external_callback_ticket_is_released_when_callback_panics() {
+        let (raw_sender, _receiver) = crossbeam_channel::unbounded();
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender, &producer_fence);
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let callback = event_loop_sender
+                .begin_external_callback()
+                .unwrap()
+                .unwrap();
+            let parse_work = move || {
+                let _keep_callback_live = &callback;
+                panic!("synthetic stylesheet parse failure");
+            };
+            parse_work();
+        }));
+
+        assert!(unwind.is_err());
+        assert!(producer_fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn discarded_external_callback_closure_releases_its_ticket() {
+        let (raw_sender, _receiver) = crossbeam_channel::unbounded();
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender, &producer_fence);
+
+        let callback = event_loop_sender
+            .begin_external_callback()
+            .unwrap()
+            .unwrap();
+        let parse_work = move || drop(callback);
+        assert_eq!(producer_fence.snapshot().pending(), 1);
+
+        drop(parse_work);
+        assert!(producer_fence.snapshot().is_empty());
+    }
+
+    #[test]
     fn discarding_an_inactive_task_queue_completes_its_ticket() {
         let _script_thread_state = ScriptThreadStateGuard::enter();
         let (raw_sender, receiver) = crossbeam_channel::unbounded();
@@ -743,6 +946,7 @@ mod producer_fence_tests {
     fn realtime_transport_does_not_install_producer_tracking_or_pipeline_tombstones() {
         let _script_thread_state = ScriptThreadStateGuard::enter();
         let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        let producer_fence = DocumentProducerFence::default();
         let event_loop_sender = ScriptEventLoopSender::MainThread {
             sender: raw_sender.clone(),
             producer_fence: None,
@@ -752,9 +956,17 @@ mod producer_fence_tests {
         fully_active.insert(TEST_PIPELINE_ID);
 
         task_queue.discard_pipeline(TEST_PIPELINE_ID);
+        assert!(
+            event_loop_sender
+                .begin_external_callback()
+                .unwrap()
+                .is_none()
+        );
         event_loop_sender
             .send(task_message(Some(TEST_PIPELINE_ID), TaskSourceName::Timer))
             .unwrap();
+
+        assert!(producer_fence.snapshot().is_empty());
 
         let message = task_queue.take_tasks_and_recv(&fully_active).unwrap();
         assert_eq!(message.pipeline_id(), Some(TEST_PIPELINE_ID));

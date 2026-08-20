@@ -574,9 +574,20 @@ impl ElementStylesheetLoader<'_> {
             ElementStylesheetLoader::Asynchronous(asynchronous_loader) => {
                 let css_error_reporter = window.css_error_reporter().clone();
 
-                // The completion task is producer-fenced by ScriptEventLoopSender. A separate
-                // ExternalCallback lease for the parallel parsing interval is added with the
-                // remaining non-task producer hooks.
+                // Keep parallel parsing visible after this networking task returns. The external
+                // callback ticket is acquired before the thread-pool handoff, then overlaps the
+                // completion task's ticket until that task has been committed to the event loop.
+                let parse_producer = match asynchronous_loader
+                    .main_thread_sender
+                    .begin_external_callback()
+                {
+                    Ok(parse_producer) => parse_producer,
+                    Err(error) => {
+                        log::error!("failed to fence asynchronous stylesheet parsing: {error}");
+                        return;
+                    },
+                };
+
                 let parse_stylesheet = move || {
                     let pipeline_id = asynchronous_loader.pipeline_id;
                     let main_thread_sender = asynchronous_loader.main_thread_sender.clone();
@@ -587,12 +598,19 @@ impl ElementStylesheetLoader<'_> {
                     let task = task!(finish_parsing_of_stylesheet_on_main_thread: move |cx| {
                         listener.do_post_parse_tasks(true, stylesheet, cx);
                     });
-                    let _ = main_thread_sender.send(CommonScriptMsg::Task(
+                    let send_result = main_thread_sender.send(CommonScriptMsg::Task(
                         ScriptThreadEventCategory::StylesheetLoad,
                         Box::new(task),
                         Some(pipeline_id),
                         TaskSourceName::Networking,
                     ));
+                    // On success the task fence is already live in the event-loop queue. On any
+                    // send failure both the attempted task ticket and this callback ticket are
+                    // released, leaving the producer fence terminal or empty rather than stuck.
+                    drop(parse_producer);
+                    if let Err(error) = send_result {
+                        log::debug!("discarding asynchronous stylesheet result: {error}");
+                    }
                 };
 
                 let thread_pool = STYLE_THREAD_POOL.pool();
