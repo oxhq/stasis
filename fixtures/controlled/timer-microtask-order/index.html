@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Controlled timer microtask order</title>
+  </head>
+  <body>
+    <button id="start" type="button">Start</button>
+    <output id="order">idle</output>
+
+    <script>
+      const order = [];
+      const output = document.querySelector("#order");
+
+      document.querySelector("#start").addEventListener("click", () => {
+        document.documentElement.dataset.state = "scheduled";
+
+        setTimeout(() => {
+          order.push("timer-1");
+          Promise.resolve().then(() => {
+            order.push("microtask");
+          });
+        }, 1000);
+
+        setTimeout(() => {
+          order.push("timer-2");
+          output.textContent = order.join(",");
+          document.documentElement.dataset.state = "complete";
+        }, 1000);
+      });
+    </script>
+  </body>
+</html>

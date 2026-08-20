@@ -67,6 +67,19 @@ Trigger: activate `#start`.
 - The journal preserves four causally nested microtask records before the DOM
   mutation and quiescence event.
 
+### `timer-microtask-order`
+
+Trigger: activate `#start`.
+
+- The action registers two one-shot timers at the same 1,000 ms deadline.
+- Controlled settlement runs the first timer as one event-loop turn, performs
+  its promise microtask checkpoint, and only then runs the second timer.
+- `#order` is exactly `timer-1,microtask,timer-2`; `timer-1,timer-2,microtask`
+  is a failure that reveals timer callbacks were incorrectly batched into one
+  turn.
+- Required journal subsequence:
+  `timer-1.started -> timer-1.completed -> microtask -> timer-2.started -> runtime.quiescent`.
+
 ### `interval-heartbeat`
 
 The interval is registered while parsing; no action is required.
@@ -121,11 +134,12 @@ Trigger: activate `#go`.
 
 ## Global invariants
 
-- Fixture code contains no `setTimeout` except the two finite timers under
-  test, no retry loop, no polling, and no authored `ready`/`settled` promise.
-  The 10,000 ms timer and 800 ms debounce are application work that the runtime
-  must discover and execute; neither is a client-side wait. The 5,000 ms
-  interval is likewise intentional persistent application work.
+- Fixture code contains no `setTimeout` except the finite timers under test,
+  no retry loop, no polling, and no authored `ready`/`settled` promise. The
+  10,000 ms timer, 800 ms debounce, and same-deadline 1,000 ms timer pair are
+  application work that the runtime must discover and execute; none is a
+  client-side wait. The 5,000 ms interval is likewise intentional persistent
+  application work.
 - Assertions inspect only commands, snapshots, journal metadata, URL, and DOM.
 - A controlled run uses one top-level document, no iframe, worker, service
   worker, WebSocket, SSE, animation loop, or live network resource.
