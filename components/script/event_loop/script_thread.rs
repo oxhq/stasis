@@ -43,7 +43,7 @@ use embedder_traits::user_contents::{UserContentManagerId, UserContents, UserScr
 use embedder_traits::{
     EmbedderControlId, EmbedderControlResponse, EmbedderMsg, FocusSequenceNumber,
     InputEventOutcome, JavaScriptEvaluationError, JavaScriptEvaluationId, MediaSessionActionType,
-    Theme, ViewportDetails, WebDriverScriptCommand,
+    ScriptToEmbedderChan, Theme, ViewportDetails, WebDriverScriptCommand,
 };
 use encoding_rs::Encoding;
 use fonts::{FontContext, SystemFontServiceProxy, WebFontLoadEvent};
@@ -109,8 +109,8 @@ use style::stylesheets::{AllowImportRules, DocumentStyleSheet, Origin, Styleshee
 use style::thread_state::{self, ThreadState};
 use stylo_atoms::Atom;
 use timers::{
-    DocumentClock, DocumentClockError, DocumentTime, DocumentTimeSurface, TimerEventRequest, TimerId,
-    TimerControlError, TimerScheduler,
+    DocumentClock, DocumentClockError, DocumentProducerFence, DocumentTime, DocumentTimeSurface,
+    TimerControlError, TimerEventRequest, TimerId, TimerScheduler,
 };
 use url::Position;
 #[cfg(feature = "webgpu")]
@@ -327,6 +327,10 @@ pub struct ScriptThread {
     #[no_trace]
     document_clock: DocumentClock,
 
+    /// Optional linearizable lifecycle fence shared by tracked tasks on this event loop.
+    #[no_trace]
+    document_producer_fence: Option<DocumentProducerFence>,
+
     /// First checked timer-scheduler failure observed by this ScriptThread.
     #[no_trace]
     timer_control_terminal: Cell<Option<TimerControlError>>,
@@ -529,7 +533,10 @@ impl ScriptThreadFactory for ScriptThread {
                 memory_profiler_sender.run_with_memory_reporting(
                     || script_thread.start(&mut cx),
                     reporter_name,
-                    ScriptEventLoopSender::MainThread(script_thread.senders.self_sender.clone()),
+                    ScriptEventLoopSender::MainThread {
+                        sender: script_thread.senders.self_sender.clone(),
+                        producer_fence: script_thread.document_producer_fence.clone(),
+                    },
                     CommonScriptMsg::CollectReports,
                 );
 
@@ -636,6 +643,11 @@ impl ScriptThread {
     /// Return the document clock for the current ScriptThread.
     pub(crate) fn current_document_clock() -> DocumentClock {
         with_script_thread(|script_thread| script_thread.document_clock.clone())
+    }
+
+    /// Return producer tracking shared by main-thread task senders on this ScriptThread.
+    pub(crate) fn document_producer_fence(&self) -> Option<DocumentProducerFence> {
+        self.document_producer_fence.clone()
     }
 
     // https://html.spec.whatwg.org/multipage/#await-a-stable-state
@@ -901,8 +913,14 @@ impl ScriptThread {
         // The clock mode is immutable and selected by the WebView before its initial navigation.
         // Every Window and timer queue on this event loop shares this one clock domain.
         let document_clock = DocumentClock::new(state.document_clock);
-        let mut runtime =
-            Runtime::new(Some(ScriptEventLoopSender::MainThread(self_sender.clone())));
+        let document_producer_fence = document_producer_fence_for_clock(
+            &document_clock,
+            &state.script_to_embedder_sender,
+        );
+        let mut runtime = Runtime::new(Some(ScriptEventLoopSender::MainThread {
+            sender: self_sender.clone(),
+            producer_fence: document_producer_fence.clone(),
+        }));
 
         // SAFETY: We ensure that only one JSContext exists in this thread.
         // This is the first one and the only one
@@ -922,7 +940,11 @@ impl ScriptThread {
         let (ipc_devtools_sender, ipc_devtools_receiver) = generic_channel::channel().unwrap();
         let devtools_server_receiver = ipc_devtools_receiver.route_preserving_errors();
 
-        let task_queue = TaskQueue::new(self_receiver, self_sender.clone());
+        let task_queue = TaskQueue::new_with_producer_tracking(
+            self_receiver,
+            self_sender.clone(),
+            document_producer_fence.is_some(),
+        );
 
         let closing = Arc::new(AtomicBool::new(false));
         let background_hang_monitor_exit_signal = BHMExitSignal {
@@ -1018,6 +1040,7 @@ impl ScriptThread {
                         document_clock.clone(),
                     )),
                     document_clock,
+                    document_producer_fence,
                     timer_control_terminal: Default::default(),
                     microtask_queue,
                     js_runtime: Rc::new(runtime),
@@ -2147,6 +2170,13 @@ impl ScriptThread {
     fn handle_msg_from_script(&self, msg: MainThreadScriptMsg, cx: &mut js::context::JSContext) {
         match msg {
             MainThreadScriptMsg::Common(CommonScriptMsg::Task(_, task, pipeline_id, _)) => {
+                if self.document_producer_fence.is_some() &&
+                    pipeline_id.is_some_and(|pipeline_id| {
+                        self.closed_pipelines.borrow().contains(&pipeline_id)
+                    })
+                {
+                    return;
+                }
                 let global = pipeline_id.and_then(|id| self.documents.borrow().find_global(id));
                 match global {
                     None => task.run_box(cx),
@@ -3279,6 +3309,15 @@ impl ScriptThread {
     ) {
         debug!("{pipeline_id}: Starting pipeline exit.");
 
+        if self.document_producer_fence.is_some() {
+            // Establish a permanent task-queue tombstone before tearing down the document. This
+            // purges every locally retained task and makes producers racing the exit fail closed
+            // on their next intake. Tasks already gathered into this turn are rejected by
+            // `handle_msg_from_script` against the same ScriptThread tombstone.
+            self.closed_pipelines.borrow_mut().insert(pipeline_id);
+            self.task_queue.discard_pipeline(pipeline_id);
+        }
+
         // Abort the parser, if any,
         // to prevent any further incoming networking messages from being handled.
         let document = self.documents.borrow_mut().remove(pipeline_id);
@@ -3322,8 +3361,10 @@ impl ScriptThread {
             }
         }
 
-        // Prevent any further work for this Pipeline.
-        self.closed_pipelines.borrow_mut().insert(pipeline_id);
+        if self.document_producer_fence.is_none() {
+            // Preserve upstream Real-mode ordering: the pipeline closes after document teardown.
+            self.closed_pipelines.borrow_mut().insert(pipeline_id);
+        }
 
         debug!("{pipeline_id}: Sending PipelineExited message to constellation");
         self.senders
@@ -4585,6 +4626,26 @@ fn renderer_may_drive_rendering(clock: &DocumentClock) -> bool {
     !clock.is_controlled()
 }
 
+fn controlled_producer_state_change_notifier(
+    document_clock: &DocumentClock,
+    script_to_embedder_sender: &ScriptToEmbedderChan,
+) -> Option<Arc<dyn Fn() + Send + Sync>> {
+    document_clock.is_controlled().then(|| {
+        let script_to_embedder_sender = script_to_embedder_sender.clone();
+        Arc::new(move || {
+            let _ = script_to_embedder_sender.wake();
+        }) as Arc<dyn Fn() + Send + Sync>
+    })
+}
+
+fn document_producer_fence_for_clock(
+    document_clock: &DocumentClock,
+    script_to_embedder_sender: &ScriptToEmbedderChan,
+) -> Option<DocumentProducerFence> {
+    controlled_producer_state_change_notifier(document_clock, script_to_embedder_sender)
+        .map(|notifier| DocumentProducerFence::with_notifier(Some(notifier)))
+}
+
 fn record_first_timer_control_error(
     terminal: &Cell<Option<TimerControlError>>,
     error: TimerControlError,
@@ -4636,19 +4697,33 @@ impl Drop for ScriptThread {
 mod document_clock_tests {
     use std::cell::Cell;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use embedder_traits::{EventLoopWaker, ScriptToEmbedderChan};
     use timers::{
-        DocumentClock, DocumentClockConfiguration, DocumentClockError, DocumentTime,
-        DocumentUnixTime, TimerControlError, TimerScheduler,
+        DocumentClock, DocumentClockConfiguration, DocumentClockError, DocumentProducerKind,
+        DocumentTime, DocumentUnixTime, TimerControlError, TimerScheduler,
     };
 
     use super::{
-        record_first_timer_control_error, remaining_rendering_opportunity_delay,
-        renderer_may_drive_rendering,
+        document_producer_fence_for_clock, record_first_timer_control_error,
+        remaining_rendering_opportunity_delay, renderer_may_drive_rendering,
         try_schedule_rendering_update_timer,
     };
+
+    #[derive(Clone)]
+    struct CountingEventLoopWaker(Arc<AtomicUsize>);
+
+    impl EventLoopWaker for CountingEventLoopWaker {
+        fn clone_box(&self) -> Box<dyn EventLoopWaker> {
+            Box::new(self.clone())
+        }
+
+        fn wake(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn rendering_opportunity_delay_uses_checked_document_time() {
@@ -4688,6 +4763,34 @@ mod document_clock_tests {
 
         assert!(!renderer_may_drive_rendering(&controlled));
         assert!(renderer_may_drive_rendering(&DocumentClock::default()));
+    }
+
+    #[test]
+    fn controlled_producer_wakes_do_not_require_settlement_accounting() {
+        let (embedder_sender, embedder_receiver) = crossbeam_channel::unbounded();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let sender = ScriptToEmbedderChan::new(
+            embedder_sender,
+            Box::new(CountingEventLoopWaker(wake_count.clone())),
+        );
+        let controlled_clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        });
+        let fence = document_producer_fence_for_clock(&controlled_clock, &sender)
+            .expect("controlled clocks must install producer tracking");
+
+        let producer = fence.begin(DocumentProducerKind::Task).unwrap();
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+        drop(producer);
+        assert_eq!(wake_count.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            embedder_receiver.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ));
+
+        assert!(document_producer_fence_for_clock(&DocumentClock::default(), &sender).is_none());
+        assert_eq!(wake_count.load(Ordering::SeqCst), 2);
     }
 
     #[test]

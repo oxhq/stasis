@@ -651,13 +651,19 @@ impl Window {
     pub(crate) fn new_script_pair(&self) -> (ScriptEventLoopSender, ScriptEventLoopReceiver) {
         let (sender, receiver) = unbounded();
         (
-            ScriptEventLoopSender::MainThread(sender),
+            ScriptEventLoopSender::MainThread {
+                sender,
+                producer_fence: self.script_thread().document_producer_fence(),
+            },
             ScriptEventLoopReceiver::MainThread(receiver),
         )
     }
 
     pub(crate) fn event_loop_sender(&self) -> ScriptEventLoopSender {
-        ScriptEventLoopSender::MainThread(self.script_chan.clone())
+        ScriptEventLoopSender::MainThread {
+            sender: self.script_chan.clone(),
+            producer_fence: self.script_thread().document_producer_fence(),
+        }
     }
 
     pub(crate) fn image_cache(&self) -> Arc<dyn ImageCache> {

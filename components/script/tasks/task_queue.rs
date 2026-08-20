@@ -54,10 +54,21 @@ pub(crate) struct TaskQueue<T> {
     throttled: DomRefCell<FxHashMap<TaskSourceName, VecDeque<QueuedTask>>>,
     /// Tasks for not fully-active documents.
     inactive: DomRefCell<FxHashMap<PipelineId, VecDeque<QueuedTask>>>,
+    /// Pipelines whose tasks must be discarded even when they arrive after teardown.
+    closed_pipelines: Option<DomRefCell<FxHashSet<PipelineId>>>,
 }
 
 impl<T: QueuedTaskConversion> TaskQueue<T> {
     pub(crate) fn new(port: Receiver<T>, wake_up_sender: Sender<T>) -> TaskQueue<T> {
+        Self::new_with_producer_tracking(port, wake_up_sender, false)
+    }
+
+    /// Construct a task queue that permanently filters tasks after their pipeline exits.
+    pub(crate) fn new_with_producer_tracking(
+        port: Receiver<T>,
+        wake_up_sender: Sender<T>,
+        producer_tracking: bool,
+    ) -> TaskQueue<T> {
         TaskQueue {
             port,
             wake_up_sender,
@@ -65,7 +76,29 @@ impl<T: QueuedTaskConversion> TaskQueue<T> {
             taken_task_counter: Default::default(),
             throttled: Default::default(),
             inactive: Default::default(),
+            closed_pipelines: producer_tracking.then(Default::default),
         }
+    }
+
+    /// Permanently discard tasks for `pipeline_id` from every queue and future channel intake.
+    pub(crate) fn discard_pipeline(&self, pipeline_id: PipelineId) {
+        let Some(closed_pipelines) = &self.closed_pipelines else {
+            return;
+        };
+        closed_pipelines.borrow_mut().insert(pipeline_id);
+
+        self.msg_queue
+            .borrow_mut()
+            .retain(|message| message.pipeline_id() != Some(pipeline_id));
+
+        let mut throttled = self.throttled.borrow_mut();
+        throttled.retain(|_, queue| {
+            queue.retain(|task| task.pipeline_id != Some(pipeline_id));
+            !queue.is_empty()
+        });
+        drop(throttled);
+
+        self.inactive.borrow_mut().remove(&pipeline_id);
     }
 
     /// Release previously held-back tasks for documents that are now fully-active.
@@ -121,6 +154,17 @@ impl<T: QueuedTaskConversion> TaskQueue<T> {
             if !msg.is_wake_up() {
                 incoming.push(msg);
             }
+        }
+
+        // Pipeline identity is permanent. Drop both tasks already present at close time and any
+        // producer that races teardown and arrives later; global (`None`) tasks remain eligible.
+        if let Some(closed_pipelines) = &self.closed_pipelines {
+            let closed_pipelines = closed_pipelines.borrow();
+            incoming.retain(|message| {
+                message
+                    .pipeline_id()
+                    .is_none_or(|pipeline_id| !closed_pipelines.contains(&pipeline_id))
+            });
         }
 
         // 4. Filter tasks from non-priority task-sources.

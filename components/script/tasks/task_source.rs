@@ -12,7 +12,7 @@ use stylo_atoms::Atom;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::event::{EventBubbles, EventCancelable, EventTask, SimpleEventTask};
 use crate::dom::eventtarget::EventTarget;
-use crate::messaging::{CommonScriptMsg, ScriptEventLoopSender};
+use crate::messaging::{CommonScriptMsg, ScriptEventLoopSendError, ScriptEventLoopSender};
 use crate::script_runtime::ScriptThreadEventCategory;
 use crate::tasks::task::{TaskCanceller, TaskOnce};
 use crate::tasks::task_manager::TaskManager;
@@ -98,6 +98,20 @@ pub(crate) struct TaskSource<'task_manager> {
     pub(crate) name: TaskSourceName,
 }
 
+fn handle_unconditional_send_result(result: Result<(), ScriptEventLoopSendError>) {
+    match result {
+        Ok(()) => {},
+        Err(ScriptEventLoopSendError::ChannelClosed) => {
+            panic!("Tried to send a task on a task queue after shutdown.")
+        },
+        Err(ScriptEventLoopSendError::Producer(error)) => {
+            // Producer admission failures are already sticky in the owning fence snapshot. Do not
+            // turn a checked Controlled-mode terminal into an unrelated task-source panic.
+            warn!("Could not admit task into the document producer fence: {error}");
+        },
+    }
+}
+
 impl TaskSource<'_> {
     /// Queue a task with the default canceller for this [`TaskSource`].
     pub(crate) fn queue(&self, task: impl TaskOnce + 'static) {
@@ -112,7 +126,7 @@ impl TaskSource<'_> {
     /// This queues a task that will not be cancelled when its associated global scope gets destroyed.
     pub(crate) fn queue_unconditionally(&self, task: impl TaskOnce + 'static) {
         let sender = self.task_manager.sender();
-        sender
+        let result = sender
             .as_ref()
             .expect("Tried to enqueue task for DedicatedWorker while not handling a message.")
             .send(CommonScriptMsg::Task(
@@ -120,8 +134,8 @@ impl TaskSource<'_> {
                 Box::new(task),
                 Some(self.task_manager.pipeline_id()),
                 self.name,
-            ))
-            .expect("Tried to send a task on a task queue after shutdown.");
+            ));
+        handle_unconditional_send_result(result);
     }
 
     pub(crate) fn queue_simple_event(&self, target: &EventTarget, name: Atom) {
@@ -186,7 +200,7 @@ impl SendableTaskSource {
 
     /// This queues a task that will not be cancelled when its associated global scope gets destroyed.
     pub(crate) fn queue_unconditionally(&self, task: impl TaskOnce + 'static) {
-        if self
+        if let Err(error) = self
             .sender
             .send(CommonScriptMsg::Task(
                 self.name.into(),
@@ -194,11 +208,11 @@ impl SendableTaskSource {
                 Some(self.pipeline_id),
                 self.name,
             ))
-            .is_err()
         {
             warn!(
-                "Could not queue non-main-thread task {:?}. Likely tried to queue during shutdown.",
-                self.name
+                "Could not queue non-main-thread task {:?}: {:?}. Likely tried to queue during shutdown or after a producer terminal.",
+                self.name,
+                error,
             );
         }
     }
@@ -218,5 +232,25 @@ impl Clone for SendableTaskSource {
 impl fmt::Debug for SendableTaskSource {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}(...)", self.name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use timers::DocumentProducerFenceError;
+
+    use super::*;
+
+    #[test]
+    fn producer_terminal_during_task_dispatch_does_not_panic() {
+        handle_unconditional_send_result(Err(ScriptEventLoopSendError::Producer(
+            DocumentProducerFenceError::CounterOverflow,
+        )));
+    }
+
+    #[test]
+    #[should_panic(expected = "Tried to send a task on a task queue after shutdown.")]
+    fn channel_shutdown_during_task_dispatch_preserves_the_upstream_panic() {
+        handle_unconditional_send_result(Err(ScriptEventLoopSendError::ChannelClosed));
     }
 }

@@ -5,7 +5,6 @@
 use std::io::{Read, Seek, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crossbeam_channel::Sender;
 use cssparser::SourceLocation;
 use encoding_rs::UTF_8;
 use js::context::JSContext;
@@ -47,7 +46,7 @@ use crate::dom::window::CSSErrorReporter;
 use crate::event_loop::document_loader::LoadType;
 use crate::fetch::fetch::{RequestWithGlobalScope, create_a_potential_cors_request};
 use crate::fetch::network_listener::{self, FetchResponseListener, ResourceTimingListener};
-use crate::messaging::{CommonScriptMsg, MainThreadScriptMsg};
+use crate::messaging::{CommonScriptMsg, ScriptEventLoopSender};
 use crate::script_runtime::ScriptThreadEventCategory;
 use crate::tasks::task_source::TaskSourceName;
 use crate::unminify::{
@@ -575,6 +574,9 @@ impl ElementStylesheetLoader<'_> {
             ElementStylesheetLoader::Asynchronous(asynchronous_loader) => {
                 let css_error_reporter = window.css_error_reporter().clone();
 
+                // The completion task is producer-fenced by ScriptEventLoopSender. A separate
+                // ExternalCallback lease for the parallel parsing interval is added with the
+                // remaining non-task producer hooks.
                 let parse_stylesheet = move || {
                     let pipeline_id = asynchronous_loader.pipeline_id;
                     let main_thread_sender = asynchronous_loader.main_thread_sender.clone();
@@ -585,13 +587,11 @@ impl ElementStylesheetLoader<'_> {
                     let task = task!(finish_parsing_of_stylesheet_on_main_thread: move |cx| {
                         listener.do_post_parse_tasks(true, stylesheet, cx);
                     });
-                    let _ = main_thread_sender.send(MainThreadScriptMsg::Common(
-                        CommonScriptMsg::Task(
-                            ScriptThreadEventCategory::StylesheetLoad,
-                            Box::new(task),
-                            Some(pipeline_id),
-                            TaskSourceName::Networking,
-                        ),
+                    let _ = main_thread_sender.send(CommonScriptMsg::Task(
+                        ScriptThreadEventCategory::StylesheetLoad,
+                        Box::new(task),
+                        Some(pipeline_id),
+                        TaskSourceName::Networking,
                     ));
                 };
 
@@ -689,13 +689,12 @@ impl StyleStylesheetLoader for ElementStylesheetLoader<'_> {
                         "".to_owned()
                     );
                 });
-                let _ =
-                    main_thread_sender.send(MainThreadScriptMsg::Common(CommonScriptMsg::Task(
-                        ScriptThreadEventCategory::StylesheetLoad,
-                        Box::new(task),
-                        Some(*pipeline_id),
-                        TaskSourceName::Networking,
-                    )));
+                let _ = main_thread_sender.send(CommonScriptMsg::Task(
+                    ScriptThreadEventCategory::StylesheetLoad,
+                    Box::new(task),
+                    Some(*pipeline_id),
+                    TaskSourceName::Networking,
+                ));
             },
         }
 
@@ -705,7 +704,7 @@ impl StyleStylesheetLoader for ElementStylesheetLoader<'_> {
 
 pub(crate) struct AsynchronousStylesheetLoader {
     element: Trusted<HTMLElement>,
-    main_thread_sender: Sender<MainThreadScriptMsg>,
+    main_thread_sender: ScriptEventLoopSender,
     pipeline_id: PipelineId,
 }
 
@@ -714,7 +713,7 @@ impl AsynchronousStylesheetLoader {
         let window = element.owner_window();
         Self {
             element: Trusted::new(element),
-            main_thread_sender: window.main_thread_script_chan().clone(),
+            main_thread_sender: window.event_loop_sender(),
             pipeline_id: window.pipeline_id(),
         }
     }

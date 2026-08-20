@@ -29,7 +29,7 @@ use crate::dom::node::node::Node;
 use crate::dom::promise::Promise;
 use crate::dom::shadowroot::ShadowRoot;
 use crate::dom::types::HTMLDialogElement;
-use crate::messaging::{CommonScriptMsg, MainThreadScriptMsg};
+use crate::messaging::{CommonScriptMsg, ScriptEventLoopSendError};
 use crate::script_runtime::ScriptThreadEventCategory;
 use crate::tasks::task::TaskOnce;
 use crate::tasks::task_source::TaskSourceName;
@@ -142,8 +142,22 @@ impl Document {
             Some(pipeline_id),
             TaskSourceName::DOMManipulation,
         );
-        let msg = MainThreadScriptMsg::Common(script_msg);
-        self.window().main_thread_script_chan().send(msg).unwrap();
+        match self.window().event_loop_sender().send(script_msg) {
+            Ok(()) => {},
+            Err(ScriptEventLoopSendError::Producer(producer_error)) => {
+                warn!("Could not admit fullscreen-enter task: {producer_error}");
+                if !error {
+                    self.send_to_embedder(EmbedderMsg::NotifyFullscreenStateChanged(
+                        self.webview_id(),
+                        false,
+                    ));
+                }
+                promise.reject_error(cx, Error::Abort(None));
+            },
+            Err(ScriptEventLoopSendError::ChannelClosed) => {
+                panic!("Could not queue fullscreen-enter task after ScriptThread shutdown")
+            },
+        }
 
         promise
     }
@@ -192,8 +206,16 @@ impl Document {
             pipeline_id,
             TaskSourceName::DOMManipulation,
         );
-        let msg = MainThreadScriptMsg::Common(script_msg);
-        window.main_thread_script_chan().send(msg).unwrap();
+        match window.event_loop_sender().send(script_msg) {
+            Ok(()) => {},
+            Err(ScriptEventLoopSendError::Producer(producer_error)) => {
+                warn!("Could not admit fullscreen-exit task: {producer_error}");
+                promise.reject_error(cx, Error::Abort(None));
+            },
+            Err(ScriptEventLoopSendError::ChannelClosed) => {
+                panic!("Could not queue fullscreen-exit task after ScriptThread shutdown")
+            },
+        }
 
         promise
     }

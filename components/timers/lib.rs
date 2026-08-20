@@ -856,6 +856,7 @@ impl DocumentProducerWatermark {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
 pub struct DocumentProducerSnapshot {
     fence_id: DocumentProducerFenceId,
+    terminal_error: Option<DocumentProducerFenceError>,
     revision: u64,
     enqueued: u64,
     completed: u64,
@@ -867,6 +868,11 @@ impl DocumentProducerSnapshot {
     /// Return the identity of the fence that produced this snapshot.
     pub const fn fence_id(self) -> DocumentProducerFenceId {
         self.fence_id
+    }
+
+    /// Return the first terminal producer-lifecycle failure without clearing it.
+    pub const fn terminal_error(self) -> Option<DocumentProducerFenceError> {
+        self.terminal_error
     }
 
     /// A mutation sequence incremented for every enqueue and completion.
@@ -902,6 +908,7 @@ impl DocumentProducerSnapshot {
 
 #[derive(Default)]
 struct DocumentProducerFenceState {
+    terminal_error: Option<DocumentProducerFenceError>,
     revision: u64,
     enqueued: u64,
     completed: u64,
@@ -914,6 +921,7 @@ impl DocumentProducerFenceState {
     fn snapshot(&self, fence_id: DocumentProducerFenceId) -> DocumentProducerSnapshot {
         DocumentProducerSnapshot {
             fence_id,
+            terminal_error: self.terminal_error,
             revision: self.revision,
             enqueued: self.enqueued,
             completed: self.completed,
@@ -924,7 +932,7 @@ impl DocumentProducerFenceState {
 }
 
 /// A checked producer-fence failure.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
 pub enum DocumentProducerFenceError {
     /// A sequence or watermark would exceed the `u64` representation.
     CounterOverflow,
@@ -1010,34 +1018,36 @@ impl DocumentProducerFence {
         kind: DocumentProducerKind,
     ) -> Result<DocumentProducerGuard, DocumentProducerFenceError> {
         let mut state = self.inner.lock().expect("document producer fence poisoned");
+        if let Some(error) = state.terminal_error {
+            return Err(error);
+        }
         let index = kind.index();
 
-        let revision = state
-            .revision
-            .checked_add(1)
-            .ok_or(DocumentProducerFenceError::CounterOverflow)?;
-        let enqueued = state
-            .enqueued
-            .checked_add(1)
-            .ok_or(DocumentProducerFenceError::CounterOverflow)?;
-        let pending = state
-            .pending
-            .checked_add(1)
-            .ok_or(DocumentProducerFenceError::CounterOverflow)?;
-        let kind_enqueued = state.by_kind[index]
-            .enqueued
-            .checked_add(1)
-            .ok_or(DocumentProducerFenceError::CounterOverflow)?;
-        let kind_pending = state.by_kind[index]
-            .pending
-            .checked_add(1)
-            .ok_or(DocumentProducerFenceError::CounterOverflow)?;
+        macro_rules! checked_or_latch_overflow {
+            ($value:expr) => {
+                match $value {
+                    Some(value) => value,
+                    None => {
+                        let error = DocumentProducerFenceError::CounterOverflow;
+                        state.terminal_error = Some(error);
+                        drop(state);
+                        self.notify_state_change();
+                        return Err(error);
+                    },
+                }
+            };
+        }
+
+        let revision = checked_or_latch_overflow!(state.revision.checked_add(1));
+        let enqueued = checked_or_latch_overflow!(state.enqueued.checked_add(1));
+        let pending = checked_or_latch_overflow!(state.pending.checked_add(1));
+        let kind_enqueued =
+            checked_or_latch_overflow!(state.by_kind[index].enqueued.checked_add(1));
+        let kind_pending = checked_or_latch_overflow!(state.by_kind[index].pending.checked_add(1));
 
         // Each live ticket will consume one more revision when it completes. Reserve all of those
         // future increments before admitting another ticket so guard destruction stays infallible.
-        revision
-            .checked_add(pending)
-            .ok_or(DocumentProducerFenceError::CounterOverflow)?;
+        checked_or_latch_overflow!(revision.checked_add(pending));
 
         state.revision = revision;
         state.enqueued = enqueued;
@@ -1068,6 +1078,16 @@ impl DocumentProducerFence {
             .lock()
             .expect("document producer fence poisoned")
             .snapshot(self.fence_id)
+    }
+
+    /// Wake the host after externally committing work already represented by a live ticket.
+    ///
+    /// This does not mutate producer state or its revision. It closes the handoff window where
+    /// `begin` must notify before a producer can commit its task to an external queue: the queue
+    /// owner receives a second notification after that commit becomes observable.
+    #[doc(hidden)]
+    pub fn notify_observer_after_commit(&self) {
+        self.notify_state_change();
     }
 
     /// Run an action only while the producer snapshot still exactly matches `expected`.
@@ -1862,11 +1882,58 @@ mod tests {
             fence.begin(DocumentProducerKind::Task),
             Err(DocumentProducerFenceError::CounterOverflow)
         ));
-        assert_eq!(fence.snapshot(), before);
+        let terminal = fence.snapshot();
+        assert_eq!(
+            terminal.terminal_error(),
+            Some(DocumentProducerFenceError::CounterOverflow)
+        );
+        assert_eq!(terminal.revision(), before.revision());
+        assert_eq!(terminal.enqueued(), before.enqueued());
+        assert_eq!(terminal.completed(), before.completed());
+        assert_eq!(terminal.pending(), before.pending());
         assert_eq!(
             DocumentProducerCheckpoint(u64::MAX).checked_next(),
             Err(DocumentProducerFenceError::CounterOverflow)
         );
+    }
+
+    #[test]
+    fn producer_overflow_latches_once_without_mutating_watermarks_and_notifies() {
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed_notifications = notifications.clone();
+        let state = DocumentProducerFenceState {
+            revision: u64::MAX - 1,
+            ..DocumentProducerFenceState::default()
+        };
+        let fence = DocumentProducerFence {
+            fence_id: DocumentProducerFenceId(0),
+            inner: Arc::new(Mutex::new(state)),
+            state_change_notifier: Some(Arc::new(move || {
+                observed_notifications.fetch_add(1, Ordering::SeqCst);
+            })),
+        };
+        let before = fence.snapshot();
+
+        assert_eq!(
+            fence.begin(DocumentProducerKind::Task).err(),
+            Some(DocumentProducerFenceError::CounterOverflow)
+        );
+        let terminal = fence.snapshot();
+        assert_eq!(
+            terminal.terminal_error(),
+            Some(DocumentProducerFenceError::CounterOverflow)
+        );
+        assert_eq!(terminal.revision(), before.revision());
+        assert_eq!(terminal.enqueued(), before.enqueued());
+        assert_eq!(terminal.completed(), before.completed());
+        assert_eq!(terminal.pending(), before.pending());
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            fence.begin(DocumentProducerKind::Resource).err(),
+            Some(DocumentProducerFenceError::CounterOverflow)
+        );
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1894,6 +1961,21 @@ mod tests {
 
         assert_eq!(*observed.lock().unwrap(), vec![1, 0]);
         assert!(fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn observer_notification_after_external_commit_does_not_mutate_producer_state() {
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed_notifications = notifications.clone();
+        let fence = DocumentProducerFence::with_notifier(Some(Arc::new(move || {
+            observed_notifications.fetch_add(1, Ordering::SeqCst);
+        })));
+        let before = fence.snapshot();
+
+        fence.notify_observer_after_commit();
+
+        assert_eq!(fence.snapshot(), before);
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
     }
 
     #[test]

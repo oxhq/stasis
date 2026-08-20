@@ -124,6 +124,12 @@ impl ProducerFencedTaskBox {
     pub(crate) fn new(inner: Box<dyn TaskBox>, guard: DocumentProducerGuard) -> Self {
         Self { inner, guard }
     }
+
+    fn run_inner(self, run: impl FnOnce(Box<dyn TaskBox>)) {
+        let Self { inner, guard } = self;
+        run(inner);
+        drop(guard);
+    }
 }
 
 impl TaskBox for ProducerFencedTaskBox {
@@ -132,9 +138,7 @@ impl TaskBox for ProducerFencedTaskBox {
     }
 
     fn run_box(self: Box<Self>, cx: &mut js::context::JSContext) {
-        let Self { inner, guard } = *self;
-        inner.run_box(cx);
-        drop(guard);
+        (*self).run_inner(|inner| inner.run_box(cx));
     }
 }
 
@@ -286,5 +290,38 @@ mod tests {
         assert_eq!(fence.snapshot().pending(), 1);
         drop(task);
         assert!(fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn running_a_fenced_task_keeps_its_ticket_until_the_inner_task_returns() {
+        let fence = DocumentProducerFence::default();
+        let guard = fence.begin(DocumentProducerKind::Task).unwrap();
+        let task = ProducerFencedTaskBox::new(Box::new(NamedTask), guard);
+        let observed_fence = fence.clone();
+
+        task.run_inner(move |_| assert_eq!(observed_fence.snapshot().pending(), 1));
+
+        assert!(fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn panicking_inner_task_still_completes_its_ticket_during_unwind() {
+        let fence = DocumentProducerFence::default();
+        let guard = fence.begin(DocumentProducerKind::Task).unwrap();
+        let task = ProducerFencedTaskBox::new(Box::new(NamedTask), guard);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            task.run_inner(|_| panic!("inner task panic"));
+        }));
+
+        assert!(result.is_err());
+        assert!(fence.snapshot().is_empty());
+        assert_eq!(
+            fence
+                .snapshot()
+                .for_kind(DocumentProducerKind::Task)
+                .completed(),
+            1
+        );
     }
 }

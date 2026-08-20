@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::option::Option;
 use std::result::Result;
 
-use crossbeam_channel::{Receiver, Select, SelectedOperation, SendError, Sender};
+use crossbeam_channel::{Receiver, Select, SelectedOperation, Sender};
 use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg};
 use embedder_traits::{EmbedderControlId, EmbedderControlResponse, ScriptToEmbedderChan};
 use net_traits::FetchResponseMsg;
@@ -23,7 +23,9 @@ use servo_base::id::{PipelineId, WebViewId};
 use servo_bluetooth_traits::BluetoothRequest;
 use servo_constellation_traits::ScriptToConstellationMessage;
 use stylo_atoms::Atom;
-use timers::TimerScheduler;
+use timers::{
+    DocumentProducerFence, DocumentProducerFenceError, DocumentProducerKind, TimerScheduler,
+};
 #[cfg(feature = "webgpu")]
 use webgpu_traits::WebGPUMsg;
 
@@ -35,6 +37,7 @@ use crate::dom::serviceworkerglobalscope::ServiceWorkerScriptMsg;
 use crate::dom::sharedworkerglobalscope::SharedWorkerScriptMsg;
 use crate::dom::worker::TrustedWorkerAddress;
 use crate::dom::{WorkletControl, WorkletExecutor};
+use crate::producer_fence::ProducerFencedTaskBox;
 use crate::script_runtime::ScriptThreadEventCategory;
 use crate::tasks::task::TaskBox;
 use crate::tasks::task_queue::{QueuedTask, QueuedTaskConversion, TaskQueue};
@@ -191,6 +194,26 @@ pub(crate) enum CommonScriptMsg {
     ReportCspViolations(PipelineId, Vec<Violation>),
 }
 
+/// A checked failure to hand work to a script event loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScriptEventLoopSendError {
+    /// The receiving event loop has shut down.
+    ChannelClosed,
+    /// Producer admission failed and the owning fence latched the terminal.
+    Producer(DocumentProducerFenceError),
+}
+
+impl fmt::Display for ScriptEventLoopSendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ChannelClosed => formatter.write_str("script event-loop channel closed"),
+            Self::Producer(error) => {
+                write!(formatter, "document producer admission failed: {error}")
+            },
+        }
+    }
+}
+
 impl fmt::Debug for CommonScriptMsg {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
@@ -209,12 +232,20 @@ impl fmt::Debug for CommonScriptMsg {
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 pub(crate) enum ScriptEventLoopSender {
     /// A sender that sends to the main `ScriptThread` event loop.
-    MainThread(Sender<MainThreadScriptMsg>),
+    MainThread {
+        sender: Sender<MainThreadScriptMsg>,
+        #[no_trace]
+        #[ignore_malloc_size_of = "The producer fence is shared by the ScriptThread"]
+        producer_fence: Option<DocumentProducerFence>,
+    },
     /// A sender that sends to a `SharedWorker` event loop.
     SharedWorker(Sender<SharedWorkerScriptMsg>),
     /// A sender that sends to a `ServiceWorker` event loop.
     ServiceWorker(Sender<ServiceWorkerScriptMsg>),
-    /// A wrapper that sends to the event loops of all threads belonging to a `Worklet`
+    /// A wrapper that sends to the event loops of all threads belonging to a `Worklet`.
+    ///
+    /// Worklets intentionally do not participate in this ScriptThread-owned fence: controlled
+    /// mode rejects the Worklet surface before its separate event loop can be created.
     Worklet(WorkletExecutor),
     /// A sender that sends to a dedicated worker (such as a generic Web Worker) event loop.
     /// Note that this sender keeps the main thread Worker DOM object alive as long as it or
@@ -227,21 +258,57 @@ pub(crate) enum ScriptEventLoopSender {
 
 impl ScriptEventLoopSender {
     /// Send a message to the event loop, which might be a main thread event loop or a worker event loop.
-    pub(crate) fn send(&self, message: CommonScriptMsg) -> Result<(), SendError<()>> {
+    pub(crate) fn send(
+        &self,
+        mut message: CommonScriptMsg,
+    ) -> Result<(), ScriptEventLoopSendError> {
         match self {
-            Self::MainThread(sender) => sender
-                .send(MainThreadScriptMsg::Common(message))
-                .map_err(|_| SendError(())),
+            Self::MainThread {
+                sender,
+                producer_fence,
+            } => {
+                let notify_after_commit = if let Some(producer_fence) = producer_fence {
+                    if let CommonScriptMsg::Task(category, task, pipeline_id, task_source) = message
+                    {
+                        let guard = producer_fence
+                            .begin(DocumentProducerKind::Task)
+                            .map_err(ScriptEventLoopSendError::Producer)?;
+                        message = CommonScriptMsg::Task(
+                            category,
+                            Box::new(ProducerFencedTaskBox::new(task, guard)),
+                            pipeline_id,
+                            task_source,
+                        );
+                        Some(producer_fence)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                match sender.send(MainThreadScriptMsg::Common(message)) {
+                    Ok(()) => {
+                        if let Some(producer_fence) = notify_after_commit {
+                            // `begin` wakes before this queue mutation. Wake again after commit so
+                            // an owner that observed Busy between the two cannot go to sleep with
+                            // a newly queued task and no subsequent notification.
+                            producer_fence.notify_observer_after_commit();
+                        }
+                        Ok(())
+                    },
+                    Err(_) => Err(ScriptEventLoopSendError::ChannelClosed),
+                }
+            },
             Self::SharedWorker(sender) => sender
                 .send(SharedWorkerScriptMsg::CommonWorker(
                     WorkerScriptMsg::Common(message),
                 ))
-                .map_err(|_| SendError(())),
+                .map_err(|_| ScriptEventLoopSendError::ChannelClosed),
             Self::ServiceWorker(sender) => sender
                 .send(ServiceWorkerScriptMsg::CommonWorker(
                     WorkerScriptMsg::Common(message),
                 ))
-                .map_err(|_| SendError(())),
+                .map_err(|_| ScriptEventLoopSendError::ChannelClosed),
             Self::DedicatedWorker {
                 sender,
                 main_thread_worker,
@@ -252,11 +319,11 @@ impl ScriptEventLoopSender {
                         main_thread_worker.clone(),
                         common_message,
                     ))
-                    .map_err(|_| SendError(()))
+                    .map_err(|_| ScriptEventLoopSendError::ChannelClosed)
             },
-            Self::Worklet(executor) => {
-                executor.send_control_message(WorkletControl::Common(message))
-            },
+            Self::Worklet(executor) => executor
+                .send_control_message(WorkletControl::Common(message))
+                .map_err(|_| ScriptEventLoopSendError::ChannelClosed),
         }
     }
 }
@@ -370,6 +437,328 @@ impl QueuedTaskConversion for MainThreadScriptMsg {
 impl OpaqueSender<CommonScriptMsg> for ScriptEventLoopSender {
     fn send(&self, message: CommonScriptMsg) {
         self.send(message).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod producer_fence_tests {
+    use std::sync::{Arc, Mutex};
+
+    use embedder_traits::{EventLoopWaker, ScriptToEmbedderChan};
+    use servo_base::id::TEST_PIPELINE_ID;
+    use style::thread_state::{self, ThreadState};
+
+    use super::*;
+
+    struct ScriptThreadStateGuard {
+        entered_script: bool,
+    }
+
+    impl ScriptThreadStateGuard {
+        fn enter() -> Self {
+            let entered_script = !thread_state::get().is_script();
+            if entered_script {
+                thread_state::enter(ThreadState::SCRIPT);
+            }
+            Self { entered_script }
+        }
+    }
+
+    impl Drop for ScriptThreadStateGuard {
+        fn drop(&mut self) {
+            if self.entered_script {
+                thread_state::exit(ThreadState::SCRIPT);
+            }
+        }
+    }
+
+    struct NeverRunTask;
+
+    impl TaskBox for NeverRunTask {
+        fn name(&self) -> &'static str {
+            "NeverRunTask"
+        }
+
+        fn run_box(self: Box<Self>, _: &mut js::context::JSContext) {
+            panic!("producer-fence transport tests never execute tasks")
+        }
+    }
+
+    #[derive(Clone)]
+    struct QueueObservingWaker {
+        receiver: Receiver<MainThreadScriptMsg>,
+        observations: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl EventLoopWaker for QueueObservingWaker {
+        fn clone_box(&self) -> Box<dyn EventLoopWaker> {
+            Box::new(self.clone())
+        }
+
+        fn wake(&self) {
+            self.observations
+                .lock()
+                .unwrap()
+                .push(!self.receiver.is_empty());
+        }
+    }
+
+    fn task_message(
+        pipeline_id: Option<PipelineId>,
+        task_source: TaskSourceName,
+    ) -> CommonScriptMsg {
+        CommonScriptMsg::Task(
+            ScriptThreadEventCategory::ScriptEvent,
+            Box::new(NeverRunTask),
+            pipeline_id,
+            task_source,
+        )
+    }
+
+    fn main_thread_sender(
+        sender: Sender<MainThreadScriptMsg>,
+        producer_fence: &DocumentProducerFence,
+    ) -> ScriptEventLoopSender {
+        ScriptEventLoopSender::MainThread {
+            sender,
+            producer_fence: Some(producer_fence.clone()),
+        }
+    }
+
+    #[test]
+    fn successful_main_thread_send_stays_fenced_through_the_ready_queue() {
+        let _script_thread_state = ScriptThreadStateGuard::enter();
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender.clone(), &producer_fence);
+        let task_queue = TaskQueue::new_with_producer_tracking(receiver, raw_sender, true);
+
+        event_loop_sender
+            .send(task_message(None, TaskSourceName::Timer))
+            .unwrap();
+        assert_eq!(producer_fence.snapshot().pending(), 1);
+
+        let message = task_queue
+            .take_tasks_and_recv(&FxHashSet::default())
+            .unwrap();
+        assert_eq!(producer_fence.snapshot().pending(), 1);
+
+        drop(message);
+        let complete = producer_fence.snapshot();
+        assert!(complete.is_empty());
+        assert_eq!(complete.for_kind(DocumentProducerKind::Task).completed(), 1);
+    }
+
+    #[test]
+    fn successful_send_wakes_before_and_after_queue_commit_without_an_embedder_message() {
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let (embedder_message_sender, embedder_message_receiver) = crossbeam_channel::unbounded();
+        let embedder_sender = ScriptToEmbedderChan::new(
+            embedder_message_sender,
+            Box::new(QueueObservingWaker {
+                receiver: receiver.clone(),
+                observations: observations.clone(),
+            }),
+        );
+        let notifier_sender = embedder_sender.clone();
+        let producer_fence = DocumentProducerFence::with_notifier(Some(Arc::new(move || {
+            let _ = notifier_sender.wake();
+        })));
+        let event_loop_sender = main_thread_sender(raw_sender, &producer_fence);
+
+        event_loop_sender
+            .send(task_message(None, TaskSourceName::Timer))
+            .unwrap();
+
+        assert_eq!(*observations.lock().unwrap(), vec![false, true]);
+        assert!(matches!(
+            embedder_message_receiver.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ));
+
+        drop(receiver.recv().unwrap());
+        assert_eq!(*observations.lock().unwrap(), vec![false, true, false]);
+    }
+
+    #[test]
+    fn failed_main_thread_send_completes_the_task_ticket() {
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        drop(receiver);
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender, &producer_fence);
+
+        assert_eq!(
+            event_loop_sender.send(task_message(None, TaskSourceName::Timer)),
+            Err(ScriptEventLoopSendError::ChannelClosed)
+        );
+        let complete = producer_fence.snapshot();
+        assert!(complete.is_empty());
+        assert_eq!(complete.revision(), 2);
+        assert_eq!(complete.for_kind(DocumentProducerKind::Task).completed(), 1);
+    }
+
+    #[test]
+    fn discarding_an_inactive_task_queue_completes_its_ticket() {
+        let _script_thread_state = ScriptThreadStateGuard::enter();
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender.clone(), &producer_fence);
+        let task_queue = TaskQueue::new_with_producer_tracking(receiver, raw_sender, true);
+
+        event_loop_sender
+            .send(task_message(Some(TEST_PIPELINE_ID), TaskSourceName::Timer))
+            .unwrap();
+        task_queue.take_tasks(MainThreadScriptMsg::WakeUp, &FxHashSet::default());
+        assert!(matches!(
+            task_queue.recv(),
+            Ok(MainThreadScriptMsg::Inactive)
+        ));
+        assert!(task_queue.recv().is_err());
+        assert_eq!(producer_fence.snapshot().pending(), 1);
+
+        drop(task_queue);
+        assert!(producer_fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn discarding_a_throttled_task_queue_completes_its_ticket() {
+        let _script_thread_state = ScriptThreadStateGuard::enter();
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender.clone(), &producer_fence);
+        let task_queue =
+            TaskQueue::new_with_producer_tracking(receiver, raw_sender.clone(), true);
+
+        for _ in 0..6 {
+            event_loop_sender
+                .send(task_message(None, TaskSourceName::Timer))
+                .unwrap();
+        }
+        event_loop_sender
+            .send(task_message(None, TaskSourceName::PerformanceTimeline))
+            .unwrap();
+        task_queue.take_tasks(MainThreadScriptMsg::WakeUp, &FxHashSet::default());
+        for expected_pending in (1..=6).rev() {
+            drop(task_queue.recv().unwrap());
+            assert_eq!(producer_fence.snapshot().pending(), expected_pending);
+        }
+        assert!(task_queue.recv().is_err());
+        assert_eq!(producer_fence.snapshot().pending(), 1);
+
+        drop(task_queue);
+        let complete = producer_fence.snapshot();
+        assert!(complete.is_empty());
+        assert_eq!(complete.for_kind(DocumentProducerKind::Task).completed(), 7);
+    }
+
+    #[test]
+    fn discarding_a_pipeline_purges_local_queues_and_filters_channel_on_intake() {
+        let _script_thread_state = ScriptThreadStateGuard::enter();
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender.clone(), &producer_fence);
+        let task_queue = TaskQueue::new_with_producer_tracking(receiver, raw_sender, true);
+        let mut fully_active = FxHashSet::default();
+        fully_active.insert(TEST_PIPELINE_ID);
+
+        for _ in 0..6 {
+            event_loop_sender
+                .send(task_message(Some(TEST_PIPELINE_ID), TaskSourceName::Timer))
+                .unwrap();
+        }
+        event_loop_sender
+            .send(task_message(
+                Some(TEST_PIPELINE_ID),
+                TaskSourceName::PerformanceTimeline,
+            ))
+            .unwrap();
+        task_queue.take_tasks(MainThreadScriptMsg::WakeUp, &fully_active);
+
+        event_loop_sender
+            .send(task_message(Some(TEST_PIPELINE_ID), TaskSourceName::Timer))
+            .unwrap();
+        task_queue.take_tasks(MainThreadScriptMsg::WakeUp, &FxHashSet::default());
+
+        event_loop_sender
+            .send(task_message(Some(TEST_PIPELINE_ID), TaskSourceName::Timer))
+            .unwrap();
+        event_loop_sender
+            .send(task_message(None, TaskSourceName::Timer))
+            .unwrap();
+        assert_eq!(producer_fence.snapshot().pending(), 10);
+
+        task_queue.discard_pipeline(TEST_PIPELINE_ID);
+
+        // Ready, throttled, and inactive tasks were purged synchronously. Channel input remains
+        // bounded by normal intake, where the tombstone filters the target and preserves global
+        // work without dropping the TaskQueue.
+        assert_eq!(producer_fence.snapshot().pending(), 2);
+        let global_task = task_queue
+            .take_tasks_and_recv(&FxHashSet::default())
+            .unwrap();
+        assert_eq!(producer_fence.snapshot().pending(), 1);
+        assert_eq!(global_task.pipeline_id(), None);
+        drop(global_task);
+        assert!(producer_fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn task_for_a_pipeline_arriving_after_discard_is_dropped_on_intake() {
+        let _script_thread_state = ScriptThreadStateGuard::enter();
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender.clone(), &producer_fence);
+        let task_queue = TaskQueue::new_with_producer_tracking(receiver, raw_sender, true);
+        task_queue.discard_pipeline(TEST_PIPELINE_ID);
+
+        event_loop_sender
+            .send(task_message(Some(TEST_PIPELINE_ID), TaskSourceName::Timer))
+            .unwrap();
+        event_loop_sender
+            .send(task_message(None, TaskSourceName::Timer))
+            .unwrap();
+        assert_eq!(producer_fence.snapshot().pending(), 2);
+
+        let global_task = task_queue
+            .take_tasks_and_recv(&FxHashSet::default())
+            .unwrap();
+        assert_eq!(producer_fence.snapshot().pending(), 1);
+        assert_eq!(global_task.pipeline_id(), None);
+        drop(global_task);
+        assert!(producer_fence.snapshot().is_empty());
+
+        event_loop_sender
+            .send(task_message(None, TaskSourceName::Timer))
+            .unwrap();
+        drop(
+            task_queue
+                .take_tasks_and_recv(&FxHashSet::default())
+                .unwrap(),
+        );
+        assert!(producer_fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn realtime_transport_does_not_install_producer_tracking_or_pipeline_tombstones() {
+        let _script_thread_state = ScriptThreadStateGuard::enter();
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        let event_loop_sender = ScriptEventLoopSender::MainThread {
+            sender: raw_sender.clone(),
+            producer_fence: None,
+        };
+        let task_queue = TaskQueue::new(receiver, raw_sender);
+        let mut fully_active = FxHashSet::default();
+        fully_active.insert(TEST_PIPELINE_ID);
+
+        task_queue.discard_pipeline(TEST_PIPELINE_ID);
+        event_loop_sender
+            .send(task_message(Some(TEST_PIPELINE_ID), TaskSourceName::Timer))
+            .unwrap();
+
+        let message = task_queue.take_tasks_and_recv(&fully_active).unwrap();
+        assert_eq!(message.pipeline_id(), Some(TEST_PIPELINE_ID));
+        drop(message);
     }
 }
 
