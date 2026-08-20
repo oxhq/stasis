@@ -20,6 +20,41 @@ use crate::browsingcontext::BrowsingContext;
 use crate::pipeline::Pipeline;
 use crate::session_history::{JointSessionHistory, SessionHistoryChange};
 
+/// A terminal failure of the monotonically increasing top-level navigation revision.
+///
+/// Once this failure is reached, the revision stays at its last valid value and navigation
+/// authority snapshots fail closed rather than observing a wrapped revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NavigationRevisionError {
+    Overflow,
+}
+
+/// A canonical, side-effect-free view of the top-level navigation state owned by a WebView.
+///
+/// The pending pipeline ids are sorted and deduplicated so callers can compare snapshots without
+/// depending on `pending_changes` insertion or `swap_remove` order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the upcoming authoritative RawPending capture"
+    )
+)]
+pub(crate) struct TopLevelNavigationSnapshot {
+    pub active_pipeline_id: Option<PipelineId>,
+    pub active_pipeline_epoch: Epoch,
+    pub navigation_revision: u64,
+    pub pending_pipeline_ids: Vec<PipelineId>,
+}
+
+/// The previous and next active top-level pipeline epochs produced by an activation.
+pub(crate) struct TopLevelPipelineActivation {
+    pub old_pipeline_id: Option<PipelineId>,
+    pub old_epoch: Epoch,
+    pub new_epoch: Epoch,
+}
+
 /// The `Constellation`'s view of a `WebView` in the embedding layer. This tracks all of the
 /// `Constellation` state for this `WebView`.
 pub(crate) struct ConstellationWebView {
@@ -27,17 +62,23 @@ pub(crate) struct ConstellationWebView {
     webview_id: WebViewId,
 
     /// The [`PipelineId`] of the currently active pipeline at the top level of this WebView.
-    pub active_top_level_pipeline_id: Option<PipelineId>,
+    active_top_level_pipeline_id: Option<PipelineId>,
 
     /// A counter for changes to [`Self::active_top_level_pipeline_id`].
-    pub active_top_level_pipeline_epoch: Epoch,
+    active_top_level_pipeline_epoch: Epoch,
+
+    /// A revision for changes to top-level pending membership or active pipeline identity.
+    navigation_revision: u64,
+
+    /// A sticky terminal failure that prevents revision wraparound and snapshot reuse.
+    navigation_revision_failure: Option<NavigationRevisionError>,
 
     /// When a navigation is performed, we do not immediately update
     /// the session history, instead we ask the event loop to begin loading
     /// the new document, and do not update the browsing context until the
     /// document is active. Between starting the load and it activating,
     /// we store a `SessionHistoryChange` object for the navigation in progress.
-    pub pending_changes: Vec<SessionHistoryChange>,
+    pending_changes: Vec<SessionHistoryChange>,
 
     /// The currently focused browsing context in this webview for key events.
     /// The focused pipeline is the current entry of the focused browsing
@@ -107,6 +148,8 @@ impl ConstellationWebView {
             document_time_failure: None,
             active_top_level_pipeline_id: None,
             active_top_level_pipeline_epoch: Epoch::default(),
+            navigation_revision: 0,
+            navigation_revision_failure: None,
             pending_changes: Default::default(),
             focused_browsing_context_id,
             hovered_browsing_context_id: None,
@@ -172,6 +215,86 @@ impl ConstellationWebView {
     /// Get the [`Theme`] of this [`ConstellationWebView`].
     pub(crate) fn theme(&self) -> Theme {
         self.theme
+    }
+
+    pub(crate) fn active_top_level_pipeline(&self) -> Option<(PipelineId, Epoch)> {
+        self.active_top_level_pipeline_id
+            .map(|pipeline_id| (pipeline_id, self.active_top_level_pipeline_epoch))
+    }
+
+    fn advance_navigation_revision_by(
+        &mut self,
+        amount: u64,
+    ) -> Result<u64, NavigationRevisionError> {
+        if let Some(error) = self.navigation_revision_failure {
+            return Err(error);
+        }
+
+        let Some(next_revision) = self.navigation_revision.checked_add(amount) else {
+            self.navigation_revision_failure = Some(NavigationRevisionError::Overflow);
+            return Err(NavigationRevisionError::Overflow);
+        };
+        self.navigation_revision = next_revision;
+        Ok(next_revision)
+    }
+
+    fn is_top_level_change(&self, change: &SessionHistoryChange) -> bool {
+        change.browsing_context_id == BrowsingContextId::from(self.webview_id)
+    }
+
+    /// Return a canonical navigation snapshot without advancing or otherwise driving the runtime.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the upcoming authoritative RawPending capture"
+        )
+    )]
+    pub(crate) fn top_level_navigation_snapshot(
+        &self,
+    ) -> Result<TopLevelNavigationSnapshot, NavigationRevisionError> {
+        if let Some(error) = self.navigation_revision_failure {
+            return Err(error);
+        }
+
+        let mut pending_pipeline_ids = self
+            .pending_changes
+            .iter()
+            .filter(|change| self.is_top_level_change(change))
+            .map(|change| change.new_pipeline_id)
+            .collect::<Vec<_>>();
+        pending_pipeline_ids.sort_unstable();
+        pending_pipeline_ids.dedup();
+
+        Ok(TopLevelNavigationSnapshot {
+            active_pipeline_id: self.active_top_level_pipeline_id,
+            active_pipeline_epoch: self.active_top_level_pipeline_epoch,
+            navigation_revision: self.navigation_revision,
+            pending_pipeline_ids,
+        })
+    }
+
+    /// Activate a new top-level pipeline and advance the navigation revision atomically.
+    pub(crate) fn activate_top_level_pipeline(
+        &mut self,
+        new_pipeline_id: PipelineId,
+    ) -> Result<Option<TopLevelPipelineActivation>, NavigationRevisionError> {
+        if self.active_top_level_pipeline_id == Some(new_pipeline_id) {
+            return Ok(None);
+        }
+
+        self.advance_navigation_revision_by(1)?;
+        let old_pipeline_id = self.active_top_level_pipeline_id;
+        let old_epoch = self.active_top_level_pipeline_epoch;
+        let new_epoch = old_epoch.next();
+        self.active_top_level_pipeline_id = Some(new_pipeline_id);
+        self.active_top_level_pipeline_epoch = new_epoch;
+
+        Ok(Some(TopLevelPipelineActivation {
+            old_pipeline_id,
+            old_epoch,
+            new_epoch,
+        }))
     }
 
     fn target_pipeline_id_for_input_event(
@@ -306,13 +429,20 @@ impl ConstellationWebView {
         !self.pending_changes.is_empty()
     }
 
+    pub(crate) fn pending_changes(&self) -> &[SessionHistoryChange] {
+        &self.pending_changes
+    }
+
     pub(crate) fn pipeline_is_pending(&self, pipeline_id: PipelineId) -> bool {
         self.pending_changes
             .iter()
             .any(|pending_change| pending_change.new_pipeline_id == pipeline_id)
     }
 
-    pub(crate) fn add_pending_change(&mut self, change: SessionHistoryChange) {
+    pub(crate) fn add_pending_change(
+        &mut self,
+        change: SessionHistoryChange,
+    ) -> Result<(), NavigationRevisionError> {
         debug!(
             "adding pending session history change with {}",
             if change.replace.is_some() {
@@ -321,29 +451,84 @@ impl ConstellationWebView {
                 "no replacement"
             },
         );
+        if self.is_top_level_change(&change) {
+            self.advance_navigation_revision_by(1)?;
+        }
         self.pending_changes.push(change);
+        Ok(())
     }
 
     pub(crate) fn remove_pending_change_for_pipeline(
         &mut self,
         pipeline_id: PipelineId,
-    ) -> Option<SessionHistoryChange> {
-        let pending_index = self
+    ) -> Result<Option<SessionHistoryChange>, NavigationRevisionError> {
+        let Some(pending_index) = self
             .pending_changes
             .iter()
-            .rposition(|change| change.new_pipeline_id == pipeline_id)?;
-        Some(self.pending_changes.swap_remove(pending_index))
+            .rposition(|change| change.new_pipeline_id == pipeline_id)
+        else {
+            return Ok(None);
+        };
+        if self.is_top_level_change(&self.pending_changes[pending_index]) {
+            self.advance_navigation_revision_by(1)?;
+        }
+        Ok(Some(self.pending_changes.swap_remove(pending_index)))
+    }
+
+    pub(crate) fn take_pending_changes(
+        &mut self,
+    ) -> Result<Vec<SessionHistoryChange>, NavigationRevisionError> {
+        let top_level_change_count = self
+            .pending_changes
+            .iter()
+            .filter(|change| self.is_top_level_change(change))
+            .count() as u64;
+        self.advance_navigation_revision_by(top_level_change_count)?;
+        Ok(std::mem::take(&mut self.pending_changes))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use embedder_traits::ViewportDetails;
     use servo_base::id::{
-        ScriptEventLoopId, TEST_BROWSING_CONTEXT_ID, TEST_SCRIPT_EVENT_LOOP_ID, TEST_WEBVIEW_ID,
+        PipelineNamespaceId, ScriptEventLoopId, TEST_BROWSING_CONTEXT_ID,
+        TEST_BROWSING_CONTEXT_INDEX, TEST_PIPELINE_INDEX, TEST_SCRIPT_EVENT_LOOP_ID,
+        TEST_WEBVIEW_ID,
     };
     use timers::DocumentUnixTime;
 
     use super::*;
+    use crate::session_history::NeedsToReload;
+
+    fn pipeline_id(namespace: u32) -> PipelineId {
+        PipelineId {
+            namespace_id: PipelineNamespaceId(namespace),
+            index: TEST_PIPELINE_INDEX,
+        }
+    }
+
+    fn child_browsing_context_id(namespace: u32) -> BrowsingContextId {
+        BrowsingContextId {
+            namespace_id: PipelineNamespaceId(namespace),
+            index: TEST_BROWSING_CONTEXT_INDEX,
+        }
+    }
+
+    fn pending_change(
+        pipeline_id: PipelineId,
+        browsing_context_id: BrowsingContextId,
+        replace: Option<NeedsToReload>,
+    ) -> SessionHistoryChange {
+        SessionHistoryChange {
+            browsing_context_id,
+            webview_id: TEST_WEBVIEW_ID,
+            new_pipeline_id: pipeline_id,
+            replace,
+            new_browsing_context_info: None,
+            viewport_details: ViewportDetails::default(),
+        }
+    }
 
     fn controlled_webview() -> ConstellationWebView {
         ConstellationWebView::new(
@@ -423,6 +608,254 @@ mod tests {
         webview.fail_document_time(DocumentTimeSurface::AuxiliaryWebView);
         assert_eq!(webview.controlled_event_loop_id(), None);
         assert_eq!(webview.document_time_failure(), None);
+    }
+
+    #[test]
+    fn top_level_navigation_start_advances_revision_and_canonicalizes_pending_ids() {
+        let mut webview = controlled_webview();
+        let first_pipeline_id = pipeline_id(20);
+        let second_pipeline_id = pipeline_id(10);
+
+        assert_eq!(
+            webview.add_pending_change(pending_change(
+                first_pipeline_id,
+                TEST_BROWSING_CONTEXT_ID,
+                None,
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            webview.add_pending_change(pending_change(
+                second_pipeline_id,
+                TEST_BROWSING_CONTEXT_ID,
+                None,
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            webview.add_pending_change(pending_change(
+                first_pipeline_id,
+                TEST_BROWSING_CONTEXT_ID,
+                None,
+            )),
+            Ok(())
+        );
+
+        let Ok(snapshot) = webview.top_level_navigation_snapshot() else {
+            assert!(false, "navigation snapshot unexpectedly failed");
+            return;
+        };
+        assert_eq!(snapshot.navigation_revision, 3);
+        assert_eq!(snapshot.active_pipeline_id, None);
+        assert_eq!(snapshot.active_pipeline_epoch, Epoch::default());
+        assert_eq!(
+            snapshot.pending_pipeline_ids,
+            vec![second_pipeline_id, first_pipeline_id]
+        );
+    }
+
+    #[test]
+    fn top_level_navigation_cancel_advances_revision_only_for_a_real_removal() {
+        let mut webview = controlled_webview();
+        let pipeline_id = pipeline_id(10);
+        assert_eq!(
+            webview.add_pending_change(pending_change(
+                pipeline_id,
+                TEST_BROWSING_CONTEXT_ID,
+                None,
+            )),
+            Ok(())
+        );
+        assert!(matches!(
+            webview.remove_pending_change_for_pipeline(pipeline_id),
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            webview.remove_pending_change_for_pipeline(pipeline_id),
+            Ok(None)
+        ));
+
+        let Ok(snapshot) = webview.top_level_navigation_snapshot() else {
+            assert!(false, "navigation snapshot unexpectedly failed");
+            return;
+        };
+        assert_eq!(snapshot.navigation_revision, 2);
+        assert!(snapshot.pending_pipeline_ids.is_empty());
+    }
+
+    #[test]
+    fn top_level_redirect_replacement_gets_a_fresh_revision() {
+        let mut webview = controlled_webview();
+        let redirected_pipeline_id = pipeline_id(10);
+        let replacement_pipeline_id = pipeline_id(11);
+        assert_eq!(
+            webview.add_pending_change(pending_change(
+                redirected_pipeline_id,
+                TEST_BROWSING_CONTEXT_ID,
+                None,
+            )),
+            Ok(())
+        );
+        assert!(matches!(
+            webview.remove_pending_change_for_pipeline(redirected_pipeline_id),
+            Ok(Some(_))
+        ));
+        assert_eq!(
+            webview.add_pending_change(pending_change(
+                replacement_pipeline_id,
+                TEST_BROWSING_CONTEXT_ID,
+                Some(NeedsToReload::No(redirected_pipeline_id)),
+            )),
+            Ok(())
+        );
+
+        let Ok(snapshot) = webview.top_level_navigation_snapshot() else {
+            assert!(false, "navigation snapshot unexpectedly failed");
+            return;
+        };
+        assert_eq!(snapshot.navigation_revision, 3);
+        assert_eq!(
+            snapshot.pending_pipeline_ids,
+            vec![replacement_pipeline_id]
+        );
+    }
+
+    #[test]
+    fn top_level_activation_advances_revision_and_active_epoch() {
+        let mut webview = controlled_webview();
+        let first_pipeline_id = pipeline_id(10);
+        let second_pipeline_id = pipeline_id(11);
+
+        assert!(matches!(
+            webview.activate_top_level_pipeline(first_pipeline_id),
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            webview.activate_top_level_pipeline(first_pipeline_id),
+            Ok(None)
+        ));
+        assert!(matches!(
+            webview.activate_top_level_pipeline(second_pipeline_id),
+            Ok(Some(_))
+        ));
+
+        let Ok(snapshot) = webview.top_level_navigation_snapshot() else {
+            assert!(false, "navigation snapshot unexpectedly failed");
+            return;
+        };
+        assert_eq!(snapshot.navigation_revision, 2);
+        assert_eq!(snapshot.active_pipeline_id, Some(second_pipeline_id));
+        assert_eq!(snapshot.active_pipeline_epoch, Epoch(2));
+    }
+
+    #[test]
+    fn child_pending_changes_do_not_affect_top_level_navigation_revision() {
+        let mut webview = controlled_webview();
+        let child_pipeline_id = pipeline_id(10);
+        assert_eq!(
+            webview.add_pending_change(pending_change(
+                child_pipeline_id,
+                child_browsing_context_id(30),
+                None,
+            )),
+            Ok(())
+        );
+
+        let Ok(snapshot) = webview.top_level_navigation_snapshot() else {
+            assert!(false, "navigation snapshot unexpectedly failed");
+            return;
+        };
+        assert_eq!(snapshot.navigation_revision, 0);
+        assert!(snapshot.pending_pipeline_ids.is_empty());
+        assert!(matches!(
+            webview.remove_pending_change_for_pipeline(child_pipeline_id),
+            Ok(Some(_))
+        ));
+
+        let Ok(snapshot) = webview.top_level_navigation_snapshot() else {
+            assert!(false, "navigation snapshot unexpectedly failed");
+            return;
+        };
+        assert_eq!(snapshot.navigation_revision, 0);
+    }
+
+    #[test]
+    fn navigation_revision_prevents_aba_snapshot_reuse() {
+        let mut webview = controlled_webview();
+        let active_pipeline_id = pipeline_id(10);
+        let pending_pipeline_id = pipeline_id(11);
+        assert!(matches!(
+            webview.activate_top_level_pipeline(active_pipeline_id),
+            Ok(Some(_))
+        ));
+        assert_eq!(
+            webview.add_pending_change(pending_change(
+                pending_pipeline_id,
+                TEST_BROWSING_CONTEXT_ID,
+                None,
+            )),
+            Ok(())
+        );
+        let Ok(before_aba) = webview.top_level_navigation_snapshot() else {
+            assert!(false, "navigation snapshot unexpectedly failed");
+            return;
+        };
+
+        assert!(matches!(
+            webview.remove_pending_change_for_pipeline(pending_pipeline_id),
+            Ok(Some(_))
+        ));
+        assert_eq!(
+            webview.add_pending_change(pending_change(
+                pending_pipeline_id,
+                TEST_BROWSING_CONTEXT_ID,
+                None,
+            )),
+            Ok(())
+        );
+        let Ok(after_aba) = webview.top_level_navigation_snapshot() else {
+            assert!(false, "navigation snapshot unexpectedly failed");
+            return;
+        };
+
+        assert_eq!(before_aba.active_pipeline_id, after_aba.active_pipeline_id);
+        assert_eq!(
+            before_aba.active_pipeline_epoch,
+            after_aba.active_pipeline_epoch
+        );
+        assert_eq!(
+            before_aba.pending_pipeline_ids,
+            after_aba.pending_pipeline_ids
+        );
+        assert_eq!(before_aba.navigation_revision, 2);
+        assert_eq!(after_aba.navigation_revision, 4);
+    }
+
+    #[test]
+    fn navigation_revision_overflow_is_sticky_and_does_not_wrap() {
+        let mut webview = controlled_webview();
+        webview.navigation_revision = u64::MAX;
+        let pipeline_id = pipeline_id(10);
+
+        assert_eq!(
+            webview.add_pending_change(pending_change(
+                pipeline_id,
+                TEST_BROWSING_CONTEXT_ID,
+                None,
+            )),
+            Err(NavigationRevisionError::Overflow)
+        );
+        assert_eq!(webview.navigation_revision, u64::MAX);
+        assert!(!webview.pipeline_is_pending(pipeline_id));
+        assert_eq!(
+            webview.top_level_navigation_snapshot(),
+            Err(NavigationRevisionError::Overflow)
+        );
+        assert!(matches!(
+            webview.activate_top_level_pipeline(pipeline_id),
+            Err(NavigationRevisionError::Overflow)
+        ));
+        assert_eq!(webview.active_top_level_pipeline(), None);
     }
 }
 

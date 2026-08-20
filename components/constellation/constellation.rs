@@ -2726,11 +2726,15 @@ where
         }
 
         // Close any pending changes and pipelines
-        let pending_changes: Vec<_> = self
-            .webviews
-            .values_mut()
-            .flat_map(|webview| webview.pending_changes.drain(..))
-            .collect();
+        let mut pending_changes = Vec::new();
+        for webview in self.webviews.values_mut() {
+            match webview.take_pending_changes() {
+                Ok(changes) => pending_changes.extend(changes),
+                Err(error) => warn!(
+                    "Navigation revision failed while draining pending changes: {error:?}"
+                ),
+            }
+        }
         for pending in pending_changes {
             debug!(
                 "{}: Removing pending browsing context",
@@ -3146,7 +3150,7 @@ where
         let Some(webview) = self.webviews.get_mut(&webview_id) else {
             return warn!("Adding pending change to unknown WebView: {webview_id:?}");
         };
-        webview.add_pending_change(SessionHistoryChange {
+        if let Err(error) = webview.add_pending_change(SessionHistoryChange {
             webview_id,
             browsing_context_id,
             new_pipeline_id,
@@ -3155,7 +3159,9 @@ where
             replace: Some(NeedsToReload::Yes(old_pipeline_id, old_load_data)),
             new_browsing_context_info: None,
             viewport_details,
-        });
+        }) {
+            warn!("{webview_id}: failed to record top-level navigation start: {error:?}");
+        }
     }
 
     #[servo_tracing::instrument(skip_all)]
@@ -3247,10 +3253,9 @@ where
         };
 
         webview.accessibility_active = active;
-        let Some(pipeline_id) = webview.active_top_level_pipeline_id else {
+        let Some((pipeline_id, epoch)) = webview.active_top_level_pipeline() else {
             return;
         };
-        let epoch = webview.active_top_level_pipeline_epoch;
         // Forward the activation to the webview’s active top-level pipeline, if any. For inactive
         // pipelines (documents in bfcache), we only need to forward the activation if and when they
         // become active (see set_frame_tree_for_webview()).
@@ -3369,7 +3374,7 @@ where
         }
 
         if let Some(webview) = self.webviews.get_mut(&webview_id) {
-            webview.add_pending_change(SessionHistoryChange {
+            if let Err(error) = webview.add_pending_change(SessionHistoryChange {
                 webview_id,
                 browsing_context_id,
                 new_pipeline_id: pipeline_id,
@@ -3381,7 +3386,9 @@ where
                     throttled,
                 }),
                 viewport_details,
-            });
+            }) {
+                warn!("{webview_id}: failed to record initial navigation start: {error:?}");
+            }
         }
 
         self.system_font_service
@@ -3609,7 +3616,7 @@ where
         }
 
         if let Some(webview) = self.webviews.get_mut(&webview_id) {
-            webview.add_pending_change(SessionHistoryChange {
+            if let Err(error) = webview.add_pending_change(SessionHistoryChange {
                 webview_id,
                 browsing_context_id,
                 new_pipeline_id,
@@ -3617,7 +3624,9 @@ where
                 // Browsing context for iframe already exists.
                 new_browsing_context_info: None,
                 viewport_details: load_info.viewport_details,
-            });
+            }) {
+                warn!("{webview_id}: failed to record iframe navigation start: {error:?}");
+            }
         } else {
             warn!("Could not find WebView for script-loaded iframe: ({webview_id:?})");
         }
@@ -3703,7 +3712,7 @@ where
         self.pipelines.insert(new_pipeline_id, pipeline);
 
         if let Some(webview) = self.webviews.get_mut(&webview_id) {
-            webview.add_pending_change(SessionHistoryChange {
+            if let Err(error) = webview.add_pending_change(SessionHistoryChange {
                 webview_id,
                 browsing_context_id,
                 new_pipeline_id,
@@ -3716,7 +3725,9 @@ where
                     throttled: is_parent_throttled,
                 }),
                 viewport_details: load_info.viewport_details,
-            });
+            }) {
+                warn!("{webview_id}: failed to record iframe creation: {error:?}");
+            }
         } else {
             warn!("Could not find WebView for new iframe: ({webview_id:?})");
         }
@@ -3835,7 +3846,7 @@ where
         assert!(!self.pipelines.contains_key(&new_pipeline_id));
         self.pipelines.insert(new_pipeline_id, pipeline);
 
-        new_webview.add_pending_change(SessionHistoryChange {
+        if let Err(error) = new_webview.add_pending_change(SessionHistoryChange {
             webview_id: new_webview_id,
             browsing_context_id: new_browsing_context_id,
             new_pipeline_id,
@@ -3848,7 +3859,9 @@ where
                 throttled: is_opener_throttled,
             }),
             viewport_details,
-        });
+        }) {
+            warn!("{new_webview_id}: failed to record auxiliary navigation start: {error:?}");
+        }
         self.webviews.insert(new_webview_id, new_webview);
 
         // https://html.spec.whatwg.org/multipage/#bcg-append
@@ -4345,7 +4358,7 @@ where
             None => {
                 // Make sure no pending page would be overridden.
                 if let Some(webview) = self.webviews.get(&webview_id) &&
-                    webview.pending_changes.iter().any(|pending_change| {
+                    webview.pending_changes().iter().any(|pending_change| {
                         pending_change.browsing_context_id == browsing_context_id
                     })
                 {
@@ -4390,7 +4403,7 @@ where
                 }
 
                 if let Some(webview) = self.webviews.get_mut(&webview_id) {
-                    webview.add_pending_change(SessionHistoryChange {
+                    if let Err(error) = webview.add_pending_change(SessionHistoryChange {
                         webview_id,
                         browsing_context_id,
                         new_pipeline_id,
@@ -4398,7 +4411,9 @@ where
                         // `load_url` is always invoked on an existing browsing context.
                         new_browsing_context_info: None,
                         viewport_details,
-                    });
+                    }) {
+                        warn!("{webview_id}: failed to record navigation start: {error:?}");
+                    }
                 } else {
                     warn!("Could not find WebView for URL load: ({webview_id:?})");
                 }
@@ -4413,12 +4428,17 @@ where
 
     #[servo_tracing::instrument(skip_all)]
     fn handle_abort_load_url_msg(&mut self, webview_id: WebViewId, new_pipeline_id: PipelineId) {
-        if self
-            .webviews
-            .get_mut(&webview_id)
-            .and_then(|webview| webview.remove_pending_change_for_pipeline(new_pipeline_id))
-            .is_none()
-        {
+        let removed_change = match self.webviews.get_mut(&webview_id) {
+            Some(webview) => match webview.remove_pending_change_for_pipeline(new_pipeline_id) {
+                Ok(change) => change,
+                Err(error) => {
+                    warn!("{webview_id}: failed to record navigation cancellation: {error:?}");
+                    None
+                },
+            },
+            None => None,
+        };
+        if removed_change.is_none() {
             return;
         }
 
@@ -4819,7 +4839,7 @@ where
                     .webviews
                     .get_mut(&webview_id)
                     .expect("WebView for history traversal should always exist at this point");
-                webview.add_pending_change(SessionHistoryChange {
+                if let Err(error) = webview.add_pending_change(SessionHistoryChange {
                     webview_id,
                     browsing_context_id,
                     new_pipeline_id,
@@ -4827,7 +4847,9 @@ where
                     // Browsing context must exist at this point.
                     new_browsing_context_info: None,
                     viewport_details,
-                });
+                }) {
+                    warn!("{webview_id}: failed to record history navigation start: {error:?}");
+                }
                 return Some(new_pipeline_id);
             },
         };
@@ -5798,11 +5820,17 @@ where
 
         // Find the pending change whose new pipeline id is pipeline_id. If it is found, remove
         // it from the pending changes, and make it the active document of its frame.
-        let Some(change) = self
-            .webviews
-            .get_mut(&webview_id)
-            .and_then(|webview| webview.remove_pending_change_for_pipeline(pipeline_id))
-        else {
+        let change = match self.webviews.get_mut(&webview_id) {
+            Some(webview) => match webview.remove_pending_change_for_pipeline(pipeline_id) {
+                Ok(change) => change,
+                Err(error) => {
+                    warn!("{webview_id}: failed to record navigation activation: {error:?}");
+                    None
+                },
+            },
+            None => None,
+        };
+        let Some(change) = change else {
             return;
         };
 
@@ -6072,7 +6100,7 @@ where
 
         // Send resize message to any pending pipelines that aren't loaded yet.
         if let Some(webview) = self.webviews.get(&webview_id) {
-            for change in &webview.pending_changes {
+            for change in webview.pending_changes() {
                 let pipeline_id = change.new_pipeline_id;
                 let Some(pipeline) = self.pipelines.get(&pipeline_id) else {
                     warn!("Pending pipeline is closed: {pipeline_id}");
@@ -6216,7 +6244,7 @@ where
                 );
             };
             webview
-                .pending_changes
+                .pending_changes()
                 .iter()
                 .filter(|change| change.browsing_context_id == browsing_context_id)
                 .map(|change| change.new_pipeline_id)
@@ -6328,7 +6356,9 @@ where
 
         // Remove this pipeline from pending changes if it hasn't loaded yet.
         if let Some(webview) = self.webviews.get_mut(&webview_id) {
-            webview.remove_pending_change_for_pipeline(pipeline_id);
+            if let Err(error) = webview.remove_pending_change_for_pipeline(pipeline_id) {
+                warn!("{webview_id}: failed to record pending pipeline closure: {error:?}");
+            }
         }
 
         // Inform script and paint that this pipeline has exited.
@@ -6430,27 +6460,28 @@ where
         let Some(webview) = self.webviews.get_mut(&webview_id) else {
             return;
         };
-        if webview.active_top_level_pipeline_id == Some(new_pipeline_id) {
-            return;
-        }
-
-        let old_pipeline_id = webview.active_top_level_pipeline_id;
-        let old_epoch = webview.active_top_level_pipeline_epoch;
-        let new_epoch = old_epoch.next();
-
         let accessibility_active = webview.accessibility_active;
-
-        webview.active_top_level_pipeline_id = Some(new_pipeline_id);
-        webview.active_top_level_pipeline_epoch = new_epoch;
+        let activation = match webview.activate_top_level_pipeline(new_pipeline_id) {
+            Ok(Some(activation)) => activation,
+            Ok(None) => return,
+            Err(error) => {
+                warn!("{webview_id}: failed to record top-level pipeline activation: {error:?}");
+                return;
+            },
+        };
 
         // Deactivate accessibility in the now-inactive top-level document in the WebView.
         // This ensures that the document stops sending tree updates, since they will be
         // discarded in libservo anyway, and also ensures that when accessibility is
         // reactivated, the document sends the whole accessibility tree from scratch.
-        if let Some(old_pipeline_id) = old_pipeline_id {
+        if let Some(old_pipeline_id) = activation.old_pipeline_id {
             self.send_message_to_pipeline(
                 old_pipeline_id,
-                ScriptThreadMessage::SetAccessibilityActive(old_pipeline_id, false, old_epoch),
+                ScriptThreadMessage::SetAccessibilityActive(
+                    old_pipeline_id,
+                    false,
+                    activation.old_epoch,
+                ),
                 "Set accessibility active after closure",
             );
         }
@@ -6462,7 +6493,7 @@ where
             ScriptThreadMessage::SetAccessibilityActive(
                 new_pipeline_id,
                 accessibility_active,
-                new_epoch,
+                activation.new_epoch,
             ),
             "Set accessibility active after closure",
         );
