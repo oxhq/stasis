@@ -550,6 +550,10 @@ impl FontContext {
         let identifier = FontIdentifier::Web(url);
         let Ok(handle) = PlatformFont::new_from_data(identifier.clone(), &font_data, None, false)
         else {
+            for download_state in download_states {
+                let font_context = download_state.font_context.clone();
+                font_context.process_next_web_font_source(download_state);
+            }
             return false;
         };
 
@@ -586,13 +590,26 @@ impl FontContext {
         &self,
         target_rule: &ServoArc<LockedFontFaceRule>,
     ) -> bool {
-        self.known_font_face_rules
-            .lock()
-            .contents
-            .values()
-            .flat_map(|bucket| bucket.iter())
-            .any(|known_rule| ServoArc::ptr_eq(&known_rule.rule_with_origin.rule, target_rule))
+        self.known_font_face_rules.lock().contains_rule(target_rule)
     }
+}
+
+fn add_stylesheet_web_font_template_if_active(
+    known_font_face_rules: &Mutex<KnownFontFaceRules>,
+    web_fonts: &CrossThreadFontStore,
+    target_rule: &ServoArc<LockedFontFaceRule>,
+    family_name: LowercaseFontFamilyName,
+    new_template: FontTemplate,
+) -> bool {
+    let known_font_face_rules = known_font_face_rules.lock();
+    if !known_font_face_rules.contains_rule(target_rule) {
+        return false;
+    }
+
+    web_fonts
+        .write()
+        .add_new_template(family_name, new_template);
+    true
 }
 
 /// Tracks the progress of loading a single `@font-face` rule by trying all specified
@@ -634,10 +651,13 @@ impl WebFontDownloadState {
         let family_name = self.css_font_face_descriptors.family_name.clone();
         match self.initiator {
             WebFontLoadInitiator::Stylesheet(initiator) => {
-                if !self
-                    .font_context
-                    .is_font_face_rule_active(&initiator.created_by)
-                {
+                if !add_stylesheet_web_font_template_if_active(
+                    &self.font_context.known_font_face_rules,
+                    &self.font_context.web_fonts,
+                    &initiator.created_by,
+                    family_name,
+                    new_template,
+                ) {
                     // This font load was cancelled.
                     if self
                         .font_context
@@ -652,10 +672,6 @@ impl WebFontDownloadState {
                     return;
                 }
 
-                self.font_context
-                    .web_fonts
-                    .write()
-                    .add_new_template(family_name, new_template);
                 self.font_context
                     .invalidate_font_groups_after_web_font_load();
 
@@ -833,7 +849,7 @@ impl FontContextWebFontMethods for Arc<FontContext> {
                     // has finished because this an opportunity to resolve document.fonts.ready.
                     (stylesheet_initiator.callback)(WebFontLoadEvent::UnblockedFontReadyPromise);
                 }
-                return;
+                continue;
             }
 
             self.process_next_web_font_source(subscriber);
@@ -1291,9 +1307,10 @@ impl RemoteWebFontDownloader {
         state: WebFontDownloadState,
     ) {
         // https://drafts.csswg.org/css-fonts/#font-fetching-requirements
-        let url = match url_source.url.url() {
-            Some(url) => url.clone(),
-            None => return,
+        let Some((url, state)) = resolve_url_source_or_continue(&url_source, state, |state| {
+            font_context.process_next_web_font_source(state);
+        }) else {
+            return;
         };
 
         let webview_id = state.webview_id;
@@ -1426,6 +1443,19 @@ impl RemoteWebFontDownloader {
     }
 }
 
+fn resolve_url_source_or_continue<T>(
+    url_source: &UrlSource,
+    state: T,
+    continue_with: impl FnOnce(T),
+) -> Option<(ServoArc<Url>, T)> {
+    let Some(url) = url_source.url.url() else {
+        continue_with(state);
+        return None;
+    };
+
+    Some((url.clone(), state))
+}
+
 #[derive(Debug, Eq, Hash, MallocSizeOf, PartialEq)]
 struct FontCacheKey {
     font_identifier: FontIdentifier,
@@ -1475,6 +1505,13 @@ struct KnownFontFaceRule {
 }
 
 impl KnownFontFaceRules {
+    fn contains_rule(&self, target_rule: &ServoArc<LockedFontFaceRule>) -> bool {
+        self.contents
+            .values()
+            .flat_map(|bucket| bucket.iter())
+            .any(|known_rule| ServoArc::ptr_eq(&known_rule.rule_with_origin.rule, target_rule))
+    }
+
     /// Computes the difference between the `@font-face `rules that are currently in effect
     /// and the ones that the `Stylist` knows about. The caller is notified about new or removed rules
     /// with callbacks.
@@ -1619,4 +1656,276 @@ fn font_face_rules_conflict(
         first_rule.font_style == second_rule.font_style &&
         first_rule.font_weight == second_rule.font_weight &&
         first_rule.unicode_range == second_rule.unicode_range
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use fonts_traits::{FontTemplateDescriptor, SystemFontServiceProxySender};
+    use net_traits::request::{InsecureRequestsPolicy, Origin as RequestOrigin};
+    use servo_base::generic_channel;
+    use servo_url::ImmutableOrigin;
+    use style::font_face::{FontFaceSourceTechFlags, Source, UrlSource};
+    use style::shared_lock::SharedRwLock;
+    use style::stylesheets::{FontFaceRule, Origin as StylesheetOrigin};
+    use style::url::SpecifiedUrl;
+    use style::values::computed::font::{FamilyName, FontFamilyNameSyntax};
+
+    use super::*;
+
+    #[derive(Debug, malloc_size_of_derive::MallocSizeOf)]
+    struct IgnoreCspViolations;
+
+    impl CspViolationHandler for IgnoreCspViolations {
+        fn process_violations(&self, _violations: Vec<Violation>) {}
+
+        fn clone(&self) -> Box<dyn CspViolationHandler> {
+            Box::new(Self)
+        }
+    }
+
+    #[derive(Debug, malloc_size_of_derive::MallocSizeOf)]
+    struct IgnoreNetworkTiming;
+
+    impl NetworkTimingHandler for IgnoreNetworkTiming {
+        fn submit_timing(&self, _url: ServoUrl, _response: ResourceFetchTiming) {}
+
+        fn clone(&self) -> Box<dyn NetworkTimingHandler> {
+            Box::new(Self)
+        }
+    }
+
+    fn test_font_context() -> Arc<FontContext> {
+        let (system_font_sender, _system_font_receiver) = generic_channel::channel().unwrap();
+        let system_font_service = SystemFontServiceProxySender(system_font_sender).to_proxy();
+        let (resource_sender, _resource_receiver) = generic_channel::channel().unwrap();
+
+        Arc::new(FontContext::new(
+            Arc::new(system_font_service),
+            CrossProcessPaintApi::dummy(),
+            ResourceThreads::new(resource_sender),
+        ))
+    }
+
+    fn test_document_context() -> WebFontDocumentContext {
+        WebFontDocumentContext {
+            policy_container: Default::default(),
+            request_client: RequestClient {
+                preloaded_resources: Default::default(),
+                policy_container: Default::default(),
+                origin: RequestOrigin::Origin(ImmutableOrigin::new_opaque()),
+                is_nested_browsing_context: false,
+                insecure_requests_policy: InsecureRequestsPolicy::DoNotUpgrade,
+                has_trustworthy_ancestor_origin: false,
+            },
+            document_url: ServoUrl::parse("https://example.test/").unwrap(),
+            csp_handler: Box::new(IgnoreCspViolations),
+            network_timing_handler: Box::new(IgnoreNetworkTiming),
+        }
+    }
+
+    fn script_download_state(
+        font_context: Arc<FontContext>,
+        completions: Arc<AtomicUsize>,
+    ) -> WebFontDownloadState {
+        WebFontDownloadState::new(
+            None,
+            font_context,
+            CSSFontFaceDescriptors::new("Test"),
+            WebFontLoadInitiator::Script(Box::new(move |_, template| {
+                assert!(template.is_none());
+                completions.fetch_add(1, Ordering::SeqCst);
+            })),
+            Vec::new(),
+            Default::default(),
+            test_document_context(),
+        )
+    }
+
+    fn locked_font_face_rule(
+        lock: &SharedRwLock,
+    ) -> ServoArc<style::shared_lock::Locked<FontFaceRule>> {
+        ServoArc::new(lock.wrap(FontFaceRule::empty(Default::default())))
+    }
+
+    fn known_rules_with(
+        rule: ServoArc<style::shared_lock::Locked<FontFaceRule>>,
+    ) -> KnownFontFaceRules {
+        let mut known_rules = KnownFontFaceRules::default();
+        known_rules.contents.insert(
+            Atom::from("Test"),
+            vec![KnownFontFaceRule {
+                rule_with_origin: FontFaceRuleWithOrigin::new(rule, StylesheetOrigin::Author),
+                generation: false,
+            }],
+        );
+        known_rules
+    }
+
+    fn url_source(url: &str) -> UrlSource {
+        UrlSource {
+            url: SpecifiedUrl::new_for_testing(url),
+            format_hint: None,
+            tech_flags: FontFaceSourceTechFlags::empty(),
+        }
+    }
+
+    fn local_source(family_name: &str) -> Source {
+        Source::Local(FamilyName {
+            name: Atom::from(family_name),
+            syntax: FontFamilyNameSyntax::Quoted,
+        })
+    }
+
+    #[test]
+    fn unresolved_url_source_continues_to_fallback() {
+        let fallback = local_source("Fallback");
+        let fallback_was_attempted = Cell::new(false);
+
+        let resolved = resolve_url_source_or_continue(
+            &url_source(""),
+            vec![fallback.clone()],
+            |mut remaining_sources| {
+                assert_eq!(remaining_sources.pop(), Some(fallback));
+                fallback_was_attempted.set(true);
+            },
+        );
+
+        assert!(resolved.is_none());
+        assert!(fallback_was_attempted.get());
+    }
+
+    #[test]
+    fn platform_font_rejection_continues_every_subscriber() {
+        let font_context = test_font_context();
+        let completions = Arc::new(AtomicUsize::new(0));
+        let url = ServoUrl::parse("https://example.test/rejected.woff2").unwrap();
+        let font_data = FontData::from_bytes(b"not a font");
+
+        assert!(
+            PlatformFont::new_from_data(FontIdentifier::Web(url.clone()), &font_data, None, false,)
+                .is_err()
+        );
+
+        font_context
+            .number_of_loading_web_fonts
+            .store(2, Ordering::SeqCst);
+        assert!(font_context.handle_web_font_request_started(
+            url.clone(),
+            script_download_state(font_context.clone(), completions.clone()),
+        ));
+        assert!(!font_context.handle_web_font_request_started(
+            url.clone(),
+            script_download_state(font_context.clone(), completions.clone()),
+        ));
+
+        assert!(!font_context.handle_web_font_request_succeeded(font_data, url));
+        assert_eq!(completions.load(Ordering::SeqCst), 2);
+        assert_eq!(font_context.web_fonts_still_loading(), 0);
+    }
+
+    #[test]
+    fn inactive_subscriber_does_not_abandon_later_subscribers() {
+        let font_context = test_font_context();
+        let script_completions = Arc::new(AtomicUsize::new(0));
+        let stylesheet_completions = Arc::new(AtomicUsize::new(0));
+        let url = ServoUrl::parse("https://example.test/shared.woff2").unwrap();
+        let lock = SharedRwLock::new();
+        let inactive_rule = locked_font_face_rule(&lock);
+        let font_face_rule = inactive_rule.read_with(&lock.read()).descriptors.clone();
+        let stylesheet_completion_count = stylesheet_completions.clone();
+        let stylesheet_state = WebFontDownloadState::new(
+            None,
+            font_context.clone(),
+            CSSFontFaceDescriptors::new("Test"),
+            WebFontLoadInitiator::Stylesheet(Box::new(FontFaceRuleInitiator {
+                created_by: inactive_rule,
+                font_face_rule,
+                callback: Arc::new(move |_| {
+                    stylesheet_completion_count.fetch_add(1, Ordering::SeqCst);
+                }),
+            })),
+            Vec::new(),
+            Default::default(),
+            test_document_context(),
+        );
+
+        font_context
+            .number_of_loading_web_fonts
+            .store(2, Ordering::SeqCst);
+        assert!(font_context.handle_web_font_request_started(url.clone(), stylesheet_state));
+        assert!(!font_context.handle_web_font_request_started(
+            url.clone(),
+            script_download_state(font_context.clone(), script_completions.clone()),
+        ));
+
+        font_context.handle_web_font_request_failed(url);
+
+        assert_eq!(stylesheet_completions.load(Ordering::SeqCst), 0);
+        assert_eq!(script_completions.load(Ordering::SeqCst), 1);
+        assert_eq!(font_context.web_fonts_still_loading(), 0);
+    }
+
+    #[test]
+    fn stylesheet_removal_serializes_with_successful_download_commit() {
+        let lock = SharedRwLock::new();
+        let rule = locked_font_face_rule(&lock);
+        let known_rules = Arc::new(Mutex::new(known_rules_with(rule.clone())));
+        let web_fonts = Arc::new(CrossThreadFontStore::default());
+        let family_name: LowercaseFontFamilyName = Atom::from("Test").into();
+        let template = FontTemplate::new(
+            FontIdentifier::Web(ServoUrl::parse("https://example.test/serialized.woff2").unwrap()),
+            FontTemplateDescriptor::default(),
+            None,
+        );
+
+        // Stall completion after it locks the active-rule set but before it can commit the
+        // template. Stylesheet removal must wait, then remove the committed template.
+        let web_fonts_guard = web_fonts.write();
+        let completion = {
+            let known_rules = known_rules.clone();
+            let web_fonts = web_fonts.clone();
+            let rule = rule.clone();
+            let family_name = family_name.clone();
+            thread::spawn(move || {
+                add_stylesheet_web_font_template_if_active(
+                    &known_rules,
+                    &web_fonts,
+                    &rule,
+                    family_name,
+                    template,
+                )
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while known_rules.try_lock().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "font completion did not lock the active-rule set"
+            );
+            thread::yield_now();
+        }
+
+        let removal = {
+            let known_rules = known_rules.clone();
+            let web_fonts = web_fonts.clone();
+            let family_name = family_name.clone();
+            thread::spawn(move || {
+                known_rules.lock().contents.clear();
+                web_fonts.write().families.remove(&family_name);
+            })
+        };
+
+        drop(web_fonts_guard);
+        assert!(completion.join().unwrap());
+        removal.join().unwrap();
+
+        assert!(!known_rules.lock().contains_rule(&rule));
+        assert!(!web_fonts.read().families.contains_key(&family_name));
+    }
 }
