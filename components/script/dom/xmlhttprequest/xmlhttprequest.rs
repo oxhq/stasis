@@ -116,6 +116,14 @@ enum XHRFetchTimeError {
     ClockDomainMismatch,
 }
 
+/// Proof that entering an XHR send path cannot start a synchronous private event loop while the
+/// document clock is controlled.
+///
+/// Keep this token private and require it at the fetch boundary so future call sites cannot bypass
+/// the fail-closed check accidentally.
+#[derive(Clone, Copy, Debug)]
+struct XHRExecutionModePermit;
+
 impl From<DocumentClockError> for XHRFetchTimeError {
     fn from(error: DocumentClockError) -> Self {
         Self::Clock(error)
@@ -364,6 +372,19 @@ impl XMLHttpRequest {
     fn sync_in_window(&self) -> bool {
         self.sync.get() && self.global().is::<Window>()
     }
+
+    fn execution_mode_permit(
+        clock: &DocumentClock,
+        synchronous: bool,
+    ) -> Result<XHRExecutionModePermit, Error> {
+        if synchronous && clock.is_controlled() {
+            return Err(Error::InvalidAccess(Some(
+                "Synchronous XMLHttpRequest is unavailable under controlled execution".into(),
+            )));
+        }
+
+        Ok(XHRExecutionModePermit)
+    }
 }
 
 impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
@@ -412,6 +433,11 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         {
             return Err(Error::InvalidState(None));
         }
+
+        // Controlled execution cannot pump XHR's private synchronous event loop. Reject the mode
+        // before URL/blob claims, fetch termination, or any XHR state mutation occurs.
+        let _execution_mode_permit =
+            Self::execution_mode_permit(&global.document_clock(), !asynch)?;
 
         // Step 5
         // FIXME(seanmonstar): use a Trie instead?
@@ -648,6 +674,12 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                 "XMLHttpRequest not open or already sent".into(),
             )));
         }
+
+        // `open(..., false)` is rejected above in controlled mode. Check again at the send
+        // boundary so even a pre-existing or otherwise restored synchronous XHR cannot mutate its
+        // body/send state or enter the nested response receiver.
+        let execution_mode_permit =
+            Self::execution_mode_permit(&self.global().document_clock(), self.sync.get())?;
         let Some(url) = self.request_url.borrow().clone() else {
             return Err(Error::InvalidState(Some("XMLHttpRequest not open".into())));
         };
@@ -883,7 +915,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         };
         self.fetch_time.set(Some(fetch_time));
 
-        if let Err(error) = self.fetch(cx, request, &self.global()) {
+        if let Err(error) = self.fetch(cx, request, &self.global(), execution_mode_permit) {
             // Admission failure happens after send state is committed but before any response task
             // exists. Run the ordinary request-error lifecycle now, and—critically for synchronous
             // XHR—return before entering the nested response receiver.
@@ -1728,6 +1760,7 @@ impl XMLHttpRequest {
         cx: &mut JSContext,
         request_builder: RequestBuilder,
         global: &GlobalScope,
+        _execution_mode_permit: XHRExecutionModePermit,
     ) -> ErrorResult {
         let xhr = Trusted::new(self);
 
@@ -1951,6 +1984,50 @@ mod tests {
             },
             other => panic!("expected XHR AbortError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn controlled_synchronous_xhr_is_rejected_before_entering_send_work() {
+        let clock = controlled_clock(0);
+        let entered_send_work = Cell::new(false);
+
+        let result = XMLHttpRequest::execution_mode_permit(&clock, true).map(|_| {
+            entered_send_work.set(true);
+        });
+
+        match result {
+            Err(Error::InvalidAccess(Some(message))) => {
+                assert!(message.contains("controlled execution"));
+            },
+            other => panic!(
+                "expected controlled synchronous XHR to return InvalidAccessError, got {other:?}"
+            ),
+        }
+        assert!(!entered_send_work.get());
+    }
+
+    #[test]
+    fn controlled_asynchronous_xhr_can_enter_send_work() {
+        let clock = controlled_clock(0);
+        let entered_send_work = Cell::new(false);
+
+        XMLHttpRequest::execution_mode_permit(&clock, false)
+            .map(|_| entered_send_work.set(true))
+            .unwrap();
+
+        assert!(entered_send_work.get());
+    }
+
+    #[test]
+    fn real_synchronous_xhr_can_enter_send_work() {
+        let clock = DocumentClock::default();
+        let entered_send_work = Cell::new(false);
+
+        XMLHttpRequest::execution_mode_permit(&clock, true)
+            .map(|_| entered_send_work.set(true))
+            .unwrap();
+
+        assert!(entered_send_work.get());
     }
 
     #[test]
