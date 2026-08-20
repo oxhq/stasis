@@ -39,7 +39,8 @@ use crate::dom::sharedworkerglobalscope::SharedWorkerScriptMsg;
 use crate::dom::worker::TrustedWorkerAddress;
 use crate::dom::{WorkletControl, WorkletExecutor};
 use crate::producer_fence::{
-    ProducerFencedTaskBox, fence_fetch_until_eof as fence_resource_fetch_until_eof,
+    DocumentProducerEnvelope, ProducerFencedTaskBox,
+    fence_fetch_until_eof as fence_resource_fetch_until_eof,
 };
 use crate::script_runtime::ScriptThreadEventCategory;
 use crate::tasks::task::TaskBox;
@@ -162,7 +163,7 @@ pub(crate) enum MainThreadScriptMsg {
     WorkletLoaded(PipelineId),
     NavigationResponse {
         pipeline_id: PipelineId,
-        message: Box<FetchResponseMsg>,
+        response: Box<DocumentProducerEnvelope<FetchResponseMsg>>,
     },
     /// Notifies the script thread that a new paint worklet has been registered.
     RegisterPaintWorklet {
@@ -301,6 +302,47 @@ impl ScriptEventLoopSender {
         producer_fence
             .begin(DocumentProducerKind::ExternalCallback)
             .map(Some)
+    }
+
+    /// Queue one navigation response while retaining its Task producer through ScriptThread
+    /// handling.
+    ///
+    /// Navigation responses use a dedicated main-thread message rather than `CommonScriptMsg::Task`,
+    /// so they need the same checked admission and post-commit wake explicitly. Realtime preserves
+    /// Servo's direct message path and carries no producer guard.
+    pub(crate) fn send_navigation_response(
+        &self,
+        pipeline_id: PipelineId,
+        message: FetchResponseMsg,
+    ) -> Result<(), ScriptEventLoopSendError> {
+        let Self::MainThread {
+            sender,
+            producer_fence,
+        } = self
+        else {
+            unreachable!("document navigation responses only target the main ScriptThread")
+        };
+
+        let guard = producer_fence
+            .as_ref()
+            .map(|producer_fence| producer_fence.begin(DocumentProducerKind::Task))
+            .transpose()
+            .map_err(ScriptEventLoopSendError::Producer)?;
+        let response = Box::new(DocumentProducerEnvelope::new(message, guard));
+
+        sender
+            .send(MainThreadScriptMsg::NavigationResponse {
+                pipeline_id,
+                response,
+            })
+            .map_err(|_| ScriptEventLoopSendError::ChannelClosed)?;
+
+        if let Some(producer_fence) = producer_fence {
+            // Admission wakes before the channel mutation. Wake again after commit so a controlled
+            // owner cannot observe Busy, sleep, and strand this newly queued response.
+            producer_fence.notify_observer_after_commit();
+        }
+        Ok(())
     }
 
     /// Send a message to the event loop, which might be a main thread event loop or a worker event loop.
@@ -580,6 +622,127 @@ mod producer_fence_tests {
             Ok(()),
             ResourceFetchTiming::new(ResourceTimingType::Resource),
         )
+    }
+
+    #[test]
+    fn controlled_navigation_eof_hands_resource_off_to_a_guarded_response_task() {
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender, &producer_fence);
+        let callback_sender = event_loop_sender.clone();
+        let mut callback = event_loop_sender
+            .fence_fetch_until_eof(Box::new(move |message| {
+                callback_sender
+                    .send_navigation_response(TEST_PIPELINE_ID, message)
+                    .unwrap();
+            }))
+            .unwrap();
+
+        callback(response_eof());
+
+        let after_eof = producer_fence.snapshot();
+        assert_eq!(
+            after_eof.for_kind(DocumentProducerKind::Resource).pending(),
+            0
+        );
+        assert_eq!(after_eof.for_kind(DocumentProducerKind::Task).pending(), 1);
+
+        let response = match receiver.recv().unwrap() {
+            MainThreadScriptMsg::NavigationResponse {
+                pipeline_id,
+                response,
+            } => {
+                assert_eq!(pipeline_id, TEST_PIPELINE_ID);
+                response
+            },
+            _ => panic!("expected a navigation response"),
+        };
+        let (_message, producer_guard) = response.into_parts();
+        assert!(producer_guard.is_some());
+        assert_eq!(producer_fence.snapshot().pending(), 1);
+        drop(producer_guard);
+
+        let complete = producer_fence.snapshot();
+        assert!(complete.is_empty());
+        assert_eq!(
+            complete
+                .for_kind(DocumentProducerKind::Resource)
+                .completed(),
+            1
+        );
+        assert_eq!(complete.for_kind(DocumentProducerKind::Task).completed(), 1);
+    }
+
+    #[test]
+    fn navigation_response_wakes_before_and_after_direct_queue_commit() {
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let (embedder_message_sender, embedder_message_receiver) = crossbeam_channel::unbounded();
+        let embedder_sender = ScriptToEmbedderChan::new(
+            embedder_message_sender,
+            Box::new(QueueObservingWaker {
+                receiver: receiver.clone(),
+                observations: observations.clone(),
+            }),
+        );
+        let notifier_sender = embedder_sender.clone();
+        let producer_fence = DocumentProducerFence::with_notifier(Some(Arc::new(move || {
+            let _ = notifier_sender.wake();
+        })));
+        let event_loop_sender = main_thread_sender(raw_sender, &producer_fence);
+
+        event_loop_sender
+            .send_navigation_response(TEST_PIPELINE_ID, response_eof())
+            .unwrap();
+
+        assert_eq!(*observations.lock().unwrap(), vec![false, true]);
+        assert!(matches!(
+            embedder_message_receiver.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ));
+
+        drop(receiver.recv().unwrap());
+        assert_eq!(*observations.lock().unwrap(), vec![false, true, false]);
+    }
+
+    #[test]
+    fn failed_navigation_response_send_releases_its_task_ticket() {
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        drop(receiver);
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender, &producer_fence);
+
+        assert_eq!(
+            event_loop_sender.send_navigation_response(TEST_PIPELINE_ID, response_eof()),
+            Err(ScriptEventLoopSendError::ChannelClosed)
+        );
+
+        let complete = producer_fence.snapshot();
+        assert!(complete.is_empty());
+        assert_eq!(complete.for_kind(DocumentProducerKind::Task).completed(), 1);
+    }
+
+    #[test]
+    fn realtime_navigation_response_preserves_the_raw_direct_message_path() {
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = ScriptEventLoopSender::MainThread {
+            sender: raw_sender,
+            producer_fence: None,
+        };
+
+        event_loop_sender
+            .send_navigation_response(TEST_PIPELINE_ID, response_eof())
+            .unwrap();
+
+        assert!(producer_fence.snapshot().is_empty());
+        let response = match receiver.recv().unwrap() {
+            MainThreadScriptMsg::NavigationResponse { response, .. } => response,
+            _ => panic!("expected a navigation response"),
+        };
+        let (_message, producer_guard) = response.into_parts();
+        assert!(producer_guard.is_none());
+        assert!(producer_fence.snapshot().is_empty());
     }
 
     #[test]

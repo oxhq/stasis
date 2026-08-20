@@ -2291,9 +2291,18 @@ impl ScriptThread {
             },
             MainThreadScriptMsg::NavigationResponse {
                 pipeline_id,
-                message,
+                response,
             } => {
-                self.handle_navigation_response(cx, pipeline_id, *message);
+                let (message, producer_guard) = (*response).into_parts();
+                if self.document_producer_fence.is_some() &&
+                    self.closed_pipelines.borrow().contains(&pipeline_id)
+                {
+                    // Controlled teardown establishes this tombstone before document destruction.
+                    // A queued redirect must not resurrect network work for the closed pipeline.
+                    return;
+                }
+                self.handle_navigation_response(cx, pipeline_id, message);
+                drop(producer_guard);
             },
             MainThreadScriptMsg::WorkletLoaded(pipeline_id) => {
                 self.handle_worklet_loaded(pipeline_id)
@@ -3373,6 +3382,12 @@ impl ScriptThread {
                     ScriptToConstellationMessage::AbortLoadUrl,
                 ))
                 .unwrap();
+            if self.document_producer_fence.is_some() {
+                // The response stream is still a live Resource producer until cancellation
+                // delivers EOF. Cancel and remove the InProgressLoad now; handle_fetch_metadata
+                // removes the parser context after its currently borrowed callback returns.
+                self.terminate_incomplete_navigation_loads(pipeline_id);
+            }
             return None;
         };
 
@@ -3386,6 +3401,32 @@ impl ScriptThread {
             return warn!("Message sent to closed pipeline {pipeline_id}.");
         };
         document.send_title_to_embedder();
+    }
+
+    /// Cancel navigation fetches that have not yet reached a complete Document.
+    fn terminate_incomplete_navigation_loads(&self, pipeline_id: PipelineId) {
+        loop {
+            let incomplete_load = {
+                let mut incomplete_loads = self.incomplete_loads.borrow_mut();
+                incomplete_loads
+                    .iter()
+                    .position(|load| load.pipeline_id == pipeline_id)
+                    .map(|index| incomplete_loads.remove(index))
+            };
+            let Some(mut incomplete_load) = incomplete_load else {
+                break;
+            };
+            incomplete_load.canceller.terminate();
+        }
+    }
+
+    /// Cancel and forget navigation state that has not yet reached a complete Document.
+    fn terminate_incomplete_navigation(&self, pipeline_id: PipelineId) {
+        self.terminate_incomplete_navigation_loads(pipeline_id);
+        self.incomplete_parser_contexts
+            .0
+            .borrow_mut()
+            .retain(|(parser_pipeline_id, _)| *parser_pipeline_id != pipeline_id);
     }
 
     /// Handles a request to exit a pipeline and shut down layout.
@@ -3405,6 +3446,7 @@ impl ScriptThread {
             // `handle_msg_from_script` against the same ScriptThread tombstone.
             self.closed_pipelines.borrow_mut().insert(pipeline_id);
             self.task_queue.discard_pipeline(pipeline_id);
+            self.terminate_incomplete_navigation(pipeline_id);
         }
 
         // Abort the parser, if any,
@@ -3419,6 +3461,12 @@ impl ScriptThread {
                     .iter()
                     .any(|load| load.pipeline_id == pipeline_id)
             );
+
+            if self.document_producer_fence.is_some() {
+                // Once response headers create a Document, it owns the navigation canceller.
+                // Terminate it before dropping the DOM so the fenced response stream reaches EOF.
+                document.terminate_navigation_and_subresource_fetches();
+            }
 
             if let Some(parser) = document.get_current_parser() {
                 parser.abort(cx);
@@ -4170,8 +4218,25 @@ impl ScriptThread {
             false,
             self.resource_threads.core_thread.clone(),
         );
-        NavigationListener::new(request_builder, self.senders.self_sender.clone())
-            .initiate_fetch(&self.resource_threads.core_thread, None);
+        let event_loop_sender = ScriptEventLoopSender::MainThread {
+            sender: self.senders.self_sender.clone(),
+            producer_fence: self.document_producer_fence.clone(),
+        };
+        if let Err(error) = NavigationListener::new(request_builder, event_loop_sender)
+            .initiate_fetch(&self.resource_threads.core_thread, None)
+        {
+            // Producer admission failure is sticky. Remove the parser context created for this
+            // request and refuse to start an untracked navigation.
+            self.incomplete_parser_contexts
+                .0
+                .borrow_mut()
+                .retain(|(pipeline_id, _)| *pipeline_id != incomplete.pipeline_id);
+            error!(
+                "Refusing to start an unfenced navigation for pipeline {:?}: {error}",
+                incomplete.pipeline_id
+            );
+            return;
+        }
         self.incomplete_loads.borrow_mut().push(incomplete);
     }
 
@@ -4220,11 +4285,32 @@ impl ScriptThread {
         };
 
         let mut incomplete_parser_contexts = self.incomplete_parser_contexts.0.borrow_mut();
-        let parser = incomplete_parser_contexts
-            .iter_mut()
-            .find(|&&mut (pipeline_id, _)| pipeline_id == id);
-        if let Some(&mut (_, ref mut ctxt)) = parser {
-            ctxt.process_response(cx, request_id, fetch_metadata);
+        let Some(parser_index) = incomplete_parser_contexts
+            .iter()
+            .position(|(pipeline_id, _)| *pipeline_id == id)
+        else {
+            return;
+        };
+
+        incomplete_parser_contexts[parser_index]
+            .1
+            .process_response(cx, request_id, fetch_metadata);
+
+        if self.document_producer_fence.is_some() &&
+            incomplete_parser_contexts[parser_index]
+                .1
+                .get_document()
+                .is_none() &&
+            !self
+                .incomplete_loads
+                .borrow()
+                .iter()
+                .any(|load| load.pipeline_id == id)
+        {
+            // `page_headers_available` runs inside `process_response`, while this RefCell is
+            // already borrowed. A Controlled 204/205 cancels and removes the InProgressLoad there;
+            // remove its now-orphaned parser context only after the callback has returned.
+            incomplete_parser_contexts.remove(parser_index);
         }
     }
 
@@ -4361,8 +4447,17 @@ impl ScriptThread {
             false,
             self.resource_threads.core_thread.clone(),
         );
-        NavigationListener::new(request_builder, self.senders.self_sender.clone())
-            .initiate_fetch(&self.resource_threads.core_thread, response_init);
+        let event_loop_sender = ScriptEventLoopSender::MainThread {
+            sender: self.senders.self_sender.clone(),
+            producer_fence: self.document_producer_fence.clone(),
+        };
+        if let Err(error) = NavigationListener::new(request_builder, event_loop_sender)
+            .initiate_fetch(&self.resource_threads.core_thread, response_init)
+        {
+            // The old redirect response remains guarded until this handler returns. The failed new
+            // admission is a sticky terminal, so never fall back to an untracked redirect fetch.
+            error!("Refusing to start an unfenced redirect for pipeline {id:?}: {error}");
+        }
     }
 
     /// Synchronously fetch a page with fixed content. Stores the `InProgressLoad`

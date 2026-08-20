@@ -10,7 +10,7 @@ use std::default::Default;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::str::FromStr;
-use std::sync::{Arc as StdArc, LazyLock, Mutex};
+use std::sync::{Arc as StdArc, LazyLock};
 use std::time::Duration;
 
 use bitflags::bitflags;
@@ -545,8 +545,8 @@ pub(crate) struct Document {
     interactive_time: DomRefCell<ProgressiveWebMetrics>,
     #[no_trace]
     tti_window: DomRefCell<InteractiveWindow>,
-    /// RAII canceller for Fetch
-    canceller: FetchCanceller,
+    /// Cancels the physical navigation fetch if this Document is torn down before EOF.
+    navigation_fetch_canceller: DomRefCell<FetchCanceller>,
     /// <https://html.spec.whatwg.org/multipage/#throw-on-dynamic-markup-insertion-counter>
     throw_on_dynamic_markup_insertion_counter: Cell<u64>,
     /// <https://html.spec.whatwg.org/multipage/#page-showing>
@@ -989,6 +989,21 @@ impl Document {
     #[inline]
     pub(crate) fn loader_mut(&self) -> RefMut<'_, DocumentLoader> {
         self.loader.borrow_mut()
+    }
+
+    /// Terminate fetches owned by this Document during Controlled pipeline teardown.
+    ///
+    /// Response headers transfer the navigation canceller into the Document, while subresource
+    /// cancellers accumulate in its loader. Both families retain Resource producers until their
+    /// terminal callbacks, so teardown must request cancellation before dropping the DOM.
+    pub(crate) fn terminate_navigation_and_subresource_fetches(&self) {
+        self.navigation_fetch_canceller.borrow_mut().terminate();
+        let mut cancellers = self.loader.borrow_mut().cancel_all_loads();
+        for canceller in &mut cancellers {
+            if !canceller.keep_alive() {
+                canceller.terminate();
+            }
+        }
     }
 
     #[inline]
@@ -1951,15 +1966,25 @@ impl Document {
         request: RequestBuilder,
         listener: Listener,
     ) {
-        let callback = NetworkListener {
-            context: std::sync::Arc::new(Mutex::new(Some(listener))),
-            task_source: self
-                .owner_global()
+        let network_listener = NetworkListener::new(
+            listener,
+            self.owner_global()
                 .task_manager()
                 .networking_task_source()
                 .into(),
-        }
-        .into_callback();
+        );
+        let event_loop_sender = network_listener.task_source.sender.clone();
+        let callback = match event_loop_sender
+            .fence_fetch_until_eof(network_listener.into_callback())
+        {
+            Ok(callback) => callback,
+            Err(error) => {
+                // Admission is sticky in Controlled mode. Do not add a blocking load or start an
+                // untracked request after the fence has become terminal.
+                error!("Refusing to start an unfenced document load: {error}");
+                return;
+            },
+        };
         self.loader_mut()
             .fetch_async_with_callback(load, request, callback);
     }
@@ -1969,15 +1994,23 @@ impl Document {
         request: RequestBuilder,
         listener: Listener,
     ) {
-        let callback = NetworkListener {
-            context: std::sync::Arc::new(Mutex::new(Some(listener))),
-            task_source: self
-                .owner_global()
+        let network_listener = NetworkListener::new(
+            listener,
+            self.owner_global()
                 .task_manager()
                 .networking_task_source()
                 .into(),
-        }
-        .into_callback();
+        );
+        let event_loop_sender = network_listener.task_source.sender.clone();
+        let callback = match event_loop_sender
+            .fence_fetch_until_eof(network_listener.into_callback())
+        {
+            Ok(callback) => callback,
+            Err(error) => {
+                error!("Refusing to start an unfenced background document load: {error}");
+                return;
+            },
+        };
         self.loader_mut().fetch_async_background(request, callback);
     }
 
@@ -3973,7 +4006,7 @@ impl Document {
             form_id_listener_map: Default::default(),
             interactive_time: DomRefCell::new(interactive_time),
             tti_window: DomRefCell::new(InteractiveWindow::default()),
-            canceller,
+            navigation_fetch_canceller: DomRefCell::new(canceller),
             throw_on_dynamic_markup_insertion_counter: Cell::new(0),
             page_showing: Cell::new(false),
             salvageable: Cell::new(true),

@@ -9,7 +9,6 @@
 use std::cell::Cell;
 
 use content_security_policy::sandboxing_directive::SandboxingFlagSet;
-use crossbeam_channel::Sender;
 use embedder_traits::user_contents::UserContentManagerId;
 use embedder_traits::{Theme, ViewportDetails, WebDriverLoadStatus};
 use http::header;
@@ -46,29 +45,34 @@ use crate::dom::window::Window;
 use crate::dom::windowproxy::WindowProxy;
 use crate::event_loop::script_thread::ScriptThread;
 use crate::fetch::fetch::FetchCanceller;
-use crate::messaging::MainThreadScriptMsg;
+use crate::messaging::{ScriptEventLoopSendError, ScriptEventLoopSender};
 
 #[derive(Clone)]
 pub struct NavigationListener {
     request_builder: RequestBuilder,
-    main_thread_sender: Sender<MainThreadScriptMsg>,
+    event_loop_sender: ScriptEventLoopSender,
     // Whether or not results are sent to the main thread. After a redirect results are no longer sent,
     // as the main thread has already started a new request.
     send_results_to_main_thread: Cell<bool>,
 }
 
 impl NavigationListener {
-    pub(crate) fn into_callback(self) -> BoxedFetchCallback {
-        Box::new(move |response_msg| self.notify_fetch(response_msg))
+    pub(crate) fn into_callback(
+        self,
+    ) -> Result<BoxedFetchCallback, ScriptEventLoopSendError> {
+        let event_loop_sender = self.event_loop_sender.clone();
+        event_loop_sender.fence_fetch_until_eof(Box::new(move |response_msg| {
+            self.notify_fetch(response_msg)
+        }))
     }
 
     pub fn new(
         request_builder: RequestBuilder,
-        main_thread_sender: Sender<MainThreadScriptMsg>,
+        event_loop_sender: ScriptEventLoopSender,
     ) -> NavigationListener {
         NavigationListener {
             request_builder,
-            main_thread_sender,
+            event_loop_sender,
             send_results_to_main_thread: Cell::new(true),
         }
     }
@@ -77,13 +81,16 @@ impl NavigationListener {
         self,
         core_resource_thread: &CoreResourceThread,
         response_init: Option<ResponseInit>,
-    ) {
+    ) -> Result<(), ScriptEventLoopSendError> {
+        let request_builder = self.request_builder.clone();
+        let callback = self.into_callback()?;
         fetch_async(
             core_resource_thread,
-            self.request_builder.clone(),
+            request_builder,
             response_init,
-            self.into_callback(),
+            callback,
         );
+        Ok(())
     }
 
     fn notify_fetch(&self, message: FetchResponseMsg) {
@@ -103,11 +110,8 @@ impl NavigationListener {
             .pipeline_id
             .expect("Navigation should always have an associated Pipeline");
         let result = self
-            .main_thread_sender
-            .send(MainThreadScriptMsg::NavigationResponse {
-                pipeline_id,
-                message: Box::new(message),
-            });
+            .event_loop_sender
+            .send_navigation_response(pipeline_id, message);
 
         if let Err(error) = result {
             warn!(
