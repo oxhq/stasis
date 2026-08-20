@@ -1340,9 +1340,24 @@ impl TimerId {
     }
 }
 
+static NEXT_TIMER_SCHEDULER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Stable process-local identity for one timer scheduler.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub struct TimerSchedulerId(u64);
+
+impl TimerSchedulerId {
+    /// Return the process-local scheduler identifier.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// The finite deadline exposed by a controlled scheduler.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TimerDeadlineSnapshot {
+    /// Identity of the scheduler that issued this snapshot.
+    pub scheduler_id: TimerSchedulerId,
     /// Stable identity and insertion order for this event.
     pub id: TimerId,
     /// Absolute integer-nanosecond offset in the document clock.
@@ -1360,7 +1375,7 @@ pub enum TimerControlError {
     SequenceExhausted,
     /// A finite-deadline operation was requested from a realtime scheduler.
     RealtimeScheduler,
-    /// The caller tried to activate a snapshot that is no longer current.
+    /// The caller supplied a snapshot that is not current for this scheduler.
     StaleDeadline {
         /// Snapshot supplied by the caller.
         expected: TimerDeadlineSnapshot,
@@ -1393,6 +1408,8 @@ impl std::error::Error for TimerControlError {}
 /// A queue of [`TimerEventRequest`]s that are stored in order of next-to-fire.
 #[derive(MallocSizeOf)]
 pub struct TimerScheduler {
+    /// Stable process-local identity for snapshots issued by this scheduler.
+    id: TimerSchedulerId,
     /// A priority queue of future events, sorted by due time and insertion sequence.
     queue: BinaryHeap<ScheduledEvent>,
     /// The next stable timer insertion sequence.
@@ -1410,11 +1427,26 @@ impl Default for TimerScheduler {
 impl TimerScheduler {
     /// Create a scheduler driven by the supplied document clock.
     pub fn with_clock(clock: DocumentClock) -> Self {
+        let id = TimerSchedulerId(
+            NEXT_TIMER_SCHEDULER_ID
+                .fetch_update(
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                    |current| current.checked_add(1),
+                )
+                .expect("timer scheduler identifier exhausted"),
+        );
         Self {
+            id,
             queue: BinaryHeap::new(),
             next_id: 0,
             clock,
         }
+    }
+
+    /// Return this scheduler's stable process-local identity.
+    pub const fn id(&self) -> TimerSchedulerId {
+        self.id
     }
 
     /// Return the scheduler's shared document clock.
@@ -1496,6 +1528,7 @@ impl TimerScheduler {
             return Err(TimerControlError::RealtimeScheduler);
         }
         Ok(self.queue.peek().map(|event| TimerDeadlineSnapshot {
+            scheduler_id: self.id,
             id: event.id,
             deadline: event.deadline,
         }))
@@ -1641,6 +1674,82 @@ mod tests {
             callback: Box::new(move || events.lock().unwrap().push(value)),
             duration,
         }
+    }
+
+    type RecordedEvents = Arc<Mutex<Vec<usize>>>;
+
+    fn same_shaped_scheduler_pair(
+        duration: Duration,
+    ) -> (
+        TimerScheduler,
+        TimerDeadlineSnapshot,
+        RecordedEvents,
+        TimerScheduler,
+        TimerDeadlineSnapshot,
+        RecordedEvents,
+    ) {
+        let local_events = Arc::new(Mutex::new(Vec::new()));
+        let foreign_events = Arc::new(Mutex::new(Vec::new()));
+        let mut local = TimerScheduler::with_clock(controlled_clock(0));
+        let mut foreign = TimerScheduler::with_clock(controlled_clock(0));
+        local.schedule_timer(recording_request(&local_events, 1, duration));
+        foreign.schedule_timer(recording_request(&foreign_events, 2, duration));
+        let local_snapshot = local.finite_deadline_snapshot().unwrap().unwrap();
+        let foreign_snapshot = foreign.finite_deadline_snapshot().unwrap().unwrap();
+        assert_ne!(local_snapshot.scheduler_id, foreign_snapshot.scheduler_id);
+        assert_eq!(local_snapshot.id, foreign_snapshot.id);
+        assert_eq!(local_snapshot.deadline, foreign_snapshot.deadline);
+        (
+            local,
+            local_snapshot,
+            local_events,
+            foreign,
+            foreign_snapshot,
+            foreign_events,
+        )
+    }
+
+    fn assert_scheduler_state_unchanged(
+        scheduler: &TimerScheduler,
+        snapshot: TimerDeadlineSnapshot,
+        now: DocumentTime,
+        events: &RecordedEvents,
+    ) {
+        assert_eq!(scheduler.clock().now(), now);
+        assert_eq!(
+            scheduler.finite_deadline_snapshot().unwrap(),
+            Some(snapshot)
+        );
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    fn assert_foreign_snapshot_rejected(
+        local_now: DocumentTime,
+        operation: impl FnOnce(
+            &mut TimerScheduler,
+            TimerDeadlineSnapshot,
+        ) -> Result<(), TimerControlError>,
+    ) {
+        let (mut local, local_snapshot, local_events, foreign, foreign_snapshot, foreign_events) =
+            same_shaped_scheduler_pair(Duration::from_nanos(10));
+        if local_now != DocumentTime::ZERO {
+            local.advance_controlled_time_to(local_now).unwrap();
+        }
+
+        assert_eq!(
+            operation(&mut local, foreign_snapshot),
+            Err(TimerControlError::StaleDeadline {
+                expected: foreign_snapshot,
+                observed: Some(local_snapshot),
+            })
+        );
+        assert_scheduler_state_unchanged(&local, local_snapshot, local_now, &local_events);
+        assert_scheduler_state_unchanged(
+            &foreign,
+            foreign_snapshot,
+            DocumentTime::ZERO,
+            &foreign_events,
+        );
     }
 
     #[test]
@@ -2146,6 +2255,48 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_identity_is_stable_unique_and_bound_to_its_snapshots() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut scheduler = TimerScheduler::with_clock(controlled_clock(0));
+        let other = TimerScheduler::with_clock(controlled_clock(0));
+        let id = scheduler.id();
+
+        assert_ne!(id.get(), 0);
+        assert_eq!(scheduler.id(), id);
+        assert_ne!(other.id(), id);
+        scheduler.schedule_timer(recording_request(&events, 1, Duration::from_nanos(1)));
+        assert_eq!(
+            scheduler
+                .finite_deadline_snapshot()
+                .unwrap()
+                .unwrap()
+                .scheduler_id,
+            id
+        );
+        assert_eq!(scheduler.id(), id);
+    }
+
+    #[test]
+    fn foreign_scheduler_snapshots_cannot_validate_advance_or_activate() {
+        assert_foreign_snapshot_rejected(DocumentTime::ZERO, |scheduler, snapshot| {
+            scheduler.validate_deadline_snapshot(snapshot)
+        });
+        assert_foreign_snapshot_rejected(DocumentTime::ZERO, |scheduler, snapshot| {
+            scheduler.advance_to_and_activate(snapshot)
+        });
+        assert_foreign_snapshot_rejected(DocumentTime::ZERO, |scheduler, snapshot| {
+            scheduler.validate_and_advance_to(snapshot)
+        });
+        assert_foreign_snapshot_rejected(DocumentTime::ZERO, |scheduler, snapshot| {
+            scheduler.validate_and_advance_from(DocumentTime::ZERO, snapshot)
+        });
+        assert_foreign_snapshot_rejected(
+            DocumentTime::from_nanos(10),
+            TimerScheduler::activate_due_timer,
+        );
+    }
+
+    #[test]
     fn cancellation_invalidates_snapshot_without_moving_time_or_running_callback() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut scheduler = TimerScheduler::with_clock(controlled_clock(3));
@@ -2516,6 +2667,7 @@ mod tests {
             .try_schedule_timer(recording_request(&recorded, 1, Duration::ZERO))
             .unwrap();
         let due = TimerDeadlineSnapshot {
+            scheduler_id: scheduler.id(),
             id: due,
             deadline: DocumentTime::ZERO,
         };
@@ -2583,7 +2735,9 @@ mod tests {
             initial_time_ns: WIDE_SPAN_NS,
             unix_time_origin_ns: DocumentUnixTime::from_nanos(NEGATIVE_EPOCH_NS),
         });
+        assert_postcard_round_trip(TimerSchedulerId(u64::MAX));
         assert_postcard_round_trip(TimerDeadlineSnapshot {
+            scheduler_id: TimerSchedulerId(u64::MAX),
             id: TimerId(u64::MAX),
             deadline: DocumentTime::from_nanos(u128::MAX),
         });
@@ -2594,10 +2748,12 @@ mod tests {
         });
         assert_postcard_round_trip(TimerControlError::StaleDeadline {
             expected: TimerDeadlineSnapshot {
+                scheduler_id: TimerSchedulerId(1),
                 id: TimerId(1),
                 deadline: DocumentTime::from_nanos(2),
             },
             observed: Some(TimerDeadlineSnapshot {
+                scheduler_id: TimerSchedulerId(1),
                 id: TimerId(3),
                 deadline: DocumentTime::from_nanos(4),
             }),
@@ -2660,6 +2816,7 @@ mod tests {
         }
 
         let deadline = TimerDeadlineSnapshot {
+            scheduler_id: TimerSchedulerId(0),
             id: TimerId(0),
             deadline: DocumentTime::ZERO,
         };
