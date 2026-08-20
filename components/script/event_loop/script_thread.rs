@@ -18,7 +18,7 @@
 //! loop.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::default::Default;
 use std::option::Option;
 use std::rc::{Rc, Weak};
@@ -39,6 +39,8 @@ use devtools_traits::{
     CSSError, DevtoolScriptControlMsg, DevtoolsPageInfo, NavigationState,
     ScriptToDevtoolsControlMsg, WorkerId,
 };
+use embedder_traits::document_control::DocumentControlError;
+use embedder_traits::document_pending::PendingInputRevision;
 use embedder_traits::user_contents::{UserContentManagerId, UserContents, UserScript};
 use embedder_traits::{
     EmbedderControlId, EmbedderControlResponse, EmbedderMsg, FocusSequenceNumber,
@@ -194,6 +196,109 @@ pub(crate) struct IncompleteParserContexts(RefCell<Vec<(PipelineId, ParserContex
 unsafe_no_jsmanaged_fields!(TaskQueue<MainThreadScriptMsg>);
 
 type NodeIdSet = HashSet<String>;
+
+const CONTROLLED_INPUT_BATCH_LIMIT: usize = 64;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ControlledInputBatch {
+    admitted: usize,
+    saturated: bool,
+}
+
+/// ScriptThread-owned ordinary input admitted ahead of controlled page turns.
+///
+/// Transport receivers are not authoritative queue state: this owner queue and its checked
+/// revision establish the barrier that later pending snapshots and advance tokens can bind.
+#[derive(Default)]
+struct ControlledInputState {
+    ready: VecDeque<MixedMessage>,
+    revision: PendingInputRevision,
+    intake_saturated: bool,
+    revision_overflowed: bool,
+}
+
+impl ControlledInputState {
+    fn admit(&mut self, event: MixedMessage) {
+        // Commit the event before changing its revision. If the checked sequence is exhausted,
+        // the event remains owned and the sticky terminal prevents a false-empty observation.
+        self.ready.push_back(event);
+        if self.revision_overflowed {
+            return;
+        }
+        let Some(revision) = self.revision.checked_next() else {
+            self.revision_overflowed = true;
+            return;
+        };
+        self.revision = revision;
+    }
+
+    fn drain_bounded(
+        &mut self,
+        input: &mut impl Iterator<Item = MixedMessage>,
+    ) -> ControlledInputBatch {
+        let mut admitted = 0;
+        while admitted < CONTROLLED_INPUT_BATCH_LIMIT {
+            let Some(event) = input.next() else {
+                self.intake_saturated = false;
+                return ControlledInputBatch {
+                    admitted,
+                    saturated: false,
+                };
+            };
+            self.admit(event);
+            admitted += 1;
+        }
+
+        // Filling the cap is conservatively saturated. Peeking would remove an event that this
+        // batch is not allowed to own.
+        self.intake_saturated = true;
+        ControlledInputBatch {
+            admitted,
+            saturated: true,
+        }
+    }
+
+    fn revision(&self) -> Result<PendingInputRevision, DocumentControlError> {
+        if self.revision_overflowed {
+            Err(DocumentControlError::InputRevisionOverflow)
+        } else {
+            Ok(self.revision)
+        }
+    }
+
+    fn last_revision(&self) -> PendingInputRevision {
+        self.revision
+    }
+
+    fn revision_overflowed(&self) -> bool {
+        self.revision_overflowed
+    }
+
+    fn ready_len(&self) -> usize {
+        self.ready.len()
+    }
+
+    fn intake_saturated(&self) -> bool {
+        self.intake_saturated
+    }
+
+    fn pop_front(&mut self) -> Option<MixedMessage> {
+        self.ready.pop_front()
+    }
+
+    fn discard_pipeline(&mut self, pipeline_id: PipelineId) {
+        self.ready
+            .retain(|event| event.pipeline_id() != Some(pipeline_id));
+    }
+}
+
+fn controlled_input_state_for_clock(
+    document_clock: &DocumentClock,
+) -> Option<RefCell<ControlledInputState>> {
+    document_clock
+        .is_controlled()
+        .then(|| RefCell::new(ControlledInputState::default()))
+}
 
 /// A simple guard structure that restore the user interacting state when dropped
 #[derive(Default)]
@@ -384,6 +489,10 @@ pub struct ScriptThread {
     /// Optional linearizable lifecycle fence shared by tracked tasks on this event loop.
     #[no_trace]
     document_producer_fence: Option<DocumentProducerFence>,
+
+    /// Ordinary input retained behind the controlled event-loop barrier.
+    #[no_trace]
+    controlled_input: Option<RefCell<ControlledInputState>>,
 
     /// First checked timer-scheduler failure observed by this ScriptThread.
     #[no_trace]
@@ -1005,6 +1114,7 @@ impl ScriptThread {
             &document_clock,
             &state.script_to_embedder_sender,
         );
+        let controlled_input = controlled_input_state_for_clock(&document_clock);
         let mut runtime = Runtime::new(Some(ScriptEventLoopSender::MainThread {
             sender: self_sender.clone(),
             producer_fence: document_producer_fence.clone(),
@@ -1129,6 +1239,7 @@ impl ScriptThread {
                     )),
                     document_clock,
                     document_producer_fence,
+                    controlled_input,
                     timer_control_terminal: Default::default(),
                     dom_mutation_epochs,
                     microtask_queue,
@@ -1549,6 +1660,24 @@ impl ScriptThread {
                 .window()
                 .maybe_resolve_pending_screenshot_readiness_requests(cx);
         }
+    }
+
+    /// Admit a bounded ready-input batch without executing page work.
+    #[expect(
+        dead_code,
+        reason = "consumed by the upcoming authoritative RawPending control barrier"
+    )]
+    fn drain_ready_controlled_inputs(&self) -> ControlledInputBatch {
+        let Some(controlled_input) = &self.controlled_input else {
+            return ControlledInputBatch::default();
+        };
+        let fully_active = self.get_fully_active_document_ids();
+        let mut input = std::iter::from_fn(|| {
+            self.receivers
+                .try_recv_controlled(&self.task_queue, &fully_active)
+        });
+        let batch = controlled_input.borrow_mut().drain_bounded(&mut input);
+        batch
     }
 
     /// Handle incoming messages from other tasks and the task queue.
@@ -3446,6 +3575,9 @@ impl ScriptThread {
             // `handle_msg_from_script` against the same ScriptThread tombstone.
             self.closed_pipelines.borrow_mut().insert(pipeline_id);
             self.task_queue.discard_pipeline(pipeline_id);
+            if let Some(controlled_input) = &self.controlled_input {
+                controlled_input.borrow_mut().discard_pipeline(pipeline_id);
+            }
             self.terminate_incomplete_navigation(pipeline_id);
         }
 
@@ -4977,6 +5109,108 @@ mod dom_mutation_epoch_tests {
             unix_time_origin_ns: DocumentUnixTime::default(),
         });
         assert!(dom_mutation_epoch_tracker_for_clock(&controlled).is_some());
+    }
+}
+
+#[cfg(test)]
+mod controlled_input_tests {
+    use embedder_traits::document_control::DocumentControlError;
+    use embedder_traits::document_pending::PendingInputRevision;
+    use script_traits::{DiscardBrowsingContext, ScriptThreadMessage};
+    use servo_base::id::{TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
+    use timers::{DocumentClock, DocumentClockConfiguration, DocumentUnixTime};
+
+    use super::{
+        CONTROLLED_INPUT_BATCH_LIMIT, ControlledInputBatch, ControlledInputState, MixedMessage,
+        controlled_input_state_for_clock,
+    };
+
+    #[test]
+    fn controlled_input_batch_is_bounded_and_conservatively_saturated() {
+        let mut state = ControlledInputState::default();
+        let mut input = (0..CONTROLLED_INPUT_BATCH_LIMIT + 1).map(|_| MixedMessage::TimerFired);
+
+        assert_eq!(
+            state.drain_bounded(&mut input),
+            ControlledInputBatch {
+                admitted: CONTROLLED_INPUT_BATCH_LIMIT,
+                saturated: true,
+            }
+        );
+        assert_eq!(state.ready_len(), CONTROLLED_INPUT_BATCH_LIMIT);
+        assert_eq!(
+            state.revision().unwrap().get(),
+            CONTROLLED_INPUT_BATCH_LIMIT as u64
+        );
+        assert!(state.intake_saturated());
+        assert_eq!(
+            input.size_hint(),
+            (1, Some(1)),
+            "the capped suffix stays unconsumed"
+        );
+
+        assert_eq!(
+            state.drain_bounded(&mut input),
+            ControlledInputBatch {
+                admitted: 1,
+                saturated: false,
+            }
+        );
+        assert_eq!(state.revision().unwrap().get(), 65);
+        assert!(!state.intake_saturated());
+    }
+
+    #[test]
+    fn revision_overflow_is_sticky_and_never_drops_owned_input() {
+        let mut state = ControlledInputState {
+            revision: PendingInputRevision::new(u64::MAX),
+            ..ControlledInputState::default()
+        };
+
+        state.admit(MixedMessage::TimerFired);
+        assert_eq!(state.ready_len(), 1);
+        assert_eq!(state.last_revision(), PendingInputRevision::new(u64::MAX));
+        assert!(state.revision_overflowed());
+        assert_eq!(
+            state.revision(),
+            Err(DocumentControlError::InputRevisionOverflow)
+        );
+
+        state.admit(MixedMessage::TimerFired);
+        assert_eq!(state.ready_len(), 2);
+        assert_eq!(
+            state.revision(),
+            Err(DocumentControlError::InputRevisionOverflow)
+        );
+    }
+
+    #[test]
+    fn pipeline_discard_purges_only_matching_owned_input() {
+        let mut state = ControlledInputState::default();
+        state.admit(MixedMessage::FromConstellation(
+            ScriptThreadMessage::ExitPipeline(
+                TEST_WEBVIEW_ID,
+                TEST_PIPELINE_ID,
+                DiscardBrowsingContext::No,
+            ),
+        ));
+        state.admit(MixedMessage::TimerFired);
+
+        state.discard_pipeline(TEST_PIPELINE_ID);
+
+        assert_eq!(state.ready_len(), 1);
+        assert!(matches!(state.pop_front(), Some(MixedMessage::TimerFired)));
+    }
+
+    #[test]
+    fn owner_queue_exists_only_for_controlled_time() {
+        assert!(controlled_input_state_for_clock(&DocumentClock::default()).is_none());
+
+        let controlled = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        });
+        assert!(controlled_input_state_for_clock(&controlled).is_some());
     }
 }
 

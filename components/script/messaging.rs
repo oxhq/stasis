@@ -469,13 +469,26 @@ impl QueuedTaskConversion for MainThreadScriptMsg {
     }
 
     fn pipeline_id(&self) -> Option<PipelineId> {
-        let script_msg = match self {
-            MainThreadScriptMsg::Common(script_msg) => script_msg,
-            _ => return None,
-        };
-        match script_msg {
-            CommonScriptMsg::Task(_category, _boxed, pipeline_id, _task_source) => *pipeline_id,
-            _ => None,
+        match self {
+            MainThreadScriptMsg::Common(CommonScriptMsg::Task(
+                _category,
+                _boxed,
+                pipeline_id,
+                _task_source,
+            )) => *pipeline_id,
+            MainThreadScriptMsg::Common(CommonScriptMsg::ReportCspViolations(
+                pipeline_id,
+                _,
+            )) => Some(*pipeline_id),
+            MainThreadScriptMsg::NavigationResponse { pipeline_id, .. } => Some(*pipeline_id),
+            MainThreadScriptMsg::WorkletLoaded(pipeline_id) => Some(*pipeline_id),
+            MainThreadScriptMsg::RegisterPaintWorklet { pipeline_id, .. } => Some(*pipeline_id),
+            MainThreadScriptMsg::ForwardEmbedderControlResponseFromFileManager(control_id, ..) => {
+                Some(control_id.pipeline_id)
+            },
+            MainThreadScriptMsg::Common(CommonScriptMsg::CollectReports(_)) |
+            MainThreadScriptMsg::Inactive |
+            MainThreadScriptMsg::WakeUp => None,
         }
     }
 
@@ -1239,6 +1252,50 @@ mod producer_fence_tests {
     }
 
     #[test]
+    fn discarding_a_pipeline_purges_direct_navigation_messages() {
+        let _script_thread_state = ScriptThreadStateGuard::enter();
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        let task_queue = TaskQueue::new_with_producer_tracking(
+            receiver,
+            raw_sender.clone(),
+            true,
+        );
+        let producer_fence = DocumentProducerFence::default();
+        let fully_active = FxHashSet::default();
+
+        raw_sender
+            .send(MainThreadScriptMsg::NavigationResponse {
+                pipeline_id: TEST_PIPELINE_ID,
+                response: Box::new(DocumentProducerEnvelope::new(
+                    response_eof(),
+                    Some(producer_fence.begin(DocumentProducerKind::Task).unwrap()),
+                )),
+            })
+            .unwrap();
+        task_queue.take_tasks(MainThreadScriptMsg::WakeUp, &fully_active);
+        assert_eq!(task_queue.observation().ready, 1);
+        assert_eq!(producer_fence.snapshot().pending(), 1);
+
+        task_queue.discard_pipeline(TEST_PIPELINE_ID);
+        assert_eq!(task_queue.observation().ready, 0);
+        assert!(task_queue.recv().is_err());
+        assert!(producer_fence.snapshot().is_empty());
+
+        raw_sender
+            .send(MainThreadScriptMsg::NavigationResponse {
+                pipeline_id: TEST_PIPELINE_ID,
+                response: Box::new(DocumentProducerEnvelope::new(
+                    response_eof(),
+                    Some(producer_fence.begin(DocumentProducerKind::Task).unwrap()),
+                )),
+            })
+            .unwrap();
+        task_queue.take_tasks(MainThreadScriptMsg::WakeUp, &fully_active);
+        assert_eq!(task_queue.observation().ready, 0);
+        assert!(producer_fence.snapshot().is_empty());
+    }
+
+    #[test]
     fn task_for_a_pipeline_arriving_after_discard_is_dropped_on_intake() {
         let _script_thread_state = ScriptThreadStateGuard::enter();
         let (raw_sender, receiver) = crossbeam_channel::unbounded();
@@ -1444,6 +1501,83 @@ impl ScriptThreadReceivers {
         }
     }
 
+    /// Block for one controlled input without draining a ready task-port suffix.
+    #[expect(
+        dead_code,
+        reason = "used by the upcoming ScriptThread controlled owner loop"
+    )]
+    pub(crate) fn recv_controlled(
+        &self,
+        task_queue: &TaskQueue<MainThreadScriptMsg>,
+        timer_scheduler: &TimerScheduler,
+        fully_active: &FxHashSet<PipelineId>,
+    ) -> MixedMessage {
+        // A blocking wait begins a fresh event-loop intake iteration. Reset before the
+        // nonblocking precheck so newly eligible retained throttles cannot be stranded while the
+        // raw receiver sleeps.
+        let task_recv = task_queue.select();
+        if let Some(message) = self.try_recv_controlled(task_queue, fully_active) {
+            return message;
+        }
+
+        let mut select = Select::new();
+
+        let task_index = select.recv(task_recv);
+        let constellation_index = select.recv(&self.constellation_receiver);
+        let devtools_index = select.recv(&self.devtools_server_receiver);
+        let image_cache_index = select.recv(&self.image_cache_receiver);
+
+        #[cfg(feature = "webgpu")]
+        let webgpu_receiver = self.webgpu_receiver.borrow();
+        #[cfg(feature = "webgpu")]
+        let webgpu_index = select.recv(&*webgpu_receiver);
+
+        let message_from_operation = |operation: SelectedOperation| {
+            let index = operation.index();
+            if index == task_index {
+                let msg = operation.recv(task_recv).unwrap();
+                MixedMessage::FromScript(
+                    task_queue.take_controlled_task_and_recv(msg, fully_active),
+                )
+            } else if index == constellation_index {
+                MixedMessage::FromConstellation(
+                    operation
+                        .recv(&self.constellation_receiver)
+                        .unwrap()
+                        .unwrap(),
+                )
+            } else if index == devtools_index {
+                MixedMessage::FromDevtools(
+                    operation
+                        .recv(&self.devtools_server_receiver)
+                        .unwrap()
+                        .unwrap(),
+                )
+            } else if index == image_cache_index {
+                MixedMessage::FromImageCache(operation.recv(&self.image_cache_receiver).unwrap())
+            } else {
+                #[cfg(feature = "webgpu")]
+                {
+                    debug_assert_eq!(index, webgpu_index);
+                    MixedMessage::FromWebGPUServer(
+                        operation.recv(&*webgpu_receiver).unwrap().unwrap(),
+                    )
+                }
+                #[cfg(not(feature = "webgpu"))]
+                unreachable!("select returned an unknown index {index}")
+            }
+        };
+
+        if let Some(deadline) = timer_scheduler.next_deadline() {
+            select
+                .select_deadline(deadline)
+                .map(message_from_operation)
+                .unwrap_or(MixedMessage::TimerFired)
+        } else {
+            message_from_operation(select.select())
+        }
+    }
+
     /// Try to receive a from any of the receivers of this [`ScriptThreadReceivers`] or the given
     /// [`TaskQueue`]. Return `None` if no messages are ready to be received.
     pub(crate) fn try_recv(
@@ -1474,6 +1608,39 @@ impl ScriptThreadReceivers {
         #[cfg(feature = "webgpu")]
         if let Ok(message) = self.webgpu_receiver.borrow().try_recv() {
             return MixedMessage::FromWebGPUServer(message.unwrap()).into();
+        }
+        None
+    }
+
+    /// Receive at most one controlled input from the selected source invocation.
+    pub(crate) fn try_recv_controlled(
+        &self,
+        task_queue: &TaskQueue<MainThreadScriptMsg>,
+        fully_active: &FxHashSet<PipelineId>,
+    ) -> Option<MixedMessage> {
+        if let Ok(message) = self.constellation_receiver.try_recv() {
+            let message = message
+                .inspect_err(|e| {
+                    log::warn!(
+                        "ScriptThreadReceivers IPC error on constellation_receiver: {:?}",
+                        e
+                    );
+                })
+                .ok()?;
+            return Some(MixedMessage::FromConstellation(message));
+        }
+        if let Ok(message) = task_queue.take_one_task_and_recv(fully_active) {
+            return Some(MixedMessage::FromScript(message));
+        }
+        if let Ok(message) = self.devtools_server_receiver.try_recv() {
+            return Some(MixedMessage::FromDevtools(message.unwrap()));
+        }
+        if let Ok(message) = self.image_cache_receiver.try_recv() {
+            return Some(MixedMessage::FromImageCache(message));
+        }
+        #[cfg(feature = "webgpu")]
+        if let Ok(message) = self.webgpu_receiver.borrow().try_recv() {
+            return Some(MixedMessage::FromWebGPUServer(message.unwrap()));
         }
         None
     }
