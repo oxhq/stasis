@@ -516,6 +516,7 @@ impl ServoParser {
         let content_for_devtools = (document.global().devtools_chan().is_some() &&
             document.has_browsing_context())
         .then_some(DomRefCell::new(String::new()));
+        let is_controlled = document.global().document_clock().is_controlled();
 
         ServoParser {
             reflector: Reflector::new(),
@@ -523,6 +524,7 @@ impl ServoParser {
             network_decoder: DomRefCell::new(NetworkDecoderState::new(
                 encoding_hint_from_content_type,
                 encoding_of_container_document,
+                is_controlled,
             )),
             network_input: BufferQueue::default(),
             script_input: BufferQueue::default(),

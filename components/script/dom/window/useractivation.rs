@@ -2,14 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::ops::Add;
+use std::time::Duration as StdDuration;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use script_bindings::codegen::GenericBindings::UserActivationBinding::UserActivationMethods;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 use servo_base::cross_process_instant::CrossProcessInstant;
-use time::Duration;
+use time::Duration as TimeDuration;
+use timers::{DocumentClock, DocumentTime};
 
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
@@ -65,13 +66,13 @@ impl UserActivation {
 
         // Step 5.
         // > For each window in windows:
-        let current_timestamp = CrossProcessInstant::now();
+        let current_timestamp = UserActivationTimestamp::current(
+            &owner_window.as_global_scope().document_clock(),
+        );
         for window in windows.iter() {
             // Step 5.1.
             // > Set window's last activation timestamp to the current high resolution time.
-            window.set_last_activation_timestamp(UserActivationTimestamp::TimeStamp(
-                current_timestamp,
-            ));
+            window.set_last_activation_timestamp(current_timestamp);
 
             // Step 5.2.
             // > Notify the close watcher manager about user activation given window.
@@ -98,23 +99,191 @@ impl UserActivationMethods<crate::DomTypeHolder> for UserActivation {
 /// > ... which is either a DOMHighResTimeStamp, positive infinity (indicating that W has never been activated), or negative infinity
 /// > (indicating that the activation has been consumed). Initially positive infinity.
 /// > <https://html.spec.whatwg.org/multipage/#user-activation-data-model>
-#[derive(Clone, Copy, Default, PartialEq, PartialOrd, MallocSizeOf)]
+#[derive(Clone, Copy, Debug, PartialEq, MallocSizeOf)]
+pub(crate) enum UserActivationTime {
+    /// A host monotonic timestamp used by normal interactive Servo.
+    Host(CrossProcessInstant),
+    /// A timestamp in the controlled Window's shared document-clock domain.
+    Document(DocumentTime),
+}
+
+impl UserActivationTime {
+    fn current(clock: &DocumentClock) -> Self {
+        Self::current_with_host(clock, CrossProcessInstant::now)
+    }
+
+    fn current_with_host(
+        clock: &DocumentClock,
+        host_now: impl FnOnce() -> CrossProcessInstant,
+    ) -> Self {
+        if clock.is_controlled() {
+            Self::Document(clock.now())
+        } else {
+            Self::Host(host_now())
+        }
+    }
+
+    fn is_at_or_after(self, earlier: Self) -> bool {
+        match (self, earlier) {
+            (Self::Host(current), Self::Host(earlier)) => current >= earlier,
+            (Self::Document(current), Self::Document(earlier)) => current >= earlier,
+            // Comparing clock domains would make host time observable in Controlled mode.
+            _ => false,
+        }
+    }
+
+    fn is_before_expiry(self, activation: Self, duration_ms: i64) -> bool {
+        match (self, activation) {
+            (Self::Host(current), Self::Host(activation)) => {
+                current < activation + TimeDuration::milliseconds(duration_ms)
+            },
+            (Self::Document(current), Self::Document(activation)) => {
+                let Ok(duration_ms) = u64::try_from(duration_ms) else {
+                    return false;
+                };
+                let Ok(expiry) = activation.checked_add(StdDuration::from_millis(duration_ms))
+                else {
+                    // If the positive expiry is beyond DocumentTime's representable range, every
+                    // representable current timestamp after activation is still transient.
+                    return current >= activation;
+                };
+                current < expiry
+            },
+            // A timestamp from another domain cannot establish transient activation.
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, MallocSizeOf)]
 pub(crate) enum UserActivationTimestamp {
     NegativeInfinity,
-    TimeStamp(CrossProcessInstant),
+    TimeStamp(UserActivationTime),
     #[default]
     PositiveInfinity,
 }
 
-impl Add<i64> for UserActivationTimestamp {
-    type Output = UserActivationTimestamp;
+impl UserActivationTimestamp {
+    pub(crate) fn current(clock: &DocumentClock) -> Self {
+        Self::TimeStamp(UserActivationTime::current(clock))
+    }
 
-    fn add(self, rhs: i64) -> Self::Output {
+    fn current_with_host(
+        clock: &DocumentClock,
+        host_now: impl FnOnce() -> CrossProcessInstant,
+    ) -> Self {
+        Self::TimeStamp(UserActivationTime::current_with_host(clock, host_now))
+    }
+
+    pub(crate) fn has_sticky_activation(self, clock: &DocumentClock) -> bool {
+        self.has_sticky_activation_with_host(clock, CrossProcessInstant::now)
+    }
+
+    fn has_sticky_activation_with_host(
+        self,
+        clock: &DocumentClock,
+        host_now: impl FnOnce() -> CrossProcessInstant,
+    ) -> bool {
         match self {
-            UserActivationTimestamp::TimeStamp(timestamp) => {
-                UserActivationTimestamp::TimeStamp(timestamp + Duration::milliseconds(rhs))
+            Self::NegativeInfinity => true,
+            Self::TimeStamp(activation) => {
+                UserActivationTime::current_with_host(clock, host_now)
+                    .is_at_or_after(activation)
             },
-            _ => self,
+            Self::PositiveInfinity => false,
         }
+    }
+
+    pub(crate) fn has_transient_activation(
+        self,
+        clock: &DocumentClock,
+        duration_ms: i64,
+    ) -> bool {
+        self.has_transient_activation_with_host(clock, duration_ms, CrossProcessInstant::now)
+    }
+
+    fn has_transient_activation_with_host(
+        self,
+        clock: &DocumentClock,
+        duration_ms: i64,
+        host_now: impl FnOnce() -> CrossProcessInstant,
+    ) -> bool {
+        match self {
+            Self::TimeStamp(activation) => {
+                let current = UserActivationTime::current_with_host(clock, host_now);
+                current.is_at_or_after(activation) &&
+                    current.is_before_expiry(activation, duration_ms)
+            },
+            Self::NegativeInfinity | Self::PositiveInfinity => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use timers::{DocumentClockConfiguration, DocumentUnixTime};
+
+    use super::*;
+
+    fn controlled_clock(initial_time_ns: u128) -> DocumentClock {
+        DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        })
+    }
+
+    #[test]
+    fn activation_is_captured_at_virtual_time() {
+        let clock = controlled_clock(42_000_000);
+
+        assert_eq!(
+            UserActivationTimestamp::current(&clock),
+            UserActivationTimestamp::TimeStamp(UserActivationTime::Document(
+                DocumentTime::from_nanos(42_000_000),
+            )),
+        );
+    }
+
+    #[test]
+    fn sticky_activation_persists_after_virtual_advance() {
+        let clock = controlled_clock(10_000_000);
+        let activation = UserActivationTimestamp::current(&clock);
+
+        clock
+            .advance_to(DocumentTime::from_nanos(60_000_000_000))
+            .unwrap();
+
+        assert!(activation.has_sticky_activation(&clock));
+    }
+
+    #[test]
+    fn transient_activation_expires_on_virtual_deadline() {
+        let clock = controlled_clock(10_000_000);
+        let activation = UserActivationTimestamp::current(&clock);
+
+        clock
+            .advance_to(DocumentTime::from_nanos(5_009_999_999))
+            .unwrap();
+        assert!(activation.has_transient_activation(&clock, 5_000));
+
+        clock
+            .advance_to(DocumentTime::from_nanos(5_010_000_000))
+            .unwrap();
+        assert!(!activation.has_transient_activation(&clock, 5_000));
+    }
+
+    #[test]
+    fn controlled_activation_never_samples_host_time() {
+        let clock = controlled_clock(1);
+        let activation = UserActivationTimestamp::current_with_host(&clock, || {
+            panic!("controlled activation sampled the host clock")
+        });
+
+        assert!(activation.has_sticky_activation_with_host(&clock, || {
+            panic!("controlled sticky activation sampled the host clock")
+        }));
+        assert!(activation.has_transient_activation_with_host(&clock, 5_000, || {
+            panic!("controlled transient activation sampled the host clock")
+        }));
     }
 }

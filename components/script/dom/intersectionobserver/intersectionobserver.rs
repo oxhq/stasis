@@ -21,6 +21,7 @@ use style::stylesheets::CssRuleType;
 use style::values::computed::Overflow;
 use style::values::specified::intersection_observer::IntersectionObserverMargin;
 use style_traits::{CSSPixel, ParsingMode, ToCss};
+use timers::{DocumentClock, DocumentRenderingTime, DocumentTimeSurface};
 
 use crate::css::css::{ANONYMOUS_CONTENT_URL_DATA, parser_context_for_anonymous_content};
 use crate::dom::bindings::callback::ExceptionHandling;
@@ -36,11 +37,87 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::utils::to_frozen_array;
 use crate::dom::document::{Document, RenderingUpdateReason};
+use crate::dom::documenttimeline::rendering_timestamp_from_elapsed;
 use crate::dom::domrectreadonly::DOMRectReadOnly;
 use crate::dom::element::Element;
 use crate::dom::intersectionobserverentry::IntersectionObserverEntry;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::window::Window;
+
+/// The clock provenance for one invocation of the intersection-observation update steps.
+///
+/// Interactive Servo keeps using the cross-process host clock. A controlled Window instead
+/// receives the immutable timestamp already captured for the surrounding rendering update, so
+/// observer delay decisions and entry timestamps cannot sample wall time independently.
+#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
+pub(crate) enum IntersectionObserverRenderingTime {
+    Host(CrossProcessInstant),
+    Document(DocumentRenderingTime),
+}
+
+impl IntersectionObserverRenderingTime {
+    pub(crate) fn for_rendering_update(
+        clock: &DocumentClock,
+        frame_time: DocumentRenderingTime,
+    ) -> Self {
+        if clock.is_controlled() {
+            Self::Document(frame_time)
+        } else {
+            // Preserve Servo's existing realtime clock and sampling point. In particular, do not
+            // derive realtime IntersectionObserver timestamps from DocumentClock's host origin.
+            Self::Host(CrossProcessInstant::now())
+        }
+    }
+
+    fn has_elapsed_since(self, previous: Self, delay: Duration) -> bool {
+        match (self, previous) {
+            (Self::Host(current), Self::Host(previous)) => Duration::try_from(current - previous)
+                .is_ok_and(|elapsed| elapsed >= delay),
+            (Self::Document(current), Self::Document(previous)) => current
+                .document_time()
+                .checked_duration_since(previous.document_time())
+                .is_ok_and(|elapsed| elapsed >= delay),
+            // The execution mode is immutable for a WebView. Treat an impossible provenance
+            // transition as not due rather than comparing unrelated clock domains.
+            _ => false,
+        }
+    }
+
+    fn to_dom_high_res_time_stamp(
+        self,
+        cx: &mut JSContext,
+        document: &Document,
+    ) -> Finite<f64> {
+        match self {
+            Self::Host(time) => document
+                .owner_global()
+                .performance(cx)
+                .to_dom_high_res_time_stamp(time),
+            Self::Document(frame_time) => {
+                let elapsed = document
+                    .window()
+                    .document_time_since_navigation(
+                        frame_time.document_time(),
+                        DocumentTimeSurface::UpdateRendering,
+                    )
+                    .expect(
+                        "intersection-observer time cannot precede the Window navigation origin",
+                    );
+                rendering_timestamp_from_elapsed(elapsed)
+            },
+        }
+    }
+}
+
+fn intersection_observation_is_due(
+    time: IntersectionObserverRenderingTime,
+    last_update_time: Option<IntersectionObserverRenderingTime>,
+    delay: Duration,
+) -> bool {
+    // The spec initializes lastUpdateTime to negative infinity. `None` represents that value
+    // without manufacturing a sentinel in either the host or document-clock domain.
+    last_update_time.is_none_or(|previous| time.has_elapsed_since(previous, delay))
+}
 
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 #[derive(JSTraceable, MallocSizeOf)]
@@ -343,7 +420,7 @@ impl IntersectionObserver {
         &self,
         cx: &mut JSContext,
         document: &Document,
-        time: CrossProcessInstant,
+        time: IntersectionObserverRenderingTime,
         root_bounds: Rect<Au, CSSPixel>,
         bounding_client_rect: Rect<Au, CSSPixel>,
         intersection_rect: Rect<Au, CSSPixel>,
@@ -370,10 +447,7 @@ impl IntersectionObserver {
 
         // Step 1. Construct an IntersectionObserverEntry, passing in time, rootBounds,
         // >    boundingClientRect, intersectionRect, isIntersecting, and target.
-        let time = document
-            .owner_global()
-            .performance(cx)
-            .to_dom_high_res_time_stamp(time);
+        let time = time.to_dom_high_res_time_stamp(cx, document);
         let entry = IntersectionObserverEntry::new(
             cx,
             self.owner_doc.window(),
@@ -654,7 +728,7 @@ impl IntersectionObserver {
         &self,
         cx: &mut JSContext,
         document: &Document,
-        time: CrossProcessInstant,
+        time: IntersectionObserverRenderingTime,
         root_bounds: Option<Rect<Au, CSSPixel>>,
     ) {
         for target in &*self.observation_targets.borrow() {
@@ -665,15 +739,17 @@ impl IntersectionObserver {
 
             // Step 2
             // > If (time - registration.lastUpdateTime < observer.delay), skip further processing for target.
-            if time - registration.last_update_time.get() <
-                Duration::from_millis(self.delay.get().max(0) as u64)
-            {
+            if !intersection_observation_is_due(
+                time,
+                registration.last_update_time.get(),
+                Duration::from_millis(self.delay.get().max(0) as u64),
+            ) {
                 return;
             }
 
             // Step 3
             // > Set registration.lastUpdateTime to time.
-            registration.last_update_time.set(time);
+            registration.last_update_time.set(Some(time));
 
             // step 4-14
             let intersection_output = self.maybe_compute_intersection_output(target, root_bounds);
@@ -859,7 +935,7 @@ pub(crate) struct IntersectionObserverRegistration {
     previous_threshold_index: Cell<Option<ThresholdIndex>>,
     previous_is_intersecting: Cell<bool>,
     #[no_trace]
-    last_update_time: Cell<CrossProcessInstant>,
+    last_update_time: Cell<Option<IntersectionObserverRenderingTime>>,
     previous_is_visible: Cell<bool>,
 }
 
@@ -874,7 +950,7 @@ impl IntersectionObserverRegistration {
             observer: Dom::from_ref(observer),
             previous_threshold_index: Cell::new(None),
             previous_is_intersecting: Cell::new(false),
-            last_update_time: Cell::new(CrossProcessInstant::epoch()),
+            last_update_time: Cell::new(None),
             previous_is_visible: Cell::new(false),
         }
     }
@@ -1107,3 +1183,101 @@ impl IntersectionObservationOutput {
 }
 
 impl script_bindings::callback::OwnerWindow<crate::DomTypeHolder> for IntersectionObserver {}
+
+#[cfg(test)]
+mod rendering_time_tests {
+    use std::time::Duration;
+
+    use timers::{
+        DocumentClock, DocumentClockConfiguration, DocumentTime, DocumentUnixTime,
+    };
+
+    use super::{
+        IntersectionObserverRenderingTime, intersection_observation_is_due,
+    };
+
+    fn controlled_clock() -> DocumentClock {
+        DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 10_000_000,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        })
+    }
+
+    #[test]
+    fn controlled_observations_use_the_rendering_snapshot_for_delay_decisions() {
+        let clock = controlled_clock();
+        let first_frame = clock.rendering_time().unwrap();
+        let first =
+            IntersectionObserverRenderingTime::for_rendering_update(&clock, first_frame);
+
+        assert_eq!(
+            first,
+            IntersectionObserverRenderingTime::Document(first_frame)
+        );
+        assert!(intersection_observation_is_due(
+            first,
+            None,
+            Duration::from_secs(60)
+        ));
+        assert!(!intersection_observation_is_due(
+            first,
+            Some(first),
+            Duration::from_millis(100)
+        ));
+
+        clock
+            .advance_to(DocumentTime::from_nanos(110_000_000))
+            .unwrap();
+        let next_frame = clock.rendering_time().unwrap();
+        let next = IntersectionObserverRenderingTime::for_rendering_update(&clock, next_frame);
+        assert!(intersection_observation_is_due(
+            next,
+            Some(first),
+            Duration::from_millis(100)
+        ));
+    }
+
+    #[test]
+    fn realtime_observations_keep_explicit_host_provenance() {
+        let clock = DocumentClock::default();
+        let time = IntersectionObserverRenderingTime::for_rendering_update(
+            &clock,
+            clock.rendering_time().unwrap(),
+        );
+
+        assert!(matches!(
+            time,
+            IntersectionObserverRenderingTime::Host(_)
+        ));
+        assert!(intersection_observation_is_due(
+            time,
+            Some(time),
+            Duration::ZERO
+        ));
+        assert!(!intersection_observation_is_due(
+            time,
+            Some(time),
+            Duration::from_nanos(1)
+        ));
+    }
+
+    #[test]
+    fn unrelated_clock_provenance_is_never_compared() {
+        let clock = controlled_clock();
+        let document_time = IntersectionObserverRenderingTime::for_rendering_update(
+            &clock,
+            clock.rendering_time().unwrap(),
+        );
+        let realtime_clock = DocumentClock::default();
+        let host_time = IntersectionObserverRenderingTime::for_rendering_update(
+            &realtime_clock,
+            realtime_clock.rendering_time().unwrap(),
+        );
+
+        assert!(!intersection_observation_is_due(
+            document_time,
+            Some(host_time),
+            Duration::ZERO
+        ));
+    }
+}

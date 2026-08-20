@@ -47,6 +47,7 @@ use servo_config::pref;
 use servo_constellation_traits::{KeyboardScroll, ScriptToConstellationMessage};
 use style::Atom;
 use style_traits::CSSPixel;
+use timers::{DocumentClock, DocumentTime};
 use webrender_api::ExternalScrollId;
 
 #[cfg(feature = "gamepad")]
@@ -63,6 +64,8 @@ use crate::dom::event::{EventBubbles, EventCancelable, EventComposed, EventFlags
 use crate::dom::gamepad::gamepad::{Gamepad, contains_user_gesture};
 #[cfg(feature = "gamepad")]
 use crate::dom::gamepad::gamepadevent::GamepadEventType;
+#[cfg(feature = "gamepad")]
+use crate::dom::globalscope::GlobalScope;
 use crate::dom::inputevent::HitTestResult;
 use crate::dom::interactive_element_command::InteractiveElementCommand;
 use crate::dom::iterators::ShadowIncluding;
@@ -71,7 +74,7 @@ use crate::dom::node::focus::FocusTrigger;
 use crate::dom::node::{self, Node, NodeTraits};
 use crate::dom::pointerevent::{PointerEvent, PointerId};
 use crate::dom::types::{
-    ClipboardEvent, CompositionEvent, DataTransfer, Element, Event, EventTarget, GlobalScope,
+    ClipboardEvent, CompositionEvent, DataTransfer, Element, Event, EventTarget,
     HTMLAnchorElement, HTMLElement, HTMLLabelElement, MouseEvent, Touch, TouchEvent, TouchList,
     WheelEvent, Window,
 };
@@ -89,9 +92,50 @@ use crate::realms::enter_auto_realm;
 /// > events. This MUST be a non-negative integer indicating the number of consecutive
 /// > clicks of a pointing device button within a specific time. The delay after which
 /// > the count resets is specific to the environment configuration.
+#[derive(Clone, Copy, Debug, MallocSizeOf, PartialEq)]
+enum ClickCountingTime {
+    /// A host monotonic timestamp used by normal interactive Servo.
+    Host(Instant),
+    /// A timestamp in the controlled Window's shared document-clock domain.
+    Document(DocumentTime),
+}
+
+impl ClickCountingTime {
+    fn current(clock: &DocumentClock) -> Self {
+        Self::current_with_host(clock, Instant::now)
+    }
+
+    fn current_with_host(clock: &DocumentClock, host_now: impl FnOnce() -> Instant) -> Self {
+        if clock.is_controlled() {
+            Self::Document(clock.now())
+        } else {
+            Self::Host(host_now())
+        }
+    }
+
+    fn exceeds(self, earlier: Self, interval: Duration) -> bool {
+        match (self, earlier) {
+            (Self::Host(current), Self::Host(earlier)) => {
+                current.duration_since(earlier) > interval
+            },
+            (Self::Document(current), Self::Document(earlier)) => {
+                match current.checked_duration_since(earlier) {
+                    Ok(elapsed) => elapsed > interval,
+                    // A clock-domain regression cannot establish a consecutive click.
+                    Err(_) => true,
+                }
+            },
+            // Never compare host and document timestamps. Doing so would make host time
+            // observable in Controlled mode after a clock-domain transition.
+            _ => true,
+        }
+    }
+}
+
 #[derive(Default, JSTraceable, MallocSizeOf)]
 struct ClickCountingInfo {
-    time: Option<Instant>,
+    #[no_trace]
+    time: Option<ClickCountingTime>,
     #[no_trace]
     point: Option<Point2D<f32, CSSPixel>>,
     #[no_trace]
@@ -102,8 +146,31 @@ struct ClickCountingInfo {
 impl ClickCountingInfo {
     fn reset_click_count_if_necessary(
         &mut self,
+        clock: &DocumentClock,
         button: MouseButton,
         point_in_frame: Point2D<f32, CSSPixel>,
+    ) {
+        if self.time.is_none() || self.point.is_none() || self.button.is_none() {
+            assert_eq!(self.count, 0);
+            return;
+        }
+
+        self.reset_click_count_if_necessary_at(
+            button,
+            point_in_frame,
+            ClickCountingTime::current(clock),
+            Duration::from_millis(pref!(dom_document_dblclick_timeout) as u64),
+            pref!(dom_document_dblclick_dist) as u64,
+        );
+    }
+
+    fn reset_click_count_if_necessary_at(
+        &mut self,
+        button: MouseButton,
+        point_in_frame: Point2D<f32, CSSPixel>,
+        now: ClickCountingTime,
+        double_click_timeout: Duration,
+        double_click_distance_threshold: u64,
     ) {
         let (Some(previous_button), Some(previous_point), Some(previous_time)) =
             (self.button, self.point, self.time)
@@ -112,15 +179,11 @@ impl ClickCountingInfo {
             return;
         };
 
-        let double_click_timeout =
-            Duration::from_millis(pref!(dom_document_dblclick_timeout) as u64);
-        let double_click_distance_threshold = pref!(dom_document_dblclick_dist) as u64;
-
         // Calculate distance between this click and the previous click.
         let line = point_in_frame - previous_point;
         let distance = (line.dot(line) as f64).sqrt();
         if previous_button != button ||
-            Instant::now().duration_since(previous_time) > double_click_timeout ||
+            now.exceeds(previous_time, double_click_timeout) ||
             distance > double_click_distance_threshold as f64
         {
             self.count = 0;
@@ -131,14 +194,121 @@ impl ClickCountingInfo {
 
     fn increment_click_count(
         &mut self,
+        clock: &DocumentClock,
         button: MouseButton,
         point: Point2D<f32, CSSPixel>,
     ) -> usize {
-        self.time = Some(Instant::now());
+        self.increment_click_count_at(button, point, ClickCountingTime::current(clock))
+    }
+
+    fn increment_click_count_at(
+        &mut self,
+        button: MouseButton,
+        point: Point2D<f32, CSSPixel>,
+        now: ClickCountingTime,
+    ) -> usize {
+        self.time = Some(now);
         self.point = Some(point);
         self.button = Some(button);
         self.count += 1;
         self.count
+    }
+}
+
+#[cfg(test)]
+mod controlled_click_counting_tests {
+    use timers::{DocumentClockConfiguration, DocumentUnixTime};
+
+    use super::*;
+
+    const DOUBLE_CLICK_TIMEOUT: Duration = Duration::from_millis(500);
+    const DOUBLE_CLICK_DISTANCE: u64 = 4;
+
+    fn point(x: f32, y: f32) -> Point2D<f32, CSSPixel> {
+        Point2D::new(x, y)
+    }
+
+    fn controlled_time(nanoseconds: u128) -> ClickCountingTime {
+        ClickCountingTime::Document(DocumentTime::from_nanos(nanoseconds))
+    }
+
+    #[test]
+    fn virtual_click_within_interval_continues_the_click_sequence() {
+        let mut info = ClickCountingInfo::default();
+        let location = point(10.0, 20.0);
+
+        assert_eq!(
+            info.increment_click_count_at(MouseButton::Primary, location, controlled_time(0)),
+            1
+        );
+        info.reset_click_count_if_necessary_at(
+            MouseButton::Primary,
+            location,
+            controlled_time(DOUBLE_CLICK_TIMEOUT.as_nanos()),
+            DOUBLE_CLICK_TIMEOUT,
+            DOUBLE_CLICK_DISTANCE,
+        );
+
+        assert_eq!(info.count, 1);
+        assert_eq!(
+            info.increment_click_count_at(
+                MouseButton::Primary,
+                location,
+                controlled_time(DOUBLE_CLICK_TIMEOUT.as_nanos()),
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn virtual_click_outside_interval_starts_a_new_click_sequence() {
+        let mut info = ClickCountingInfo::default();
+        let location = point(10.0, 20.0);
+
+        assert_eq!(
+            info.increment_click_count_at(MouseButton::Primary, location, controlled_time(0)),
+            1
+        );
+        info.reset_click_count_if_necessary_at(
+            MouseButton::Primary,
+            location,
+            controlled_time(DOUBLE_CLICK_TIMEOUT.as_nanos() + 1),
+            DOUBLE_CLICK_TIMEOUT,
+            DOUBLE_CLICK_DISTANCE,
+        );
+
+        assert_eq!(info.count, 0);
+        assert_eq!(
+            info.increment_click_count_at(
+                MouseButton::Primary,
+                location,
+                controlled_time(DOUBLE_CLICK_TIMEOUT.as_nanos() + 1),
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn controlled_click_timestamp_does_not_sample_the_host_clock() {
+        let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        });
+
+        assert_eq!(
+            ClickCountingTime::current_with_host(&clock, || {
+                panic!("controlled click counting sampled the host clock")
+            }),
+            controlled_time(0)
+        );
+
+        clock.advance_to(DocumentTime::from_nanos(25)).unwrap();
+        assert_eq!(
+            ClickCountingTime::current_with_host(&clock, || {
+                panic!("controlled click counting sampled the host clock")
+            }),
+            controlled_time(25)
+        );
     }
 }
 
@@ -967,9 +1137,11 @@ impl DocumentEventHandler {
         // example, if no click happened before the mousedown, detail will contain
         // the value 1
         if mouse_button_event.action == MouseButtonAction::Down {
+            let clock = self.window.as_global_scope().document_clock();
             self.click_counting_info
                 .safe_borrow_mut(cx.no_gc())
                 .reset_click_count_if_necessary(
+                    &clock,
                     mouse_button_event.button,
                     hit_test_result.point_in_frame,
                 );
@@ -1117,9 +1289,11 @@ impl DocumentEventHandler {
                 // Click counts should still work for other buttons even though they
                 // do not trigger "click" and "dblclick" events, so we increment
                 // even when those events are not fired.
+                let clock = self.window.as_global_scope().document_clock();
                 self.click_counting_info
                     .safe_borrow_mut(cx.no_gc())
                     .increment_click_count(
+                        &clock,
                         mouse_button_event.button,
                         hit_test_result.point_in_frame,
                     );

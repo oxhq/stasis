@@ -22,7 +22,11 @@ pub(super) struct DetectingState {
     /// `<iframe>`.
     #[no_trace]
     encoding_of_container_document: Option<&'static Encoding>,
-    start_timestamp: Instant,
+    /// The wall-clock instant used by Servo's normal progressive-decoding heuristic.
+    ///
+    /// Controlled documents intentionally do not capture a host timestamp. Their parse boundary
+    /// is determined only by [`Self::BUFFER_THRESHOLD`] or end-of-file.
+    realtime_start_timestamp: Option<Instant>,
     attempted_bom_sniffing: bool,
     buffered_bytes: Vec<u8>,
 }
@@ -68,8 +72,39 @@ impl DetectingState {
         is_at_end_of_file: AtEndOfFile,
     ) -> Option<&'static Encoding> {
         self.buffered_bytes.extend_from_slice(data);
-        let can_wait_longer = self.start_timestamp.elapsed() < Self::MAX_TIME_TO_BUFFER;
+        let realtime_elapsed = self
+            .realtime_start_timestamp
+            .map(|start_timestamp| start_timestamp.elapsed());
+        let can_wait_longer = Self::should_wait_for_more_data(
+            self.realtime_start_timestamp.is_none(),
+            self.buffered_bytes.len(),
+            realtime_elapsed,
+            is_at_end_of_file,
+        );
         self.determine_the_character_encoding(document, can_wait_longer, is_at_end_of_file)
+    }
+
+    /// Decide whether encoding detection may wait for another network chunk.
+    ///
+    /// This helper keeps the controlled policy independent of host time and makes the real-time
+    /// threshold boundary explicit. `realtime_elapsed` is required only for real-time documents;
+    /// controlled documents ignore it by construction.
+    fn should_wait_for_more_data(
+        is_controlled: bool,
+        buffered_bytes: usize,
+        realtime_elapsed: Option<Duration>,
+        is_at_end_of_file: AtEndOfFile,
+    ) -> bool {
+        if is_at_end_of_file == AtEndOfFile::Yes || buffered_bytes >= Self::BUFFER_THRESHOLD {
+            return false;
+        }
+
+        if is_controlled {
+            return true;
+        }
+
+        realtime_elapsed.expect("real-time encoding detection must have a start timestamp") <
+            Self::MAX_TIME_TO_BUFFER
     }
 
     /// <https://html.spec.whatwg.org/multipage/#determining-the-character-encoding>
@@ -193,11 +228,12 @@ impl NetworkDecoderState {
     pub(super) fn new(
         encoding_hint_from_content_type: Option<&'static Encoding>,
         encoding_of_container_document: Option<&'static Encoding>,
+        is_controlled: bool,
     ) -> Self {
         Self::Detecting(DetectingState {
             encoding_hint_from_content_type,
             encoding_of_container_document,
-            start_timestamp: Instant::now(),
+            realtime_start_timestamp: (!is_controlled).then(Instant::now),
             attempted_bom_sniffing: false,
             buffered_bytes: vec![],
         })
@@ -820,8 +856,96 @@ pub fn get_xml_encoding(input: &[u8]) -> Option<&'static Encoding> {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum AtEndOfFile {
     Yes,
     No,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{AtEndOfFile, DetectingState};
+
+    fn controlled_detection_boundary(
+        chunk_sizes: &[usize],
+        observed_host_elapsed: &[Duration],
+    ) -> Option<usize> {
+        assert_eq!(chunk_sizes.len(), observed_host_elapsed.len());
+
+        let mut buffered_bytes = 0;
+        for (&chunk_size, &host_elapsed) in chunk_sizes.iter().zip(observed_host_elapsed) {
+            buffered_bytes += chunk_size;
+            if !DetectingState::should_wait_for_more_data(
+                true,
+                buffered_bytes,
+                Some(host_elapsed),
+                AtEndOfFile::No,
+            ) {
+                return Some(buffered_bytes);
+            }
+        }
+
+        None
+    }
+
+    #[test]
+    fn controlled_chunk_partition_boundary_is_independent_of_host_time() {
+        let chunk_sizes = [128, 384, 511, 1];
+        let immediate_chunks = [Duration::ZERO; 4];
+        let delayed_chunks = [
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+            Duration::from_secs(3_000),
+        ];
+
+        assert_eq!(
+            controlled_detection_boundary(&chunk_sizes, &immediate_chunks),
+            Some(DetectingState::BUFFER_THRESHOLD),
+        );
+        assert_eq!(
+            controlled_detection_boundary(&chunk_sizes, &delayed_chunks),
+            Some(DetectingState::BUFFER_THRESHOLD),
+        );
+    }
+
+    #[test]
+    fn controlled_detection_waits_for_threshold_or_end_of_file() {
+        assert!(DetectingState::should_wait_for_more_data(
+            true,
+            DetectingState::BUFFER_THRESHOLD - 1,
+            None,
+            AtEndOfFile::No,
+        ));
+        assert!(!DetectingState::should_wait_for_more_data(
+            true,
+            DetectingState::BUFFER_THRESHOLD,
+            None,
+            AtEndOfFile::No,
+        ));
+        assert!(!DetectingState::should_wait_for_more_data(
+            true,
+            1,
+            None,
+            AtEndOfFile::Yes,
+        ));
+    }
+
+    #[test]
+    fn realtime_detection_preserves_the_existing_deadline_boundary() {
+        assert!(DetectingState::should_wait_for_more_data(
+            false,
+            DetectingState::BUFFER_THRESHOLD - 1,
+            Some(DetectingState::MAX_TIME_TO_BUFFER - Duration::from_nanos(1)),
+            AtEndOfFile::No,
+        ));
+        assert!(!DetectingState::should_wait_for_more_data(
+            false,
+            DetectingState::BUFFER_THRESHOLD - 1,
+            Some(DetectingState::MAX_TIME_TO_BUFFER),
+            AtEndOfFile::No,
+        ));
+    }
 }

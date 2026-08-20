@@ -16,9 +16,9 @@ use crossbeam_channel::RecvTimeoutError;
 use devtools_traits::ScriptToDevtoolsControlMsg;
 use embedder_traits::user_contents::{UserContentManagerId, UserContents};
 use embedder_traits::{
-    EmbedderControlId, EmbedderControlResponse, FocusSequenceNumber, InputEventAndId,
-    JavaScriptEvaluationId, MediaSessionActionType, MouseButton, PaintHitTestResult,
-    ScriptToEmbedderChan, Theme, ViewportDetails, WebDriverScriptCommand,
+    DocumentClockConfiguration, EmbedderControlId, EmbedderControlResponse, FocusSequenceNumber,
+    InputEventAndId, JavaScriptEvaluationId, MediaSessionActionType, MouseButton,
+    PaintHitTestResult, ScriptToEmbedderChan, Theme, ViewportDetails, WebDriverScriptCommand,
 };
 use euclid::{Scale, Size2D};
 use fonts_traits::{SystemFontServiceProxySender, WebFontLoadEvent};
@@ -447,6 +447,8 @@ pub struct InitialScriptState {
     /// The id of the script event loop that this state will start. This is used to uniquely
     /// identify an event loop.
     pub id: ScriptEventLoopId,
+    /// The immutable document clock shared by every pipeline on this event loop.
+    pub document_clock: DocumentClockConfiguration,
     /// The sender to use to install the `Pipeline` namespace into this process (if necessary).
     pub namespace_request_sender: GenericSender<PipelineNamespaceRequest>,
     /// A channel with which messages can be sent to us (the script thread).

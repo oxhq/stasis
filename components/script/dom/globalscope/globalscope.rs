@@ -74,7 +74,9 @@ use servo_constellation_traits::{
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
 use storage_traits::StorageThreads;
 use strum::VariantArray;
-use timers::{TimerEventRequest, TimerId};
+use timers::{
+    DocumentClock, DocumentClockError, TimerControlError, TimerEventRequest, TimerId,
+};
 use uuid::Uuid;
 #[cfg(feature = "webgpu")]
 use webgpu_traits::{DeviceLostReason, WebGPUDevice};
@@ -2621,13 +2623,36 @@ impl GlobalScope {
         unreachable!();
     }
 
-    /// Schedule a [`TimerEventRequest`] on this [`GlobalScope`]'s [`timers::TimerScheduler`].
-    /// Every Worker has its own scheduler, which handles events in the Worker event loop,
-    /// but `Window`s use a shared scheduler associated with their [`ScriptThread`].
-    pub(crate) fn schedule_timer(&self, request: TimerEventRequest) -> Option<TimerId> {
+    /// Schedule a timer without converting checked clock, deadline, or sequence failures into a
+    /// panic. Logical DOM timers use this path so controlled execution can fail closed.
+    pub(crate) fn try_schedule_timer(
+        &self,
+        request: TimerEventRequest,
+    ) -> Result<TimerId, TimerControlError> {
         match self.downcast::<WorkerGlobalScope>() {
-            Some(worker_global) => Some(worker_global.timer_scheduler().schedule_timer(request)),
-            _ => with_script_thread(|script_thread| Some(script_thread.schedule_timer(request))),
+            Some(worker_global) => worker_global
+                .timer_scheduler()
+                .try_schedule_timer(request),
+            _ => with_script_thread(|script_thread| {
+                Some(script_thread.try_schedule_timer(request))
+            })
+            .unwrap_or(Err(TimerControlError::Clock(DocumentClockError::Overflow))),
+        }
+    }
+
+    /// Cancel an outer scheduler event previously returned by [`Self::try_schedule_timer`].
+    pub(crate) fn cancel_timer(&self, timer_id: TimerId) {
+        match self.downcast::<WorkerGlobalScope>() {
+            Some(worker_global) => worker_global.timer_scheduler().cancel_timer(timer_id),
+            _ => with_script_thread(|script_thread| script_thread.cancel_timer(timer_id)),
+        }
+    }
+
+    /// Return the clock shared by this global's DOM timers and outer timer scheduler.
+    pub(crate) fn document_clock(&self) -> DocumentClock {
+        match self.downcast::<WorkerGlobalScope>() {
+            Some(worker_global) => worker_global.timer_scheduler().clock(),
+            _ => ScriptThread::current_document_clock(),
         }
     }
 
@@ -3010,6 +3035,10 @@ impl GlobalScope {
 
     pub(crate) fn unschedule_callback(&self, handle: OneshotTimerHandle) {
         self.with_timers(|timers| timers.unschedule_callback(handle));
+    }
+
+    pub(crate) fn latch_timer_error(&self, error: DocumentClockError) {
+        self.with_timers(|timers| timers.latch_timer_error(error));
     }
 
     /// <https://html.spec.whatwg.org/multipage/#timer-initialisation-steps>
@@ -3482,6 +3511,16 @@ impl GlobalScope {
         deferred_record_id
     }
 
+    pub(crate) fn remove_deferred_fetch(
+        &self,
+        deferred_fetch_record_id: &DeferredFetchRecordId,
+    ) -> Option<QueuedDeferredFetchRecord> {
+        self.fetch_group
+            .borrow_mut()
+            .deferred_fetch_records
+            .remove(deferred_fetch_record_id)
+    }
+
     pub(crate) fn deferred_fetches(&self) -> Vec<QueuedDeferredFetchRecord> {
         self.fetch_group
             .borrow()
@@ -3559,15 +3598,17 @@ impl GlobalScope {
         let ms = milliseconds.max(0) as u64;
         let delay = std::time::Duration::from_millis(ms);
 
-        let (callback, timer_key) = self.with_timers(|timers| {
+        let scheduled = self.with_timers(|timers| -> Result<_, DocumentClockError> {
             // Step 1. Let timerKey be a new unique internal value.
-            let timer_key = timers.fresh_runsteps_key();
+            let timer_key = timers.fresh_runsteps_key()?;
 
             // Step 2. Let startTime be the current high resolution time given global.
-            let start_time = timers.now_for_runsteps();
+            let start_time = timers.now_for_runsteps()?;
 
             // Step 3. Set global's map of active timers[timerKey] to startTime plus milliseconds.
-            let deadline = start_time + delay;
+            let deadline = start_time.checked_add(delay).inspect_err(|error| {
+                timers.latch_timer_error(*error);
+            })?;
             timers.runsteps_set_active(timer_key, deadline);
 
             // Step 4. Run the following steps in parallel:
@@ -3582,8 +3623,11 @@ impl GlobalScope {
                 // Step 4.4 Perform completionSteps.
                 completion: Box::new(completion_steps),
             };
-            (callback, timer_key)
+            Ok((callback, timer_key))
         });
+        let Ok((callback, timer_key)) = scheduled else {
+            return 0;
+        };
         let _ = self.schedule_callback(callback, delay);
 
         // Step 5. Return timerKey.

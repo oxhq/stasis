@@ -15,7 +15,7 @@ use rustc_hash::FxHashMap;
 use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
 use script_bindings::root::Dom;
 use style::dom::OpaqueNode;
-use timers::{TimerEventRequest, TimerId};
+use timers::{TimerControlError, TimerEventRequest, TimerId};
 
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::trace::NoTrace;
@@ -37,6 +37,14 @@ pub struct ImageAnimationManager {
     #[no_trace]
     callback_timer_id: Cell<Option<TimerId>>,
 
+    /// The first checked scheduler failure observed while arranging the next image frame.
+    ///
+    /// This remains sticky so pending-work inspection can distinguish a failed scheduling
+    /// attempt from an animation that naturally has no next frame.
+    #[no_trace]
+    #[ignore_malloc_size_of = "TimerControlError has no heap allocations"]
+    timer_control_error: Cell<Option<TimerControlError>>,
+
     /// A map of nodes with in-progress image animations. This is kept outside
     /// of [`Self::animating_images`] as that data structure is shared with layout.
     rooted_nodes: FxHashMap<NoTrace<OpaqueNode>, Dom<Node>>,
@@ -45,6 +53,10 @@ pub struct ImageAnimationManager {
 impl ImageAnimationManager {
     pub(crate) fn animating_images(&self) -> Arc<RwLock<AnimatingImages>> {
         self.animating_images.clone()
+    }
+
+    pub(crate) fn timer_control_error(&self) -> Option<TimerControlError> {
+        self.timer_control_error.get()
     }
 
     fn duration_to_next_frame(&self, now: f64) -> Option<Duration> {
@@ -140,21 +152,61 @@ impl ImageAnimationManager {
 
             if let Some(duration) = self.duration_to_next_frame(now) {
                 let trusted_window = Trusted::new(window);
-                let timer_id = script_thread.schedule_timer(TimerEventRequest {
+                let result = script_thread.try_schedule_timer(TimerEventRequest {
                     callback: Box::new(move || {
                         let window = trusted_window.root();
                         window.Document().set_has_pending_animated_image_update();
                     }),
                     duration,
                 });
-                self.callback_timer_id.set(Some(timer_id));
+                self.record_schedule_result(result, || {
+                    window.Document().set_has_pending_animated_image_update();
+                });
             }
         })
+    }
+
+    fn record_schedule_result(
+        &self,
+        result: Result<TimerId, TimerControlError>,
+        retain_pending_animation: impl FnOnce(),
+    ) {
+        match result {
+            Ok(timer_id) => self.callback_timer_id.set(Some(timer_id)),
+            Err(error) => {
+                debug!("Not scheduling animated image update: {error}");
+                if self.timer_control_error.get().is_none() {
+                    self.timer_control_error.set(Some(error));
+                }
+                self.callback_timer_id.set(None);
+                retain_pending_animation();
+            },
+        }
     }
 
     pub(crate) fn cancel_animations_for_node(&mut self, node: &Node) {
         let opaque_node = node.to_opaque();
         self.animating_images().write().remove(opaque_node);
         self.rooted_nodes.remove(&NoTrace(opaque_node));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use timers::DocumentClockError;
+
+    use super::*;
+
+    #[test]
+    fn scheduler_failure_retains_pending_animation_without_a_timer_id() {
+        let manager = ImageAnimationManager::default();
+        let pending_animation = Cell::new(false);
+        let error = TimerControlError::Clock(DocumentClockError::Overflow);
+
+        manager.record_schedule_result(Err(error), || pending_animation.set(true));
+
+        assert!(pending_animation.get());
+        assert_eq!(manager.callback_timer_id.get(), None);
+        assert_eq!(manager.timer_control_error(), Some(error));
     }
 }

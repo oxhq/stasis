@@ -433,6 +433,28 @@ impl Default for DocumentClock {
 }
 
 impl DocumentClock {
+    /// Validate every controlled-time representation boundary without constructing a clock or
+    /// consuming a process-local clock identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentClockError::Overflow`] when the configured initial monotonic offset and
+    /// Unix-time origin cannot be combined exactly.
+    #[doc(hidden)]
+    pub fn validate_configuration(
+        configuration: DocumentClockConfiguration,
+    ) -> Result<(), DocumentClockError> {
+        if let DocumentClockConfiguration::Controlled {
+            initial_time_ns,
+            unix_time_origin_ns,
+        } = configuration
+        {
+            unix_time_origin_ns
+                .checked_add_document_time(DocumentTime::from_nanos(initial_time_ns))?;
+        }
+        Ok(())
+    }
+
     /// Construct a clock from its immutable mode configuration.
     pub fn new(configuration: DocumentClockConfiguration) -> Self {
         Self::try_new(configuration).expect("invalid document clock configuration")
@@ -440,6 +462,7 @@ impl DocumentClock {
 
     /// Construct a clock after validating every controlled-time representation boundary.
     pub fn try_new(configuration: DocumentClockConfiguration) -> Result<Self, DocumentClockError> {
+        Self::validate_configuration(configuration)?;
         let inner = match configuration {
             DocumentClockConfiguration::Realtime => DocumentClockInner::Realtime {
                 origin: Instant::now(),
@@ -449,7 +472,6 @@ impl DocumentClock {
                 unix_time_origin_ns,
             } => {
                 let initial_time = DocumentTime::from_nanos(initial_time_ns);
-                unix_time_origin_ns.checked_add_document_time(initial_time)?;
                 DocumentClockInner::Controlled {
                     state: Mutex::new(ControlledClockState {
                         now: initial_time,
@@ -673,7 +695,12 @@ impl DocumentClock {
         if !self.is_controlled()
             || matches!(
                 surface,
-                DocumentTimeSurface::WindowTimers | DocumentTimeSurface::JavaScriptDate
+                DocumentTimeSurface::WindowTimers
+                    | DocumentTimeSurface::JavaScriptDate
+                    | DocumentTimeSurface::Performance
+                    | DocumentTimeSurface::UpdateRendering
+                    | DocumentTimeSurface::AnimationFrame
+                    | DocumentTimeSurface::DocumentTimeline
             )
         {
             Ok(())
@@ -2311,6 +2338,21 @@ mod tests {
     }
 
     #[test]
+    fn configuration_validation_is_pure_and_rejects_initial_wall_time_overflow() {
+        assert_eq!(
+            DocumentClock::validate_configuration(DocumentClockConfiguration::Realtime),
+            Ok(()),
+        );
+        assert_eq!(
+            DocumentClock::validate_configuration(DocumentClockConfiguration::Controlled {
+                initial_time_ns: 1,
+                unix_time_origin_ns: DocumentUnixTime::from_nanos(i128::MAX),
+            }),
+            Err(DocumentClockError::Overflow),
+        );
+    }
+
+    #[test]
     fn wall_time_overflow_is_sticky_and_precedes_monotonic_mutation() {
         assert!(matches!(
             DocumentClock::try_new(DocumentClockConfiguration::Controlled {
@@ -2359,6 +2401,28 @@ mod tests {
     }
 
     #[test]
+    fn controlled_same_event_loop_iframe_is_unsupported_but_realtime_is_unchanged() {
+        let controlled = controlled_clock(0);
+        assert_eq!(
+            controlled.require_surface(DocumentTimeSurface::SameEventLoopIframe),
+            Err(DocumentClockError::UnsupportedSurface(
+                DocumentTimeSurface::SameEventLoopIframe,
+            ))
+        );
+        assert_eq!(
+            controlled.unsupported_surface(),
+            Some(DocumentTimeSurface::SameEventLoopIframe)
+        );
+
+        let realtime = DocumentClock::default();
+        assert_eq!(
+            realtime.require_surface(DocumentTimeSurface::SameEventLoopIframe),
+            Ok(())
+        );
+        assert_eq!(realtime.unsupported_surface(), None);
+    }
+
+    #[test]
     fn sticky_clock_terminal_rejects_new_and_already_due_timer_callbacks() {
         let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
             initial_time_ns: 0,
@@ -2391,27 +2455,34 @@ mod tests {
     }
 
     #[test]
-    fn rendering_surfaces_remain_fail_closed_until_their_integration_slice() {
+    fn one_rendering_snapshot_drives_raf_and_document_timeline() {
         let clock = controlled_clock(5_000_000);
-        assert_eq!(
-            clock.rendering_time(),
-            Err(DocumentClockError::UnsupportedSurface(
-                DocumentTimeSurface::UpdateRendering,
-            )),
-        );
-        for surface in [
-            DocumentTimeSurface::AnimationFrame,
-            DocumentTimeSurface::DocumentTimeline,
-        ] {
-            assert_eq!(
-                clock.duration_since_for_surface(surface, DocumentTime::ZERO, DocumentTime::ZERO,),
-                Err(DocumentClockError::UnsupportedSurface(surface)),
-            );
-        }
-        assert_eq!(
-            clock.unsupported_surface(),
-            Some(DocumentTimeSurface::UpdateRendering),
-        );
+        let origin = clock.now();
+        clock
+            .advance_to(DocumentTime::from_nanos(12_000_000))
+            .unwrap();
+        let frame = clock.rendering_time().unwrap();
+        let raf = clock
+            .duration_since_for_surface(
+                DocumentTimeSurface::AnimationFrame,
+                origin,
+                frame.document_time(),
+            )
+            .unwrap();
+        let timeline = clock
+            .duration_since_for_surface(
+                DocumentTimeSurface::DocumentTimeline,
+                origin,
+                frame.document_time(),
+            )
+            .unwrap();
+
+        assert_eq!(raf, Duration::from_millis(7));
+        assert_eq!(timeline, raf);
+        clock
+            .advance_to(DocumentTime::from_nanos(20_000_000))
+            .unwrap();
+        assert_eq!(frame.document_time(), DocumentTime::from_nanos(12_000_000));
     }
 
     #[test]

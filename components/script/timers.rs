@@ -7,7 +7,7 @@ use std::cmp::{Ord, Ordering};
 use std::collections::VecDeque;
 use std::default::Default;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use deny_public_fields::DenyPublicFields;
 use js::context::JSContext;
@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 use servo_base::id::PipelineId;
 use servo_config::pref;
 use servo_url::ServoUrl;
-use timers::{BoxedTimerCallback, TimerEventRequest};
+use timers::{
+    BoxedTimerCallback, DocumentClock, DocumentClockError, DocumentTime, DocumentTimeSurface,
+    TimerControlError, TimerEventRequest, TimerId,
+};
 
 use crate::dom::bindings::callback::ExceptionHandling::Report;
 use crate::dom::bindings::codegen::Bindings::FunctionBinding::Function;
@@ -48,7 +51,7 @@ use crate::script_runtime::IntroductionType;
 use crate::tasks::task_source::SendableTaskSource;
 
 type TimerKey = i32;
-type RunStepsDeadline = Instant;
+type RunStepsDeadline = DocumentTime;
 type CompletionStep = Box<dyn FnOnce(&mut JSContext, &GlobalScope) + 'static>;
 
 /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
@@ -71,6 +74,12 @@ type RunStepsActiveMap = FxHashMap<TimerKey, RunStepsDeadline>;
 #[derive(Clone, Copy, Debug, Eq, Hash, JSTraceable, MallocSizeOf, Ord, PartialEq, PartialOrd)]
 pub(crate) struct OneshotTimerHandle(i32);
 
+impl OneshotTimerHandle {
+    pub(crate) const fn sequence(self) -> i32 {
+        self.0
+    }
+}
+
 #[derive(DenyPublicFields, JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) struct OneshotTimers {
@@ -78,12 +87,16 @@ pub(crate) struct OneshotTimers {
     js_timers: JsTimers,
     next_timer_handle: Cell<OneshotTimerHandle>,
     timers: DomRefCell<VecDeque<OneshotTimer>>,
-    suspended_since: Cell<Option<Instant>>,
-    /// Initially 0, increased whenever the associated document is reactivated
-    /// by the amount of ms the document was inactive. The current time can be
-    /// offset back by this amount for a coherent time across document
-    /// activations.
-    suspension_offset: Cell<Duration>,
+    #[no_trace]
+    document_clock: DocumentClock,
+    #[no_trace]
+    timebase: Cell<TimerTimebase>,
+    /// The first checked failure in this logical timer layer. Once set, no more callbacks are
+    /// scheduled or invoked; the controlled runtime can report the failure instead of exposing a
+    /// wrapped deadline or falling back to host time.
+    #[no_trace]
+    #[ignore_malloc_size_of = "Copy-only checked failure state"]
+    terminal_error: Cell<Option<DocumentClockError>>,
     /// Calls to `fire_timer` with a different argument than this get ignored.
     /// They were previously scheduled and got invalidated when
     ///  - timers were suspended,
@@ -92,9 +105,13 @@ pub(crate) struct OneshotTimers {
     ///    original timer is rescheduled when it is the next one to get called.
     #[no_trace]
     expected_event_id: Cell<TimerEventId>,
+    /// The low-level scheduler event currently representing the earliest logical DOM timer.
+    #[no_trace]
+    scheduled_timer_id: Cell<Option<TimerId>>,
     /// <https://html.spec.whatwg.org/multipage/#map-of-active-timers>
     /// TODO this should also be used for the other timers
     /// as per <html.spec.whatwg.org/multipage/#map-of-settimeout-and-setinterval-ids>Z.
+    #[no_trace]
     map_of_active_timers: DomRefCell<RunStepsActiveMap>,
 
     /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
@@ -108,6 +125,9 @@ pub(crate) struct OneshotTimers {
     /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
     /// Start order sequence to break ties for Step 4.2.
     runsteps_start_seq: Cell<u64>,
+
+    /// Stable creation order for logical timers that share a deadline.
+    creation_sequence: Cell<u64>,
 }
 
 #[derive(DenyPublicFields, JSTraceable, MallocSizeOf)]
@@ -116,7 +136,82 @@ struct OneshotTimer {
     #[no_trace]
     source: TimerSource,
     callback: OneshotTimerCallback,
-    scheduled_for: Instant,
+    #[no_trace]
+    scheduled_for: DocumentTime,
+    creation_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, MallocSizeOf, PartialEq)]
+struct TimerTimebase {
+    suspended_at: Option<DocumentTime>,
+    suspension_offset: Duration,
+}
+
+impl TimerTimebase {
+    fn now(self, clock: &DocumentClock) -> Result<DocumentTime, DocumentClockError> {
+        if let Some(error) = clock.terminal_error() {
+            return Err(error);
+        }
+        let now = match self.suspended_at {
+            Some(suspended_at) => suspended_at,
+            None => clock.try_now()?,
+        };
+        now.checked_sub(self.suspension_offset)
+    }
+
+    fn suspend(&mut self, clock: &DocumentClock) -> Result<bool, DocumentClockError> {
+        if self.suspended_at.is_some() {
+            return Ok(false);
+        }
+        if let Some(error) = clock.terminal_error() {
+            return Err(error);
+        }
+        self.suspended_at = Some(clock.try_now()?);
+        Ok(true)
+    }
+
+    fn resume(&mut self, clock: &DocumentClock) -> Result<bool, DocumentClockError> {
+        let Some(suspended_at) = self.suspended_at else {
+            return Ok(false);
+        };
+        if let Some(error) = clock.terminal_error() {
+            return Err(error);
+        }
+        let paused_for = clock.try_now()?.checked_duration_since(suspended_at)?;
+        self.suspension_offset = self
+            .suspension_offset
+            .checked_add(paused_for)
+            .ok_or(DocumentClockError::Overflow)?;
+        self.suspended_at = None;
+        Ok(true)
+    }
+}
+
+/// The semantic source and recurrence class of a pending logical DOM timer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DomTimerKind {
+    JsOneShot,
+    JsInterval { requested_period: Duration },
+    XhrTimeout,
+    EventSourceReconnect,
+    RefreshRedirect,
+    RunStepsAfterTimeout,
+    #[cfg(feature = "testbinding")]
+    TestBindingCallback,
+}
+
+/// Stable metadata for a pending logical DOM timer, ordered by deadline then creation sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DomTimerMetadata {
+    pub(crate) handle: OneshotTimerHandle,
+    pub(crate) javascript_handle: Option<i32>,
+    pub(crate) creation_sequence: u64,
+    pub(crate) deadline: DocumentTime,
+    pub(crate) suspended: bool,
+    /// Whether this timer may be selected in the next controlled turn. A run-steps timer can be
+    /// blocked by an earlier entry in its ordering-identifier queue even when its deadline is due.
+    pub(crate) eligible_in_controlled_turn: bool,
+    pub(crate) kind: DomTimerKind,
 }
 
 // This enum is required to work around the fact that trait objects do not support generic methods.
@@ -165,10 +260,24 @@ impl OneshotTimerCallback {
 
 impl Ord for OneshotTimer {
     fn cmp(&self, other: &OneshotTimer) -> Ordering {
-        match self.scheduled_for.cmp(&other.scheduled_for).reverse() {
-            Ordering::Equal => self.handle.cmp(&other.handle).reverse(),
-            res => res,
-        }
+        compare_timer_order(
+            self.scheduled_for,
+            self.creation_sequence,
+            other.scheduled_for,
+            other.creation_sequence,
+        )
+    }
+}
+
+fn compare_timer_order(
+    left_deadline: DocumentTime,
+    left_sequence: u64,
+    right_deadline: DocumentTime,
+    right_sequence: u64,
+) -> Ordering {
+    match left_deadline.cmp(&right_deadline).reverse() {
+        Ordering::Equal => left_sequence.cmp(&right_sequence).reverse(),
+        ordering => ordering,
     }
 }
 
@@ -185,36 +294,233 @@ impl PartialEq for OneshotTimer {
     }
 }
 
+impl OneshotTimer {
+    fn metadata(
+        &self,
+        timebase: TimerTimebase,
+        eligible_in_controlled_turn: bool,
+    ) -> Result<DomTimerMetadata, DocumentClockError> {
+        let (javascript_handle, kind) = match &self.callback {
+            OneshotTimerCallback::JsTimer(task) => (
+                Some(task.handle.0),
+                match task.is_interval {
+                    IsInterval::Interval => DomTimerKind::JsInterval {
+                        requested_period: task.duration,
+                    },
+                    IsInterval::NonInterval => DomTimerKind::JsOneShot,
+                },
+            ),
+            OneshotTimerCallback::XhrTimeout(_) => (None, DomTimerKind::XhrTimeout),
+            OneshotTimerCallback::EventSourceTimeout(_) => {
+                (None, DomTimerKind::EventSourceReconnect)
+            },
+            OneshotTimerCallback::RefreshRedirectDue(_) => {
+                (None, DomTimerKind::RefreshRedirect)
+            },
+            OneshotTimerCallback::RunStepsAfterTimeout { .. } => {
+                (None, DomTimerKind::RunStepsAfterTimeout)
+            },
+            #[cfg(feature = "testbinding")]
+            OneshotTimerCallback::TestBindingCallback(_) => {
+                (None, DomTimerKind::TestBindingCallback)
+            },
+        };
+        Ok(DomTimerMetadata {
+            handle: self.handle,
+            javascript_handle,
+            creation_sequence: self.creation_sequence,
+            deadline: self.scheduled_for.checked_add(timebase.suspension_offset)?,
+            suspended: timebase.suspended_at.is_some(),
+            eligible_in_controlled_turn,
+            kind,
+        })
+    }
+}
+
+fn insert_timer(timers: &mut VecDeque<OneshotTimer>, timer: OneshotTimer) {
+    let insertion_index = timers.binary_search(&timer).err().unwrap();
+    timers.insert(insertion_index, timer);
+}
+
+fn runsteps_timer_is_eligible(timer: &OneshotTimer, queues: &OrderingQueues) -> bool {
+    let OneshotTimerCallback::RunStepsAfterTimeout { ordering_id, .. } = &timer.callback else {
+        return true;
+    };
+    queues
+        .get(ordering_id)
+        .and_then(|queue| queue.first())
+        .is_none_or(|head| head.handle == timer.handle)
+}
+
+fn select_timer_for_outer<'a>(
+    timers: &'a VecDeque<OneshotTimer>,
+    runsteps_queues: &OrderingQueues,
+    controlled: bool,
+) -> Option<&'a OneshotTimer> {
+    if controlled {
+        timers
+            .iter()
+            .rev()
+            .find(|timer| runsteps_timer_is_eligible(timer, runsteps_queues))
+    } else {
+        timers.back()
+    }
+}
+
+fn take_due_timers_for_turn(
+    timers: &mut VecDeque<OneshotTimer>,
+    runsteps_queues: &OrderingQueues,
+    now: DocumentTime,
+    controlled: bool,
+) -> Vec<OneshotTimer> {
+    if controlled {
+        let selected = timers
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, timer)| {
+                (timer.scheduled_for <= now &&
+                    runsteps_timer_is_eligible(timer, runsteps_queues))
+                .then_some(index)
+            });
+        return selected
+            .and_then(|index| timers.remove(index))
+            .into_iter()
+            .collect();
+    }
+
+    // Preserve Servo's realtime batching behavior. Controlled mode deliberately selects one
+    // eligible logical timer so the normal task boundary performs a microtask checkpoint.
+    let mut due = Vec::new();
+    while timers
+        .back()
+        .is_some_and(|timer| timer.scheduled_for <= now)
+    {
+        due.push(timers.pop_back().unwrap());
+    }
+    due
+}
+
+fn map_timer_control_error(error: TimerControlError) -> DocumentClockError {
+    match error {
+        TimerControlError::Clock(error) => error,
+        TimerControlError::DeadlineOverflow | TimerControlError::SequenceExhausted => {
+            DocumentClockError::Overflow
+        },
+        TimerControlError::RealtimeScheduler |
+        TimerControlError::StaleDeadline { .. } |
+        TimerControlError::TimerNotDue { .. } => DocumentClockError::Overflow,
+    }
+}
+
+fn replace_scheduled_timer_id(
+    slot: &Cell<Option<TimerId>>,
+    replacement: Option<TimerId>,
+) -> Option<TimerId> {
+    slot.replace(replacement)
+}
+
 impl OneshotTimers {
     pub(crate) fn new(global_scope: &GlobalScope) -> OneshotTimers {
+        let document_clock = global_scope.document_clock();
+        let surface = if global_scope.is::<Window>() {
+            DocumentTimeSurface::WindowTimers
+        } else {
+            DocumentTimeSurface::Worker
+        };
+        let terminal_error = document_clock.require_surface(surface).err();
         OneshotTimers {
             global_scope: Dom::from_ref(global_scope),
+            document_clock,
             js_timers: JsTimers::default(),
             next_timer_handle: Cell::new(OneshotTimerHandle(1)),
             timers: DomRefCell::new(VecDeque::new()),
-            suspended_since: Cell::new(None),
-            suspension_offset: Cell::new(Duration::ZERO),
+            timebase: Cell::new(TimerTimebase::default()),
+            terminal_error: Cell::new(terminal_error),
             expected_event_id: Cell::new(TimerEventId(0)),
+            scheduled_timer_id: Cell::new(None),
             map_of_active_timers: Default::default(),
             runsteps_queues: Default::default(),
             next_runsteps_key: Cell::new(1),
             runsteps_start_seq: Cell::new(0),
+            creation_sequence: Cell::new(0),
         }
+    }
+
+    fn terminal_error(&self) -> Option<DocumentClockError> {
+        self.terminal_error
+            .get()
+            .or_else(|| self.document_clock.terminal_error())
+    }
+
+    fn latch_terminal(&self, error: DocumentClockError) {
+        if self.terminal_error.get().is_none() {
+            self.terminal_error.set(Some(error));
+        }
+        self.cancel_scheduled_timer();
+    }
+
+    pub(crate) fn latch_timer_error(&self, error: DocumentClockError) {
+        self.latch_terminal(error);
+    }
+
+    /// Return the first checked logical-timer failure. A terminal timer layer never falls back to
+    /// host time and never invokes another callback.
+    pub(crate) fn checked_terminal_error(&self) -> Option<DocumentClockError> {
+        self.terminal_error()
+    }
+
+    /// Return stable metadata for pending logical timers in execution order.
+    pub(crate) fn pending_timer_metadata(
+        &self,
+    ) -> Result<Vec<DomTimerMetadata>, DocumentClockError> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
+        let timebase = self.timebase.get();
+        let runsteps_queues = self.runsteps_queues.borrow();
+        let metadata = self
+            .timers
+            .borrow()
+            .iter()
+            .rev()
+            .map(|timer| {
+                timer.metadata(
+                    timebase,
+                    runsteps_timer_is_eligible(timer, &runsteps_queues),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>();
+        if let Err(error) = &metadata {
+            self.latch_terminal(*error);
+        }
+        metadata
     }
 
     /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
     #[inline]
-    pub(crate) fn now_for_runsteps(&self) -> Instant {
+    pub(crate) fn now_for_runsteps(&self) -> Result<DocumentTime, DocumentClockError> {
         // Step 2. Let startTime be the current high resolution time given global.
-        self.base_time()
+        let now = self.base_time();
+        if let Err(error) = now {
+            self.latch_terminal(error);
+        }
+        now
     }
 
     /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
     /// Step 1. Let timerKey be a new unique internal value.
-    pub(crate) fn fresh_runsteps_key(&self) -> TimerKey {
+    pub(crate) fn fresh_runsteps_key(&self) -> Result<TimerKey, DocumentClockError> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         let k = self.next_runsteps_key.get();
-        self.next_runsteps_key.set(k + 1);
-        k
+        let Some(next) = k.checked_add(1) else {
+            self.latch_terminal(DocumentClockError::Overflow);
+            return Err(DocumentClockError::Overflow);
+        };
+        self.next_runsteps_key.set(next);
+        Ok(k)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
@@ -232,13 +538,14 @@ impl OneshotTimers {
         ordering_id: &DOMString,
         handle: OneshotTimerHandle,
         milliseconds: u64,
-    ) {
+    ) -> Result<(), DocumentClockError> {
         let mut map = self.runsteps_queues.borrow_mut();
         let q = map.entry(ordering_id.clone()).or_default();
 
         let seq = {
             let cur = self.runsteps_start_seq.get();
-            self.runsteps_start_seq.set(cur + 1);
+            self.runsteps_start_seq
+                .set(cur.checked_add(1).ok_or(DocumentClockError::Overflow)?);
             cur
         };
 
@@ -259,6 +566,7 @@ impl OneshotTimers {
             .unwrap_or_else(|i| i);
 
         q.insert(idx, key);
+        Ok(())
     }
 
     pub(crate) fn schedule_callback(
@@ -267,15 +575,39 @@ impl OneshotTimers {
         duration: Duration,
         source: TimerSource,
     ) -> OneshotTimerHandle {
+        if self.terminal_error().is_some() {
+            return OneshotTimerHandle(0);
+        }
         let new_handle = self.next_timer_handle.get();
+        let Some(next_handle) = new_handle.0.checked_add(1) else {
+            self.latch_terminal(DocumentClockError::Overflow);
+            return OneshotTimerHandle(0);
+        };
+        let creation_sequence = self.creation_sequence.get();
+        let Some(next_creation_sequence) = creation_sequence.checked_add(1) else {
+            self.latch_terminal(DocumentClockError::Overflow);
+            return OneshotTimerHandle(0);
+        };
+        let scheduled_for = match self
+            .base_time()
+            .and_then(|now| now.checked_add(duration))
+        {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                self.latch_terminal(error);
+                return OneshotTimerHandle(0);
+            },
+        };
         self.next_timer_handle
-            .set(OneshotTimerHandle(new_handle.0 + 1));
+            .set(OneshotTimerHandle(next_handle));
+        self.creation_sequence.set(next_creation_sequence);
 
         let timer = OneshotTimer {
             handle: new_handle,
             source,
             callback,
-            scheduled_for: self.base_time() + duration,
+            scheduled_for,
+            creation_sequence,
         };
 
         // https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout
@@ -286,16 +618,20 @@ impl OneshotTimers {
             ..
         } = &timer.callback
         {
-            self.runsteps_enqueue_sorted(ordering_id, new_handle, *milliseconds);
+            if let Err(error) =
+                self.runsteps_enqueue_sorted(ordering_id, new_handle, *milliseconds)
+            {
+                self.latch_terminal(error);
+                return OneshotTimerHandle(0);
+            }
         }
 
         {
             let mut timers = self.timers.borrow_mut();
-            let insertion_index = timers.binary_search(&timer).err().unwrap();
-            timers.insert(insertion_index, timer);
+            insert_timer(&mut timers, timer);
         }
 
-        if self.is_next_timer(new_handle) {
+        if self.document_clock.is_controlled() || self.is_next_timer(new_handle) {
             self.schedule_timer_call();
         }
 
@@ -307,8 +643,7 @@ impl OneshotTimers {
 
         self.timers.borrow_mut().retain(|t| t.handle != handle);
 
-        if was_next {
-            self.invalidate_expected_event_id();
+        if self.document_clock.is_controlled() || was_next {
             self.schedule_timer_call();
         }
     }
@@ -332,28 +667,60 @@ impl OneshotTimers {
             return;
         }
 
-        assert!(self.suspended_since.get().is_none());
+        // The matching outer scheduler event has already been consumed. Clearing its identity
+        // before any callback can schedule a replacement prevents us from retaining or canceling
+        // an obsolete TimerId.
+        replace_scheduled_timer_id(&self.scheduled_timer_id, None);
 
-        let base_time = self.base_time();
-
-        // Since the event id was the expected one, at least one timer should be due.
-        if base_time < self.timers.borrow().back().unwrap().scheduled_for {
-            warn!("Unexpected timing!");
+        if self.terminal_error().is_some() {
+            return;
+        }
+        if self.timebase.get().suspended_at.is_some() {
+            warn!("Ignoring a DOM timer task while its timebase is suspended.");
             return;
         }
 
-        // select timers to run to prevent firing timers
-        // that were installed during fire of another timer
-        let mut timers_to_run = Vec::new();
+        let base_time = match self.base_time() {
+            Ok(base_time) => base_time,
+            Err(error) => {
+                self.latch_terminal(error);
+                return;
+            },
+        };
 
-        loop {
+        let Some(next_deadline) = self
+            .timers
+            .borrow()
+            .back()
+            .map(|timer| timer.scheduled_for)
+        else {
+            warn!("A DOM timer task fired after its logical timer was removed.");
+            return;
+        };
+        if base_time < next_deadline {
+            warn!("Unexpected timing!");
+            // A low-level wake can be delivered before its queued task runs or after a timebase
+            // transition. Re-arm the still-pending logical timer instead of stranding it.
+            self.schedule_timer_call();
+            return;
+        }
+
+        // Controlled mode pops exactly one eligible timer. Realtime mode preserves Servo's
+        // existing due-timer batch semantics.
+        let timers_to_run = {
+            let runsteps_queues = self.runsteps_queues.borrow();
             let mut timers = self.timers.borrow_mut();
-
-            if timers.is_empty() || timers.back().unwrap().scheduled_for > base_time {
-                break;
-            }
-
-            timers_to_run.push(timers.pop_back().unwrap());
+            take_due_timers_for_turn(
+                &mut timers,
+                &runsteps_queues,
+                base_time,
+                self.document_clock.is_controlled(),
+            )
+        };
+        if timers_to_run.is_empty() {
+            warn!("A DOM timer task fired without an eligible logical timer.");
+            self.schedule_timer_call();
+            return;
         }
 
         for timer in timers_to_run {
@@ -383,11 +750,11 @@ impl OneshotTimers {
                             handle: timer.handle,
                             source: timer.source,
                             callback: timer.callback,
-                            scheduled_for: self.base_time(),
+                            scheduled_for: base_time,
+                            creation_sequence: timer.creation_sequence,
                         };
                         let mut timers = self.timers.borrow_mut();
-                        let idx = timers.binary_search(&rein).err().unwrap();
-                        timers.insert(idx, rein);
+                        insert_timer(&mut timers, rein);
                         continue;
                     }
 
@@ -432,12 +799,11 @@ impl OneshotTimers {
         self.schedule_timer_call();
     }
 
-    fn base_time(&self) -> Instant {
-        let offset = self.suspension_offset.get();
-        match self.suspended_since.get() {
-            Some(suspend_time) => suspend_time - offset,
-            None => Instant::now() - offset,
+    fn base_time(&self) -> Result<DocumentTime, DocumentClockError> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
         }
+        self.timebase.get().now(&self.document_clock)
     }
 
     pub(crate) fn slow_down(&self) {
@@ -452,43 +818,72 @@ impl OneshotTimers {
 
     pub(crate) fn suspend(&self) {
         // Suspend is idempotent: do nothing if the timers are already suspended.
-        if self.suspended_since.get().is_some() {
+        let mut timebase = self.timebase.get();
+        let suspended = match timebase.suspend(&self.document_clock) {
+            Ok(suspended) => suspended,
+            Err(error) => {
+                self.latch_terminal(error);
+                return;
+            },
+        };
+        if !suspended {
             return warn!("Suspending an already suspended timer.");
         }
 
         debug!("Suspending timers.");
-        self.suspended_since.set(Some(Instant::now()));
-        self.invalidate_expected_event_id();
+        self.timebase.set(timebase);
+        let _ = self.invalidate_expected_event_id();
     }
 
     pub(crate) fn resume(&self) {
         // Resume is idempotent: do nothing if the timers are already resumed.
-        let additional_offset = match self.suspended_since.get() {
-            Some(suspended_since) => Instant::now() - suspended_since,
-            None => return warn!("Resuming an already resumed timer."),
+        let mut timebase = self.timebase.get();
+        let resumed = match timebase.resume(&self.document_clock) {
+            Ok(resumed) => resumed,
+            Err(error) => {
+                self.latch_terminal(error);
+                return;
+            },
         };
+        if !resumed {
+            return warn!("Resuming an already resumed timer.");
+        }
 
         debug!("Resuming timers.");
-        self.suspension_offset
-            .set(self.suspension_offset.get() + additional_offset);
-        self.suspended_since.set(None);
+        self.timebase.set(timebase);
 
         self.schedule_timer_call();
     }
 
     /// <https://html.spec.whatwg.org/multipage/#timer-initialisation-steps>
     fn schedule_timer_call(&self) {
-        if self.suspended_since.get().is_some() {
+        // Invalidate first even when the queue becomes empty: a low-level callback may already
+        // have queued its task and can no longer be canceled by TimerId alone.
+        let Some(expected_event_id) = self.invalidate_expected_event_id() else {
+            return;
+        };
+        if self.terminal_error().is_some() {
+            return;
+        }
+        if self.timebase.get().suspended_at.is_some() {
             // The timer will be scheduled when the pipeline is fully activated.
             return;
         }
 
-        let timers = self.timers.borrow();
-        let Some(timer) = timers.back() else {
+        let selected = {
+            let timers = self.timers.borrow();
+            let runsteps_queues = self.runsteps_queues.borrow();
+            select_timer_for_outer(
+                &timers,
+                &runsteps_queues,
+                self.document_clock.is_controlled(),
+            )
+            .map(|timer| (timer.scheduled_for, timer.source))
+        };
+        let Some((scheduled_for, source)) = selected else {
             return;
         };
 
-        let expected_event_id = self.invalidate_expected_event_id();
         // Step 12. Let completionStep be an algorithm step which queues a global
         // task on the timer task source given global to run task.
         let callback = TimerListener {
@@ -498,28 +893,64 @@ impl OneshotTimers {
                 .task_manager()
                 .timer_task_source()
                 .to_sendable(),
-            source: timer.source,
+            source,
             id: expected_event_id,
         }
         .into_callback();
 
+        let base_time = match self.base_time() {
+            Ok(base_time) => base_time,
+            Err(error) => {
+                self.latch_terminal(error);
+                return;
+            },
+        };
+        let duration = if scheduled_for <= base_time {
+            Duration::ZERO
+        } else {
+            match scheduled_for.checked_duration_since(base_time) {
+                Ok(duration) => duration,
+                Err(error) => {
+                    self.latch_terminal(error);
+                    return;
+                },
+            }
+        };
         let event_request = TimerEventRequest {
             callback,
-            duration: timer.scheduled_for - self.base_time(),
+            duration,
         };
 
-        self.global_scope.schedule_timer(event_request);
+        match self.global_scope.try_schedule_timer(event_request) {
+            Ok(timer_id) => {
+                debug_assert!(
+                    replace_scheduled_timer_id(&self.scheduled_timer_id, Some(timer_id)).is_none()
+                );
+            },
+            Err(error) => self.latch_terminal(map_timer_control_error(error)),
+        }
     }
 
-    fn invalidate_expected_event_id(&self) -> TimerEventId {
+    fn cancel_scheduled_timer(&self) {
+        if let Some(timer_id) = replace_scheduled_timer_id(&self.scheduled_timer_id, None) {
+            self.global_scope.cancel_timer(timer_id);
+        }
+    }
+
+    fn invalidate_expected_event_id(&self) -> Option<TimerEventId> {
+        self.cancel_scheduled_timer();
         let TimerEventId(currently_expected) = self.expected_event_id.get();
-        let next_id = TimerEventId(currently_expected + 1);
+        let Some(next) = currently_expected.checked_add(1) else {
+            self.latch_terminal(DocumentClockError::Overflow);
+            return None;
+        };
+        let next_id = TimerEventId(next);
         debug!(
             "invalidating expected timer (was {:?}, now {:?}",
             currently_expected, next_id
         );
         self.expected_event_id.set(next_id);
-        next_id
+        Some(next_id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -696,7 +1127,11 @@ impl JsTimers {
         // let id be an implementation-defined integer that is greater than zero
         // and does not already exist in global's map of setTimeout and setInterval IDs.
         let JsTimerHandle(new_handle) = self.next_timer_handle.get();
-        self.next_timer_handle.set(JsTimerHandle(new_handle + 1));
+        let Some(next_handle) = new_handle.checked_add(1) else {
+            global.latch_timer_error(DocumentClockError::Overflow);
+            return Ok(0);
+        };
+        self.next_timer_handle.set(JsTimerHandle(next_handle));
 
         // Step 3. If the surrounding agent's event loop's currently running task
         // is a task that was created by this algorithm, then let nesting level
@@ -955,5 +1390,307 @@ fn active_script_fetch_info(cx: &mut JSContext, global: &GlobalScope) -> Initiat
     InitiatingScriptFetchInfo {
         fetch_options,
         base_url,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    use timers::{
+        DocumentClockConfiguration, DocumentUnixTime, TimerEventRequest, TimerScheduler,
+    };
+
+    use super::*;
+
+    fn controlled_clock(initial_time_ns: u128) -> DocumentClock {
+        DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        })
+    }
+
+    fn test_timer(
+        handle: i32,
+        deadline: DocumentTime,
+        creation_sequence: u64,
+    ) -> OneshotTimer {
+        OneshotTimer {
+            handle: OneshotTimerHandle(handle),
+            source: TimerSource::FromWorker,
+            callback: OneshotTimerCallback::RunStepsAfterTimeout {
+                timer_key: handle,
+                ordering_id: DOMString::new(),
+                milliseconds: 0,
+                completion: Box::new(|_, _| {}),
+            },
+            scheduled_for: deadline,
+            creation_sequence,
+        }
+    }
+
+    #[test]
+    fn controlled_ten_second_dom_deadline_shares_the_outer_scheduler_clock() {
+        let clock = controlled_clock(25);
+        let timebase = TimerTimebase::default();
+        let start = timebase.now(&clock).unwrap();
+        let deadline = start.checked_add(Duration::from_secs(10)).unwrap();
+        let fired = Arc::new(AtomicBool::new(false));
+        let callback_fired = fired.clone();
+        let mut scheduler = TimerScheduler::with_clock(clock.clone());
+        let id = scheduler
+            .try_schedule_timer(TimerEventRequest {
+                callback: Box::new(move || {
+                    callback_fired.store(true, AtomicOrdering::Relaxed);
+                }),
+                duration: deadline.checked_duration_since(start).unwrap(),
+            })
+            .unwrap();
+        let snapshot = scheduler.finite_deadline_snapshot().unwrap().unwrap();
+
+        assert_eq!(snapshot.id, id);
+        assert_eq!(snapshot.deadline, deadline);
+        scheduler.advance_to_and_activate(snapshot).unwrap();
+        assert!(fired.load(AtomicOrdering::Relaxed));
+        assert_eq!(timebase.now(&clock).unwrap(), deadline);
+    }
+
+    #[test]
+    fn equal_deadline_timers_run_in_creation_order() {
+        let deadline = DocumentTime::from_nanos(10);
+        let mut timers = VecDeque::new();
+        insert_timer(&mut timers, test_timer(1, deadline, 0));
+        insert_timer(&mut timers, test_timer(2, deadline, 1));
+        let queues = OrderingQueues::default();
+
+        assert_eq!(
+            take_due_timers_for_turn(&mut timers, &queues, deadline, true)
+                .pop()
+                .unwrap()
+                .handle
+                .sequence(),
+            1
+        );
+        assert_eq!(
+            take_due_timers_for_turn(&mut timers, &queues, deadline, true)
+                .pop()
+                .unwrap()
+                .handle
+                .sequence(),
+            2
+        );
+    }
+
+    #[test]
+    fn replacing_an_outer_registration_cancels_the_obsolete_timer_id() {
+        let clock = controlled_clock(0);
+        let mut scheduler = TimerScheduler::with_clock(clock);
+        let old_id = scheduler
+            .try_schedule_timer(TimerEventRequest {
+                callback: Box::new(|| {}),
+                duration: Duration::from_secs(10),
+            })
+            .unwrap();
+        let replacement_id = scheduler
+            .try_schedule_timer(TimerEventRequest {
+                callback: Box::new(|| {}),
+                duration: Duration::from_secs(5),
+            })
+            .unwrap();
+        let registered = Cell::new(Some(old_id));
+
+        let obsolete = replace_scheduled_timer_id(&registered, Some(replacement_id)).unwrap();
+        scheduler.cancel_timer(obsolete);
+        let replacement = scheduler.finite_deadline_snapshot().unwrap().unwrap();
+        assert_eq!(replacement.id, replacement_id);
+        scheduler.advance_to_and_activate(replacement).unwrap();
+        assert_eq!(scheduler.finite_deadline_snapshot().unwrap(), None);
+    }
+
+    #[test]
+    fn one_due_logical_timer_is_popped_per_turn() {
+        let deadline = DocumentTime::from_nanos(10);
+        let mut timers = VecDeque::new();
+        insert_timer(&mut timers, test_timer(1, deadline, 0));
+        insert_timer(&mut timers, test_timer(2, deadline, 1));
+        let queues = OrderingQueues::default();
+
+        let first = take_due_timers_for_turn(&mut timers, &queues, deadline, true)
+            .pop()
+            .unwrap();
+        assert_eq!(first.handle.sequence(), 1);
+        assert_eq!(timers.len(), 1);
+        assert_eq!(timers.back().unwrap().handle.sequence(), 2);
+    }
+
+    #[test]
+    fn controlled_runsteps_selection_cannot_starve_the_ordering_queue_head() {
+        let deadline = DocumentTime::from_nanos(100);
+        let ordering_id = DOMString::new();
+        let mut timers = VecDeque::new();
+        insert_timer(&mut timers, test_timer(1, deadline, 0));
+        insert_timer(&mut timers, test_timer(2, deadline, 1));
+        let mut queues = OrderingQueues::default();
+        queues.insert(
+            ordering_id,
+            vec![
+                OrderingEntry {
+                    milliseconds: 10,
+                    start_seq: 1,
+                    handle: OneshotTimerHandle(2),
+                },
+                OrderingEntry {
+                    milliseconds: 100,
+                    start_seq: 0,
+                    handle: OneshotTimerHandle(1),
+                },
+            ],
+        );
+
+        let selected = take_due_timers_for_turn(&mut timers, &queues, deadline, true);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].handle.sequence(), 2);
+        assert_eq!(timers.back().unwrap().handle.sequence(), 1);
+    }
+
+    #[test]
+    fn realtime_turn_preserves_the_existing_due_timer_batch() {
+        let deadline = DocumentTime::from_nanos(10);
+        let mut timers = VecDeque::new();
+        insert_timer(&mut timers, test_timer(1, deadline, 0));
+        insert_timer(&mut timers, test_timer(2, deadline, 1));
+
+        let due = take_due_timers_for_turn(
+            &mut timers,
+            &OrderingQueues::default(),
+            deadline,
+            false,
+        );
+        assert_eq!(
+            due.iter()
+                .map(|timer| timer.handle.sequence())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(timers.is_empty());
+    }
+
+    #[test]
+    fn metadata_uses_the_checked_physical_deadline_and_typed_callback_kind() {
+        let timer = test_timer(1, DocumentTime::from_nanos(20), 7);
+        let metadata = timer
+            .metadata(
+                TimerTimebase {
+                    suspended_at: Some(DocumentTime::from_nanos(10)),
+                    suspension_offset: Duration::from_nanos(5),
+                },
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(metadata.handle.sequence(), 1);
+        assert_eq!(metadata.creation_sequence, 7);
+        assert_eq!(metadata.deadline, DocumentTime::from_nanos(25));
+        assert!(metadata.suspended);
+        assert!(metadata.eligible_in_controlled_turn);
+        assert_eq!(metadata.kind, DomTimerKind::RunStepsAfterTimeout);
+
+        let overflowing = test_timer(2, DocumentTime::from_nanos(u128::MAX), 8);
+        assert_eq!(
+            overflowing.metadata(
+                TimerTimebase {
+                    suspended_at: None,
+                    suspension_offset: Duration::from_nanos(1),
+                },
+                true,
+            ),
+            Err(DocumentClockError::Overflow)
+        );
+    }
+
+    #[test]
+    fn metadata_marks_an_earlier_blocked_runsteps_timer_before_the_eligible_outer_target() {
+        let ordering_id = DOMString::new();
+        let mut timers = VecDeque::new();
+        insert_timer(
+            &mut timers,
+            test_timer(1, DocumentTime::from_nanos(100), 0),
+        );
+        insert_timer(
+            &mut timers,
+            test_timer(2, DocumentTime::from_nanos(110), 1),
+        );
+        let mut queues = OrderingQueues::default();
+        queues.insert(
+            ordering_id,
+            vec![
+                OrderingEntry {
+                    milliseconds: 10,
+                    start_seq: 1,
+                    handle: OneshotTimerHandle(2),
+                },
+                OrderingEntry {
+                    milliseconds: 100,
+                    start_seq: 0,
+                    handle: OneshotTimerHandle(1),
+                },
+            ],
+        );
+
+        let metadata = timers
+            .iter()
+            .rev()
+            .map(|timer| {
+                timer
+                    .metadata(
+                        TimerTimebase::default(),
+                        runsteps_timer_is_eligible(timer, &queues),
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(metadata[0].handle.sequence(), 1);
+        assert!(!metadata[0].eligible_in_controlled_turn);
+        assert_eq!(metadata[1].handle.sequence(), 2);
+        assert!(metadata[1].eligible_in_controlled_turn);
+        assert_eq!(
+            select_timer_for_outer(&timers, &queues, true)
+                .unwrap()
+                .handle
+                .sequence(),
+            2
+        );
+    }
+
+    #[test]
+    fn realtime_timebase_preserves_the_shared_host_clock_ordering() {
+        let clock = DocumentClock::default();
+        let before = clock.try_now().unwrap();
+        let observed = TimerTimebase::default().now(&clock).unwrap();
+        let after = clock.try_now().unwrap();
+
+        assert!(before <= observed);
+        assert!(observed <= after);
+        assert_eq!(
+            observed
+                .checked_add(Duration::from_secs(10))
+                .unwrap()
+                .checked_duration_since(observed)
+                .unwrap(),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn suspension_freezes_logical_dom_time_and_checked_resume_excludes_the_pause() {
+        let clock = controlled_clock(10);
+        let mut timebase = TimerTimebase::default();
+        assert!(timebase.suspend(&clock).unwrap());
+        clock.advance_to(DocumentTime::from_nanos(20)).unwrap();
+        assert_eq!(timebase.now(&clock).unwrap(), DocumentTime::from_nanos(10));
+        assert!(timebase.resume(&clock).unwrap());
+        clock.advance_to(DocumentTime::from_nanos(25)).unwrap();
+        assert_eq!(timebase.now(&clock).unwrap(), DocumentTime::from_nanos(15));
     }
 }

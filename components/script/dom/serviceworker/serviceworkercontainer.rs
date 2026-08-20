@@ -19,6 +19,7 @@ use servo_constellation_traits::{
     ServiceWorkerAlgorithm, ServiceWorkerAlgorithmResult, ServiceWorkerRegistrationInfo,
 };
 use servo_url::{ImmutableOrigin, ServoUrl};
+use timers::DocumentTimeSurface;
 
 use crate::dom::bindings::codegen::Bindings::ServiceWorkerContainerBinding::{
     RegistrationOptions, ServiceWorkerContainerMethods,
@@ -275,6 +276,13 @@ impl ServiceWorkerContainer {
         promise: Rc<Promise>,
     ) {
         let global = self.global();
+        if let Err(error) = global
+            .document_clock()
+            .require_surface(DocumentTimeSurface::Worker)
+        {
+            promise.reject_error(cx, Error::NotSupported(Some(error.to_string())));
+            return;
+        }
         let result_handler = self.get_or_setup_callback(promise);
 
         // Step 3: Let job be the result of running Create Job with unregister,
@@ -332,6 +340,13 @@ impl ServiceWorkerContainerMethods<crate::DomTypeHolder> for ServiceWorkerContai
 
         // A: Step 1
         let promise = Promise::new_in_realm(realm);
+        if let Err(error) = global
+            .document_clock()
+            .require_surface(DocumentTimeSurface::Worker)
+        {
+            promise.reject_error(realm, Error::NotSupported(Some(error.to_string())));
+            return promise;
+        }
         let USVString(ref script_url) = script_url;
 
         // A: Step 3
@@ -466,6 +481,13 @@ impl ServiceWorkerContainerMethods<crate::DomTypeHolder> for ServiceWorkerContai
         // Step 7: Let promise be a new promise.
         // Note: done here so it can be used to handle failure of the below steps.
         let promise = Promise::new_in_realm(realm);
+        if let Err(error) = global
+            .document_clock()
+            .require_surface(DocumentTimeSurface::Worker)
+        {
+            promise.reject_error(realm, Error::NotSupported(Some(error.to_string())));
+            return promise;
+        }
 
         // Step 2: Let client storage key be the result of running obtain a storage key given client.
         let Some(storage_key) = global.obtain_storage_key() else {

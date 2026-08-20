@@ -25,6 +25,7 @@ use webrender_api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize};
 
 use crate::proxies::ConstellationProxy;
 use crate::responders::{IpcResponder, OneshotSender, ServoErrorSender};
+use crate::webview::ValidatedDocumentClockConfiguration;
 use crate::{RegisterOrUnregister, Servo, WebView, WebViewBuilder};
 
 /// A request to navigate a [`WebView`] or one of its inner frames. This can be handled
@@ -902,12 +903,18 @@ impl PromptDialog {
 pub struct CreateNewWebViewRequest {
     pub(crate) servo: Servo,
     pub(crate) responder: IpcResponder<Option<NewWebViewDetails>>,
+    pub(crate) document_clock: ValidatedDocumentClockConfiguration,
 }
 
 impl CreateNewWebViewRequest {
     /// Returns a [`WebViewBuilder`] that can be used to create a new auxiliary [`WebView`].
     pub fn builder(self, rendering_context: Rc<dyn RenderingContext>) -> WebViewBuilder {
-        WebViewBuilder::new_for_create_request(&self.servo, rendering_context, self.responder)
+        WebViewBuilder::new_for_create_request(
+            &self.servo,
+            rendering_context,
+            self.responder,
+            self.document_clock,
+        )
     }
 }
 

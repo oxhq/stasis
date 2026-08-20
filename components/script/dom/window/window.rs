@@ -104,6 +104,7 @@ use style::stylesheets::UrlExtraData;
 use style_traits::CSSPixel;
 use stylo_atoms::Atom;
 use time::Duration as TimeDuration;
+use timers::{DocumentClockError, DocumentTime, DocumentTimeSurface};
 use webrender_api::ExternalScrollId;
 use webrender_api::units::{DeviceIntSize, DevicePixel, LayoutPixel, LayoutPoint};
 
@@ -248,6 +249,10 @@ enum LayoutBlocker {
     WaitingForParse,
     /// The body is being parsed the `<body>` starting at the `Instant` specified.
     Parsing(Instant),
+    /// The body is being parsed under a controlled document clock. Progressive layout remains
+    /// blocked until the normal load/unblock path because host time must not affect controlled
+    /// execution.
+    ParsingWithoutProgressiveTimeout,
     /// The body finished parsing and the `load` event has been fired or parsing took so
     /// long, that we are going to do layout anyway. Note that subsequent changes to the body
     /// can trigger parsing again, but the `Window` stays in this state.
@@ -257,6 +262,64 @@ enum LayoutBlocker {
 impl LayoutBlocker {
     fn layout_blocked(&self) -> bool {
         !matches!(self, Self::FiredLoadEventOrParsingTimerExpired)
+    }
+
+    fn start_parsing(
+        controlled: bool,
+        host_now: impl FnOnce() -> Instant,
+    ) -> LayoutBlocker {
+        if controlled {
+            return Self::ParsingWithoutProgressiveTimeout;
+        }
+
+        Self::Parsing(host_now())
+    }
+
+    fn progressive_timeout_expired(
+        self,
+        host_now: impl FnOnce() -> Instant,
+    ) -> bool {
+        matches!(
+            self,
+            Self::Parsing(instant) if instant + INITIAL_REFLOW_DELAY < host_now()
+        )
+    }
+}
+
+#[cfg(test)]
+mod layout_blocker_tests {
+    use super::*;
+
+    #[test]
+    fn controlled_parsing_never_samples_or_expires_against_host_time() {
+        let start_sampled = Cell::new(false);
+        let blocker = LayoutBlocker::start_parsing(true, || {
+            start_sampled.set(true);
+            Instant::now()
+        });
+        assert!(!start_sampled.get());
+        assert!(matches!(
+            blocker,
+            LayoutBlocker::ParsingWithoutProgressiveTimeout
+        ));
+
+        let expiry_sampled = Cell::new(false);
+        assert!(!blocker.progressive_timeout_expired(|| {
+            expiry_sampled.set(true);
+            Instant::now()
+        }));
+        assert!(!expiry_sampled.get());
+    }
+
+    #[test]
+    fn realtime_parsing_preserves_the_strict_progressive_timeout() {
+        let started_at = Instant::now();
+        let blocker = LayoutBlocker::start_parsing(false, || started_at);
+
+        assert!(!blocker.progressive_timeout_expired(|| started_at + INITIAL_REFLOW_DELAY));
+        assert!(blocker.progressive_timeout_expired(|| {
+            started_at + INITIAL_REFLOW_DELAY + Duration::from_nanos(1)
+        }));
     }
 }
 
@@ -309,6 +372,8 @@ pub(crate) struct Window {
     performance: MutNullableDom<Performance>,
     #[no_trace]
     navigation_start: Cell<CrossProcessInstant>,
+    #[no_trace]
+    document_time_origin: Cell<DocumentTime>,
     screen: MutNullableDom<Screen>,
     session_storage: MutNullableDom<Storage>,
     local_storage: MutNullableDom<Storage>,
@@ -1791,8 +1856,14 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     // https://dvcs.w3.org/hg/webperf/raw-file/tip/specs/
     // NavigationTiming/Overview.html#sec-window.performance-attribute
     fn Performance(&self, cx: &mut JSContext) -> DomRoot<Performance> {
-        self.performance
-            .or_init(|| Performance::new(cx, self.as_global_scope(), self.navigation_start.get()))
+        self.performance.or_init(|| {
+            Performance::new(
+                cx,
+                self.as_global_scope(),
+                self.navigation_start.get(),
+                Some(self.document_time_origin.get()),
+            )
+        })
     }
 
     // https://html.spec.whatwg.org/multipage/#globaleventhandlers
@@ -2855,10 +2926,11 @@ impl Window {
     pub(crate) fn reflow_if_reflow_timer_expired(&self, cx: &mut JSContext) {
         // Only trigger a long parsing time reflow if we are in the first parse of `<body>`
         // and it started more than `INITIAL_REFLOW_DELAY` ago.
-        if !matches!(
-            self.layout_blocker.get(),
-            LayoutBlocker::Parsing(instant) if instant + INITIAL_REFLOW_DELAY < Instant::now()
-        ) {
+        if !self
+            .layout_blocker
+            .get()
+            .progressive_timeout_expired(Instant::now)
+        {
             return;
         }
         self.allow_layout_if_necessary(cx);
@@ -2874,8 +2946,9 @@ impl Window {
             return;
         }
 
+        let controlled = self.as_global_scope().document_clock().is_controlled();
         self.layout_blocker
-            .set(LayoutBlocker::Parsing(Instant::now()));
+            .set(LayoutBlocker::start_parsing(controlled, Instant::now));
     }
 
     /// Inform the [`Window`] that layout is allowed either because `load` has happened
@@ -3658,11 +3731,29 @@ impl Window {
     }
 
     pub(crate) fn set_navigation_start(&self) {
+        // This path is used by `document.open()`. Preserve Servo's existing host marker reset,
+        // but do not change the environment settings object's document-time origin or the basis
+        // of an already-cached [SameObject] Performance. Real navigation replacement resets all
+        // three together in `set_up_a_window_environment_settings_object` below.
         self.navigation_start.set(CrossProcessInstant::now());
     }
 
     pub(crate) fn navigation_start(&self) -> CrossProcessInstant {
         self.navigation_start.get()
+    }
+
+    /// Return a checked timestamp relative to this Window's navigation origin.
+    ///
+    /// Callers name the observable surface so controlled time fails closed when a newly wired
+    /// producer has not yet been admitted to this document-clock domain.
+    pub(crate) fn document_time_since_navigation(
+        &self,
+        observed: DocumentTime,
+        surface: DocumentTimeSurface,
+    ) -> Result<Duration, DocumentClockError> {
+        self.as_global_scope()
+            .document_clock()
+            .duration_since_for_surface(surface, self.document_time_origin.get(), observed)
     }
 
     pub(crate) fn set_last_activation_timestamp(&self, time: UserActivationTimestamp) {
@@ -3828,19 +3919,20 @@ impl Window {
     /// <https://html.spec.whatwg.org/multipage/#sticky-activation>
     pub(crate) fn has_sticky_activation(&self) -> bool {
         // > When the current high resolution time given W is greater than or equal to the last activation timestamp in W, W is said to have sticky activation.
-        UserActivationTimestamp::TimeStamp(CrossProcessInstant::now()) >=
-            self.last_activation_timestamp.get()
+        let clock = self.as_global_scope().document_clock();
+        self.last_activation_timestamp
+            .get()
+            .has_sticky_activation(&clock)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#transient-activation>
     pub(crate) fn has_transient_activation(&self) -> bool {
         // > When the current high resolution time given W is greater than or equal to the last activation timestamp in W, and less than the last activation
         // > timestamp in W plus the transient activation duration, then W is said to have transient activation.
-        let current_time = CrossProcessInstant::now();
-        UserActivationTimestamp::TimeStamp(current_time) >= self.last_activation_timestamp.get() &&
-            UserActivationTimestamp::TimeStamp(current_time) <
-                self.last_activation_timestamp.get() +
-                    pref!(dom_transient_activation_duration_ms)
+        let clock = self.as_global_scope().document_clock();
+        self.last_activation_timestamp
+            .get()
+            .has_transient_activation(&clock, pref!(dom_transient_activation_duration_ms))
     }
 
     pub(crate) fn consume_last_activation_timestamp(&self) {
@@ -3903,6 +3995,7 @@ impl Window {
         creation_url: ServoUrl,
         top_level_creation_url: ServoUrl,
         navigation_start: CrossProcessInstant,
+        document_time_origin: DocumentTime,
         #[cfg(feature = "webgl")] webgl_chan: Option<WebGLChan>,
         #[cfg(feature = "webxr")] webxr_registry: Option<webxr_api::Registry>,
         paint_api: CrossProcessPaintApi,
@@ -3951,6 +4044,7 @@ impl Window {
             document: Default::default(),
             performance: Default::default(),
             navigation_start: Cell::new(navigation_start),
+            document_time_origin: Cell::new(document_time_origin),
             screen: Default::default(),
             session_storage: Default::default(),
             local_storage: Default::default(),
@@ -4054,11 +4148,16 @@ impl Window {
         creation_url: ServoUrl,
         top_level_creation_url: ServoUrl,
         navigation_start: CrossProcessInstant,
+        document_time_origin: DocumentTime,
         viewport_details: ViewportDetails,
     ) {
         *self.layout.borrow_mut() = layout;
         self.set_viewport_details(viewport_details);
         self.navigation_start.set(navigation_start);
+        self.document_time_origin.set(document_time_origin);
+        if let Some(performance) = self.performance.get() {
+            performance.set_time_origin(navigation_start, Some(document_time_origin));
+        }
 
         // Step 6. Set settings object's creation URL to creationURL, settings object's top-level
         //   creation URL to topLevelCreationURL, and settings object's top-level origin to topLevelOrigin.

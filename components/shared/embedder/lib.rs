@@ -53,6 +53,53 @@ pub use crate::embedder_controls::*;
 pub use crate::input_events::*;
 use crate::user_contents::UserContentManagerId;
 pub use crate::webdriver::*;
+#[doc(hidden)]
+pub use timers::{DocumentClockConfiguration, DocumentClockError, DocumentTimeSurface};
+
+/// Validate a document-clock configuration at the embedder boundary, before it can be sent to a
+/// script thread.
+///
+/// This is a hidden automation seam. Embedders should ordinarily use the realtime default.
+///
+/// # Errors
+///
+/// Returns a checked [`DocumentClockError`] when the controlled clock cannot represent its
+/// configured initial wall-time boundary.
+#[doc(hidden)]
+pub fn validate_document_clock_configuration(
+    configuration: DocumentClockConfiguration,
+) -> Result<(), DocumentClockError> {
+    timers::DocumentClock::validate_configuration(configuration)
+}
+
+#[cfg(test)]
+mod document_clock_configuration_tests {
+    use super::{
+        DocumentClockConfiguration, DocumentClockError, validate_document_clock_configuration,
+    };
+    use timers::DocumentUnixTime;
+
+    #[test]
+    fn embedder_boundary_rejects_an_overflowing_controlled_clock() {
+        let configuration = DocumentClockConfiguration::Controlled {
+            initial_time_ns: u128::MAX,
+            unix_time_origin_ns: DocumentUnixTime::from_nanos(0),
+        };
+
+        assert_eq!(
+            validate_document_clock_configuration(configuration),
+            Err(DocumentClockError::Overflow),
+        );
+    }
+
+    #[test]
+    fn embedder_boundary_preserves_the_realtime_default() {
+        assert_eq!(
+            validate_document_clock_configuration(DocumentClockConfiguration::Realtime),
+            Ok(()),
+        );
+    }
+}
 
 /// A point in a `WebView`, either expressed in device pixels or page pixels.
 /// Page pixels are CSS pixels, which take into account device pixel scale,
@@ -1153,6 +1200,9 @@ pub struct NewWebViewDetails {
     pub webview_id: WebViewId,
     pub viewport_details: ViewportDetails,
     pub user_content_manager_id: Option<UserContentManagerId>,
+    /// The document clock selected before this WebView's initial navigation starts.
+    #[doc(hidden)]
+    pub document_clock: DocumentClockConfiguration,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

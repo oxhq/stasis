@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::GenericCallback;
 use servo_base::id::WebViewId;
 use servo_url::ServoUrl;
-use timers::TimerEventRequest;
+use timers::{TimerControlError, TimerEventRequest};
 use uuid::Uuid;
 
 use crate::dom::abortsignal::AbortAlgorithm;
@@ -301,7 +301,7 @@ fn queue_deferred_fetch(
     request: NetTraitsRequest,
     activate_after: Finite<f64>,
     global: &GlobalScope,
-) -> DeferredFetchRecordId {
+) -> Result<DeferredFetchRecordId, TimerControlError> {
     let trusted_global = Trusted::new(global);
     let mut request = request;
     // Step 1. Populate request from client given request.
@@ -320,7 +320,7 @@ fn queue_deferred_fetch(
     // Step 5. Append deferredRecord to request’s client’s fetch group’s deferred fetch records.
     let deferred_fetch_record_id = global.append_deferred_fetch(deferred_record);
     // Step 6. If activateAfter is non-null, then run the following steps in parallel:
-    global.schedule_timer(TimerEventRequest {
+    let schedule_result = global.try_schedule_timer(TimerEventRequest {
         callback: Box::new(move || {
             // Step 6.2. Process deferredRecord.
             let global = trusted_global.root();
@@ -340,8 +340,13 @@ fn queue_deferred_fetch(
         // Step 6.1. The user agent should wait until any of the following conditions is met:
         duration: Duration::from_millis(*activate_after as u64),
     });
+    if let Err(error) = schedule_result {
+        let removed = global.remove_deferred_fetch(&deferred_fetch_record_id);
+        debug_assert!(removed.is_some());
+        return Err(error);
+    }
     // Step 7. Return deferredRecord.
-    deferred_fetch_record_id
+    Ok(deferred_fetch_record_id)
 }
 
 /// <https://fetch.spec.whatwg.org/#dom-window-fetchlater>
@@ -415,7 +420,12 @@ pub(crate) fn FetchLater(
     // Step 12. Let activated be false.
     // Step 13. Let deferredRecord be the result of calling queue a deferred fetch given request,
     // activateAfter, and the following step: set activated to true.
-    let deferred_record_id = queue_deferred_fetch(request, activate_after, global_scope);
+    let deferred_record_id =
+        queue_deferred_fetch(request, activate_after, global_scope).map_err(|error| {
+            Error::Operation(Some(format!(
+                "Failed to schedule deferred fetch activation: {error}"
+            )))
+        })?;
     // Step 14. Add the following abort steps to requestObject’s signal: Set deferredRecord’s invoke state to "aborted".
     signal.add(&AbortAlgorithm::FetchLater(deferred_record_id));
     // Step 15. Return a new FetchLaterResult whose activated getter steps are to return activated.

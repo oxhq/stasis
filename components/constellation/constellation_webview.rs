@@ -5,15 +5,16 @@
 use std::collections::VecDeque;
 
 use embedder_traits::user_contents::UserContentManagerId;
-use embedder_traits::{InputEvent, MouseLeftViewportEvent, Theme};
+use embedder_traits::{DocumentClockConfiguration, InputEvent, MouseLeftViewportEvent, Theme};
 use euclid::Point2D;
 use log::{debug, warn};
 use rustc_hash::{FxHashMap, FxHashSet};
 use script_traits::{ConstellationInputEvent, ScriptThreadMessage};
 use servo_base::Epoch;
-use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
+use servo_base::id::{BrowsingContextId, PipelineId, ScriptEventLoopId, WebViewId};
 use servo_constellation_traits::SessionHistoryTraversalRequest;
 use style_traits::CSSPixel;
+use timers::DocumentTimeSurface;
 
 use crate::browsingcontext::BrowsingContext;
 use crate::pipeline::Pipeline;
@@ -69,6 +70,15 @@ pub(crate) struct ConstellationWebView {
     /// it is `None` otherwise.
     pub user_content_manager_id: Option<UserContentManagerId>,
 
+    /// The immutable clock mode selected before this WebView's initial navigation.
+    document_clock: DocumentClockConfiguration,
+
+    /// The single script event loop allowed to own a controlled WebView.
+    controlled_event_loop_id: Option<ScriptEventLoopId>,
+
+    /// The first unsupported surface reached by a controlled WebView.
+    document_time_failure: Option<DocumentTimeSurface>,
+
     /// The [`Theme`] that this [`ConstellationWebView`] uses. This is communicated to all
     /// `ScriptThread`s so that they know how to render the contents of a particular `WebView.
     theme: Theme,
@@ -87,10 +97,14 @@ impl ConstellationWebView {
         webview_id: WebViewId,
         focused_browsing_context_id: BrowsingContextId,
         user_content_manager_id: Option<UserContentManagerId>,
+        document_clock: DocumentClockConfiguration,
     ) -> Self {
         Self {
             webview_id,
             user_content_manager_id,
+            document_clock,
+            controlled_event_loop_id: None,
+            document_time_failure: None,
             active_top_level_pipeline_id: None,
             active_top_level_pipeline_epoch: Epoch::default(),
             pending_changes: Default::default(),
@@ -102,6 +116,50 @@ impl ConstellationWebView {
             ongoing_history_traversal_request: None,
             theme: Theme::Light,
             accessibility_active: false,
+        }
+    }
+
+    pub(crate) const fn document_clock(&self) -> DocumentClockConfiguration {
+        self.document_clock
+    }
+
+    pub(crate) const fn controlled_event_loop_id(&self) -> Option<ScriptEventLoopId> {
+        self.controlled_event_loop_id
+    }
+
+    pub(crate) const fn document_time_failure(&self) -> Option<DocumentTimeSurface> {
+        self.document_time_failure
+    }
+
+    pub(crate) fn bind_controlled_event_loop(
+        &mut self,
+        event_loop_id: ScriptEventLoopId,
+        mismatch_surface: DocumentTimeSurface,
+    ) -> Result<(), DocumentTimeSurface> {
+        if self.document_clock == DocumentClockConfiguration::Realtime {
+            return Ok(());
+        }
+        if let Some(failure) = self.document_time_failure {
+            return Err(failure);
+        }
+        match self.controlled_event_loop_id {
+            None => {
+                self.controlled_event_loop_id = Some(event_loop_id);
+                Ok(())
+            },
+            Some(bound) if bound == event_loop_id => Ok(()),
+            Some(_) => {
+                self.document_time_failure = Some(mismatch_surface);
+                Err(mismatch_surface)
+            },
+        }
+    }
+
+    pub(crate) fn fail_document_time(&mut self, surface: DocumentTimeSurface) {
+        if self.document_clock != DocumentClockConfiguration::Realtime &&
+            self.document_time_failure.is_none()
+        {
+            self.document_time_failure = Some(surface);
         }
     }
 
@@ -275,6 +333,96 @@ impl ConstellationWebView {
             .iter()
             .rposition(|change| change.new_pipeline_id == pipeline_id)?;
         Some(self.pending_changes.swap_remove(pending_index))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use servo_base::id::{
+        ScriptEventLoopId, TEST_BROWSING_CONTEXT_ID, TEST_SCRIPT_EVENT_LOOP_ID, TEST_WEBVIEW_ID,
+    };
+    use timers::DocumentUnixTime;
+
+    use super::*;
+
+    fn controlled_webview() -> ConstellationWebView {
+        ConstellationWebView::new(
+            TEST_WEBVIEW_ID,
+            TEST_BROWSING_CONTEXT_ID,
+            None,
+            DocumentClockConfiguration::Controlled {
+                initial_time_ns: 7,
+                unix_time_origin_ns: DocumentUnixTime::from_nanos(11),
+            },
+        )
+    }
+
+    #[test]
+    fn controlled_webview_binds_one_event_loop_and_latches_typed_mismatch() {
+        let mut webview = controlled_webview();
+        assert_eq!(webview.controlled_event_loop_id(), None);
+        assert!(
+            webview
+                .bind_controlled_event_loop(
+                    TEST_SCRIPT_EVENT_LOOP_ID,
+                    DocumentTimeSurface::CrossEventLoopNavigation,
+                )
+                .is_ok()
+        );
+        assert!(
+            webview
+                .bind_controlled_event_loop(
+                    TEST_SCRIPT_EVENT_LOOP_ID,
+                    DocumentTimeSurface::CrossEventLoopNavigation,
+                )
+                .is_ok()
+        );
+
+        let other_event_loop = ScriptEventLoopId::new();
+        assert_ne!(other_event_loop, TEST_SCRIPT_EVENT_LOOP_ID);
+        assert_eq!(
+            webview.bind_controlled_event_loop(
+                other_event_loop,
+                DocumentTimeSurface::CrossEventLoopNavigation,
+            ),
+            Err(DocumentTimeSurface::CrossEventLoopNavigation)
+        );
+        assert_eq!(
+            webview.document_time_failure(),
+            Some(DocumentTimeSurface::CrossEventLoopNavigation)
+        );
+        assert_eq!(
+            webview.controlled_event_loop_id(),
+            Some(TEST_SCRIPT_EVENT_LOOP_ID)
+        );
+        assert_eq!(
+            webview.bind_controlled_event_loop(
+                TEST_SCRIPT_EVENT_LOOP_ID,
+                DocumentTimeSurface::CrossEventLoopIframe,
+            ),
+            Err(DocumentTimeSurface::CrossEventLoopNavigation)
+        );
+    }
+
+    #[test]
+    fn realtime_webview_does_not_bind_or_latch_document_time_failures() {
+        let mut webview = ConstellationWebView::new(
+            TEST_WEBVIEW_ID,
+            TEST_BROWSING_CONTEXT_ID,
+            None,
+            DocumentClockConfiguration::Realtime,
+        );
+        assert!(
+            webview
+                .bind_controlled_event_loop(
+                    TEST_SCRIPT_EVENT_LOOP_ID,
+                    DocumentTimeSurface::CrossEventLoopNavigation,
+                )
+                .is_ok()
+        );
+        webview.fail_document_time(DocumentTimeSurface::AuxiliaryWebView);
+        assert_eq!(webview.controlled_event_loop_id(), None);
+        assert_eq!(webview.document_time_failure(), None);
     }
 }
 

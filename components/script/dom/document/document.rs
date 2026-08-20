@@ -14,7 +14,7 @@ use std::sync::{Arc as StdArc, LazyLock, Mutex};
 use std::time::Duration;
 
 use bitflags::bitflags;
-use chrono::Local;
+use chrono::{Local, TimeZone};
 use content_security_policy::sandboxing_directive::SandboxingFlagSet;
 use content_security_policy::{CspList, Policy as CspPolicy, PolicyDisposition};
 use cookie::Cookie;
@@ -78,6 +78,7 @@ use style::stylesheets::{Origin, OriginSet, Stylesheet};
 use style::stylist::Stylist;
 use stylo_atoms::Atom;
 use time::Duration as TimeDuration;
+use timers::{DocumentRenderingTime, DocumentTimeSurface};
 use url::{Host, Position};
 
 use crate::animations::Animations;
@@ -100,7 +101,6 @@ use crate::dom::bindings::codegen::Bindings::HTMLIFrameElementBinding::HTMLIFram
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::Navigator_Binding::NavigatorMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::NodeFilterBinding::NodeFilter;
-use crate::dom::bindings::codegen::Bindings::PerformanceBinding::PerformanceMethods;
 use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::PermissionName;
 use crate::dom::bindings::codegen::Bindings::SanitizerBinding::{
     SetHTMLOptions, SetHTMLUnsafeOptions,
@@ -147,7 +147,7 @@ use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::documentorshadowroot::{
     DocumentOrShadowRoot, ServoStylesheetInDocument, StylesheetSource,
 };
-use crate::dom::documenttimeline::DocumentTimeline;
+use crate::dom::documenttimeline::{DocumentTimeline, rendering_timestamp_from_elapsed};
 use crate::dom::documenttype::DocumentType;
 use crate::dom::domimplementation::DOMImplementation;
 use crate::dom::element::attributes::storage::AttrRef;
@@ -174,7 +174,9 @@ use crate::dom::html::htmlimageelement::HTMLImageElement;
 use crate::dom::html::htmlscriptelement::{HTMLScriptElement, ScriptResult};
 use crate::dom::html::htmltitleelement::HTMLTitleElement;
 use crate::dom::htmldetailselement::DetailsNameGroups;
-use crate::dom::intersectionobserver::IntersectionObserver;
+use crate::dom::intersectionobserver::{
+    IntersectionObserver, IntersectionObserverRenderingTime,
+};
 use crate::dom::iterators::ShadowIncluding;
 use crate::dom::keyboardevent::KeyboardEvent;
 use crate::dom::largestcontentfulpaint::LargestContentfulPaint;
@@ -188,7 +190,7 @@ use crate::dom::node::{Node, NodeDamage, NodeFlags, NodeTraits};
 use crate::dom::nodeiterator::NodeIterator;
 use crate::dom::nodelist::NodeList;
 use crate::dom::pagetransitionevent::PageTransitionEvent;
-use crate::dom::performance::performanceentry::PerformanceEntry;
+use crate::dom::performance::performanceentry::{PerformanceEntry, PerformanceEntryTime};
 use crate::dom::performance::performancepainttiming::PerformancePaintTiming;
 use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::promise::Promise;
@@ -221,6 +223,34 @@ use crate::tasks::task_manager::TaskManager;
 use crate::tasks::task_source::TaskSourceName;
 use crate::timers::{OneshotTimerCallback, OneshotTimers};
 use crate::xpath::parse_expression;
+
+fn format_last_modified_from_unix_nanoseconds(unix_nanoseconds: i128) -> Option<String> {
+    let seconds = i64::try_from(unix_nanoseconds.div_euclid(1_000_000_000)).ok()?;
+    let nanoseconds = u32::try_from(unix_nanoseconds.rem_euclid(1_000_000_000)).ok()?;
+    Local
+        .timestamp_opt(seconds, nanoseconds)
+        .single()
+        .map(|date_time| date_time.format("%m/%d/%Y %H:%M:%S").to_string())
+}
+
+#[cfg(test)]
+mod controlled_last_modified_tests {
+    use super::format_last_modified_from_unix_nanoseconds;
+
+    #[test]
+    fn legacy_document_format_has_second_precision() {
+        assert_eq!(
+            format_last_modified_from_unix_nanoseconds(0),
+            format_last_modified_from_unix_nanoseconds(999_999_999)
+        );
+    }
+
+    #[test]
+    fn values_outside_chronos_domain_fail_closed() {
+        assert_eq!(format_last_modified_from_unix_nanoseconds(i128::MAX), None);
+        assert_eq!(format_last_modified_from_unix_nanoseconds(i128::MIN), None);
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum FireMouseEventType {
@@ -1846,17 +1876,26 @@ impl Document {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#run-the-animation-frame-callbacks>
-    pub(crate) fn run_the_animation_frame_callbacks(&self, cx: &mut CurrentRealm) {
+    pub(crate) fn run_the_animation_frame_callbacks(
+        &self,
+        cx: &mut CurrentRealm,
+        frame_time: DocumentRenderingTime,
+    ) {
         self.running_animation_callbacks.set(true);
-        let timing = self.global().performance(cx).Now();
+        let timing = self
+            .window()
+            .document_time_since_navigation(
+                frame_time.document_time(),
+                DocumentTimeSurface::AnimationFrame,
+            )
+            .map(rendering_timestamp_from_elapsed)
+            .expect("animation-frame time cannot precede the Window navigation origin");
 
-        let num_callbacks = self.animation_frame_list.borrow().len();
-        for _ in 0..num_callbacks {
-            let (_, maybe_callback) = self.animation_frame_list.borrow_mut().pop_front().unwrap();
-            if let Some(callback) = maybe_callback {
-                callback.call(cx, self, *timing);
-            }
-        }
+        run_animation_frame_callback_snapshot(
+            &self.animation_frame_list,
+            timing,
+            |callback, timestamp| callback.call(cx, self, *timestamp),
+        );
         self.running_animation_callbacks.set(false);
 
         if self.animation_frame_list.borrow().is_empty() {
@@ -3188,10 +3227,12 @@ impl Document {
 
         let mut phases = ReflowPhasesRun::empty();
         if self.has_pending_animated_image_update.get() {
+            // Clear the consumed reason before updating frames so a checked timer-scheduling
+            // failure can reassert it and remain visible to the next rendering observation.
+            self.has_pending_animated_image_update.set(false);
             self.image_animation_manager
                 .borrow()
                 .update_active_frames(&self.window, self.current_animation_timeline_value());
-            self.has_pending_animated_image_update.set(false);
             phases.insert(ReflowPhasesRun::UpdatedImageData);
         }
 
@@ -3429,7 +3470,7 @@ impl Document {
     pub(crate) fn update_intersection_observer_steps(
         &self,
         cx: &mut JSContext,
-        time: CrossProcessInstant,
+        time: IntersectionObserverRenderingTime,
     ) {
         if self.intersection_observers.borrow().is_empty() {
             return;
@@ -3449,7 +3490,7 @@ impl Document {
         &self,
         cx: &mut JSContext,
         intersection_observer: &IntersectionObserver,
-        time: CrossProcessInstant,
+        time: IntersectionObserverRenderingTime,
     ) {
         // Step 1
         // > Let rootBounds be observer’s root intersection rectangle.
@@ -3526,7 +3567,7 @@ impl Document {
                     cx,
                     self.window.as_global_scope(),
                     metric_type.clone(),
-                    metric_value,
+                    PerformanceEntryTime::Host(metric_value),
                 );
                 metrics.set_performance_paint_metric(metric_value, first_reflow, metric_type);
                 let entry = binding.upcast::<PerformanceEntry>();
@@ -3536,7 +3577,7 @@ impl Document {
                 let binding = LargestContentfulPaint::new(
                     cx,
                     self.window.as_global_scope(),
-                    metric_value,
+                    PerformanceEntryTime::Host(metric_value),
                     area,
                     url,
                     self.lcp_candidates.borrow_mut().remove(&id).as_deref(),
@@ -4812,10 +4853,14 @@ impl Document {
     }
 
     /// An implementation of <https://drafts.csswg.org/web-animations-1/#update-animations-and-send-events>.
-    pub(crate) fn update_animations_and_send_events(&self, cx: &mut CurrentRealm) {
+    pub(crate) fn update_animations_and_send_events(
+        &self,
+        cx: &mut CurrentRealm,
+        frame_time: DocumentRenderingTime,
+    ) {
         // Only update the time if it isn't being managed by a test.
         if !self.layout_animations_test_enabled {
-            self.timeline.update(self.window());
+            self.timeline.update(self.window(), frame_time);
         }
 
         // > 1. Update the current time of all timelines associated with doc passing now
@@ -5148,6 +5193,99 @@ impl Document {
     pub(crate) fn set_theme(&self, new_theme: Option<Theme>) {
         self.theme.set(new_theme);
         self.window.refresh_theme();
+    }
+}
+
+fn run_animation_frame_callback_snapshot<T, Timestamp: Copy>(
+    callbacks: &DomRefCell<VecDeque<(u32, Option<T>)>>,
+    timestamp: Timestamp,
+    mut invoke: impl FnMut(T, Timestamp),
+) {
+    // Snapshot only the list length. Keeping the remaining entries in the live list lets an
+    // earlier callback cancel a later callback in this same snapshot, while callbacks appended by
+    // a callback remain beyond this bound for the next rendering opportunity.
+    let callback_count = callbacks.borrow().len();
+    for _ in 0..callback_count {
+        let (_, callback) = callbacks
+            .borrow_mut()
+            .pop_front()
+            .expect("the snapshotted animation-frame callback must remain in the list");
+        if let Some(callback) = callback {
+            invoke(callback, timestamp);
+        }
+    }
+}
+
+#[cfg(test)]
+mod animation_frame_callback_tests {
+    use style::thread_state::{self, ThreadState};
+
+    use super::*;
+
+    struct ScriptThreadStateGuard {
+        entered_script: bool,
+    }
+
+    impl ScriptThreadStateGuard {
+        fn enter() -> Self {
+            let entered_script = !thread_state::get().is_script();
+            if entered_script {
+                thread_state::enter(ThreadState::SCRIPT);
+            }
+            Self { entered_script }
+        }
+    }
+
+    impl Drop for ScriptThreadStateGuard {
+        fn drop(&mut self) {
+            if self.entered_script {
+                thread_state::exit(ThreadState::SCRIPT);
+            }
+        }
+    }
+
+    #[test]
+    fn same_deadline_callbacks_share_timestamp_and_nested_raf_waits_for_next_snapshot() {
+        let _script_thread_state = ScriptThreadStateGuard::enter();
+        let callbacks = DomRefCell::new(VecDeque::from([(1, Some(1)), (2, Some(2))]));
+        let observed = RefCell::new(Vec::new());
+
+        run_animation_frame_callback_snapshot(&callbacks, 50_u64, |callback, timestamp| {
+            observed.borrow_mut().push((callback, timestamp));
+            if callback == 1 {
+                callbacks.borrow_mut().push_back((3, Some(3)));
+            }
+        });
+
+        assert_eq!(*observed.borrow(), vec![(1, 50), (2, 50)]);
+        assert_eq!(*callbacks.borrow(), VecDeque::from([(3, Some(3))]));
+
+        run_animation_frame_callback_snapshot(&callbacks, 70_u64, |callback, timestamp| {
+            observed.borrow_mut().push((callback, timestamp));
+        });
+        assert_eq!(*observed.borrow(), vec![(1, 50), (2, 50), (3, 70)]);
+    }
+
+    #[test]
+    fn callback_can_cancel_a_later_entry_in_the_current_snapshot() {
+        let _script_thread_state = ScriptThreadStateGuard::enter();
+        let callbacks = DomRefCell::new(VecDeque::from([(1, Some(1)), (2, Some(2))]));
+        let observed = RefCell::new(Vec::new());
+
+        run_animation_frame_callback_snapshot(&callbacks, 50_u64, |callback, timestamp| {
+            observed.borrow_mut().push((callback, timestamp));
+            if callback == 1 {
+                callbacks
+                    .borrow_mut()
+                    .iter_mut()
+                    .find(|(identifier, _)| *identifier == 2)
+                    .expect("the second callback is still in the current snapshot")
+                    .1 = None;
+            }
+        });
+
+        assert_eq!(*observed.borrow(), vec![(1, 50)]);
+        assert!(callbacks.borrow().is_empty());
     }
 }
 
@@ -5882,6 +6020,24 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
     /// <https://html.spec.whatwg.org/multipage/#dom-document-lastmodified>
     fn LastModified(&self) -> DOMString {
         DOMString::from(self.last_modified.as_ref().cloned().unwrap_or_else(|| {
+            let clock = self.global().document_clock();
+            if clock.is_controlled() {
+                if clock.terminal_error().is_none() {
+                    if let Ok(unix_time) = clock.unix_time_ns() {
+                        if let Some(last_modified) =
+                            format_last_modified_from_unix_nanoseconds(unix_time.as_nanos())
+                        {
+                            return last_modified;
+                        }
+                    }
+                }
+
+                // The DOMString return type has no error value. Suppress host wall time and leave
+                // sticky fail-closed evidence for the control plane if conversion is impossible.
+                let _ = clock.require_surface(DocumentTimeSurface::HostTimestamp);
+                return String::new();
+            }
+
             // Ideally this would get the local time using `time`, but `time` always fails to get the local
             // timezone on Unix unless the application is single threaded unless the library is explicitly
             // set to "unsound" mode. Maybe that's fine, but it needs more investigation. see

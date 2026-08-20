@@ -29,6 +29,7 @@ use js::glue::{
     RunScriptEnvironmentPreparerClosure, SetBuildId, StreamConsumerConsumeChunk,
     StreamConsumerNoteResponseURLs, StreamConsumerStreamEnd, StreamConsumerStreamError,
 };
+use js::jsapi::JS::{RTPCallerTypeToken, SetReduceMicrosecondTimePrecisionCallback};
 use js::jsapi::{
     AsmJSOption, BuildIdCharVector, CompilationType, Dispatchable_MaybeShuttingDown, GCDescription,
     GCOptions, GCProgress, GCReason, GetPromiseUserInputEventHandlingState, Handle as RawHandle,
@@ -67,6 +68,7 @@ use script_bindings::settings_stack::run_a_script;
 use servo_config::opts::{self, DiagnosticsLoggingOption};
 use servo_config::pref;
 use style::thread_state::{self, ThreadState};
+use timers::{DocumentClock, DocumentTimeSurface};
 
 use crate::dom::bindings::codegen::Bindings::PromiseBinding::PromiseJobCallback;
 use crate::dom::bindings::codegen::Bindings::ResponseBinding::Response_Binding::ResponseMethods;
@@ -87,6 +89,7 @@ use crate::dom::bindings::utils::DOM_CALLBACKS;
 use crate::dom::bindings::{principals, settings_stack};
 use crate::dom::console::stringify_handle_value;
 use crate::dom::csp::CspReporting;
+use crate::dom::debugger::debuggerglobalscope::DebuggerGlobalScope;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
@@ -94,6 +97,10 @@ use crate::dom::promise::Promise;
 use crate::dom::promiserejectionevent::PromiseRejectionEvent;
 use crate::dom::response::Response;
 use crate::dom::trustedtypes::trustedscript::TrustedScript;
+use crate::dom::window::dissimilaroriginwindow::DissimilarOriginWindow;
+use crate::dom::window::Window;
+use crate::dom::workers::workerglobalscope::WorkerGlobalScope;
+use crate::dom::worklet::workletglobalscope::WorkletGlobalScope;
 use crate::messaging::{CommonScriptMsg, ScriptEventLoopSender};
 use crate::microtask::{EnqueuedPromiseCallback, MicrotaskQueue};
 use crate::modules::script_module::EnsureModuleHooksInitialized;
@@ -116,6 +123,136 @@ static SECURITY_CALLBACKS: JSSecurityCallbacks = JSSecurityCallbacks {
     codeForEvalGets: Some(code_for_eval_gets),
     subsumes: Some(principals::subsumes),
 };
+
+fn window_date_time_microseconds(host_time: f64, clock: &DocumentClock) -> f64 {
+    if !clock.is_controlled() {
+        return host_time;
+    }
+
+    clock
+        .javascript_date_time_microseconds()
+        .unwrap_or(f64::NAN)
+}
+
+fn worker_date_time_microseconds(host_time: f64, clock: &DocumentClock) -> f64 {
+    if !clock.is_controlled() {
+        return host_time;
+    }
+
+    // Worker time is not controlled by this slice. Latch the unsupported surface before refusing
+    // to expose either the worker's controlled value or SpiderMonkey's host value.
+    let _ = clock.require_surface(DocumentTimeSurface::Worker);
+    f64::NAN
+}
+
+fn debugger_date_time_microseconds(host_time: f64, clock: &DocumentClock) -> f64 {
+    if !clock.is_controlled() {
+        return host_time;
+    }
+
+    // Debugger timestamps are still host-derived. A controlled ScriptThread must leave typed
+    // evidence and suppress that value until this surface is routed through the document clock.
+    let _ = clock.require_surface(DocumentTimeSurface::HostTimestamp);
+    f64::NAN
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DateRealmTimeSource {
+    ScriptThreadDocumentClock,
+    WorkerClock,
+    AllowlistedWorkletHost,
+    AllowlistedWorkerThreadDebuggerHost,
+    ScriptThreadDebuggerClock,
+    FailClosed,
+}
+
+fn classify_date_realm(
+    is_window: bool,
+    is_dissimilar_origin_window: bool,
+    is_worker: bool,
+    is_worklet: bool,
+    is_debugger: bool,
+    is_worker_thread: bool,
+) -> DateRealmTimeSource {
+    if is_window || is_dissimilar_origin_window {
+        DateRealmTimeSource::ScriptThreadDocumentClock
+    } else if is_worker {
+        DateRealmTimeSource::WorkerClock
+    } else if is_worklet {
+        DateRealmTimeSource::AllowlistedWorkletHost
+    } else if is_debugger && is_worker_thread {
+        DateRealmTimeSource::AllowlistedWorkerThreadDebuggerHost
+    } else if is_debugger {
+        DateRealmTimeSource::ScriptThreadDebuggerClock
+    } else {
+        DateRealmTimeSource::FailClosed
+    }
+}
+
+/// SpiderMonkey obtains JavaScript `Date` wall time before invoking this process-wide hook. A
+/// positively identified realtime realm keeps that exact host value; a controlled Window uses the
+/// document clock shared with its scheduler. Any realm or global that cannot be classified fails
+/// closed so a partially wired controlled Window can never observe host time.
+#[expect(unsafe_code)]
+unsafe extern "C" fn reduce_microsecond_time_precision(
+    host_time: f64,
+    _caller_type: RTPCallerTypeToken,
+    cx: *mut RawJSContext,
+) -> f64 {
+    let mut reduced_time = f64::NAN;
+    wrap_panic(&mut || {
+        let Some(cx) = NonNull::new(cx) else {
+            return;
+        };
+        // SAFETY: SpiderMonkey invokes this callback with its currently-entered JSContext.
+        let mut cx = unsafe { JSContext::from_ptr(cx) };
+        let mut realm = CurrentRealm::assert(&mut cx);
+        let global_object = realm.global().get();
+        if global_object.is_null() {
+            return;
+        }
+        // SAFETY: the current realm roots this non-null global object for the callback's duration.
+        if unsafe { get_dom_class(global_object) }.is_err() {
+            return;
+        }
+
+        let global = GlobalScope::from_current_realm(&mut realm);
+        reduced_time = match classify_date_realm(
+            global.is::<Window>(),
+            global.is::<DissimilarOriginWindow>(),
+            global.is::<WorkerGlobalScope>(),
+            global.is::<WorkletGlobalScope>(),
+            global.is::<DebuggerGlobalScope>(),
+            thread_state::get().is_worker(),
+        ) {
+            DateRealmTimeSource::ScriptThreadDocumentClock => {
+                window_date_time_microseconds(host_time, &global.document_clock())
+            },
+            DateRealmTimeSource::WorkerClock => {
+                worker_date_time_microseconds(host_time, &global.document_clock())
+            },
+            DateRealmTimeSource::AllowlistedWorkletHost => {
+                // Worklets run on separate threads and do not carry their creator's document clock
+                // yet. Keep existing realtime behavior for this explicitly identified realm. A
+                // controlled-mode constructor gate must reject Worklets before creating the realm.
+                // TODO(stasis): pass clock mode into WorkletGlobalScope and remove this allowlist.
+                host_time
+            },
+            DateRealmTimeSource::AllowlistedWorkerThreadDebuggerHost => {
+                // Worker debugger globals have no ScriptThread document clock. Their owning worker
+                // is explicitly realtime in this slice; controlled worker creation is gated.
+                host_time
+            },
+            DateRealmTimeSource::ScriptThreadDebuggerClock => {
+                debugger_date_time_microseconds(host_time, &global.document_clock())
+            },
+            // Any future or malformed DOM global is not positively identified as realtime.
+            // Returning the initialized NaN avoids leaking host time.
+            DateRealmTimeSource::FailClosed => return,
+        };
+    });
+    reduced_time
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, JSTraceable, MallocSizeOf, PartialEq)]
 pub(crate) enum ScriptThreadEventCategory {
@@ -1085,19 +1222,31 @@ impl DerefMut for Runtime {
 pub struct JSEngineSetup(JSEngine);
 
 impl Default for JSEngineSetup {
+    #[expect(unsafe_code)]
     fn default() -> Self {
         let engine = JSEngine::init().unwrap();
+        // Every Servo-created realm receives the matching caller token in create_global_object.
+        unsafe {
+            SetReduceMicrosecondTimePrecisionCallback(Some(reduce_microsecond_time_precision));
+        }
         *JS_ENGINE.lock().unwrap() = Some(engine.handle());
         Self(engine)
     }
 }
 
 impl Drop for JSEngineSetup {
+    #[expect(unsafe_code)]
     fn drop(&mut self) {
         *JS_ENGINE.lock().unwrap() = None;
 
         while !self.0.can_shutdown() {
             thread::sleep(Duration::from_millis(50));
+        }
+
+        // Keep the process-wide hook installed until every live engine handle is gone. Clearing it
+        // earlier would let a still-running controlled realm fall back to SpiderMonkey host time.
+        unsafe {
+            SetReduceMicrosecondTimePrecisionCallback(None);
         }
     }
 }
@@ -1543,4 +1692,161 @@ impl IntroductionType {
     /// <https://firefox-source-docs.mozilla.org/devtools-user/debugger-api/debugger.source/index.html>
     pub const WORKER: &CStr = c"Worker";
     pub const WORKER_STR: &str = "Worker";
+}
+
+#[cfg(test)]
+mod tests {
+    use timers::{DocumentClockConfiguration, DocumentTime, DocumentUnixTime};
+
+    use super::*;
+
+    #[test]
+    fn date_realm_classification_has_no_wildcard_host_fallback() {
+        assert_eq!(
+            classify_date_realm(true, false, false, false, false, false),
+            DateRealmTimeSource::ScriptThreadDocumentClock
+        );
+        assert_eq!(
+            classify_date_realm(false, true, false, false, false, false),
+            DateRealmTimeSource::ScriptThreadDocumentClock
+        );
+        assert_eq!(
+            classify_date_realm(false, false, true, false, false, false),
+            DateRealmTimeSource::WorkerClock
+        );
+        assert_eq!(
+            classify_date_realm(false, false, false, true, false, false),
+            DateRealmTimeSource::AllowlistedWorkletHost
+        );
+        assert_eq!(
+            classify_date_realm(false, false, false, false, true, false),
+            DateRealmTimeSource::ScriptThreadDebuggerClock
+        );
+        assert_eq!(
+            classify_date_realm(false, false, false, false, true, true),
+            DateRealmTimeSource::AllowlistedWorkerThreadDebuggerHost
+        );
+        assert_eq!(
+            classify_date_realm(false, false, false, false, false, true),
+            DateRealmTimeSource::FailClosed
+        );
+    }
+
+    #[test]
+    fn worker_date_preserves_only_an_explicitly_realtime_clock() {
+        let host_time = 1_725_555_123_456_789.0;
+        assert_eq!(
+            worker_date_time_microseconds(host_time, &DocumentClock::default()),
+            host_time
+        );
+
+        let controlled = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::from_nanos(0),
+        });
+        assert!(worker_date_time_microseconds(host_time, &controlled).is_nan());
+        assert_eq!(
+            controlled.unsupported_surface(),
+            Some(DocumentTimeSurface::Worker)
+        );
+    }
+
+    #[test]
+    fn debugger_date_preserves_realtime_and_suppresses_controlled_host_time() {
+        let host_time = 1_725_555_123_456_789.0;
+        assert_eq!(
+            debugger_date_time_microseconds(host_time, &DocumentClock::default()),
+            host_time
+        );
+
+        let controlled = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::from_nanos(0),
+        });
+        assert!(debugger_date_time_microseconds(host_time, &controlled).is_nan());
+        assert_eq!(
+            controlled.unsupported_surface(),
+            Some(DocumentTimeSurface::HostTimestamp)
+        );
+    }
+
+    #[test]
+    fn controlled_window_date_uses_the_shared_wall_clock() {
+        let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 2_000,
+            unix_time_origin_ns: DocumentUnixTime::from_nanos(5_000),
+        });
+
+        assert_eq!(window_date_time_microseconds(99.0, &clock), 7.0);
+        clock.advance_to(DocumentTime::from_nanos(3_000)).unwrap();
+        assert_eq!(window_date_time_microseconds(1.0, &clock), 8.0);
+        assert_eq!(window_date_time_microseconds(2.0, &clock), 8.0);
+    }
+
+    #[test]
+    fn controlled_window_date_preserves_negative_fractional_unix_time() {
+        let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::from_nanos(-1),
+        });
+
+        let observed = window_date_time_microseconds(123.0, &clock);
+        assert!((observed - -0.001).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn controlled_window_date_fails_closed_after_clock_terminal() {
+        let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::from_nanos(i128::MAX),
+        });
+
+        assert_eq!(
+            clock.advance_to(DocumentTime::from_nanos(1)),
+            Err(timers::DocumentClockError::Overflow)
+        );
+        assert!(window_date_time_microseconds(456.0, &clock).is_nan());
+        assert_eq!(clock.try_now(), Ok(DocumentTime::ZERO));
+    }
+
+    #[test]
+    fn controlled_window_date_returns_spec_nan_outside_time_clip() {
+        const TIME_CLIP_LIMIT_NS: i128 = 8_640_000_000_000_000_000_000;
+        let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 1,
+            unix_time_origin_ns: DocumentUnixTime::from_nanos(TIME_CLIP_LIMIT_NS),
+        });
+
+        assert!(window_date_time_microseconds(-123.0, &clock).is_nan());
+        assert_eq!(clock.terminal_error(), None);
+    }
+
+    #[test]
+    fn controlled_window_date_latches_unrepresentable_in_range_millisecond() {
+        const ADVERSARIAL_EPOCH_MS: i128 = 8_639_999_999_999_979;
+
+        for epoch_ms in [ADVERSARIAL_EPOCH_MS, -ADVERSARIAL_EPOCH_MS] {
+            let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
+                initial_time_ns: 0,
+                unix_time_origin_ns: DocumentUnixTime::from_nanos(epoch_ms * 1_000_000),
+            });
+
+            assert!(window_date_time_microseconds(789.0, &clock).is_nan());
+            assert!(matches!(
+                clock.terminal_error(),
+                Some(timers::DocumentClockError::JavaScriptDatePrecisionLoss {
+                    expected_milliseconds,
+                    ..
+                }) if expected_milliseconds == epoch_ms
+            ));
+            assert_eq!(clock.try_now(), Ok(DocumentTime::ZERO));
+        }
+    }
+
+    #[test]
+    fn realtime_window_date_preserves_spidermonkey_host_time_exactly() {
+        let clock = DocumentClock::default();
+        let host_time = 1_725_555_123_456_789.0;
+        assert_eq!(window_date_time_microseconds(host_time, &clock), host_time);
+    }
 }

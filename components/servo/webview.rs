@@ -11,10 +11,12 @@ use accesskit::{
 };
 use dpi::PhysicalSize;
 use embedder_traits::{
-    ContextMenuAction, ContextMenuItem, Cursor, EmbedderControlId, EmbedderControlRequest, Image,
-    InputEvent, InputEventAndId, InputEventId, JSValue, JavaScriptEvaluationError, LoadStatus,
+    ContextMenuAction, ContextMenuItem, Cursor, DocumentClockConfiguration, DocumentClockError,
+    DocumentTimeSurface, EmbedderControlId, EmbedderControlRequest, Image, InputEvent,
+    InputEventAndId, InputEventId, JSValue, JavaScriptEvaluationError, LoadStatus,
     MediaSessionActionType, NewWebViewDetails, ScreenGeometry, ScreenshotCaptureError, Scroll,
     Theme, TraversalId, UrlRequest, ViewportDetails, WebViewPoint, WebViewRect,
+    validate_document_clock_configuration,
 };
 use euclid::{Scale, Size2D};
 use image::RgbaImage;
@@ -116,6 +118,7 @@ pub(crate) struct WebViewInner {
 
     rendering_context: Rc<dyn RenderingContext>,
     user_content_manager: Option<Rc<UserContentManager>>,
+    document_clock: ValidatedDocumentClockConfiguration,
     hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
     load_status: LoadStatus,
     status_text: Option<String>,
@@ -130,6 +133,28 @@ pub(crate) struct WebViewInner {
 
     /// The current index in the back / forward list.
     back_forward_list_index: usize,
+}
+
+/// A document-clock configuration that has crossed the checked embedder boundary.
+///
+/// Keeping this wrapper in the WebView owner prevents an unchecked configuration from reaching
+/// `NewWebViewDetails`, including through the auxiliary-WebView inheritance path.
+#[derive(Clone, Copy)]
+pub(crate) struct ValidatedDocumentClockConfiguration(DocumentClockConfiguration);
+
+impl ValidatedDocumentClockConfiguration {
+    const REALTIME: Self = Self(DocumentClockConfiguration::Realtime);
+
+    fn try_new(
+        configuration: DocumentClockConfiguration,
+    ) -> Result<Self, DocumentClockError> {
+        validate_document_clock_configuration(configuration)?;
+        Ok(Self(configuration))
+    }
+
+    const fn get(self) -> DocumentClockConfiguration {
+        self.0
+    }
 }
 
 impl Drop for WebViewInner {
@@ -175,6 +200,7 @@ impl WebView {
             back_forward_list: Default::default(),
             back_forward_list_index: 0,
             user_content_manager: builder.user_content_manager.clone(),
+            document_clock: builder.document_clock,
         })));
 
         let viewport_details = webview.viewport_details();
@@ -199,6 +225,7 @@ impl WebView {
             webview_id: webview.id(),
             viewport_details,
             user_content_manager_id,
+            document_clock: builder.document_clock.get(),
         };
 
         // There are two possibilities here. Either the WebView is a new toplevel
@@ -243,6 +270,7 @@ impl WebView {
         let request = CreateNewWebViewRequest {
             servo: self.inner().servo.clone(),
             responder: IpcResponder::new(response_sender, None),
+            document_clock: self.inner().document_clock,
         };
         self.delegate().request_create_new(self.clone(), request);
     }
@@ -1026,6 +1054,8 @@ pub struct WebViewBuilder {
     hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
     create_new_webview_responder: Option<IpcResponder<Option<NewWebViewDetails>>>,
     user_content_manager: Option<Rc<UserContentManager>>,
+    document_clock: ValidatedDocumentClockConfiguration,
+    document_clock_is_inherited: bool,
     clipboard_delegate: Option<Rc<dyn ClipboardDelegate>>,
     #[cfg(feature = "gamepad")]
     gamepad_delegate: Option<Rc<dyn GamepadDelegate>>,
@@ -1045,6 +1075,8 @@ impl WebViewBuilder {
             delegate: Rc::new(DefaultWebViewDelegate),
             create_new_webview_responder: None,
             user_content_manager: None,
+            document_clock: ValidatedDocumentClockConfiguration::REALTIME,
+            document_clock_is_inherited: false,
             clipboard_delegate: None,
             #[cfg(feature = "gamepad")]
             gamepad_delegate: None,
@@ -1055,9 +1087,12 @@ impl WebViewBuilder {
         servo: &Servo,
         rendering_context: Rc<dyn RenderingContext>,
         responder: IpcResponder<Option<NewWebViewDetails>>,
+        document_clock: ValidatedDocumentClockConfiguration,
     ) -> Self {
         let mut builder = Self::new(servo, rendering_context);
         builder.create_new_webview_responder = Some(responder);
+        builder.document_clock = document_clock;
+        builder.document_clock_is_inherited = true;
         builder
     }
 
@@ -1089,6 +1124,35 @@ impl WebViewBuilder {
     pub fn user_content_manager(mut self, user_content_manager: Rc<UserContentManager>) -> Self {
         self.user_content_manager = Some(user_content_manager);
         self
+    }
+
+    /// Select the immutable document-observable clock before the initial navigation is sent.
+    ///
+    /// This is an internal automation seam. Ordinary WebViews retain the realtime default.
+    /// Auxiliary WebViews inherit their opener's clock and cannot override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a checked [`DocumentClockError`] before WebView creation when a controlled clock
+    /// configuration cannot represent its initial wall-time boundary, or when an auxiliary
+    /// WebView attempts to select a clock different from its opener's inherited clock.
+    #[doc(hidden)]
+    pub fn document_clock(
+        mut self,
+        document_clock: DocumentClockConfiguration,
+    ) -> Result<Self, DocumentClockError> {
+        if self.document_clock_is_inherited {
+            return if self.document_clock.get() == document_clock {
+                Ok(self)
+            } else {
+                Err(DocumentClockError::UnsupportedSurface(
+                    DocumentTimeSurface::AuxiliaryWebView,
+                ))
+            };
+        }
+        let document_clock = ValidatedDocumentClockConfiguration::try_new(document_clock)?;
+        self.document_clock = document_clock;
+        Ok(self)
     }
 
     /// Set the [`ClipboardDelegate`] for the `WebView` being created. The same

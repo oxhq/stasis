@@ -12,6 +12,7 @@ use script_bindings::inheritance::Castable;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 use script_bindings::root::DomRoot;
 use servo_base::cross_process_instant::CrossProcessInstant;
+use timers::{DocumentClock, DocumentTimeSurface};
 
 use crate::dom::bindings::codegen::Bindings::PerformanceTimingBinding::PerformanceTimingMethods;
 use crate::dom::bindings::reflector::DomGlobal;
@@ -68,12 +69,8 @@ impl PerformanceTiming {
         reflect_dom_object_with_cx(Box::new(PerformanceTiming::new_inherited()), global, cx)
     }
 
-    fn instant_to_millis(instant: Option<CrossProcessInstant>) -> u64 {
-        // From <https://www.w3.org/TR/navigation-timing/#terminology>:
-        // Throughout this work, time is measured in milliseconds since midnight of January 1, 1970 (UTC).
-        let instant = instant.unwrap_or(CrossProcessInstant::epoch());
-        let epoch = CrossProcessInstant::epoch();
-        (instant - epoch).whole_milliseconds() as u64
+    fn instant_to_millis(&self, instant: Option<CrossProcessInstant>) -> u64 {
+        observable_host_instant_to_millis(&self.global().document_clock(), instant)
     }
 
     fn navigation_timing(&self) -> Option<Rc<NavigationTiming>> {
@@ -83,10 +80,34 @@ impl PerformanceTiming {
     }
 }
 
+fn observable_host_instant_to_millis(
+    clock: &DocumentClock,
+    instant: Option<CrossProcessInstant>,
+) -> u64 {
+    let Some(instant) = instant else {
+        // An absent NavigationTiming event is the legacy API's specified zero sentinel. It is not
+        // evidence that a host timestamp entered a controlled realm, so do not latch a terminal.
+        return 0;
+    };
+    if clock
+        .require_surface(DocumentTimeSurface::HostTimestamp)
+        .is_err()
+    {
+        // Legacy PerformanceTiming has no provenance-aware return type. Suppress the host value;
+        // the sticky unsupported-surface latch makes the control plane reject publication.
+        return 0;
+    }
+
+        // From <https://www.w3.org/TR/navigation-timing/#terminology>:
+        // Throughout this work, time is measured in milliseconds since midnight of January 1, 1970 (UTC).
+    let epoch = CrossProcessInstant::epoch();
+    (instant - epoch).whole_milliseconds() as u64
+}
+
 impl PerformanceTimingMethods<crate::DomTypeHolder> for PerformanceTiming {
     /// <https://w3c.github.io/navigation-timing/#dom-performancetiming-navigationstart>
     fn NavigationStart(&self) -> u64 {
-        Self::instant_to_millis(
+        self.instant_to_millis(
             self.navigation_timing()
                 .and_then(|timing| timing.navigation_start.get()),
         )
@@ -94,7 +115,7 @@ impl PerformanceTimingMethods<crate::DomTypeHolder> for PerformanceTiming {
 
     /// <https://w3c.github.io/navigation-timing/#dom-performancetiming-unloadeventstart
     fn UnloadEventStart(&self) -> u64 {
-        Self::instant_to_millis(
+        self.instant_to_millis(
             self.navigation_timing()
                 .and_then(|timing| timing.unload_event_start.get()),
         )
@@ -102,7 +123,7 @@ impl PerformanceTimingMethods<crate::DomTypeHolder> for PerformanceTiming {
 
     /// <https://w3c.github.io/navigation-timing/#dom-performancetiming-unloadeventend>
     fn UnloadEventEnd(&self) -> u64 {
-        Self::instant_to_millis(
+        self.instant_to_millis(
             self.navigation_timing()
                 .and_then(|timing| timing.unload_event_end.get()),
         )
@@ -165,7 +186,7 @@ impl PerformanceTimingMethods<crate::DomTypeHolder> for PerformanceTiming {
 
     /// <https://w3c.github.io/navigation-timing/#dom-performancetiming-domloading>
     fn DomLoading(&self) -> u64 {
-        Self::instant_to_millis(
+        self.instant_to_millis(
             self.navigation_timing()
                 .and_then(|timing| timing.dom_loading.get()),
         )
@@ -173,7 +194,7 @@ impl PerformanceTimingMethods<crate::DomTypeHolder> for PerformanceTiming {
 
     /// <https://w3c.github.io/navigation-timing/#dom-performancetiming-dominteractive>
     fn DomInteractive(&self) -> u64 {
-        Self::instant_to_millis(
+        self.instant_to_millis(
             self.navigation_timing()
                 .and_then(|timing| timing.dom_interactive.get()),
         )
@@ -181,7 +202,7 @@ impl PerformanceTimingMethods<crate::DomTypeHolder> for PerformanceTiming {
 
     /// <https://w3c.github.io/navigation-timing/#dom-performancetiming-domcontentloadedeventstart>
     fn DomContentLoadedEventStart(&self) -> u64 {
-        Self::instant_to_millis(
+        self.instant_to_millis(
             self.navigation_timing()
                 .and_then(|timing| timing.dom_content_loaded_event_start.get()),
         )
@@ -189,7 +210,7 @@ impl PerformanceTimingMethods<crate::DomTypeHolder> for PerformanceTiming {
 
     /// <https://w3c.github.io/navigation-timing/#dom-performancetiming-domcontentloadedeventend>
     fn DomContentLoadedEventEnd(&self) -> u64 {
-        Self::instant_to_millis(
+        self.instant_to_millis(
             self.navigation_timing()
                 .and_then(|timing| timing.dom_content_loaded_event_end.get()),
         )
@@ -197,7 +218,7 @@ impl PerformanceTimingMethods<crate::DomTypeHolder> for PerformanceTiming {
 
     /// <https://w3c.github.io/navigation-timing/#dom-performancetiming-domcomplete>
     fn DomComplete(&self) -> u64 {
-        Self::instant_to_millis(
+        self.instant_to_millis(
             self.navigation_timing()
                 .and_then(|timing| timing.dom_complete.get()),
         )
@@ -205,7 +226,7 @@ impl PerformanceTimingMethods<crate::DomTypeHolder> for PerformanceTiming {
 
     /// <https://w3c.github.io/navigation-timing/#dom-performancetiming-loadeventstart>
     fn LoadEventStart(&self) -> u64 {
-        Self::instant_to_millis(
+        self.instant_to_millis(
             self.navigation_timing()
                 .and_then(|timing| timing.load_event_start.get()),
         )
@@ -213,9 +234,50 @@ impl PerformanceTimingMethods<crate::DomTypeHolder> for PerformanceTiming {
 
     /// <https://w3c.github.io/navigation-timing/#dom-performancetiming-loadeventend>
     fn LoadEventEnd(&self) -> u64 {
-        Self::instant_to_millis(
+        self.instant_to_millis(
             self.navigation_timing()
                 .and_then(|timing| timing.load_event_end.get()),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use timers::{DocumentClockConfiguration, DocumentUnixTime};
+
+    use super::*;
+
+    #[test]
+    fn controlled_legacy_timing_suppresses_and_latches_present_host_time() {
+        let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        });
+        let host_time = CrossProcessInstant::epoch() + time::Duration::milliseconds(37);
+
+        assert_eq!(observable_host_instant_to_millis(&clock, Some(host_time)), 0);
+        assert_eq!(
+            clock.unsupported_surface(),
+            Some(DocumentTimeSurface::HostTimestamp)
+        );
+    }
+
+    #[test]
+    fn controlled_legacy_timing_absence_is_zero_without_false_latch() {
+        let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        });
+        assert_eq!(observable_host_instant_to_millis(&clock, None), 0);
+        assert_eq!(clock.unsupported_surface(), None);
+    }
+
+    #[test]
+    fn realtime_legacy_timing_preserves_existing_host_value() {
+        let clock = DocumentClock::default();
+        let host_time = CrossProcessInstant::epoch() + time::Duration::milliseconds(37);
+        assert_eq!(observable_host_instant_to_millis(&clock, Some(host_time)), 37);
+        assert_eq!(observable_host_instant_to_millis(&clock, None), 0);
+        assert_eq!(clock.unsupported_surface(), None);
     }
 }

@@ -43,6 +43,7 @@ use script_traits::DocumentActivity;
 use servo_constellation_traits::BlobImpl;
 use servo_url::ServoUrl;
 use stylo_atoms::Atom;
+use timers::{DocumentClock, DocumentClockError, DocumentTime, DocumentTimeSurface};
 use url::Position;
 
 use crate::dom::bindings::buffer_source::{HeapBufferSource, get_buffer_source_copy};
@@ -97,6 +98,70 @@ enum XMLHttpRequestState {
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
 pub(crate) struct GenerationId(u32);
+
+/// The start of an XMLHttpRequest fetch, preserving the clock domain that produced it.
+///
+/// Normal Servo continues to use the host's exact monotonic `Instant`. Controlled execution uses
+/// the shared document clock and must never fall back to sampling host time.
+#[derive(Clone, Copy, Debug, MallocSizeOf)]
+enum XHRFetchTime {
+    Host(Instant),
+    Document(DocumentTime),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum XHRFetchTimeError {
+    Clock(DocumentClockError),
+    ClockDomainMismatch,
+}
+
+impl From<DocumentClockError> for XHRFetchTimeError {
+    fn from(error: DocumentClockError) -> Self {
+        Self::Clock(error)
+    }
+}
+
+impl XHRFetchTime {
+    fn current(clock: &DocumentClock) -> Result<Self, XHRFetchTimeError> {
+        Self::current_with_host(clock, Instant::now)
+    }
+
+    fn current_with_host(
+        clock: &DocumentClock,
+        host_now: impl FnOnce() -> Instant,
+    ) -> Result<Self, XHRFetchTimeError> {
+        if clock.is_controlled() {
+            if let Some(error) = clock.terminal_error() {
+                return Err(error.into());
+            }
+            return clock
+                .now_for_surface(DocumentTimeSurface::WindowTimers)
+                .map(Self::Document)
+                .map_err(Into::into);
+        }
+
+        Ok(Self::Host(host_now()))
+    }
+
+    fn elapsed(self, clock: &DocumentClock) -> Result<Duration, XHRFetchTimeError> {
+        self.elapsed_with_host(clock, Instant::now)
+    }
+
+    fn elapsed_with_host(
+        self,
+        clock: &DocumentClock,
+        host_now: impl FnOnce() -> Instant,
+    ) -> Result<Duration, XHRFetchTimeError> {
+        let observed = Self::current_with_host(clock, host_now)?;
+        match (self, observed) {
+            (Self::Host(start), Self::Host(end)) => Ok(end - start),
+            (Self::Document(start), Self::Document(end)) => {
+                end.checked_duration_since(start).map_err(Into::into)
+            },
+            _ => Err(XHRFetchTimeError::ClockDomainMismatch),
+        }
+    }
+}
 
 /// Closure of required data for each async network event that comprises the
 /// XHR's response.
@@ -232,7 +297,8 @@ pub(crate) struct XMLHttpRequest {
     send_flag: Cell<bool>,
 
     timeout_cancel: DomRefCell<Option<OneshotTimerHandle>>,
-    fetch_time: Cell<Instant>,
+    #[no_trace]
+    fetch_time: Cell<Option<XHRFetchTime>>,
     generation_id: Cell<GenerationId>,
     response_status: Cell<Result<(), ()>>,
     #[no_trace]
@@ -271,7 +337,7 @@ impl XMLHttpRequest {
             send_flag: Cell::new(false),
 
             timeout_cancel: DomRefCell::new(None),
-            fetch_time: Cell::new(Instant::now()),
+            fetch_time: Cell::new(None),
             generation_id: Cell::new(GenerationId(0)),
             response_status: Cell::new(Ok(())),
             referrer: global.get_referrer(),
@@ -522,7 +588,15 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                 self.cancel_timeout(no_gc);
                 return Ok(());
             }
-            let progress = Instant::now() - self.fetch_time.get();
+            // `send()` fires loadstart before the fetch boundary. A setter invoked by that event
+            // only updates the timeout value; the timer will be scheduled after fetching starts.
+            let Some(fetch_time) = self.fetch_time.get() else {
+                return Ok(());
+            };
+            let clock = self.global().document_clock();
+            let progress = fetch_time
+                .elapsed(&clock)
+                .map_err(Self::timeout_clock_error)?;
             if timeout > progress {
                 self.set_timeout(no_gc, timeout - progress);
             } else {
@@ -792,7 +866,21 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
             }
         }
 
-        self.fetch_time.set(Instant::now());
+        // Preserve Servo's existing fetch boundary in Real mode. In Controlled mode this captures
+        // the equivalent point in the shared document-clock domain without reading host time.
+        let clock = self.global().document_clock();
+        let fetch_time = match XHRFetchTime::current(&clock) {
+            Ok(fetch_time) => fetch_time,
+            Err(error) => {
+                let generation_id = self.generation_id.get();
+                self.process_partial_response(
+                    cx,
+                    XHRProgress::Errored(generation_id, Error::Abort(None)),
+                );
+                return Err(Self::timeout_clock_error(error));
+            },
+        };
+        self.fetch_time.set(Some(fetch_time));
 
         let rv = self.fetch(cx, request, &self.global());
         // Step 10
@@ -1258,6 +1346,7 @@ impl XMLHttpRequest {
 
     fn terminate_ongoing_fetch(&self, no_gc: &NoGC) {
         self.canceller.safe_borrow_mut(no_gc).abort();
+        self.fetch_time.set(None);
         let GenerationId(prev_id) = self.generation_id.get();
         self.generation_id.set(GenerationId(prev_id + 1));
         self.response_status.set(Ok(()));
@@ -1331,6 +1420,7 @@ impl XMLHttpRequest {
     fn set_timeout(&self, no_gc: &NoGC, duration: Duration) {
         // Sets up the object to timeout in a given number of milliseconds
         // This will cancel all previous timeouts
+        self.cancel_timeout(no_gc);
         let callback = OneshotTimerCallback::XhrTimeout(XHRTimeoutCallback {
             xhr: Trusted::new(self),
             generation_id: self.generation_id.get(),
@@ -1343,6 +1433,15 @@ impl XMLHttpRequest {
         if let Some(handle) = self.timeout_cancel.safe_borrow_mut(no_gc).take() {
             self.global().unschedule_callback(handle);
         }
+    }
+
+    /// Expose a clock-domain failure without falling back to host time. Callers with a JS context
+    /// run the normal request-error steps before returning this exception; attribute setters cannot
+    /// safely synthesize those events and therefore leave the request lifecycle intact.
+    fn timeout_clock_error(error: XHRFetchTimeError) -> Error {
+        Error::Abort(Some(format!(
+            "XMLHttpRequest timeout clock failed closed: {error:?}"
+        )))
     }
 
     /// <https://xhr.spec.whatwg.org/#text-response>
@@ -1793,4 +1892,87 @@ pub(crate) fn is_field_value(slice: &[u8]) -> bool {
             _ => false, // Previous character was a CR/LF but not part of the [CRLF] (SP|HT) rule
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use timers::{DocumentClockConfiguration, DocumentUnixTime};
+
+    use super::*;
+
+    fn controlled_clock(initial_time_ns: u128) -> DocumentClock {
+        DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        })
+    }
+
+    #[test]
+    fn xhr_timeout_elapsed_uses_virtual_document_time() {
+        let clock = controlled_clock(200_000_000);
+        let fetch_start = XHRFetchTime::current_with_host(&clock, || {
+            panic!("controlled XHR start sampled the host clock")
+        })
+        .unwrap();
+
+        clock
+            .advance_to(DocumentTime::from_nanos(1_000_000_000))
+            .unwrap();
+
+        assert_eq!(
+            fetch_start.elapsed_with_host(&clock, || {
+                panic!("controlled XHR elapsed time sampled the host clock")
+            }),
+            Ok(Duration::from_millis(800)),
+        );
+    }
+
+    #[test]
+    fn real_xhr_timeout_elapsed_preserves_exact_host_instants() {
+        let clock = DocumentClock::default();
+        let host_start = Instant::now();
+        let fetch_start = XHRFetchTime::current_with_host(&clock, || host_start).unwrap();
+        let host_end = host_start + Duration::from_nanos(12_345_678);
+
+        assert_eq!(
+            fetch_start.elapsed_with_host(&clock, || host_end),
+            Ok(Duration::from_nanos(12_345_678)),
+        );
+    }
+
+    #[test]
+    fn xhr_timeout_clock_domain_mismatch_does_not_fall_back_to_host_time() {
+        let clock = controlled_clock(1_000_000);
+        let fetch_start = XHRFetchTime::Host(Instant::now());
+
+        assert_eq!(
+            fetch_start.elapsed_with_host(&clock, || {
+                panic!("clock-domain mismatch sampled the host clock")
+            }),
+            Err(XHRFetchTimeError::ClockDomainMismatch),
+        );
+    }
+
+    #[test]
+    fn xhr_timeout_observes_a_sticky_document_clock_overflow() {
+        let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::from_nanos(i128::MAX),
+        });
+        let fetch_start = XHRFetchTime::current_with_host(&clock, || {
+            panic!("controlled XHR start sampled the host clock")
+        })
+        .unwrap();
+
+        assert_eq!(
+            clock.advance_to(DocumentTime::from_nanos(1)),
+            Err(DocumentClockError::Overflow),
+        );
+        assert_eq!(
+            fetch_start.elapsed_with_host(&clock, || {
+                panic!("overflowed controlled XHR sampled the host clock")
+            }),
+            Err(XHRFetchTimeError::Clock(DocumentClockError::Overflow)),
+        );
+    }
 }

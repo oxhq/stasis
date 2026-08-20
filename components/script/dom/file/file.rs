@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::rc::Rc;
-use std::time::SystemTime;
+use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use dom_struct::dom_struct;
 use embedder_traits::SelectedFile;
@@ -13,6 +13,7 @@ use script_bindings::reflector::reflect_weak_referenceable_dom_object_with_proto
 use servo_base::id::{FileId, FileIndex};
 use servo_constellation_traits::{BlobImpl, SerializableFile};
 use time::{Duration, OffsetDateTime};
+use timers::DocumentTimeSurface;
 
 use crate::dom::bindings::codegen::Bindings::FileBinding;
 use crate::dom::bindings::codegen::Bindings::FileBinding::FileMethods;
@@ -38,18 +39,76 @@ pub(crate) struct File {
     webkit_relative_path: USVString,
 }
 
+fn system_time_from_unix_nanoseconds(unix_nanoseconds: i128) -> Option<SystemTime> {
+    // `LastModified()` currently converts the stored value through `OffsetDateTime`; validate that
+    // representation here so a controlled default cannot create a later conversion panic.
+    OffsetDateTime::from_unix_timestamp_nanos(unix_nanoseconds).ok()?;
+    let magnitude = unix_nanoseconds.unsigned_abs();
+    let seconds = u64::try_from(magnitude / 1_000_000_000).ok()?;
+    let nanoseconds = u32::try_from(magnitude % 1_000_000_000).ok()?;
+    let duration = StdDuration::new(seconds, nanoseconds);
+
+    if unix_nanoseconds.is_negative() {
+        UNIX_EPOCH.checked_sub(duration)
+    } else {
+        UNIX_EPOCH.checked_add(duration)
+    }
+}
+
+#[cfg(test)]
+mod controlled_default_modified_tests {
+    use super::*;
+
+    #[test]
+    fn unix_nanoseconds_convert_on_both_sides_of_the_epoch() {
+        assert_eq!(
+            system_time_from_unix_nanoseconds(1_500_000_001),
+            Some(UNIX_EPOCH + StdDuration::new(1, 500_000_001))
+        );
+        assert_eq!(
+            system_time_from_unix_nanoseconds(-1_500_000_001),
+            Some(UNIX_EPOCH - StdDuration::new(1, 500_000_001))
+        );
+    }
+
+    #[test]
+    fn values_outside_the_file_storage_domain_fail_closed() {
+        assert_eq!(system_time_from_unix_nanoseconds(i128::MAX), None);
+        assert_eq!(system_time_from_unix_nanoseconds(i128::MIN), None);
+    }
+}
+
+fn default_modified(global: &GlobalScope) -> SystemTime {
+    let clock = global.document_clock();
+    if !clock.is_controlled() {
+        return SystemTime::now();
+    }
+
+    if clock.terminal_error().is_none() {
+        if let Ok(unix_time) = clock.unix_time_ns() {
+            if let Some(modified) = system_time_from_unix_nanoseconds(unix_time.as_nanos()) {
+                return modified;
+            }
+        }
+    }
+
+    // `File.lastModified` cannot represent an absent value. Publish a deterministic sentinel and
+    // leave sticky fail-closed evidence for the control plane rather than sampling host wall time.
+    let _ = clock.require_surface(DocumentTimeSurface::HostTimestamp);
+    UNIX_EPOCH
+}
+
 impl File {
     fn new_inherited(
         blob_impl: &BlobImpl,
         name: DOMString,
-        modified: Option<SystemTime>,
+        modified: SystemTime,
         webkit_relative_path: USVString,
     ) -> File {
         File {
             blob: Blob::new_inherited(blob_impl),
             name,
-            // https://w3c.github.io/FileAPI/#dfn-lastModified
-            modified: modified.unwrap_or_else(SystemTime::now),
+            modified,
             webkit_relative_path,
         }
     }
@@ -81,6 +140,8 @@ impl File {
         modified: Option<SystemTime>,
         webkit_relative_path: USVString,
     ) -> DomRoot<File> {
+        // https://w3c.github.io/FileAPI/#dfn-lastModified
+        let modified = modified.unwrap_or_else(|| default_modified(global));
         let file = reflect_weak_referenceable_dom_object_with_proto(
             cx,
             Rc::new(File::new_inherited(

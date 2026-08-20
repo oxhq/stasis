@@ -108,7 +108,10 @@ use style::shared_lock::SharedRwLock;
 use style::stylesheets::{AllowImportRules, DocumentStyleSheet, Origin, Stylesheet};
 use style::thread_state::{self, ThreadState};
 use stylo_atoms::Atom;
-use timers::{TimerEventRequest, TimerId, TimerScheduler};
+use timers::{
+    DocumentClock, DocumentClockError, DocumentTime, DocumentTimeSurface, TimerEventRequest, TimerId,
+    TimerControlError, TimerScheduler,
+};
 use url::Position;
 #[cfg(feature = "webgpu")]
 use webgpu_traits::{WebGPUDevice, WebGPUMsg};
@@ -137,6 +140,7 @@ use crate::dom::document::{
 use crate::dom::element::Element;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmliframeelement::{HTMLIFrameElement, IframeContext, ProcessingMode};
+use crate::dom::intersectionobserver::IntersectionObserverRenderingTime;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::servoparser::{ParserContext, ServoParser};
 use crate::dom::types::DebuggerGlobalScope;
@@ -273,7 +277,8 @@ pub struct ScriptThread {
     this: Weak<ScriptThread>,
 
     /// <https://html.spec.whatwg.org/multipage/#last-render-opportunity-time>
-    last_render_opportunity_time: Cell<Option<Instant>>,
+    #[no_trace]
+    last_render_opportunity_time: Cell<Option<DocumentTime>>,
 
     /// The documents for pipelines managed by this thread
     documents: DomRefCell<DocumentCollection>,
@@ -317,6 +322,14 @@ pub struct ScriptThread {
     /// in the [`ScriptThread`] event loop.
     #[no_trace]
     timer_scheduler: RefCell<TimerScheduler>,
+
+    /// The document-observable clock shared by this event loop's Window realms and timer queue.
+    #[no_trace]
+    document_clock: DocumentClock,
+
+    /// First checked timer-scheduler failure observed by this ScriptThread.
+    #[no_trace]
+    timer_control_terminal: Cell<Option<TimerControlError>>,
 
     /// A proxy to the `SystemFontService` to use for accessing system font lists.
     #[no_trace]
@@ -597,15 +610,32 @@ impl ScriptThread {
         })
     }
 
-    /// Schedule a [`TimerEventRequest`] on this [`ScriptThread`]'s [`TimerScheduler`].
-    pub(crate) fn schedule_timer(&self, request: TimerEventRequest) -> TimerId {
-        self.timer_scheduler.borrow_mut().schedule_timer(request)
+    /// Schedule a timer while preserving checked clock, deadline, and sequence failures.
+    pub(crate) fn try_schedule_timer(
+        &self,
+        request: TimerEventRequest,
+    ) -> Result<TimerId, TimerControlError> {
+        try_schedule_timer_recording_terminal(
+            &mut self.timer_scheduler.borrow_mut(),
+            &self.timer_control_terminal,
+            request,
+        )
+    }
+
+    /// Return the first checked timer-scheduler failure without clearing it.
+    pub(crate) fn timer_control_terminal_error(&self) -> Option<TimerControlError> {
+        self.timer_control_terminal.get()
     }
 
     /// Cancel a the [`TimerEventRequest`] for the given [`TimerId`] on this
     /// [`ScriptThread`]'s [`TimerScheduler`].
     pub(crate) fn cancel_timer(&self, timer_id: TimerId) {
         self.timer_scheduler.borrow_mut().cancel_timer(timer_id)
+    }
+
+    /// Return the document clock for the current ScriptThread.
+    pub(crate) fn current_document_clock() -> DocumentClock {
+        with_script_thread(|script_thread| script_thread.document_clock.clone())
     }
 
     // https://html.spec.whatwg.org/multipage/#await-a-stable-state
@@ -868,6 +898,9 @@ impl ScriptThread {
         background_hang_monitor_register: Box<dyn BackgroundHangMonitorRegister>,
     ) -> (Rc<ScriptThread>, js::context::JSContext) {
         let (self_sender, self_receiver) = unbounded();
+        // The clock mode is immutable and selected by the WebView before its initial navigation.
+        // Every Window and timer queue on this event loop shares this one clock domain.
+        let document_clock = DocumentClock::new(state.document_clock);
         let mut runtime =
             Runtime::new(Some(ScriptEventLoopSender::MainThread(self_sender.clone())));
 
@@ -981,7 +1014,11 @@ impl ScriptThread {
                     task_queue,
                     background_hang_monitor,
                     closing,
-                    timer_scheduler: Default::default(),
+                    timer_scheduler: RefCell::new(TimerScheduler::with_clock(
+                        document_clock.clone(),
+                    )),
+                    document_clock,
+                    timer_control_terminal: Default::default(),
                     microtask_queue,
                     js_runtime: Rc::new(runtime),
                     closed_pipelines: DomRefCell::new(FxHashSet::default()),
@@ -1087,12 +1124,23 @@ impl ScriptThread {
 
         debug!("Scheduling ScriptThread animation frame.");
         let trigger_script_thread_animation = self.needs_rendering_update.clone();
-        let timer_id = self.schedule_timer(TimerEventRequest {
-            callback: Box::new(move || {
-                trigger_script_thread_animation.store(true, Ordering::Relaxed);
-            }),
-            duration: delay,
-        });
+        let timer_id = match try_schedule_rendering_update_timer(
+            &mut self.timer_scheduler.borrow_mut(),
+            &self.timer_control_terminal,
+            trigger_script_thread_animation,
+            delay,
+        ) {
+            Ok(timer_id) => timer_id,
+            Err(error) => {
+                // In controlled mode the document clock retains the typed terminal for the
+                // control plane. Rendering work must not turn that terminal into a panic.
+                debug!(
+                    "Not scheduling ScriptThread animation frame: {error}; first timer terminal: {:?}",
+                    self.timer_control_terminal_error(),
+                );
+                return;
+            },
+        };
 
         *self.scheduled_update_the_rendering.borrow_mut() = Some(timer_id);
     }
@@ -1104,7 +1152,12 @@ impl ScriptThread {
     ///
     /// Returns true if any reflows produced a new display list.
     pub(crate) fn update_the_rendering(&self, cx: &mut js::context::JSContext) -> bool {
-        self.last_render_opportunity_time.set(Some(Instant::now()));
+        let frame_time = self
+            .document_clock
+            .rendering_time()
+            .expect("update the rendering requires a supported document clock");
+        self.last_render_opportunity_time
+            .set(Some(frame_time.document_time()));
         self.cancel_scheduled_update_the_rendering();
         self.needs_rendering_update.store(false, Ordering::Relaxed);
 
@@ -1211,7 +1264,7 @@ impl ScriptThread {
             // > 11. For each doc of docs, update animations and send events for doc, passing
             // > in relative high resolution time given frameTimestamp and doc's relevant
             // > global object as the timestamp [WEBANIMATIONS]
-            document.update_animations_and_send_events(cx);
+            document.update_animations_and_send_events(cx, frame_time);
 
             // TODO(#31866): Implement "run the fullscreen steps" from
             // https://fullscreen.spec.whatwg.org/multipage/#run-the-fullscreen-steps.
@@ -1222,7 +1275,7 @@ impl ScriptThread {
             // > 14. For each doc of docs, run the animation frame callbacks for doc, passing
             // > in the relative high resolution time given frameTimestamp and doc's
             // > relevant global object as the timestamp.
-            document.run_the_animation_frame_callbacks(cx);
+            document.run_the_animation_frame_callbacks(cx, frame_time);
 
             // Run the resize observer steps.
             let mut depth = Default::default();
@@ -1252,8 +1305,12 @@ impl ScriptThread {
             // > 19. For each doc of docs, run the update intersection observations steps for doc,
             // > passing in the relative high resolution time given now and
             // > doc's relevant global object as the timestamp. [INTERSECTIONOBSERVER]
-            // TODO(stevennovaryo): The time attribute should be relative to the time origin of the global object
-            document.update_intersection_observer_steps(cx, CrossProcessInstant::now());
+            let intersection_observer_time =
+                IntersectionObserverRenderingTime::for_rendering_update(
+                    &self.document_clock,
+                    frame_time,
+                );
+            document.update_intersection_observer_steps(cx, intersection_observer_time);
 
             // TODO: Mark paint timing from https://w3c.github.io/paint-timing.
 
@@ -1320,7 +1377,10 @@ impl ScriptThread {
         // If animations are running and a reflow in this event loop iteration
         // produced a display list, rely on the renderer to inform us of the
         // next animation tick / rendering opportunity.
-        if running_animations && built_any_display_lists {
+        if renderer_may_drive_rendering(&self.document_clock) &&
+            running_animations &&
+            built_any_display_lists
+        {
             return;
         }
 
@@ -1342,15 +1402,17 @@ impl ScriptThread {
             Duration::from_millis(20)
         };
 
-        let time_since_last_rendering_opportunity = self
-            .last_render_opportunity_time
-            .get()
-            .map(|last_render_opportunity_time| Instant::now() - last_render_opportunity_time)
-            .unwrap_or(Duration::MAX)
-            .min(animation_delay);
-        self.schedule_update_the_rendering_timer_if_necessary(
-            animation_delay - time_since_last_rendering_opportunity,
-        );
+        let now = self
+            .document_clock
+            .now_for_surface(DocumentTimeSurface::UpdateRendering)
+            .expect("rendering opportunity scheduling requires a supported document clock");
+        let remaining_delay = remaining_rendering_opportunity_delay(
+            self.last_render_opportunity_time.get(),
+            now,
+            animation_delay,
+        )
+        .expect("the document clock cannot move backwards between rendering opportunities");
+        self.schedule_update_the_rendering_timer_if_necessary(remaining_delay);
     }
 
     /// Fulfill the possibly-pending pending `document.fonts.ready` promise if
@@ -1926,7 +1988,9 @@ impl ScriptThread {
                 *self.receivers.webgpu_receiver.borrow_mut() = port.route_preserving_errors();
             },
             ScriptThreadMessage::TickAllAnimations(_webviews) => {
-                self.set_needs_rendering_update();
+                if renderer_may_drive_rendering(&self.document_clock) {
+                    self.set_needs_rendering_update();
+                }
             },
             ScriptThreadMessage::NoLongerWaitingOnAsychronousImageUpdates(pipeline_id) => {
                 if let Some(document) = self.documents.borrow().find_document(pipeline_id) {
@@ -2771,8 +2835,13 @@ impl ScriptThread {
                 self.devtools_state
                     .notify_pipeline_created(new_pipeline_info.new_pipeline_id);
 
-                // Kick off the fetch for the new resource.
-                self.pre_page_load(cx, InProgressLoad::new(new_pipeline_info));
+                // Capture the document-clock origin before navigation begins so redirects and
+                // response delivery cannot move the observable navigation origin.
+                let document_time_origin = self.document_clock.now();
+                self.pre_page_load(
+                    cx,
+                    InProgressLoad::new(new_pipeline_info, document_time_origin),
+                );
             },
         );
     }
@@ -3496,6 +3565,7 @@ impl ScriptThread {
                     // TODO(37417): Set correct top-level URL here.
                     final_url.clone(),
                     incomplete.navigation_start,
+                    incomplete.document_time_origin,
                     incomplete.viewport_details,
                 );
                 window
@@ -3529,6 +3599,7 @@ impl ScriptThread {
                     // is another nested iframe in a frame).
                     final_url.clone(),
                     incomplete.navigation_start,
+                    incomplete.document_time_origin,
                     #[cfg(feature = "webgl")]
                     self.webgl_chan.as_ref().map(|chan| chan.channel()),
                     #[cfg(feature = "webxr")]
@@ -4498,11 +4569,188 @@ impl ScriptThread {
     }
 }
 
+fn remaining_rendering_opportunity_delay(
+    last_rendering_time: Option<DocumentTime>,
+    now: DocumentTime,
+    target_delay: Duration,
+) -> Result<Duration, DocumentClockError> {
+    let elapsed = match last_rendering_time {
+        Some(last_rendering_time) => now.checked_duration_since(last_rendering_time)?,
+        None => Duration::MAX,
+    };
+    Ok(target_delay - elapsed.min(target_delay))
+}
+
+fn renderer_may_drive_rendering(clock: &DocumentClock) -> bool {
+    !clock.is_controlled()
+}
+
+fn record_first_timer_control_error(
+    terminal: &Cell<Option<TimerControlError>>,
+    error: TimerControlError,
+) {
+    if terminal.get().is_none() {
+        terminal.set(Some(error));
+    }
+}
+
+fn try_schedule_timer_recording_terminal(
+    timer_scheduler: &mut TimerScheduler,
+    terminal: &Cell<Option<TimerControlError>>,
+    request: TimerEventRequest,
+) -> Result<TimerId, TimerControlError> {
+    let result = timer_scheduler.try_schedule_timer(request);
+    if let Err(error) = result {
+        record_first_timer_control_error(terminal, error);
+    }
+    result
+}
+
+fn try_schedule_rendering_update_timer(
+    timer_scheduler: &mut TimerScheduler,
+    terminal: &Cell<Option<TimerControlError>>,
+    trigger_rendering_update: Arc<AtomicBool>,
+    delay: Duration,
+) -> Result<TimerId, TimerControlError> {
+    try_schedule_timer_recording_terminal(
+        timer_scheduler,
+        terminal,
+        TimerEventRequest {
+            callback: Box::new(move || {
+                trigger_rendering_update.store(true, Ordering::Relaxed);
+            }),
+            duration: delay,
+        },
+    )
+}
+
 impl Drop for ScriptThread {
     fn drop(&mut self) {
         SCRIPT_THREAD_ROOT.with(|root| {
             root.set(None);
         });
+    }
+}
+
+#[cfg(test)]
+mod document_clock_tests {
+    use std::cell::Cell;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use timers::{
+        DocumentClock, DocumentClockConfiguration, DocumentClockError, DocumentTime,
+        DocumentUnixTime, TimerControlError, TimerScheduler,
+    };
+
+    use super::{
+        record_first_timer_control_error, remaining_rendering_opportunity_delay,
+        renderer_may_drive_rendering,
+        try_schedule_rendering_update_timer,
+    };
+
+    #[test]
+    fn rendering_opportunity_delay_uses_checked_document_time() {
+        let target = Duration::from_millis(20);
+
+        assert_eq!(
+            remaining_rendering_opportunity_delay(
+                Some(DocumentTime::from_nanos(10_000_000)),
+                DocumentTime::from_nanos(15_000_000),
+                target,
+            ),
+            Ok(Duration::from_millis(15))
+        );
+        assert_eq!(
+            remaining_rendering_opportunity_delay(None, DocumentTime::ZERO, target),
+            Ok(Duration::ZERO)
+        );
+        assert_eq!(
+            remaining_rendering_opportunity_delay(
+                Some(DocumentTime::from_nanos(2)),
+                DocumentTime::from_nanos(1),
+                target,
+            ),
+            Err(DocumentClockError::TimeMovedBackwards {
+                current: DocumentTime::from_nanos(2),
+                requested: DocumentTime::from_nanos(1),
+            })
+        );
+    }
+
+    #[test]
+    fn renderer_ticks_cannot_activate_controlled_rendering() {
+        let controlled = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        });
+
+        assert!(!renderer_may_drive_rendering(&controlled));
+        assert!(renderer_may_drive_rendering(&DocumentClock::default()));
+    }
+
+    #[test]
+    fn rendering_timer_preserves_a_controlled_clock_terminal_without_panicking() {
+        const ADVERSARIAL_MILLISECONDS: i128 = 8_639_999_999_999_979;
+
+        let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::from_nanos(
+                ADVERSARIAL_MILLISECONDS * 1_000_000,
+            ),
+        });
+        let terminal = clock
+            .javascript_date_time_microseconds()
+            .expect_err("adversarial Date time must latch a precision terminal");
+        let trigger = Arc::new(AtomicBool::new(false));
+        let mut scheduler = TimerScheduler::with_clock(clock.clone());
+        let timer_terminal = Cell::new(None);
+
+        assert_eq!(
+            try_schedule_rendering_update_timer(
+                &mut scheduler,
+                &timer_terminal,
+                trigger.clone(),
+                Duration::ZERO,
+            ),
+            Err(TimerControlError::Clock(terminal))
+        );
+        assert!(!trigger.load(Ordering::Relaxed));
+        assert_eq!(clock.terminal_error(), Some(terminal));
+        assert_eq!(
+            timer_terminal.get(),
+            Some(TimerControlError::Clock(terminal))
+        );
+    }
+
+    #[test]
+    fn rendering_timer_still_runs_on_the_realtime_scheduler() {
+        let trigger = Arc::new(AtomicBool::new(false));
+        let mut scheduler = TimerScheduler::default();
+        let timer_terminal = Cell::new(None);
+
+        try_schedule_rendering_update_timer(
+            &mut scheduler,
+            &timer_terminal,
+            trigger.clone(),
+            Duration::ZERO,
+        )
+        .expect("realtime rendering timer should schedule");
+        scheduler.dispatch_completed_timers();
+
+        assert!(trigger.load(Ordering::Relaxed));
+        assert_eq!(timer_terminal.get(), None);
+    }
+
+    #[test]
+    fn timer_control_terminal_keeps_the_first_non_clock_failure() {
+        let terminal = Cell::new(None);
+
+        record_first_timer_control_error(&terminal, TimerControlError::DeadlineOverflow);
+        record_first_timer_control_error(&terminal, TimerControlError::SequenceExhausted);
+
+        assert_eq!(terminal.get(), Some(TimerControlError::DeadlineOverflow));
     }
 }
 
