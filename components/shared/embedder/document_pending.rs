@@ -912,6 +912,30 @@ fn validate_producer_snapshot_conservation(
             expected: expected_revision,
         });
     }
+    if let Some(DocumentProducerFenceError::ProducerAbandoned(lease_id)) = snapshot.terminal_error()
+    {
+        let observed_sequence = lease_id.sequence().get();
+        let resource = snapshot.for_kind(DocumentProducerKind::Resource);
+        if lease_id.fence_id() != snapshot.fence_id()
+            || lease_id.kind() != DocumentProducerKind::Resource
+            || observed_sequence == 0
+            || observed_sequence > snapshot.enqueued()
+            || resource.enqueued() == 0
+            || resource.completed() == 0
+        {
+            return Err(
+                PendingSnapshotInvariantError::ProducerAbandonedLeaseMismatch {
+                    expected_fence: snapshot.fence_id(),
+                    observed_fence: lease_id.fence_id(),
+                    observed_kind: lease_id.kind(),
+                    observed_sequence,
+                    enqueued: snapshot.enqueued(),
+                    resource_enqueued: resource.enqueued(),
+                    resource_completed: resource.completed(),
+                },
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2168,6 +2192,23 @@ pub enum PendingSnapshotInvariantError {
         /// Exact `enqueued + completed` revision implied by the watermarks.
         expected: u64,
     },
+    /// An abandoned producer terminal named an impossible resource lease.
+    ProducerAbandonedLeaseMismatch {
+        /// Producer fence which owns the terminal snapshot.
+        expected_fence: DocumentProducerFenceId,
+        /// Producer fence embedded in the abandoned lease identity.
+        observed_fence: DocumentProducerFenceId,
+        /// Producer class embedded in the abandoned lease identity.
+        observed_kind: DocumentProducerKind,
+        /// Global enqueue sequence embedded in the abandoned lease identity.
+        observed_sequence: u64,
+        /// Global enqueue watermark available on the terminal snapshot.
+        enqueued: u64,
+        /// Resource enqueue watermark available on the terminal snapshot.
+        resource_enqueued: u64,
+        /// Resource completion watermark available on the terminal snapshot.
+        resource_completed: u64,
+    },
     /// Main microtask evidence belonged to a different event loop than the target.
     MicrotaskEventLoopMismatch,
     /// Producer-fence evidence belonged to a different event loop than the target.
@@ -2313,7 +2354,8 @@ mod tests {
     };
     use timers::{
         DocumentClock, DocumentClockConfiguration, DocumentProducerFence, DocumentProducerKind,
-        DocumentTimeSurface, DocumentUnixTime, TimerEventRequest, TimerScheduler,
+        DocumentProducerLeaseId, DocumentTimeSurface, DocumentUnixTime, TimerEventRequest,
+        TimerScheduler,
     };
 
     use super::*;
@@ -2345,20 +2387,53 @@ mod tests {
         by_kind: [EncodedProducerWatermark; 5],
     }
 
+    #[derive(Serialize)]
+    struct EncodedProducerLeaseId {
+        fence_id: DocumentProducerFenceId,
+        sequence: u64,
+        kind: DocumentProducerKind,
+    }
+
     fn deserialize_forged_producer_snapshot(
         fence_id: DocumentProducerFenceId,
         revision: u64,
         global: EncodedProducerWatermark,
         by_kind: [EncodedProducerWatermark; 5],
     ) -> DocumentProducerSnapshot {
+        deserialize_forged_producer_snapshot_with_terminal(
+            fence_id, None, revision, global, by_kind,
+        )
+    }
+
+    fn deserialize_forged_producer_snapshot_with_terminal(
+        fence_id: DocumentProducerFenceId,
+        terminal_error: Option<DocumentProducerFenceError>,
+        revision: u64,
+        global: EncodedProducerWatermark,
+        by_kind: [EncodedProducerWatermark; 5],
+    ) -> DocumentProducerSnapshot {
         let bytes = postcard::to_stdvec(&EncodedProducerSnapshot {
             fence_id,
-            terminal_error: None,
+            terminal_error,
             revision,
             enqueued: global.enqueued,
             completed: global.completed,
             pending: global.pending,
             by_kind,
+        })
+        .unwrap();
+        postcard::from_bytes(&bytes).unwrap()
+    }
+
+    fn deserialize_forged_producer_lease_id(
+        fence_id: DocumentProducerFenceId,
+        sequence: u64,
+        kind: DocumentProducerKind,
+    ) -> DocumentProducerLeaseId {
+        let bytes = postcard::to_stdvec(&EncodedProducerLeaseId {
+            fence_id,
+            sequence,
+            kind,
         })
         .unwrap();
         postcard::from_bytes(&bytes).unwrap()
@@ -2912,6 +2987,128 @@ mod tests {
         assert_eq!(
             validate(forged),
             Err(PendingSnapshotInvariantError::ProducerConservationOverflow),
+        );
+    }
+
+    #[test]
+    fn abandoned_producer_terminal_requires_an_owned_resource_lease() {
+        let fence_id = DocumentProducerFence::default().id();
+        let zero = EncodedProducerWatermark {
+            enqueued: 0,
+            completed: 0,
+            pending: 0,
+        };
+        let completed_resource = EncodedProducerWatermark {
+            enqueued: 1,
+            completed: 1,
+            pending: 0,
+        };
+        let validate = |lease_id: DocumentProducerLeaseId, resource: EncodedProducerWatermark| {
+            let error = DocumentProducerFenceError::ProducerAbandoned(lease_id);
+            let task = if resource.enqueued == 0 {
+                completed_resource
+            } else {
+                zero
+            };
+            let producer_snapshot = deserialize_forged_producer_snapshot_with_terminal(
+                fence_id,
+                Some(error),
+                2,
+                completed_resource,
+                [task, resource, zero, zero, zero],
+            );
+            let mut snapshot = minimal_raw_snapshot();
+            snapshot.producers.fence_id = fence_id;
+            snapshot.producers.snapshot = producer_snapshot;
+            snapshot.terminals.producer =
+                Some(PendingProducerTerminalObservation { fence_id, error });
+            snapshot.validate()
+        };
+        let assert_mismatch = |lease_id: DocumentProducerLeaseId| {
+            assert_eq!(
+                validate(lease_id, completed_resource),
+                Err(
+                    PendingSnapshotInvariantError::ProducerAbandonedLeaseMismatch {
+                        expected_fence: fence_id,
+                        observed_fence: lease_id.fence_id(),
+                        observed_kind: lease_id.kind(),
+                        observed_sequence: lease_id.sequence().get(),
+                        enqueued: 1,
+                        resource_enqueued: 1,
+                        resource_completed: 1,
+                    }
+                ),
+            );
+        };
+
+        let valid_lease =
+            deserialize_forged_producer_lease_id(fence_id, 1, DocumentProducerKind::Resource);
+        validate(valid_lease, completed_resource).unwrap();
+        assert_mismatch(deserialize_forged_producer_lease_id(
+            DocumentProducerFence::default().id(),
+            1,
+            DocumentProducerKind::Resource,
+        ));
+        assert_mismatch(deserialize_forged_producer_lease_id(
+            fence_id,
+            1,
+            DocumentProducerKind::Task,
+        ));
+        assert_mismatch(deserialize_forged_producer_lease_id(
+            fence_id,
+            0,
+            DocumentProducerKind::Resource,
+        ));
+        assert_mismatch(deserialize_forged_producer_lease_id(
+            fence_id,
+            2,
+            DocumentProducerKind::Resource,
+        ));
+        assert_eq!(
+            validate(valid_lease, zero),
+            Err(
+                PendingSnapshotInvariantError::ProducerAbandonedLeaseMismatch {
+                    expected_fence: fence_id,
+                    observed_fence: fence_id,
+                    observed_kind: DocumentProducerKind::Resource,
+                    observed_sequence: 1,
+                    enqueued: 1,
+                    resource_enqueued: 0,
+                    resource_completed: 0,
+                }
+            ),
+        );
+
+        let incomplete_resource = EncodedProducerWatermark {
+            enqueued: 1,
+            completed: 0,
+            pending: 1,
+        };
+        let error = DocumentProducerFenceError::ProducerAbandoned(valid_lease);
+        let producer_snapshot = deserialize_forged_producer_snapshot_with_terminal(
+            fence_id,
+            Some(error),
+            1,
+            incomplete_resource,
+            [zero, incomplete_resource, zero, zero, zero],
+        );
+        let mut snapshot = minimal_raw_snapshot();
+        snapshot.producers.fence_id = fence_id;
+        snapshot.producers.snapshot = producer_snapshot;
+        snapshot.terminals.producer = Some(PendingProducerTerminalObservation { fence_id, error });
+        assert_eq!(
+            snapshot.validate(),
+            Err(
+                PendingSnapshotInvariantError::ProducerAbandonedLeaseMismatch {
+                    expected_fence: fence_id,
+                    observed_fence: fence_id,
+                    observed_kind: DocumentProducerKind::Resource,
+                    observed_sequence: 1,
+                    enqueued: 1,
+                    resource_enqueued: 1,
+                    resource_completed: 0,
+                }
+            ),
         );
     }
 

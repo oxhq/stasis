@@ -149,7 +149,9 @@ use crate::dom::workletglobalscope::WorkletGlobalScope;
 use crate::event_loop::script_thread::{ScriptThread, with_script_thread};
 use crate::fetch::fetch::{DeferredFetchRecordId, FetchGroup, QueuedDeferredFetchRecord};
 use crate::fetch::network_listener::{FetchResponseListener, NetworkListener};
-use crate::messaging::{CommonScriptMsg, ScriptEventLoopReceiver, ScriptEventLoopSender};
+use crate::messaging::{
+    CommonScriptMsg, ScriptEventLoopReceiver, ScriptEventLoopSendError, ScriptEventLoopSender,
+};
 use crate::microtask::MicrotaskRunnable;
 use crate::modules::import_map::ImportMap;
 use crate::modules::script_module::{
@@ -3435,21 +3437,46 @@ impl GlobalScope {
         context: Listener,
         task_source: SendableTaskSource,
     ) {
+        if let Err(error) = self.try_fetch(request_builder, context, task_source) {
+            // Existing fire-and-forget internal callers have no API result to complete. Producer
+            // admission failure is already sticky in Controlled mode; preserve their Real-mode
+            // call shape while refusing to start untracked network work.
+            error!("Refusing to start an unfenced document fetch: {error}");
+        }
+    }
+
+    /// Start a fetch only after its response producer has been admitted.
+    ///
+    /// Stateful callers such as `fetch()` and XMLHttpRequest use this checked boundary so they can
+    /// reject or unwind their own API state instead of waiting for a response that cannot arrive.
+    pub(crate) fn try_fetch<Listener: FetchResponseListener>(
+        &self,
+        request_builder: RequestBuilder,
+        context: Listener,
+        task_source: SendableTaskSource,
+    ) -> Result<(), ScriptEventLoopSendError> {
         let network_listener = NetworkListener::new(context, task_source);
-        self.fetch_with_network_listener(request_builder, network_listener);
+        self.fetch_with_network_listener(request_builder, network_listener)
     }
 
     pub(crate) fn fetch_with_network_listener<Listener: FetchResponseListener>(
         &self,
         request_builder: RequestBuilder,
         network_listener: NetworkListener<Listener>,
-    ) {
+    ) -> Result<(), ScriptEventLoopSendError> {
+        // Use the same event-loop sender that the NetworkListener will use for every response
+        // task. In controlled Window mode this acquires one Resource producer before network work
+        // starts, and the EOF callback cannot release it until its checked terminal Task enqueue
+        // has returned. Realtime and worker senders preserve the raw callback path.
+        let event_loop_sender = network_listener.task_source.sender.clone();
+        let callback = event_loop_sender.fence_fetch_until_eof(network_listener.into_callback())?;
         fetch_async(
             &self.core_resource_thread(),
             request_builder,
             None,
-            network_listener.into_callback(),
+            callback,
         );
+        Ok(())
     }
 
     pub(crate) fn unminify_js(&self) -> bool {

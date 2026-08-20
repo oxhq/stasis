@@ -82,6 +82,7 @@ use crate::fetch::body::{
 };
 use crate::fetch::fetch::{FetchCanceller, RequestWithGlobalScope};
 use crate::fetch::network_listener::{self, FetchResponseListener, ResourceTimingListener};
+use crate::messaging::{CommonScriptMsg, ScriptEventLoopReceiver, ScriptEventLoopSendError};
 use crate::mime::{APPLICATION, CHARSET, HTML, MimeExt, TEXT, XML};
 use crate::tasks::task_source::{SendableTaskSource, TaskSourceName};
 use crate::timers::{OneshotTimerCallback, OneshotTimerHandle};
@@ -882,10 +883,21 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         };
         self.fetch_time.set(Some(fetch_time));
 
-        let rv = self.fetch(cx, request, &self.global());
+        if let Err(error) = self.fetch(cx, request, &self.global()) {
+            // Admission failure happens after send state is committed but before any response task
+            // exists. Run the ordinary request-error lifecycle now, and—critically for synchronous
+            // XHR—return before entering the nested response receiver.
+            let generation_id = self.generation_id.get();
+            self.fetch_time.set(None);
+            self.process_partial_response(
+                cx,
+                XHRProgress::Errored(generation_id, Error::Abort(None)),
+            );
+            return Err(error);
+        }
         // Step 10
         if self.sync.get() {
-            return rv;
+            return Ok(());
         }
 
         let timeout = self.timeout.get();
@@ -1444,6 +1456,22 @@ impl XMLHttpRequest {
         )))
     }
 
+    fn fetch_start_error(error: ScriptEventLoopSendError) -> Error {
+        Error::Abort(Some(format!(
+            "XMLHttpRequest fetch failed closed before start: {error}"
+        )))
+    }
+
+    fn receive_sync_response(
+        script_port: &ScriptEventLoopReceiver,
+    ) -> Result<CommonScriptMsg, Error> {
+        script_port.recv().map_err(|()| {
+            Error::Abort(Some(
+                "XMLHttpRequest response channel closed before completion".into(),
+            ))
+        })
+    }
+
     /// <https://xhr.spec.whatwg.org/#text-response>
     fn text_response(&self) -> String {
         // Step 3, 5
@@ -1732,11 +1760,14 @@ impl XMLHttpRequest {
         *self.canceller.safe_borrow_mut(cx.no_gc()) =
             FetchCanceller::new(request_builder.id, false, global.core_resource_thread());
 
-        global.fetch(request_builder, context, task_source);
+        global
+            .try_fetch(request_builder, context, task_source)
+            .map_err(Self::fetch_start_error)?;
 
         if let Some(script_port) = script_port {
             loop {
-                if !global.process_event(script_port.recv().unwrap(), cx) {
+                let message = Self::receive_sync_response(&script_port)?;
+                if !global.process_event(message, cx) {
                     // We're exiting.
                     return Err(Error::Abort(None));
                 }
@@ -1896,15 +1927,44 @@ pub(crate) fn is_field_value(slice: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use timers::{DocumentClockConfiguration, DocumentUnixTime};
+    use timers::{DocumentClockConfiguration, DocumentProducerFenceError, DocumentUnixTime};
 
     use super::*;
+    use crate::messaging::MainThreadScriptMsg;
 
     fn controlled_clock(initial_time_ns: u128) -> DocumentClock {
         DocumentClock::new(DocumentClockConfiguration::Controlled {
             initial_time_ns,
             unix_time_origin_ns: DocumentUnixTime::default(),
         })
+    }
+
+    #[test]
+    fn producer_admission_failure_maps_to_a_synchronous_xhr_abort() {
+        let error = XMLHttpRequest::fetch_start_error(ScriptEventLoopSendError::Producer(
+            DocumentProducerFenceError::CounterOverflow,
+        ));
+
+        match error {
+            Error::Abort(Some(message)) => {
+                assert!(message.contains("document producer admission failed"));
+            },
+            other => panic!("expected XHR AbortError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disconnected_synchronous_xhr_response_channel_returns_abort() {
+        let (sender, receiver) = crossbeam_channel::unbounded::<MainThreadScriptMsg>();
+        drop(sender);
+        let receiver = ScriptEventLoopReceiver::MainThread(receiver);
+
+        match XMLHttpRequest::receive_sync_response(&receiver) {
+            Err(Error::Abort(Some(message))) => {
+                assert!(message.contains("response channel closed before completion"));
+            },
+            _ => panic!("expected disconnected synchronous XHR to return AbortError"),
+        }
     }
 
     #[test]

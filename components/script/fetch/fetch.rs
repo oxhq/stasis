@@ -59,7 +59,12 @@ use crate::fetch::body::BodyMixin;
 use crate::fetch::network_listener::{
     self, FetchResponseListener, NetworkListener, ResourceTimingListener, submit_timing_data,
 };
+use crate::messaging::ScriptEventLoopSendError;
 use crate::realms::enter_auto_realm;
+
+fn fetch_start_error(error: ScriptEventLoopSendError) -> Error {
+    Error::Type(cformat!("Could not start fetch: {error}"))
+}
 
 /// Fetch canceller object. By default initialized to having a
 /// request associated with it, which can be aborted or terminated.
@@ -285,12 +290,25 @@ pub(crate) fn Fetch(
     );
     let fetch_context = network_listener.context.clone();
 
-    // Step 11. Add the following abort steps to requestObject’s signal:
-    signal.add(&AbortAlgorithm::Fetch(fetch_context));
-
     // Step 12. Set controller to the result of calling fetch given request and
     // processResponse given response being these steps:
-    global.fetch_with_network_listener(request_init, network_listener);
+    match global.fetch_with_network_listener(request_init, network_listener) {
+        Ok(()) => {
+            // Step 11. Add the following abort steps to requestObject’s signal. Network response
+            // callbacks are task-queued, so installing this immediately after a successful start
+            // still precedes any script-visible response handling.
+            signal.add(&AbortAlgorithm::Fetch(fetch_context));
+        },
+        Err(error) => {
+            // No network work was started. Drop the only remaining context before rejecting so the
+            // request signal does not retain an abort algorithm or TrustedPromise that can never
+            // receive a response.
+            drop(fetch_context);
+            let error = fetch_start_error(error);
+            response.error_stream(cx, error.clone());
+            promise.reject_error(cx, error);
+        },
+    }
 
     // Step 13. Return p.
     promise
@@ -831,4 +849,29 @@ pub(crate) fn create_a_potential_cors_request_with_claim(
         // mode is mode, credentials mode is credentialsMode, and whose use-URL-credentials flag is set.
         .destination(destination)
         .use_url_credentials(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use timers::DocumentProducerFenceError;
+
+    use super::*;
+
+    #[test]
+    fn producer_admission_failure_maps_to_a_rejected_fetch_type_error() {
+        let error = fetch_start_error(ScriptEventLoopSendError::Producer(
+            DocumentProducerFenceError::CounterOverflow,
+        ));
+
+        match error {
+            Error::Type(message) => {
+                assert!(
+                    message
+                        .to_string_lossy()
+                        .contains("document producer admission failed")
+                );
+            },
+            _ => panic!("expected fetch TypeError"),
+        }
+    }
 }

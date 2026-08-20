@@ -11,8 +11,8 @@ use std::result::Result;
 use crossbeam_channel::{Receiver, Select, SelectedOperation, Sender};
 use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg};
 use embedder_traits::{EmbedderControlId, EmbedderControlResponse, ScriptToEmbedderChan};
-use net_traits::FetchResponseMsg;
 use net_traits::image_cache::ImageCacheResponseMessage;
+use net_traits::{BoxedFetchCallback, FetchResponseMsg};
 use profile_traits::mem::{self as profile_mem, OpaqueSender, ReportsChan};
 use profile_traits::time::{self as profile_time};
 use rustc_hash::FxHashSet;
@@ -38,7 +38,9 @@ use crate::dom::serviceworkerglobalscope::ServiceWorkerScriptMsg;
 use crate::dom::sharedworkerglobalscope::SharedWorkerScriptMsg;
 use crate::dom::worker::TrustedWorkerAddress;
 use crate::dom::{WorkletControl, WorkletExecutor};
-use crate::producer_fence::ProducerFencedTaskBox;
+use crate::producer_fence::{
+    ProducerFencedTaskBox, fence_fetch_until_eof as fence_resource_fetch_until_eof,
+};
 use crate::script_runtime::ScriptThreadEventCategory;
 use crate::tasks::task::TaskBox;
 use crate::tasks::task_queue::{QueuedTask, QueuedTaskConversion, TaskQueue};
@@ -258,6 +260,28 @@ pub(crate) enum ScriptEventLoopSender {
 }
 
 impl ScriptEventLoopSender {
+    /// Fence one Fetch response stream when this sender targets a controlled Window event loop.
+    ///
+    /// Realtime main-thread and worker senders return the original callback without producer
+    /// accounting. A controlled producer-admission failure is returned to the caller so it can
+    /// fail closed before starting network work rather than silently falling back to an unfenced
+    /// callback.
+    pub(crate) fn fence_fetch_until_eof(
+        &self,
+        callback: BoxedFetchCallback,
+    ) -> Result<BoxedFetchCallback, ScriptEventLoopSendError> {
+        let Self::MainThread {
+            producer_fence: Some(producer_fence),
+            ..
+        } = self
+        else {
+            return Ok(callback);
+        };
+
+        fence_resource_fetch_until_eof(producer_fence, callback)
+            .map_err(ScriptEventLoopSendError::Producer)
+    }
+
     /// Begin an externally owned callback that will eventually hand work back to this event loop.
     ///
     /// Only a controlled main-thread event loop installs producer tracking. Realtime and worker
@@ -464,9 +488,12 @@ impl OpaqueSender<CommonScriptMsg> for ScriptEventLoopSender {
 
 #[cfg(test)]
 mod producer_fence_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use embedder_traits::{EventLoopWaker, ScriptToEmbedderChan};
+    use net_traits::request::RequestId;
+    use net_traits::{ResourceFetchTiming, ResourceTimingType};
     use servo_base::id::TEST_PIPELINE_ID;
     use style::thread_state::{self, ThreadState};
 
@@ -545,6 +572,148 @@ mod producer_fence_tests {
             sender,
             producer_fence: Some(producer_fence.clone()),
         }
+    }
+
+    fn response_eof() -> FetchResponseMsg {
+        FetchResponseMsg::ProcessResponseEOF(
+            RequestId::default(),
+            Ok(()),
+            ResourceFetchTiming::new(ResourceTimingType::Resource),
+        )
+    }
+
+    #[test]
+    fn controlled_fetch_resource_overlaps_response_tasks_and_terminal_handoff() {
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender, &producer_fence);
+        let callback_sender = event_loop_sender.clone();
+        let callback_fence = producer_fence.clone();
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let callback_observations = observations.clone();
+        let mut callback = event_loop_sender
+            .fence_fetch_until_eof(Box::new(move |_| {
+                callback_sender
+                    .send(task_message(None, TaskSourceName::Networking))
+                    .unwrap();
+                let snapshot = callback_fence.snapshot();
+                callback_observations.lock().unwrap().push((
+                    snapshot.for_kind(DocumentProducerKind::Resource).pending(),
+                    snapshot.for_kind(DocumentProducerKind::Task).pending(),
+                ));
+            }))
+            .unwrap();
+
+        let admitted = producer_fence.snapshot();
+        assert_eq!(
+            admitted.for_kind(DocumentProducerKind::Resource).pending(),
+            1
+        );
+        assert_eq!(admitted.for_kind(DocumentProducerKind::Task).pending(), 0);
+
+        callback(FetchResponseMsg::ProcessRequestBody(RequestId::default()));
+        assert_eq!(*observations.lock().unwrap(), vec![(1, 1)]);
+        let after_nonterminal = producer_fence.snapshot();
+        assert_eq!(
+            after_nonterminal
+                .for_kind(DocumentProducerKind::Resource)
+                .pending(),
+            1
+        );
+        assert_eq!(
+            after_nonterminal
+                .for_kind(DocumentProducerKind::Task)
+                .pending(),
+            1
+        );
+        drop(receiver.recv().unwrap());
+        assert_eq!(producer_fence.snapshot().pending(), 1);
+
+        callback(response_eof());
+        assert_eq!(*observations.lock().unwrap(), vec![(1, 1), (1, 1)]);
+        let after_eof = producer_fence.snapshot();
+        assert_eq!(
+            after_eof.for_kind(DocumentProducerKind::Resource).pending(),
+            0
+        );
+        assert_eq!(after_eof.for_kind(DocumentProducerKind::Task).pending(), 1);
+
+        drop(receiver.recv().unwrap());
+        let complete = producer_fence.snapshot();
+        assert!(complete.is_empty());
+        assert_eq!(
+            complete
+                .for_kind(DocumentProducerKind::Resource)
+                .completed(),
+            1
+        );
+        assert_eq!(complete.for_kind(DocumentProducerKind::Task).completed(), 2);
+    }
+
+    #[test]
+    fn realtime_and_worker_fetch_callbacks_preserve_the_raw_path() {
+        let (main_sender, _main_receiver) = crossbeam_channel::unbounded();
+        let (worker_sender, _worker_receiver) = crossbeam_channel::unbounded();
+        let senders = [
+            ScriptEventLoopSender::MainThread {
+                sender: main_sender,
+                producer_fence: None,
+            },
+            ScriptEventLoopSender::SharedWorker(worker_sender),
+        ];
+        let invocations = Arc::new(AtomicUsize::new(0));
+
+        for sender in senders {
+            let callback_invocations = invocations.clone();
+            let mut callback = sender
+                .fence_fetch_until_eof(Box::new(move |_| {
+                    callback_invocations.fetch_add(1, Ordering::SeqCst);
+                }))
+                .unwrap();
+            callback(response_eof());
+        }
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn failed_terminal_task_send_releases_both_task_and_resource_tickets() {
+        let (raw_sender, receiver) = crossbeam_channel::unbounded();
+        drop(receiver);
+        let producer_fence = DocumentProducerFence::default();
+        let event_loop_sender = main_thread_sender(raw_sender, &producer_fence);
+        let callback_sender = event_loop_sender.clone();
+        let callback_fence = producer_fence.clone();
+        let observed_during_callback = Arc::new(Mutex::new(None));
+        let callback_observation = observed_during_callback.clone();
+        let mut callback = event_loop_sender
+            .fence_fetch_until_eof(Box::new(move |_| {
+                let result = callback_sender.send(task_message(None, TaskSourceName::Networking));
+                let snapshot = callback_fence.snapshot();
+                *callback_observation.lock().unwrap() = Some((
+                    result,
+                    snapshot.for_kind(DocumentProducerKind::Resource).pending(),
+                    snapshot.for_kind(DocumentProducerKind::Task).pending(),
+                    snapshot.for_kind(DocumentProducerKind::Task).completed(),
+                ));
+            }))
+            .unwrap();
+
+        callback(response_eof());
+
+        assert_eq!(
+            *observed_during_callback.lock().unwrap(),
+            Some((Err(ScriptEventLoopSendError::ChannelClosed), 1, 0, 1))
+        );
+        let complete = producer_fence.snapshot();
+        assert!(complete.is_empty());
+        assert_eq!(
+            complete
+                .for_kind(DocumentProducerKind::Resource)
+                .completed(),
+            1
+        );
+        assert_eq!(complete.for_kind(DocumentProducerKind::Task).completed(), 1);
     }
 
     #[test]

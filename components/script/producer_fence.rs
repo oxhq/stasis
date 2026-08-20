@@ -15,6 +15,65 @@ use timers::{DocumentProducerFence, DocumentProducerGuard, DocumentProducerKind}
 
 use crate::tasks::task::TaskBox;
 
+/// Owns one response-stream producer until EOF completes normally.
+///
+/// Losing the callback before EOF is not a successful resource completion: the networking API may
+/// still have an unresolved promise or request state. In that case the guard latches a producer
+/// terminal while consuming the lease, so an empty snapshot cannot be mistaken for quiescence.
+struct FetchStreamProducer {
+    guard: Option<DocumentProducerGuard>,
+}
+
+impl FetchStreamProducer {
+    fn new(guard: DocumentProducerGuard) -> Self {
+        Self { guard: Some(guard) }
+    }
+
+    fn is_live(&self) -> bool {
+        self.guard.is_some()
+    }
+
+    fn complete(&mut self) {
+        drop(self.guard.take());
+    }
+
+    fn abandon(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            // This guard was created by and remains owned by this fence adapter. An unknown lease
+            // would be an internal invariant failure, but abandonment is also used during unwind,
+            // where panicking again would abort the process. The sticky terminal is authoritative
+            // on every valid path.
+            let _ = guard.abandon();
+        }
+    }
+}
+
+impl Drop for FetchStreamProducer {
+    fn drop(&mut self) {
+        self.abandon();
+    }
+}
+
+/// Resolves the response-stream producer after one callback returns.
+///
+/// Keeping this as a local call guard matters because a caller may catch a callback panic and
+/// retain the outer `BoxedFetchCallback`; the producer must become terminal at the unwind boundary
+/// rather than wait for that outer callback to be dropped.
+struct FetchCallbackCompletion<'a> {
+    producer: &'a mut FetchStreamProducer,
+    terminal: bool,
+}
+
+impl Drop for FetchCallbackCompletion<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.producer.abandon();
+        } else if self.terminal {
+            self.producer.complete();
+        }
+    }
+}
+
 /// A local event-loop message that keeps its producer live through message handling.
 pub(crate) struct DocumentProducerEnvelope<T> {
     pub(crate) message: T,
@@ -44,31 +103,41 @@ impl<T> DocumentProducerEnvelope<T> {
 /// Keep a resource ticket live until the terminal callback has queued its event-loop work.
 pub(crate) fn fence_fetch_callback(
     fence: &DocumentProducerFence,
+    callback: BoxedFetchCallback,
+    is_terminal: impl Fn(&FetchResponseMsg) -> bool + Send + 'static,
+) -> Result<BoxedFetchCallback, timers::DocumentProducerFenceError> {
+    fence_fetch_callback_with_admission(
+        || fence.begin(DocumentProducerKind::Resource),
+        callback,
+        is_terminal,
+    )
+}
+
+fn fence_fetch_callback_with_admission(
+    admit: impl FnOnce() -> Result<DocumentProducerGuard, timers::DocumentProducerFenceError>,
     mut callback: BoxedFetchCallback,
     is_terminal: impl Fn(&FetchResponseMsg) -> bool + Send + 'static,
-) -> BoxedFetchCallback {
-    let mut guard = Some(
-        fence
-            .begin(DocumentProducerKind::Resource)
-            .expect("document resource producer sequence exhausted"),
-    );
-    Box::new(move |message| {
-        if guard.is_none() {
+) -> Result<BoxedFetchCallback, timers::DocumentProducerFenceError> {
+    let mut producer = FetchStreamProducer::new(admit()?);
+    Ok(Box::new(move |message| {
+        if !producer.is_live() {
             return;
         }
         let terminal = is_terminal(&message);
+        let completion = FetchCallbackCompletion {
+            producer: &mut producer,
+            terminal,
+        };
         callback(message);
-        if terminal {
-            guard.take();
-        }
-    })
+        drop(completion);
+    }))
 }
 
 /// Keep a resource ticket live through a complete Fetch response stream.
 pub(crate) fn fence_fetch_until_eof(
     fence: &DocumentProducerFence,
     callback: BoxedFetchCallback,
-) -> BoxedFetchCallback {
+) -> Result<BoxedFetchCallback, timers::DocumentProducerFenceError> {
     fence_fetch_callback(fence, callback, |message| {
         matches!(message, FetchResponseMsg::ProcessResponseEOF(..))
     })
@@ -144,6 +213,7 @@ impl TaskBox for ProducerFencedTaskBox {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use net_traits::request::RequestId;
@@ -168,7 +238,8 @@ mod tests {
                     .unwrap()
                     .push(callback_fence.snapshot().pending());
             }),
-        );
+        )
+        .unwrap();
 
         assert_eq!(fence.snapshot().pending(), 1);
         callback(FetchResponseMsg::ProcessRequestBody(RequestId::default()));
@@ -182,6 +253,7 @@ mod tests {
         assert_eq!(*callback_saw_pending.lock().unwrap(), vec![1, 1]);
         let complete = fence.snapshot();
         assert!(complete.is_empty());
+        assert_eq!(complete.terminal_error(), None);
         assert_eq!(
             complete
                 .for_kind(DocumentProducerKind::Resource)
@@ -191,14 +263,84 @@ mod tests {
     }
 
     #[test]
-    fn dropping_an_abandoned_callback_completes_its_ticket() {
+    fn dropping_a_callback_before_eof_completes_and_latches_abandonment() {
         let fence = DocumentProducerFence::default();
-        let callback = fence_fetch_until_eof(&fence, Box::new(|_| {}));
+        let callback = fence_fetch_until_eof(&fence, Box::new(|_| {})).unwrap();
         assert_eq!(fence.snapshot().pending(), 1);
 
         drop(callback);
 
+        let abandoned = fence.snapshot();
+        assert!(abandoned.is_empty());
+        assert!(matches!(
+            abandoned.terminal_error(),
+            Some(timers::DocumentProducerFenceError::ProducerAbandoned(lease_id))
+                if lease_id.kind() == DocumentProducerKind::Resource
+        ));
+        assert_eq!(
+            abandoned
+                .for_kind(DocumentProducerKind::Resource)
+                .completed(),
+            1
+        );
+    }
+
+    #[test]
+    fn panicking_fetch_callback_releases_its_ticket_before_the_outer_callback_is_dropped() {
+        let fence = DocumentProducerFence::default();
+        let mut callback = fence_fetch_until_eof(
+            &fence,
+            Box::new(|_| panic!("synthetic fetch callback panic")),
+        )
+        .unwrap();
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            callback(FetchResponseMsg::ProcessRequestBody(RequestId::default()));
+        }));
+
+        assert!(unwind.is_err());
         assert!(fence.snapshot().is_empty());
+        assert!(matches!(
+            fence.snapshot().terminal_error(),
+            Some(timers::DocumentProducerFenceError::ProducerAbandoned(lease_id))
+                if lease_id.kind() == DocumentProducerKind::Resource
+        ));
+        assert_eq!(
+            fence
+                .snapshot()
+                .for_kind(DocumentProducerKind::Resource)
+                .completed(),
+            1
+        );
+        drop(callback);
+    }
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn failed_resource_admission_is_typed_and_discards_the_raw_callback() {
+        let callback_dropped = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(callback_dropped.clone());
+        let result = fence_fetch_callback_with_admission(
+            || Err(timers::DocumentProducerFenceError::CounterOverflow),
+            Box::new(move |_| {
+                let _keep_probe_alive = &probe;
+                panic!("an unadmitted callback must never run");
+            }),
+            |_| false,
+        );
+
+        assert!(matches!(
+            result,
+            Err(timers::DocumentProducerFenceError::CounterOverflow)
+        ));
+        assert!(callback_dropped.load(Ordering::SeqCst));
     }
 
     #[test]

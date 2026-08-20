@@ -816,6 +816,11 @@ pub struct DocumentProducerLeaseId {
 }
 
 impl DocumentProducerLeaseId {
+    /// Return the event-loop fence that issued this lease.
+    pub const fn fence_id(self) -> DocumentProducerFenceId {
+        self.fence_id
+    }
+
     /// Return the stable global enqueue sequence for this lease.
     pub const fn sequence(self) -> DocumentProducerSequence {
         self.sequence
@@ -947,6 +952,8 @@ pub enum DocumentProducerFenceError {
     },
     /// A lease acknowledgement did not name a live lease on this fence.
     UnknownLease(DocumentProducerLeaseId),
+    /// A producer lost its completion channel before delivering its terminal handoff.
+    ProducerAbandoned(DocumentProducerLeaseId),
 }
 
 impl fmt::Display for DocumentProducerFenceError {
@@ -1126,12 +1133,38 @@ impl DocumentProducerFence {
         &self,
         lease_id: DocumentProducerLeaseId,
     ) -> Result<(), DocumentProducerFenceError> {
+        self.finish_lease(lease_id, None)
+    }
+
+    /// Complete a live lease while atomically latching that its producer was abandoned.
+    ///
+    /// Abandonment consumes the same completion watermark and revision reserved by [`Self::begin`]
+    /// as an ordinary completion. The first producer terminal remains sticky, so a later
+    /// abandonment cannot hide an earlier failure.
+    fn abandon_lease(
+        &self,
+        lease_id: DocumentProducerLeaseId,
+    ) -> Result<(), DocumentProducerFenceError> {
+        self.finish_lease(
+            lease_id,
+            Some(DocumentProducerFenceError::ProducerAbandoned(lease_id)),
+        )
+    }
+
+    fn finish_lease(
+        &self,
+        lease_id: DocumentProducerLeaseId,
+        terminal_error: Option<DocumentProducerFenceError>,
+    ) -> Result<(), DocumentProducerFenceError> {
         if lease_id.fence_id != self.fence_id {
             return Err(DocumentProducerFenceError::UnknownLease(lease_id));
         }
         let mut state = self.inner.lock().expect("document producer fence poisoned");
         if state.active_leases.get(&lease_id.sequence) != Some(&lease_id.kind) {
             return Err(DocumentProducerFenceError::UnknownLease(lease_id));
+        }
+        if state.terminal_error.is_none() {
+            state.terminal_error = terminal_error;
         }
         state.active_leases.remove(&lease_id.sequence);
         let index = lease_id.kind.index();
@@ -1197,6 +1230,19 @@ impl DocumentProducerGuard {
         self.lease_id
             .take()
             .expect("document producer guard detached twice")
+    }
+
+    /// Consume this guard and mark its producer as abandoned instead of normally completed.
+    ///
+    /// This is reserved for adapters that lose a response channel before its protocol terminal.
+    /// The lease is still completed, but the fence retains a sticky terminal fact so an observer
+    /// cannot mistake the now-empty producer set for successful quiescence.
+    pub fn abandon(mut self) -> Result<(), DocumentProducerFenceError> {
+        let lease_id = self
+            .lease_id
+            .take()
+            .expect("document producer guard abandoned twice");
+        self.fence.abandon_lease(lease_id)
     }
 }
 
@@ -1967,6 +2013,55 @@ mod tests {
         second_fence.complete_lease(second_lease).unwrap();
         assert!(first_fence.snapshot().is_empty());
         assert!(second_fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn abandoned_guard_completes_its_lease_and_latches_the_exact_terminal() {
+        let fence = DocumentProducerFence::default();
+        let guard = fence.begin(DocumentProducerKind::Resource).unwrap();
+        let lease_id = DocumentProducerLeaseId {
+            fence_id: fence.id(),
+            sequence: guard.sequence(),
+            kind: DocumentProducerKind::Resource,
+        };
+
+        guard.abandon().unwrap();
+
+        let snapshot = fence.snapshot();
+        assert_eq!(
+            snapshot.terminal_error(),
+            Some(DocumentProducerFenceError::ProducerAbandoned(lease_id))
+        );
+        assert_eq!(snapshot.revision(), 2);
+        assert_eq!(snapshot.enqueued(), 1);
+        assert_eq!(snapshot.completed(), 1);
+        assert_eq!(snapshot.pending(), 0);
+        assert_eq!(
+            snapshot.for_kind(DocumentProducerKind::Resource),
+            DocumentProducerWatermark {
+                enqueued: 1,
+                completed: 1,
+                pending: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn abandonment_does_not_replace_an_earlier_producer_terminal() {
+        let fence = DocumentProducerFence::default();
+        let guard = fence.begin(DocumentProducerKind::Resource).unwrap();
+        fence.inner.lock().unwrap().terminal_error =
+            Some(DocumentProducerFenceError::CounterOverflow);
+
+        guard.abandon().unwrap();
+
+        let snapshot = fence.snapshot();
+        assert_eq!(
+            snapshot.terminal_error(),
+            Some(DocumentProducerFenceError::CounterOverflow)
+        );
+        assert!(snapshot.is_empty());
+        assert_eq!(snapshot.enqueued(), snapshot.completed());
     }
 
     #[test]
