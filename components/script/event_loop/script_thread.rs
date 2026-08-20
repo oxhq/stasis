@@ -267,6 +267,60 @@ impl Default for SharedRwLocks {
     }
 }
 
+/// Sticky local failure of the checked semantic DOM-mutation epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DomMutationEpochError {
+    /// The epoch reached `u64::MAX` and cannot represent another distinct DOM state.
+    Exhausted,
+}
+
+/// Owner-thread observation of semantic DOM mutations for one WebView.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DomMutationObservation {
+    /// Monotonic epoch of semantic attribute, character-data, and child-list mutations.
+    pub(crate) epoch: u64,
+    /// First checked epoch failure, retained without rejecting later DOM mutations.
+    pub(crate) terminal: Option<DomMutationEpochError>,
+}
+
+/// ScriptThread-owned mutation epochs keyed by WebView rather than Document or Pipeline.
+///
+/// A navigation can replace either of those lower-level owners, while the WebView's semantic DOM
+/// history must continue monotonically for ABA-safe pending-work observations.
+#[derive(Default)]
+struct DomMutationEpochTracker {
+    observations: FxHashMap<WebViewId, DomMutationObservation>,
+}
+
+impl DomMutationEpochTracker {
+    fn record(&mut self, webview_id: WebViewId) {
+        let observation = self.observations.entry(webview_id).or_default();
+        if observation.terminal.is_some() {
+            return;
+        }
+
+        match observation.epoch.checked_add(1) {
+            Some(epoch) => observation.epoch = epoch,
+            None => observation.terminal = Some(DomMutationEpochError::Exhausted),
+        }
+    }
+
+    fn observe(&self, webview_id: WebViewId) -> DomMutationObservation {
+        self.observations
+            .get(&webview_id)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+fn dom_mutation_epoch_tracker_for_clock(
+    document_clock: &DocumentClock,
+) -> Option<RefCell<DomMutationEpochTracker>> {
+    document_clock
+        .is_controlled()
+        .then(|| RefCell::new(DomMutationEpochTracker::default()))
+}
+
 #[derive(JSTraceable)]
 // ScriptThread instances are rooted on creation, so this is okay
 #[cfg_attr(crown, expect(crown::unrooted_must_root))]
@@ -334,6 +388,14 @@ pub struct ScriptThread {
     /// First checked timer-scheduler failure observed by this ScriptThread.
     #[no_trace]
     timer_control_terminal: Cell<Option<TimerControlError>>,
+
+    /// Checked semantic DOM-mutation epochs, isolated by WebView and retained across navigation.
+    ///
+    /// This owner-thread state is enabled only for controlled execution. Keeping it on the
+    /// ScriptThread rather than a Document preserves the counter when navigation replaces the
+    /// active Document for the same WebView.
+    #[no_trace]
+    dom_mutation_epochs: Option<RefCell<DomMutationEpochTracker>>,
 
     /// A proxy to the `SystemFontService` to use for accessing system font lists.
     #[no_trace]
@@ -634,6 +696,31 @@ impl ScriptThread {
         self.timer_control_terminal.get()
     }
 
+    /// Record one semantic DOM mutation for a WebView without allowing its epoch to wrap.
+    ///
+    /// Overflow is observational: the DOM mutation is not rejected or rolled back. Instead the
+    /// first terminal is latched and all later mutations leave both the maximum epoch and terminal
+    /// unchanged.
+    pub(crate) fn record_dom_mutation(&self, webview_id: WebViewId) {
+        let Some(dom_mutation_epochs) = &self.dom_mutation_epochs else {
+            return;
+        };
+        dom_mutation_epochs.borrow_mut().record(webview_id);
+    }
+
+    /// Observe the semantic DOM epoch owned by this ScriptThread for one WebView.
+    ///
+    /// Repeated observation is side-effect free. `None` means this ScriptThread is not collecting
+    /// controlled pending-work evidence; a tracked WebView with no mutations observes epoch zero.
+    pub(crate) fn dom_mutation_observation(
+        &self,
+        webview_id: WebViewId,
+    ) -> Option<DomMutationObservation> {
+        self.dom_mutation_epochs
+            .as_ref()
+            .map(|epochs| epochs.borrow().observe(webview_id))
+    }
+
     /// Cancel a the [`TimerEventRequest`] for the given [`TimerId`] on this
     /// [`ScriptThread`]'s [`TimerScheduler`].
     pub(crate) fn cancel_timer(&self, timer_id: TimerId) {
@@ -913,6 +1000,7 @@ impl ScriptThread {
         // The clock mode is immutable and selected by the WebView before its initial navigation.
         // Every Window and timer queue on this event loop shares this one clock domain.
         let document_clock = DocumentClock::new(state.document_clock);
+        let dom_mutation_epochs = dom_mutation_epoch_tracker_for_clock(&document_clock);
         let document_producer_fence = document_producer_fence_for_clock(
             &document_clock,
             &state.script_to_embedder_sender,
@@ -1042,6 +1130,7 @@ impl ScriptThread {
                     document_clock,
                     document_producer_fence,
                     timer_control_terminal: Default::default(),
+                    dom_mutation_epochs,
                     microtask_queue,
                     js_runtime: Rc::new(runtime),
                     closed_pipelines: DomRefCell::new(FxHashSet::default()),
@@ -4690,6 +4779,109 @@ impl Drop for ScriptThread {
         SCRIPT_THREAD_ROOT.with(|root| {
             root.set(None);
         });
+    }
+}
+
+#[cfg(test)]
+mod dom_mutation_epoch_tests {
+    use servo_base::id::{BrowsingContextId, TEST_WEBVIEW_ID, WebViewId};
+    use timers::{DocumentClock, DocumentClockConfiguration, DocumentUnixTime};
+
+    use super::{
+        DomMutationEpochError, DomMutationEpochTracker, DomMutationObservation,
+        dom_mutation_epoch_tracker_for_clock,
+    };
+
+    fn other_webview_id() -> WebViewId {
+        WebViewId::mock_for_testing(
+            BrowsingContextId::from_string("BrowsingContext(0,2)")
+                .expect("the test browsing-context id must be valid"),
+        )
+    }
+
+    #[test]
+    fn mutation_epochs_are_isolated_per_webview() {
+        let mut tracker = DomMutationEpochTracker::default();
+        let other_webview = other_webview_id();
+
+        tracker.record(TEST_WEBVIEW_ID);
+        tracker.record(TEST_WEBVIEW_ID);
+        tracker.record(other_webview);
+
+        assert_eq!(tracker.observe(TEST_WEBVIEW_ID).epoch, 2);
+        assert_eq!(tracker.observe(other_webview).epoch, 1);
+    }
+
+    #[test]
+    fn document_replacement_does_not_reset_a_webview_epoch() {
+        let mut tracker = DomMutationEpochTracker::default();
+        tracker.record(TEST_WEBVIEW_ID);
+        let before_document_replacement = tracker.observe(TEST_WEBVIEW_ID);
+
+        // Navigation replaces a Document or Pipeline, neither of which is a tracker key. The
+        // replacement document therefore starts from the same WebView-owned epoch.
+        let at_replacement_document_start = tracker.observe(TEST_WEBVIEW_ID);
+        tracker.record(TEST_WEBVIEW_ID);
+
+        assert_eq!(before_document_replacement.epoch, 1);
+        assert_eq!(at_replacement_document_start, before_document_replacement);
+        assert_eq!(tracker.observe(TEST_WEBVIEW_ID).epoch, 2);
+    }
+
+    #[test]
+    fn observing_an_epoch_is_side_effect_free() {
+        let mut tracker = DomMutationEpochTracker::default();
+        tracker.record(TEST_WEBVIEW_ID);
+
+        let first = tracker.observe(TEST_WEBVIEW_ID);
+        let second = tracker.observe(TEST_WEBVIEW_ID);
+        let untouched = tracker.observe(other_webview_id());
+
+        assert_eq!(first, second);
+        assert_eq!(first.epoch, 1);
+        assert_eq!(untouched, DomMutationObservation::default());
+    }
+
+    #[test]
+    fn overflow_latches_a_sticky_terminal_without_wrapping() {
+        let mut tracker = DomMutationEpochTracker::default();
+        tracker.observations.insert(
+            TEST_WEBVIEW_ID,
+            DomMutationObservation {
+                epoch: u64::MAX - 1,
+                terminal: None,
+            },
+        );
+
+        tracker.record(TEST_WEBVIEW_ID);
+        assert_eq!(
+            tracker.observe(TEST_WEBVIEW_ID),
+            DomMutationObservation {
+                epoch: u64::MAX,
+                terminal: None,
+            }
+        );
+
+        tracker.record(TEST_WEBVIEW_ID);
+        let exhausted = DomMutationObservation {
+            epoch: u64::MAX,
+            terminal: Some(DomMutationEpochError::Exhausted),
+        };
+        assert_eq!(tracker.observe(TEST_WEBVIEW_ID), exhausted);
+
+        tracker.record(TEST_WEBVIEW_ID);
+        assert_eq!(tracker.observe(TEST_WEBVIEW_ID), exhausted);
+    }
+
+    #[test]
+    fn realtime_script_threads_do_not_collect_dom_epochs() {
+        assert!(dom_mutation_epoch_tracker_for_clock(&DocumentClock::default()).is_none());
+
+        let controlled = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        });
+        assert!(dom_mutation_epoch_tracker_for_clock(&controlled).is_some());
     }
 }
 

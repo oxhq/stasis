@@ -108,7 +108,16 @@ impl MutationObserver {
     ) where
         F: FnOnce() -> Mutation<'a>,
     {
-        if !target.global().as_window().get_exists_mut_observer() {
+        let global = target.global();
+        let window = global.as_window();
+        if !record_mutation_before_observer_filter(
+            || {
+                window
+                    .script_thread()
+                    .record_dom_mutation(window.webview_id());
+            },
+            || window.get_exists_mut_observer(),
+        ) {
             return;
         }
         // Step 1 Let interestedObservers be an empty map.
@@ -237,6 +246,38 @@ impl MutationObserver {
         // Step 5 Queue a mutation observer microtask.
         let mutation_observers = ScriptThread::mutation_observers();
         mutation_observers.queue_mutation_observer_microtask(cx, ScriptThread::microtask_queue());
+    }
+}
+
+/// Record a semantic DOM mutation before applying MutationObserver's no-observer fast path.
+///
+/// Keeping this ordering in one small seam makes the DOM epoch independent of whether script has
+/// installed an observer. The closures also provide a focused test without constructing a JS
+/// realm and reflected DOM objects.
+#[inline]
+fn record_mutation_before_observer_filter(
+    record_mutation: impl FnOnce(),
+    observers_exist: impl FnOnce() -> bool,
+) -> bool {
+    record_mutation();
+    observers_exist()
+}
+
+#[cfg(test)]
+mod dom_mutation_epoch_tests {
+    use std::cell::Cell;
+
+    use super::record_mutation_before_observer_filter;
+
+    #[test]
+    fn mutation_is_recorded_when_no_observer_exists() {
+        let records = Cell::new(0);
+
+        let observers_exist =
+            record_mutation_before_observer_filter(|| records.set(records.get() + 1), || false);
+
+        assert!(!observers_exist);
+        assert_eq!(records.get(), 1);
     }
 }
 
