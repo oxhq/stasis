@@ -5,7 +5,7 @@
 //! Script-event-loop adapters for document producer fences.
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use net_traits::image_cache::{
     ImageCacheResponseCallback, ImageCacheResponseMessage, ImageResponse,
@@ -146,41 +146,160 @@ pub(crate) fn fence_fetch_until_eof(
 /// Keep an image ticket live through its terminal callback's event-loop enqueue.
 pub(crate) fn fence_image_callback(
     fence: &DocumentProducerFence,
-    callback: impl Fn(DocumentProducerEnvelope<ImageCacheResponseMessage>) + Send + 'static,
-) -> ImageCacheResponseCallback {
-    let fence = fence.clone();
-    let guard = Arc::new(Mutex::new(Some(
-        fence
-            .begin(DocumentProducerKind::Image)
-            .expect("document image producer sequence exhausted"),
-    )));
-    Box::new(move |message| {
-        let terminal = match &message {
-            ImageCacheResponseMessage::VectorImageRasterizationComplete(..) => true,
-            ImageCacheResponseMessage::NotifyPendingImageLoadStatus(response) => matches!(
-                &response.response,
-                ImageResponse::Loaded(..) | ImageResponse::FailedToLoadOrDecode
-            ),
-        };
-        let message_guard = {
-            let mut guard = guard
-                .lock()
-                .expect("document image producer guard poisoned");
-            if guard.is_none() {
+    enqueue: impl Fn(
+        DocumentProducerEnvelope<ImageCacheResponseMessage>,
+    ) -> Result<(), DocumentProducerEnvelope<ImageCacheResponseMessage>>
+    + Send
+    + 'static,
+) -> Result<ImageCacheResponseCallback, timers::DocumentProducerFenceError> {
+    let admission_fence = fence.clone();
+    fence_image_callback_with_admission(
+        fence,
+        move || admission_fence.begin(DocumentProducerKind::Image),
+        enqueue,
+    )
+}
+
+/// Own the logical image response stream until a terminal response is committed to the queue.
+///
+/// The stream lease is deliberately separate from each queued-message lease. That lets a callback
+/// report a closed queue by returning the rejected envelope while this adapter still owns the
+/// stream lease that must be abandoned. It also ensures a terminal message remains represented
+/// until the event loop actually handles its envelope.
+struct ImageStreamProducer {
+    guard: Option<DocumentProducerGuard>,
+}
+
+impl ImageStreamProducer {
+    fn new(guard: DocumentProducerGuard) -> Self {
+        Self { guard: Some(guard) }
+    }
+
+    fn is_live(&self) -> bool {
+        self.guard.is_some()
+    }
+
+    fn complete(&mut self) {
+        drop(self.guard.take());
+    }
+
+    fn abandon(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            let _ = guard.abandon();
+        }
+    }
+}
+
+impl Drop for ImageStreamProducer {
+    fn drop(&mut self) {
+        self.abandon();
+    }
+}
+
+struct ImageCallbackState<Admission> {
+    producer: ImageStreamProducer,
+    admit_message: Admission,
+}
+
+/// Resolve the image stream after one enqueue callback returns.
+///
+/// This guard stays armed across the foreign callback. A panic therefore abandons the stream at
+/// the unwind boundary even if the outer image-cache callback is caught and retained by its
+/// caller.
+struct ImageCallbackCompletion<'a> {
+    producer: &'a mut ImageStreamProducer,
+    terminal: bool,
+    committed: bool,
+}
+
+impl Drop for ImageCallbackCompletion<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.producer.abandon();
+        } else if self.terminal {
+            self.producer.complete();
+        }
+    }
+}
+
+fn image_response_is_terminal(message: &ImageCacheResponseMessage) -> bool {
+    match message {
+        ImageCacheResponseMessage::VectorImageRasterizationComplete(..) => true,
+        ImageCacheResponseMessage::NotifyPendingImageLoadStatus(response) => matches!(
+            &response.response,
+            ImageResponse::Loaded(..) | ImageResponse::FailedToLoadOrDecode
+        ),
+    }
+}
+
+fn fence_image_callback_with_admission<Admission, Enqueue>(
+    fence: &DocumentProducerFence,
+    mut admit: Admission,
+    enqueue: Enqueue,
+) -> Result<ImageCacheResponseCallback, timers::DocumentProducerFenceError>
+where
+    Admission: FnMut() -> Result<DocumentProducerGuard, timers::DocumentProducerFenceError>
+        + Send
+        + 'static,
+    Enqueue: Fn(
+            DocumentProducerEnvelope<ImageCacheResponseMessage>,
+        ) -> Result<(), DocumentProducerEnvelope<ImageCacheResponseMessage>>
+        + Send
+        + 'static,
+{
+    let producer = ImageStreamProducer::new(admit()?);
+    let state = Mutex::new(ImageCallbackState {
+        producer,
+        admit_message: admit,
+    });
+    let observer_fence = fence.clone();
+
+    Ok(Box::new(move |message| {
+        let terminal = image_response_is_terminal(&message);
+        // A callback panic poisons this mutex after its completion guard has already abandoned the
+        // producer. Recovering the inert state lets later cache notifications be suppressed rather
+        // than turning that contained callback panic into an unrelated mutex panic.
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.producer.is_live() {
+            return;
+        }
+
+        let message_guard = match (state.admit_message)() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // `DocumentProducerFence::begin` has already latched its checked failure. The
+                // abandonment fallback is still required for injected admissions and guarantees
+                // that the stream lease cannot disappear as an ordinary successful completion.
+                state.producer.abandon();
                 return;
-            }
-            if terminal {
-                guard.take()
-            } else {
-                Some(
-                    fence
-                        .begin(DocumentProducerKind::Image)
-                        .expect("document image message sequence exhausted"),
-                )
-            }
+            },
         };
-        callback(DocumentProducerEnvelope::new(message, message_guard));
-    })
+        let envelope = DocumentProducerEnvelope::new(message, Some(message_guard));
+        let mut completion = ImageCallbackCompletion {
+            producer: &mut state.producer,
+            terminal,
+            committed: false,
+        };
+
+        match enqueue(envelope) {
+            Ok(()) => {
+                completion.committed = true;
+                drop(completion);
+                drop(state);
+                // Admission notifies before the callback can make its queue entry visible. This
+                // second wake closes that handoff window and must occur only after enqueue commit.
+                observer_fence.notify_observer_after_commit();
+            },
+            Err(rejected) => {
+                // Abandon the logical stream before releasing the rejected queue envelope. The
+                // sticky terminal then remains authoritative even once every image lease is empty.
+                drop(completion);
+                drop(rejected);
+            },
+        }
+    }))
 }
 
 /// Keep a task producer live until its boxed task has either run or been discarded.
@@ -213,14 +332,21 @@ impl TaskBox for ProducerFencedTaskBox {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use net_traits::image_cache::{
+        Image, PendingImageId, PendingImageResponse, RasterizationCompleteResponse, VectorImage,
+    };
     use net_traits::request::RequestId;
     use net_traits::{ResourceFetchTiming, ResourceTimingType};
+    use pixels::{CorsStatus, ImageMetadata};
+    use servo_base::id::TEST_PIPELINE_ID;
+    use servo_url::ServoUrl;
     use timers::{
         DocumentProducerCheckpoint, DocumentProducerObservation, DocumentProducerObserver,
     };
+    use webrender_api::units::DeviceIntSize;
 
     use super::*;
 
@@ -343,10 +469,67 @@ mod tests {
         assert!(callback_dropped.load(Ordering::SeqCst));
     }
 
+    fn image_status(response: ImageResponse) -> ImageCacheResponseMessage {
+        ImageCacheResponseMessage::NotifyPendingImageLoadStatus(PendingImageResponse {
+            pipeline_id: TEST_PIPELINE_ID,
+            response,
+            id: PendingImageId(7),
+        })
+    }
+
+    fn metadata_image_message() -> ImageCacheResponseMessage {
+        image_status(ImageResponse::MetadataLoaded(ImageMetadata {
+            width: 23,
+            height: 41,
+        }))
+    }
+
+    fn failed_image_message() -> ImageCacheResponseMessage {
+        image_status(ImageResponse::FailedToLoadOrDecode)
+    }
+
+    fn loaded_image_message() -> ImageCacheResponseMessage {
+        let metadata = ImageMetadata {
+            width: 23,
+            height: 41,
+        };
+        image_status(ImageResponse::Loaded(
+            Image::Vector(VectorImage {
+                id: PendingImageId(7),
+                svg_id: None,
+                metadata,
+                cors_status: CorsStatus::Safe,
+            }),
+            ServoUrl::parse("https://example.test/image.svg").unwrap(),
+        ))
+    }
+
+    fn vector_raster_message() -> ImageCacheResponseMessage {
+        ImageCacheResponseMessage::VectorImageRasterizationComplete(RasterizationCompleteResponse {
+            pipeline_id: TEST_PIPELINE_ID,
+            image_id: PendingImageId(7),
+            requested_size: DeviceIntSize::new(23, 41),
+        })
+    }
+
+    fn assert_image_abandoned(fence: &DocumentProducerFence) {
+        let snapshot = fence.snapshot();
+        assert!(snapshot.is_empty());
+        assert!(matches!(
+            snapshot.terminal_error(),
+            Some(timers::DocumentProducerFenceError::ProducerAbandoned(lease_id))
+                if lease_id.kind() == DocumentProducerKind::Image
+        ));
+    }
+
     #[test]
-    fn dropping_an_abandoned_image_listener_completes_its_ticket() {
+    fn dropping_an_image_listener_before_terminal_latches_abandonment() {
         let fence = DocumentProducerFence::default();
-        let callback = fence_image_callback(&fence, |_| {});
+        let callback = fence_image_callback(&fence, |envelope| {
+            drop(envelope);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(
             fence
                 .snapshot()
@@ -357,12 +540,212 @@ mod tests {
 
         drop(callback);
 
-        let complete = fence.snapshot();
-        assert!(complete.is_empty());
+        assert_image_abandoned(&fence);
         assert_eq!(
-            complete.for_kind(DocumentProducerKind::Image).completed(),
+            fence
+                .snapshot()
+                .for_kind(DocumentProducerKind::Image)
+                .completed(),
             1
         );
+    }
+
+    #[test]
+    fn metadata_keeps_the_stream_live_and_terminal_hands_off_a_distinct_queue_lease() {
+        type ImageEnvelope = DocumentProducerEnvelope<ImageCacheResponseMessage>;
+
+        let fence = DocumentProducerFence::default();
+        let queued: Arc<Mutex<Vec<ImageEnvelope>>> = Arc::new(Mutex::new(Vec::new()));
+        let callback_queue = queued.clone();
+        let callback = fence_image_callback(&fence, move |envelope| {
+            callback_queue.lock().unwrap().push(envelope);
+            Ok(())
+        })
+        .unwrap();
+
+        callback(metadata_image_message());
+        assert_eq!(fence.snapshot().pending(), 2);
+        let metadata = queued.lock().unwrap().remove(0);
+        assert!(matches!(
+            metadata.message,
+            ImageCacheResponseMessage::NotifyPendingImageLoadStatus(PendingImageResponse {
+                response: ImageResponse::MetadataLoaded(..),
+                ..
+            })
+        ));
+        drop(metadata);
+        assert_eq!(fence.snapshot().pending(), 1);
+
+        callback(failed_image_message());
+        assert_eq!(fence.snapshot().pending(), 1);
+        assert_eq!(queued.lock().unwrap().len(), 1);
+
+        // Once a terminal handoff commits, later cache notifications are suppressed.
+        callback(metadata_image_message());
+        assert_eq!(queued.lock().unwrap().len(), 1);
+        assert_eq!(
+            fence
+                .snapshot()
+                .for_kind(DocumentProducerKind::Image)
+                .enqueued(),
+            3
+        );
+
+        drop(callback);
+        assert_eq!(fence.snapshot().pending(), 1);
+        drop(queued.lock().unwrap().pop());
+
+        let complete = fence.snapshot();
+        assert!(complete.is_empty());
+        assert_eq!(complete.terminal_error(), None);
+        assert_eq!(
+            complete.for_kind(DocumentProducerKind::Image).completed(),
+            3
+        );
+    }
+
+    #[test]
+    fn every_image_terminal_classification_releases_the_original_once_after_commit() {
+        for message in [
+            loaded_image_message(),
+            failed_image_message(),
+            vector_raster_message(),
+        ] {
+            let fence = DocumentProducerFence::default();
+            let queued = Arc::new(Mutex::new(None));
+            let callback_queue = queued.clone();
+            let callback = fence_image_callback(&fence, move |envelope| {
+                *callback_queue.lock().unwrap() = Some(envelope);
+                Ok(())
+            })
+            .unwrap();
+
+            callback(message);
+            assert_eq!(fence.snapshot().pending(), 1);
+            drop(callback);
+            assert_eq!(fence.snapshot().pending(), 1);
+            drop(queued.lock().unwrap().take());
+            assert!(fence.snapshot().is_empty());
+            assert_eq!(fence.snapshot().terminal_error(), None);
+        }
+    }
+
+    #[test]
+    fn failed_initial_image_admission_is_typed_and_discards_the_enqueue_callback() {
+        let fence = DocumentProducerFence::default();
+        let callback_dropped = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(callback_dropped.clone());
+        let result = fence_image_callback_with_admission(
+            &fence,
+            || Err(timers::DocumentProducerFenceError::CounterOverflow),
+            move |envelope| {
+                let _keep_probe_alive = &probe;
+                Err(envelope)
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(timers::DocumentProducerFenceError::CounterOverflow)
+        ));
+        assert!(callback_dropped.load(Ordering::SeqCst));
+        assert!(fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn later_image_message_admission_failure_abandons_stream_and_suppresses_callback() {
+        let fence = DocumentProducerFence::default();
+        let admission_fence = fence.clone();
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let admission_count = admissions.clone();
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+        let calls = callback_calls.clone();
+        let callback = fence_image_callback_with_admission(
+            &fence,
+            move || {
+                if admission_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    admission_fence.begin(DocumentProducerKind::Image)
+                } else {
+                    Err(timers::DocumentProducerFenceError::CounterOverflow)
+                }
+            },
+            move |envelope| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, DocumentProducerEnvelope<ImageCacheResponseMessage>>(drop(envelope))
+            },
+        )
+        .unwrap();
+
+        callback(metadata_image_message());
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
+        assert_image_abandoned(&fence);
+
+        callback(failed_image_message());
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(admissions.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn rejected_image_enqueue_abandons_stream_and_releases_rejected_envelope() {
+        let fence = DocumentProducerFence::default();
+        let callback = fence_image_callback(&fence, Err).unwrap();
+
+        callback(metadata_image_message());
+
+        assert_image_abandoned(&fence);
+        assert_eq!(
+            fence
+                .snapshot()
+                .for_kind(DocumentProducerKind::Image)
+                .completed(),
+            2
+        );
+    }
+
+    #[test]
+    fn panicking_image_enqueue_abandons_stream_at_the_unwind_boundary() {
+        let fence = DocumentProducerFence::default();
+        let callback =
+            fence_image_callback(&fence, |_envelope| panic!("synthetic image enqueue panic"))
+                .unwrap();
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            callback(metadata_image_message());
+        }));
+
+        assert!(unwind.is_err());
+        assert_image_abandoned(&fence);
+        // A retained callback recovers its poisoned lifecycle mutex and remains inert.
+        callback(failed_image_message());
+        assert_image_abandoned(&fence);
+        drop(callback);
+    }
+
+    #[test]
+    fn image_observer_notification_follows_successful_queue_commit() {
+        type ImageEnvelope = DocumentProducerEnvelope<ImageCacheResponseMessage>;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notifier_events = events.clone();
+        let fence = DocumentProducerFence::with_notifier(Some(Arc::new(move || {
+            notifier_events.lock().unwrap().push("notify");
+        })));
+        let queued: Arc<Mutex<Option<ImageEnvelope>>> = Arc::new(Mutex::new(None));
+        let callback_queue = queued.clone();
+        let callback_events = events.clone();
+        let callback = fence_image_callback(&fence, move |envelope| {
+            *callback_queue.lock().unwrap() = Some(envelope);
+            callback_events.lock().unwrap().push("commit");
+            Ok(())
+        })
+        .unwrap();
+        events.lock().unwrap().clear();
+
+        callback(metadata_image_message());
+
+        assert_eq!(*events.lock().unwrap(), vec!["notify", "commit", "notify"]);
+        drop(callback);
+        drop(queued.lock().unwrap().take());
     }
 
     fn queued_message_cannot_look_empty_after_its_producer_is_dropped(kind: DocumentProducerKind) {
