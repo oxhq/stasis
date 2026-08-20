@@ -330,6 +330,144 @@ pub(crate) struct OngoingNavigation(u32);
 
 type PendingImageRasterizationKey = (PendingImageId, DeviceIntSize);
 
+/// Passive, policy-free facts copied from the non-animated image work retained by a
+/// [`Window`].
+///
+/// Image callback and layout maps deliberately use the same [`PendingImageId`] namespace.
+/// `retained_unique_image_ids` is their union, so a layout listener is not reported as a
+/// second logical image operation. Rasterization requests use `(image, size)` identities and
+/// remain separate logical work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WindowImagePendingObservation {
+    /// IDs retained by callbacks waiting for an image-cache response.
+    pub(crate) retained_callback_ids: usize,
+    /// IDs retained so layout can be invalidated after an image-cache response.
+    pub(crate) retained_layout_image_ids: usize,
+    /// The exact union of callback and layout image IDs.
+    pub(crate) retained_unique_image_ids: usize,
+    /// Exact `(image, requested size)` keys waiting for vector rasterization completion.
+    pub(crate) retained_rasterization_keys: usize,
+    /// Exact logical retained work, or `None` only if the sum cannot be represented.
+    /// In particular, an observed empty owner is `Some(0)`.
+    pub(crate) retained_work_items: Option<usize>,
+    /// Ready response messages are owned by the ScriptThread input queues, not `Window`.
+    /// `None` means unavailable here and must not be interpreted as zero.
+    pub(crate) immediately_ready_work_items: Option<usize>,
+    /// Canvas image upload acknowledgement state is owned by `Document`, not `Window`.
+    /// `None` means unavailable here and must not be interpreted as zero.
+    pub(crate) outstanding_canvas_upload_acknowledgements: Option<usize>,
+}
+
+fn observe_pending_nonanimated_images(
+    callback_ids: impl IntoIterator<Item = PendingImageId>,
+    layout_image_ids: impl IntoIterator<Item = PendingImageId>,
+    retained_rasterization_keys: usize,
+) -> WindowImagePendingObservation {
+    let callback_ids: HashSet<_> = callback_ids.into_iter().collect();
+    let layout_image_ids: HashSet<_> = layout_image_ids.into_iter().collect();
+    let retained_callback_ids = callback_ids.len();
+    let retained_layout_image_ids = layout_image_ids.len();
+
+    let mut unique_image_ids = callback_ids;
+    unique_image_ids.extend(layout_image_ids);
+    let retained_unique_image_ids = unique_image_ids.len();
+
+    WindowImagePendingObservation {
+        retained_callback_ids,
+        retained_layout_image_ids,
+        retained_unique_image_ids,
+        retained_rasterization_keys,
+        retained_work_items: retained_unique_image_ids.checked_add(retained_rasterization_keys),
+        immediately_ready_work_items: None,
+        outstanding_canvas_upload_acknowledgements: None,
+    }
+}
+
+#[cfg(test)]
+mod pending_nonanimated_image_observation_tests {
+    use super::*;
+
+    fn observe(
+        callback_ids: &[u64],
+        layout_image_ids: &[u64],
+        retained_rasterization_keys: usize,
+    ) -> WindowImagePendingObservation {
+        observe_pending_nonanimated_images(
+            callback_ids.iter().copied().map(PendingImageId),
+            layout_image_ids.iter().copied().map(PendingImageId),
+            retained_rasterization_keys,
+        )
+    }
+
+    #[test]
+    fn exact_zero_is_distinct_from_unavailable_queue_and_upload_facts() {
+        let observation = observe(&[], &[], 0);
+
+        assert_eq!(observation.retained_callback_ids, 0);
+        assert_eq!(observation.retained_layout_image_ids, 0);
+        assert_eq!(observation.retained_unique_image_ids, 0);
+        assert_eq!(observation.retained_rasterization_keys, 0);
+        assert_eq!(observation.retained_work_items, Some(0));
+        assert_eq!(observation.immediately_ready_work_items, None);
+        assert_eq!(observation.outstanding_canvas_upload_acknowledgements, None);
+    }
+
+    #[test]
+    fn nonzero_sources_are_copied_without_collapsing_rasterization_keys() {
+        let observation = observe(&[1, 2], &[3], 2);
+
+        assert_eq!(observation.retained_callback_ids, 2);
+        assert_eq!(observation.retained_layout_image_ids, 1);
+        assert_eq!(observation.retained_unique_image_ids, 3);
+        assert_eq!(observation.retained_rasterization_keys, 2);
+        assert_eq!(observation.retained_work_items, Some(5));
+    }
+
+    #[test]
+    fn callback_and_layout_identity_overlap_is_deduplicated() {
+        let observation = observe(&[1, 2, 2], &[2, 3, 3], 1);
+
+        assert_eq!(observation.retained_callback_ids, 2);
+        assert_eq!(observation.retained_layout_image_ids, 2);
+        assert_eq!(observation.retained_unique_image_ids, 3);
+        assert_eq!(observation.retained_work_items, Some(4));
+    }
+
+    #[test]
+    fn terminal_key_drop_is_visible_to_the_next_observation() {
+        let id = PendingImageId(7);
+        let mut callback_ids = HashSet::from([id]);
+        let mut layout_image_ids = HashSet::from([id]);
+        let mut retained_rasterization_keys = 1;
+        let before_drop = observe_pending_nonanimated_images(
+            callback_ids.iter().copied(),
+            layout_image_ids.iter().copied(),
+            retained_rasterization_keys,
+        );
+
+        callback_ids.remove(&id);
+        layout_image_ids.remove(&id);
+        retained_rasterization_keys = 0;
+        let after_drop = observe_pending_nonanimated_images(
+            callback_ids.iter().copied(),
+            layout_image_ids.iter().copied(),
+            retained_rasterization_keys,
+        );
+
+        assert_eq!(before_drop.retained_work_items, Some(2));
+        assert_eq!(after_drop.retained_work_items, Some(0));
+    }
+
+    #[test]
+    fn retained_work_count_overflow_is_unavailable_instead_of_wrapping() {
+        let observation = observe(&[1], &[], usize::MAX);
+
+        assert_eq!(observation.retained_unique_image_ids, 1);
+        assert_eq!(observation.retained_rasterization_keys, usize::MAX);
+        assert_eq!(observation.retained_work_items, None);
+    }
+}
+
 /// Ancillary data of pending image request that was initiated by layout during a reflow.
 /// This data is used to faciliate invalidating layout when the image data becomes available
 /// at some point in the future.
@@ -787,6 +925,24 @@ impl Window {
             self,
             WorkletGlobalScopeType::Paint,
             Box::new(|| Rc::new(WorkletThreadPool::spawn(worklet_global_scope_init))),
+        )
+    }
+
+    /// Copy the image work retained directly by this window without polling the image cache,
+    /// advancing layout, consuming a response, or retaining any collection borrow.
+    pub(crate) fn pending_nonanimated_image_observation(&self) -> WindowImagePendingObservation {
+        let callback_ids = self.pending_image_callbacks.borrow();
+        let layout_image_ids = self.pending_layout_images.borrow();
+        let retained_rasterization_keys = self
+            .pending_images_for_rasterization
+            .borrow()
+            .iter()
+            .count();
+
+        observe_pending_nonanimated_images(
+            callback_ids.keys().copied(),
+            layout_image_ids.iter().map(|(id, _)| *id),
+            retained_rasterization_keys,
         )
     }
 
