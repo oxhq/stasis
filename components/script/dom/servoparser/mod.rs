@@ -170,6 +170,67 @@ pub(crate) struct ElementAttribute {
     value: DOMString,
 }
 
+/// Policy-free state of a parser which can still affect its document.
+///
+/// Consumers must keep the parser itself as the source identity. These facts only describe the
+/// parser's current mechanics; they deliberately do not decide whether suspended or
+/// script-created parsing is finite, persistent, or unsupported.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ServoParserPendingState {
+    script_created: bool,
+    suspended: bool,
+    end_of_input_received: bool,
+    has_buffered_input: bool,
+}
+
+impl ServoParserPendingState {
+    pub(crate) fn is_script_created(self) -> bool {
+        self.script_created
+    }
+
+    pub(crate) fn is_suspended(self) -> bool {
+        self.suspended
+    }
+
+    pub(crate) fn end_of_input_received(self) -> bool {
+        self.end_of_input_received
+    }
+
+    pub(crate) fn has_buffered_input(self) -> bool {
+        self.has_buffered_input
+    }
+
+    /// Whether the parser can make progress without another producer first changing its state.
+    pub(crate) fn is_runnable(self) -> bool {
+        !self.suspended && (self.has_buffered_input || self.end_of_input_received)
+    }
+
+    /// Whether progress requires another input chunk or an explicit end-of-input signal.
+    pub(crate) fn is_awaiting_input(self) -> bool {
+        !self.suspended && !self.has_buffered_input && !self.end_of_input_received
+    }
+}
+
+fn pending_state_from_flags(
+    stopped: bool,
+    aborted: bool,
+    script_created: bool,
+    suspended: bool,
+    end_of_input_received: bool,
+    has_buffered_input: bool,
+) -> Option<ServoParserPendingState> {
+    if stopped || aborted {
+        return None;
+    }
+
+    Some(ServoParserPendingState {
+        script_created,
+        suspended,
+        end_of_input_received,
+        has_buffered_input,
+    })
+}
+
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
 pub(crate) enum ParsingAlgorithm {
     Normal,
@@ -365,6 +426,22 @@ impl ServoParser {
 
     pub(crate) fn is_script_created(&self) -> bool {
         self.script_created_parser
+    }
+
+    /// Return exact, policy-free pending state while this parser is active.
+    ///
+    /// This observes both input queues. Call it only on the rooted parser returned by
+    /// [`Document::active_parser`] in the same ScriptThread owner-loop observation, not reentrantly
+    /// while the tokenizer is running.
+    pub(crate) fn pending_state(&self) -> Option<ServoParserPendingState> {
+        pending_state_from_flags(
+            self.stopped.get(),
+            self.aborted.get(),
+            self.script_created_parser,
+            self.suspended.get(),
+            self.last_chunk_received.get(),
+            !self.network_input.is_empty() || !self.script_input.is_empty(),
+        )
     }
 
     /// Corresponds to the latter part of the "Otherwise" branch of the 'An end
@@ -1627,6 +1704,100 @@ pub(crate) struct FragmentContext<'a> {
     pub(crate) context_elem: &'a Node,
     pub(crate) form_elem: Option<&'a Node>,
     pub(crate) context_element_allows_scripting: bool,
+}
+
+#[cfg(test)]
+mod pending_state_tests {
+    use super::*;
+
+    fn state(
+        script_created: bool,
+        suspended: bool,
+        end_of_input_received: bool,
+        has_buffered_input: bool,
+    ) -> ServoParserPendingState {
+        pending_state_from_flags(
+            false,
+            false,
+            script_created,
+            suspended,
+            end_of_input_received,
+            has_buffered_input,
+        )
+        .expect("an unstopped, unaborted parser must remain active")
+    }
+
+    #[test]
+    fn stopped_and_aborted_parsers_have_no_pending_state() {
+        assert_eq!(
+            pending_state_from_flags(true, false, false, false, false, false),
+            None
+        );
+        assert_eq!(
+            pending_state_from_flags(false, true, false, false, false, false),
+            None
+        );
+        assert_eq!(
+            pending_state_from_flags(true, true, true, true, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn pending_state_preserves_runnable_suspended_and_input_distinctions() {
+        for suspended in [false, true] {
+            for end_of_input_received in [false, true] {
+                for has_buffered_input in [false, true] {
+                    let observed = state(
+                        false,
+                        suspended,
+                        end_of_input_received,
+                        has_buffered_input,
+                    );
+
+                    assert_eq!(observed.is_suspended(), suspended);
+                    assert_eq!(observed.end_of_input_received(), end_of_input_received);
+                    assert_eq!(observed.has_buffered_input(), has_buffered_input);
+                    if suspended {
+                        assert!(!observed.is_runnable());
+                        assert!(!observed.is_awaiting_input());
+                    } else {
+                        assert_eq!(
+                            observed.is_runnable(),
+                            has_buffered_input || end_of_input_received
+                        );
+                        assert_eq!(
+                            observed.is_awaiting_input(),
+                            !has_buffered_input && !end_of_input_received
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn script_created_parsers_remain_distinguishable_while_awaiting_input() {
+        let network_parser = state(false, false, false, false);
+        let script_created_parser = state(true, false, false, false);
+
+        assert!(network_parser.is_awaiting_input());
+        assert!(script_created_parser.is_awaiting_input());
+        assert!(!network_parser.is_script_created());
+        assert!(script_created_parser.is_script_created());
+    }
+
+    #[test]
+    fn parser_activity_does_not_depend_on_document_ready_state() {
+        let observations = [
+            DocumentReadyState::Loading,
+            DocumentReadyState::Interactive,
+            DocumentReadyState::Complete,
+        ]
+        .map(|_ready_state| pending_state_from_flags(false, false, false, false, false, false));
+
+        assert!(observations.into_iter().all(|observation| observation.is_some()));
+    }
 }
 
 /// <https://html.spec.whatwg.org/multipage/#insert-an-element-at-the-adjusted-insertion-location>

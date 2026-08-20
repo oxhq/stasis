@@ -2914,11 +2914,16 @@ impl Document {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#active-parser>
-    fn active_parser(&self) -> Option<DomRoot<ServoParser>> {
+    pub(crate) fn active_parser(&self) -> Option<DomRoot<ServoParser>> {
         // > A Document is said to have an active parser if it is associated with
         // > an HTML parser or an XML parser that has not yet been stopped or aborted.
         self.get_current_parser()
             .filter(|parser| !(parser.has_stopped() || parser.has_aborted()))
+    }
+
+    /// Whether this document's exact current parser has neither stopped nor aborted.
+    pub(crate) fn has_active_parser(&self) -> bool {
+        self.active_parser().is_some()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#abort-a-document>
