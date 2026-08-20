@@ -11,14 +11,15 @@ semantic port order rather than a cherry-pick recipe.
 
 | Donor commits | Port | Adaptation rule |
 | --- | --- | --- |
-| `f06508f382de`, `1813db637bb7`, `6ef1ee109766` | `DocumentClock`, `u128` monotonic time, signed Unix time, controlled timer scheduler, stable ordering and exact deadline snapshots | Preserve real mode and current `Select::select_deadline` behavior; never restore the older timer wait-channel architecture |
+| `f06508f382de` | `DocumentClock`, controlled timer scheduler, stable ordering and exact deadline snapshots | Preserve real mode and current `Select::select_deadline` behavior; never restore the older timer wait-channel architecture |
+| `1813db637bb7`, `6ef1ee109766` | Checked `u128` monotonic time, signed Unix time, and per-session virtual-span limits | Keep wide engine time exact; project it as decimal strings rather than JavaScript numbers |
 | `ffa610484dae` | Window Date and Performance clock routing | Reuse SpiderMonkey's host callback and realm discrimination; no init-script Date replacement |
 | `bb3b8b947314`, `66d68bf99071` | Rendering, rAF, document timeline, and performance provenance | Fail typed on unsupported clock surfaces rather than leaking host time |
 | `6501a024c36c` | RAII producer fence, enqueue/completion watermarks, two-checkpoint stability | Extend coverage on current source paths; do not treat it as a causal journal |
 | `501d4809abfe` | Clock configuration before initial navigation | Expose only through WebView construction/open options in 0.1 |
 | `f9fcd692ae5c`, `4f9bdd944927` | Observe, DriveOneTurn, and guarded single-use AdvanceTo | Keep the token internal to product commands |
 | `715661aca7b8`, `9984d57869ea` | Typed shutdown and definitive versus indeterminate transport results | Preserve `stateEffect: none/partial/indeterminate` at the wire boundary |
-| `4db43e7a5b95` | Task, individual microtask, rendering, mutation, and virtual-span limits | Keep distinct counters; a generic `maxEvents` is only an SDK convenience |
+| `4db43e7a5b95` | Task, individual microtask, rendering, mutation, and resource-event accounting | Keep distinct counters; a generic `maxEvents` is only an SDK convenience |
 | `84b866014f13`, `580abd76eb51` | Lost-wake-safe generation/condition-variable transport | Add a separate protocol-input generation |
 | `6ba6be8cdaa2`, `877cac369b39` | Finite, open-ended, and unsupported source taxonomy | Extract from generation capture; reject Paint/capture preconditions |
 | `9f5c0270fcbe` and `ports/pliego/src/controlled_settlement.rs` | Wake-driven observe/drive/advance coordinator | Replace capture readiness with raw snapshots and Stasis policy; report intervals as persistent work rather than a PDF capture failure |

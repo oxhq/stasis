@@ -9210,6 +9210,8 @@ version = "0.5.0"
 dependencies = [
  "crossbeam-channel",
  "malloc_size_of_derive",
+ "postcard",
+ "serde",
  "servo-malloc-size-of",
 ]
 
