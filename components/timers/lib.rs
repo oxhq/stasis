@@ -1410,6 +1410,61 @@ pub struct TimerDeadlineSnapshot {
     pub deadline: DocumentTime,
 }
 
+/// The result of joining one scheduler-local timer identity to its live deadline.
+///
+/// Results from [`TimerScheduler::join_live_deadlines`] are aligned with the requested timer IDs.
+/// A missing deadline means that identity is no longer pending in the named scheduler; it is not
+/// silently omitted.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub struct TimerDeadlineJoin {
+    /// Identity of the scheduler against which this timer ID was resolved.
+    pub scheduler_id: TimerSchedulerId,
+    /// Scheduler-local timer identity supplied by the caller.
+    pub id: TimerId,
+    /// Absolute controlled-clock deadline when this timer is still live.
+    pub deadline: Option<DocumentTime>,
+}
+
+/// A checked failure while joining scheduler-local IDs to controlled deadlines.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TimerDeadlineJoinError {
+    /// The lookup was requested from a realtime scheduler.
+    RealtimeScheduler,
+    /// The timer IDs were observed in another scheduler's scope.
+    SchedulerMismatch {
+        /// Identity of the scheduler receiving the lookup.
+        expected: TimerSchedulerId,
+        /// Scheduler identity supplied by the caller.
+        observed: TimerSchedulerId,
+    },
+}
+
+impl fmt::Display for TimerDeadlineJoinError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for TimerDeadlineJoinError {}
+
+/// One timer callback detached from its scheduler but not yet dispatched.
+///
+/// This value deliberately exposes no callback accessor, cloning, or serialization. A controller
+/// can detach it while holding a producer exclusion, return it from that exclusion, and consume it
+/// only after the exclusion has been released.
+#[derive(MallocSizeOf)]
+#[must_use = "a detached timer event must be explicitly dispatched or deliberately dropped"]
+pub struct DetachedTimerEvent {
+    request: TimerEventRequest,
+}
+
+impl DetachedTimerEvent {
+    /// Dispatch the detached callback exactly once.
+    pub fn dispatch(self) {
+        self.request.dispatch();
+    }
+}
+
 /// A checked scheduler/control failure.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TimerControlError {
@@ -1580,6 +1635,50 @@ impl TimerScheduler {
         }))
     }
 
+    /// Join arbitrary scheduler-local timer IDs to their currently live controlled deadlines.
+    ///
+    /// The returned vector has exactly the same length and order as `timer_ids`, including
+    /// duplicate and missing IDs. Every row carries this scheduler's identity so downstream
+    /// observations cannot accidentally treat bare [`TimerId`] values as process-global. The
+    /// caller must supply the scheduler identity observed alongside those IDs; a foreign scope is
+    /// rejected before any values are joined.
+    pub fn join_live_deadlines(
+        &self,
+        expected_scheduler_id: TimerSchedulerId,
+        timer_ids: &[TimerId],
+    ) -> Result<Vec<TimerDeadlineJoin>, TimerDeadlineJoinError> {
+        if expected_scheduler_id != self.id {
+            return Err(TimerDeadlineJoinError::SchedulerMismatch {
+                expected: self.id,
+                observed: expected_scheduler_id,
+            });
+        }
+        if !self.clock.is_controlled() {
+            return Err(TimerDeadlineJoinError::RealtimeScheduler);
+        }
+
+        let mut live_deadlines = timer_ids
+            .iter()
+            .copied()
+            .map(|id| (id, None))
+            .collect::<BTreeMap<_, _>>();
+        for event in &self.queue {
+            if let Some(deadline) = live_deadlines.get_mut(&event.id) {
+                *deadline = Some(event.deadline);
+            }
+        }
+
+        Ok(timer_ids
+            .iter()
+            .copied()
+            .map(|id| TimerDeadlineJoin {
+                scheduler_id: self.id,
+                id,
+                deadline: live_deadlines[&id],
+            })
+            .collect())
+    }
+
     /// Require one exact finite deadline snapshot without mutating the scheduler or clock.
     pub fn validate_deadline_snapshot(
         &self,
@@ -1605,8 +1704,30 @@ impl TimerScheduler {
         &mut self,
         expected: TimerDeadlineSnapshot,
     ) -> Result<(), TimerControlError> {
-        self.validate_and_advance_to(expected)?;
-        self.activate_due_timer(expected)
+        let expected_now = self.clock.try_now()?;
+        let detached = self.validate_advance_and_detach(expected_now, expected)?;
+        detached.dispatch();
+        Ok(())
+    }
+
+    /// Validate one exact controlled deadline and observed clock offset, advance, and detach the
+    /// selected event without dispatching its callback.
+    ///
+    /// Snapshot validation precedes clock mutation. Conditional clock advancement precedes queue
+    /// mutation. Therefore a foreign or stale snapshot, clock drift, backwards time, or checked
+    /// wall-time overflow leaves the selected event attached and never invokes its callback.
+    ///
+    /// The returned event should leave any producer exclusion and mutable scheduler borrow before
+    /// [`DetachedTimerEvent::dispatch`] is called.
+    pub fn validate_advance_and_detach(
+        &mut self,
+        expected_now: DocumentTime,
+        expected: TimerDeadlineSnapshot,
+    ) -> Result<DetachedTimerEvent, TimerControlError> {
+        self.validate_deadline_snapshot(expected)?;
+        self.clock
+            .advance_from_to(expected_now, expected.deadline)?;
+        Ok(self.pop_validated_head(expected))
     }
 
     /// Validate one fresh finite deadline and advance to it without dispatching its callback.
@@ -1639,6 +1760,15 @@ impl TimerScheduler {
         &mut self,
         expected: TimerDeadlineSnapshot,
     ) -> Result<(), TimerControlError> {
+        let detached = self.validate_and_detach_due(expected)?;
+        detached.dispatch();
+        Ok(())
+    }
+
+    fn validate_and_detach_due(
+        &mut self,
+        expected: TimerDeadlineSnapshot,
+    ) -> Result<DetachedTimerEvent, TimerControlError> {
         if let Some(terminal) = self.clock.terminal_error() {
             return Err(terminal.into());
         }
@@ -1653,12 +1783,19 @@ impl TimerScheduler {
                 now,
             });
         }
-        self.queue
+        Ok(self.pop_validated_head(expected))
+    }
+
+    fn pop_validated_head(&mut self, expected: TimerDeadlineSnapshot) -> DetachedTimerEvent {
+        let event = self
+            .queue
             .pop()
-            .expect("a matching finite-deadline snapshot must still have an event")
-            .request
-            .dispatch();
-        Ok(())
+            .expect("a matching finite-deadline snapshot must still have an event");
+        debug_assert_eq!(event.id, expected.id);
+        debug_assert_eq!(event.deadline, expected.deadline);
+        DetachedTimerEvent {
+            request: event.request,
+        }
     }
 
     /// Dispatch all timers due on the host clock.
@@ -2372,6 +2509,74 @@ mod tests {
     }
 
     #[test]
+    fn bulk_deadline_join_is_aligned_live_and_scheduler_scoped() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut scheduler = TimerScheduler::with_clock(controlled_clock(5));
+        let later =
+            scheduler.schedule_timer(recording_request(&events, 1, Duration::from_nanos(30)));
+        let canceled =
+            scheduler.schedule_timer(recording_request(&events, 2, Duration::from_nanos(10)));
+        let earlier =
+            scheduler.schedule_timer(recording_request(&events, 3, Duration::from_nanos(20)));
+        scheduler.cancel_timer(canceled);
+
+        assert_eq!(
+            scheduler.join_live_deadlines(scheduler.id(), &[]),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            scheduler.join_live_deadlines(scheduler.id(), &[earlier, canceled, later, earlier],),
+            Ok(vec![
+                TimerDeadlineJoin {
+                    scheduler_id: scheduler.id(),
+                    id: earlier,
+                    deadline: Some(DocumentTime::from_nanos(25)),
+                },
+                TimerDeadlineJoin {
+                    scheduler_id: scheduler.id(),
+                    id: canceled,
+                    deadline: None,
+                },
+                TimerDeadlineJoin {
+                    scheduler_id: scheduler.id(),
+                    id: later,
+                    deadline: Some(DocumentTime::from_nanos(35)),
+                },
+                TimerDeadlineJoin {
+                    scheduler_id: scheduler.id(),
+                    id: earlier,
+                    deadline: Some(DocumentTime::from_nanos(25)),
+                },
+            ])
+        );
+        assert!(events.lock().unwrap().is_empty());
+
+        let foreign_events = Arc::new(Mutex::new(Vec::new()));
+        let mut foreign = TimerScheduler::with_clock(controlled_clock(5));
+        let colliding_foreign_id = foreign.schedule_timer(recording_request(
+            &foreign_events,
+            4,
+            Duration::from_nanos(1),
+        ));
+        assert_eq!(colliding_foreign_id, later);
+        assert_eq!(
+            scheduler.join_live_deadlines(foreign.id(), &[colliding_foreign_id]),
+            Err(TimerDeadlineJoinError::SchedulerMismatch {
+                expected: scheduler.id(),
+                observed: foreign.id(),
+            })
+        );
+        assert!(events.lock().unwrap().is_empty());
+        assert!(foreign_events.lock().unwrap().is_empty());
+
+        let realtime = TimerScheduler::default();
+        assert_eq!(
+            realtime.join_live_deadlines(realtime.id(), &[later]),
+            Err(TimerDeadlineJoinError::RealtimeScheduler)
+        );
+    }
+
+    #[test]
     fn foreign_scheduler_snapshots_cannot_validate_advance_or_activate() {
         assert_foreign_snapshot_rejected(DocumentTime::ZERO, |scheduler, snapshot| {
             scheduler.validate_deadline_snapshot(snapshot)
@@ -2388,6 +2593,147 @@ mod tests {
         assert_foreign_snapshot_rejected(
             DocumentTime::from_nanos(10),
             TimerScheduler::activate_due_timer,
+        );
+    }
+
+    #[test]
+    fn detach_rejects_foreign_and_stale_snapshots_without_time_or_callback_mutation() {
+        let (mut local, local_snapshot, local_events, foreign, foreign_snapshot, foreign_events) =
+            same_shaped_scheduler_pair(Duration::from_nanos(10));
+
+        assert!(matches!(
+            local.validate_advance_and_detach(DocumentTime::ZERO, foreign_snapshot),
+            Err(TimerControlError::StaleDeadline {
+                expected,
+                observed: Some(observed),
+            }) if expected == foreign_snapshot && observed == local_snapshot
+        ));
+        assert_scheduler_state_unchanged(&local, local_snapshot, DocumentTime::ZERO, &local_events);
+        assert_scheduler_state_unchanged(
+            &foreign,
+            foreign_snapshot,
+            DocumentTime::ZERO,
+            &foreign_events,
+        );
+
+        local.cancel_timer(local_snapshot.id);
+        assert!(matches!(
+            local.validate_advance_and_detach(DocumentTime::ZERO, local_snapshot),
+            Err(TimerControlError::StaleDeadline {
+                expected,
+                observed: None,
+            }) if expected == local_snapshot
+        ));
+        assert_eq!(local.clock().now(), DocumentTime::ZERO);
+        assert_eq!(local.finite_deadline_snapshot().unwrap(), None);
+        assert!(local_events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn detached_callback_runs_only_after_explicit_dispatch_and_exact_head_is_removed() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut scheduler = TimerScheduler::with_clock(controlled_clock(0));
+        scheduler.schedule_timer(recording_request(&events, 1, Duration::from_nanos(10)));
+        scheduler.schedule_timer(recording_request(&events, 2, Duration::from_nanos(10)));
+        scheduler.schedule_timer(recording_request(&events, 3, Duration::from_nanos(20)));
+        let selected = scheduler.finite_deadline_snapshot().unwrap().unwrap();
+
+        let detached = scheduler
+            .validate_advance_and_detach(DocumentTime::ZERO, selected)
+            .unwrap();
+
+        assert_eq!(scheduler.clock().now(), selected.deadline);
+        assert!(events.lock().unwrap().is_empty());
+        let next = scheduler.finite_deadline_snapshot().unwrap().unwrap();
+        assert_eq!(next.deadline, selected.deadline);
+        assert_ne!(next.id, selected.id);
+
+        detached.dispatch();
+        assert_eq!(*events.lock().unwrap(), vec![1]);
+        assert_eq!(scheduler.finite_deadline_snapshot().unwrap(), Some(next));
+    }
+
+    #[test]
+    fn detached_event_can_leave_producer_exclusion_before_callback_dispatch() {
+        let fence = DocumentProducerFence::default();
+        let producer_snapshot = fence.snapshot();
+        let callback_fence = fence.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = events.clone();
+        let mut scheduler = TimerScheduler::with_clock(controlled_clock(0));
+        scheduler.schedule_timer(TimerEventRequest {
+            callback: Box::new(move || {
+                let guard = callback_fence.begin(DocumentProducerKind::Task).unwrap();
+                callback_events.lock().unwrap().push(1);
+                drop(guard);
+            }),
+            duration: Duration::from_nanos(10),
+        });
+        let selected = scheduler.finite_deadline_snapshot().unwrap().unwrap();
+
+        let detached = fence
+            .with_matching_snapshot(producer_snapshot, || {
+                scheduler.validate_advance_and_detach(DocumentTime::ZERO, selected)
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(fence.snapshot(), producer_snapshot);
+        assert!(events.lock().unwrap().is_empty());
+        detached.dispatch();
+        assert_eq!(*events.lock().unwrap(), vec![1]);
+        assert_eq!(fence.snapshot().revision(), 2);
+    }
+
+    #[test]
+    fn detach_rejects_clock_drift_and_wall_overflow_without_consuming_event() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let clock = controlled_clock(0);
+        let mut scheduler = TimerScheduler::with_clock(clock.clone());
+        scheduler.schedule_timer(recording_request(&events, 1, Duration::from_nanos(10)));
+        let snapshot = scheduler.finite_deadline_snapshot().unwrap().unwrap();
+        clock.advance_to(DocumentTime::from_nanos(1)).unwrap();
+
+        assert!(matches!(
+            scheduler.validate_advance_and_detach(DocumentTime::ZERO, snapshot),
+            Err(TimerControlError::Clock(DocumentClockError::TimeChanged {
+                expected: DocumentTime::ZERO,
+                observed,
+            })) if observed == DocumentTime::from_nanos(1)
+        ));
+        assert_scheduler_state_unchanged(
+            &scheduler,
+            snapshot,
+            DocumentTime::from_nanos(1),
+            &events,
+        );
+
+        let last_representable_wall_offset = u128::try_from(i128::MAX).unwrap();
+        let overflow_events = Arc::new(Mutex::new(Vec::new()));
+        let mut overflow_scheduler =
+            TimerScheduler::with_clock(controlled_clock(last_representable_wall_offset));
+        overflow_scheduler.schedule_timer(recording_request(
+            &overflow_events,
+            2,
+            Duration::from_nanos(1),
+        ));
+        let overflow_snapshot = overflow_scheduler
+            .finite_deadline_snapshot()
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            overflow_scheduler.validate_advance_and_detach(
+                DocumentTime::from_nanos(last_representable_wall_offset),
+                overflow_snapshot,
+            ),
+            Err(TimerControlError::Clock(DocumentClockError::Overflow))
+        ));
+        assert_scheduler_state_unchanged(
+            &overflow_scheduler,
+            overflow_snapshot,
+            DocumentTime::from_nanos(last_representable_wall_offset),
+            &overflow_events,
         );
     }
 
@@ -2836,6 +3182,11 @@ mod tests {
             id: TimerId(u64::MAX),
             deadline: DocumentTime::from_nanos(u128::MAX),
         });
+        assert_postcard_round_trip(TimerDeadlineJoin {
+            scheduler_id: TimerSchedulerId(u64::MAX),
+            id: TimerId(u64::MAX),
+            deadline: Some(DocumentTime::from_nanos(u128::MAX)),
+        });
         assert_postcard_round_trip(DocumentClockError::JavaScriptDatePrecisionLoss {
             unix_time: DocumentUnixTime::from_nanos(i128::MIN),
             expected_milliseconds: i128::MAX,
@@ -2852,6 +3203,10 @@ mod tests {
                 id: TimerId(3),
                 deadline: DocumentTime::from_nanos(4),
             }),
+        });
+        assert_postcard_round_trip(TimerDeadlineJoinError::SchedulerMismatch {
+            expected: TimerSchedulerId(1),
+            observed: TimerSchedulerId(2),
         });
     }
 
@@ -2930,6 +3285,17 @@ mod tests {
             },
         ];
         for (index, error) in timer_errors.into_iter().enumerate() {
+            assert_eq!(postcard::to_stdvec(&error).unwrap()[0], index as u8);
+        }
+
+        let join_errors = [
+            TimerDeadlineJoinError::RealtimeScheduler,
+            TimerDeadlineJoinError::SchedulerMismatch {
+                expected: TimerSchedulerId(0),
+                observed: TimerSchedulerId(1),
+            },
+        ];
+        for (index, error) in join_errors.into_iter().enumerate() {
             assert_eq!(postcard::to_stdvec(&error).unwrap()[0], index as u8);
         }
     }
