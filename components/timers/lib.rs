@@ -8,8 +8,9 @@
 #![deny(unsafe_code)]
 
 use std::cmp::{self, Ord};
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -723,6 +724,533 @@ impl DocumentClock {
     }
 }
 
+const DOCUMENT_PRODUCER_KIND_COUNT: usize = 5;
+static NEXT_DOCUMENT_PRODUCER_FENCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A class of asynchronous work that can later affect a document's observable result.
+///
+/// The fence deliberately contains only producers owned by a single script event loop. Workers,
+/// worklets, and cross-event-loop documents must be handled as separate execution surfaces rather
+/// than being silently treated as idle.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+#[repr(usize)]
+pub enum DocumentProducerKind {
+    /// A task queued through a Window's task manager.
+    Task = 0,
+    /// A document or navigation resource fetch.
+    Resource = 1,
+    /// A logical web-font load, including source fallback.
+    Font = 2,
+    /// An image-cache or vector-rasterization completion listener.
+    Image = 3,
+    /// An outbound one-shot callback whose reply will be handed off to a Window task.
+    ExternalCallback = 4,
+}
+
+impl DocumentProducerKind {
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The stable enqueue identity assigned to one producer ticket.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct DocumentProducerSequence(u64);
+
+impl DocumentProducerSequence {
+    /// Return the global enqueue sequence within this fence.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Stable identity of one event-loop-owned producer fence.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub struct DocumentProducerFenceId(u64);
+
+impl DocumentProducerFenceId {
+    /// Return the process-local fence identifier.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Serializable identity for an explicitly acknowledged producer lease.
+///
+/// The ID carries no synchronization state. Its owning [`DocumentProducerFence`] validates that
+/// the sequence is still live and belongs to the expected producer class before completing it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub struct DocumentProducerLeaseId {
+    fence_id: DocumentProducerFenceId,
+    sequence: DocumentProducerSequence,
+    kind: DocumentProducerKind,
+}
+
+impl DocumentProducerLeaseId {
+    /// Return the stable global enqueue sequence for this lease.
+    pub const fn sequence(self) -> DocumentProducerSequence {
+        self.sequence
+    }
+
+    /// Return the producer class registered for this lease.
+    pub const fn kind(self) -> DocumentProducerKind {
+        self.kind
+    }
+}
+
+/// Enqueue, completion, and pending watermarks for one producer class.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub struct DocumentProducerWatermark {
+    enqueued: u64,
+    completed: u64,
+    pending: u64,
+}
+
+impl DocumentProducerWatermark {
+    /// Number of tickets ever enqueued for this producer class.
+    pub const fn enqueued(self) -> u64 {
+        self.enqueued
+    }
+
+    /// Number of tickets whose producer callback or task has completed.
+    pub const fn completed(self) -> u64 {
+        self.completed
+    }
+
+    /// Number of currently live producer tickets.
+    pub const fn pending(self) -> u64 {
+        self.pending
+    }
+}
+
+/// One mutex-consistent snapshot of all participating document producers.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub struct DocumentProducerSnapshot {
+    fence_id: DocumentProducerFenceId,
+    revision: u64,
+    enqueued: u64,
+    completed: u64,
+    pending: u64,
+    by_kind: [DocumentProducerWatermark; DOCUMENT_PRODUCER_KIND_COUNT],
+}
+
+impl DocumentProducerSnapshot {
+    /// Return the identity of the fence that produced this snapshot.
+    pub const fn fence_id(self) -> DocumentProducerFenceId {
+        self.fence_id
+    }
+
+    /// A mutation sequence incremented for every enqueue and completion.
+    pub const fn revision(self) -> u64 {
+        self.revision
+    }
+
+    /// Global number of producer tickets ever enqueued.
+    pub const fn enqueued(self) -> u64 {
+        self.enqueued
+    }
+
+    /// Global number of producer tickets completed.
+    pub const fn completed(self) -> u64 {
+        self.completed
+    }
+
+    /// Global number of live producer tickets.
+    pub const fn pending(self) -> u64 {
+        self.pending
+    }
+
+    /// Return whether no participating producer ticket is live.
+    pub const fn is_empty(self) -> bool {
+        self.pending == 0
+    }
+
+    /// Return watermarks for one producer class.
+    pub const fn for_kind(self, kind: DocumentProducerKind) -> DocumentProducerWatermark {
+        self.by_kind[kind.index()]
+    }
+}
+
+#[derive(Default)]
+struct DocumentProducerFenceState {
+    revision: u64,
+    enqueued: u64,
+    completed: u64,
+    pending: u64,
+    by_kind: [DocumentProducerWatermark; DOCUMENT_PRODUCER_KIND_COUNT],
+    active_leases: BTreeMap<DocumentProducerSequence, DocumentProducerKind>,
+}
+
+impl DocumentProducerFenceState {
+    fn snapshot(&self, fence_id: DocumentProducerFenceId) -> DocumentProducerSnapshot {
+        DocumentProducerSnapshot {
+            fence_id,
+            revision: self.revision,
+            enqueued: self.enqueued,
+            completed: self.completed,
+            pending: self.pending,
+            by_kind: self.by_kind,
+        }
+    }
+}
+
+/// A checked producer-fence failure.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum DocumentProducerFenceError {
+    /// A sequence or watermark would exceed the `u64` representation.
+    CounterOverflow,
+    /// No event-loop microtask checkpoint has completed yet.
+    CheckpointNotCompleted,
+    /// An observation reused or moved backwards from an already observed checkpoint.
+    StaleCheckpoint {
+        /// The last checkpoint accepted by this observer.
+        previous: DocumentProducerCheckpoint,
+        /// The rejected checkpoint.
+        observed: DocumentProducerCheckpoint,
+    },
+    /// A lease acknowledgement did not name a live lease on this fence.
+    UnknownLease(DocumentProducerLeaseId),
+}
+
+impl fmt::Display for DocumentProducerFenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for DocumentProducerFenceError {}
+
+/// A producer snapshot changed before a conditional action reached its linearization point.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentProducerSnapshotMismatch {
+    observed: Box<DocumentProducerSnapshot>,
+}
+
+impl DocumentProducerSnapshotMismatch {
+    /// Return the producer state observed under the fence lock.
+    pub fn observed(&self) -> DocumentProducerSnapshot {
+        *self.observed
+    }
+}
+
+/// A clonable, linearizable fence shared by all participating producers on one event loop.
+///
+/// Enqueue and completion mutate one locked state so a snapshot cannot combine watermarks from
+/// different instants. Every successful enqueue reserves enough revision space for its eventual
+/// RAII completion, making overflow a checked enqueue failure rather than a fallible destructor.
+#[derive(Clone, MallocSizeOf)]
+pub struct DocumentProducerFence {
+    fence_id: DocumentProducerFenceId,
+    #[ignore_malloc_size_of = "The producer state is shared and measured by its owner"]
+    inner: Arc<Mutex<DocumentProducerFenceState>>,
+    #[ignore_malloc_size_of = "The optional host notifier is shared embedding state"]
+    state_change_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl Default for DocumentProducerFence {
+    fn default() -> Self {
+        Self::with_notifier(None)
+    }
+}
+
+impl DocumentProducerFence {
+    /// Construct a producer fence which optionally wakes its host after every committed change.
+    ///
+    /// Notification occurs after releasing the fence lock and is independent of any execution
+    /// accounting or settlement policy.
+    pub fn with_notifier(state_change_notifier: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
+        let fence_id = DocumentProducerFenceId(
+            NEXT_DOCUMENT_PRODUCER_FENCE_ID
+                .fetch_update(
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                    |current| current.checked_add(1),
+                )
+                .expect("document producer fence identifier exhausted"),
+        );
+        Self {
+            fence_id,
+            inner: Arc::new(Mutex::new(DocumentProducerFenceState::default())),
+            state_change_notifier,
+        }
+    }
+
+    /// Begin one producer operation and return its stable RAII ticket.
+    pub fn begin(
+        &self,
+        kind: DocumentProducerKind,
+    ) -> Result<DocumentProducerGuard, DocumentProducerFenceError> {
+        let mut state = self.inner.lock().expect("document producer fence poisoned");
+        let index = kind.index();
+
+        let revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(DocumentProducerFenceError::CounterOverflow)?;
+        let enqueued = state
+            .enqueued
+            .checked_add(1)
+            .ok_or(DocumentProducerFenceError::CounterOverflow)?;
+        let pending = state
+            .pending
+            .checked_add(1)
+            .ok_or(DocumentProducerFenceError::CounterOverflow)?;
+        let kind_enqueued = state.by_kind[index]
+            .enqueued
+            .checked_add(1)
+            .ok_or(DocumentProducerFenceError::CounterOverflow)?;
+        let kind_pending = state.by_kind[index]
+            .pending
+            .checked_add(1)
+            .ok_or(DocumentProducerFenceError::CounterOverflow)?;
+
+        // Each live ticket will consume one more revision when it completes. Reserve all of those
+        // future increments before admitting another ticket so guard destruction stays infallible.
+        revision
+            .checked_add(pending)
+            .ok_or(DocumentProducerFenceError::CounterOverflow)?;
+
+        state.revision = revision;
+        state.enqueued = enqueued;
+        state.pending = pending;
+        state.by_kind[index].enqueued = kind_enqueued;
+        state.by_kind[index].pending = kind_pending;
+
+        let lease_id = DocumentProducerLeaseId {
+            fence_id: self.fence_id,
+            sequence: DocumentProducerSequence(enqueued),
+            kind,
+        };
+        let previous = state.active_leases.insert(lease_id.sequence, kind);
+        debug_assert!(previous.is_none());
+
+        drop(state);
+        self.notify_state_change();
+
+        Ok(DocumentProducerGuard {
+            fence: self.clone(),
+            lease_id: Some(lease_id),
+        })
+    }
+
+    /// Capture all producer watermarks under one lock acquisition.
+    pub fn snapshot(&self) -> DocumentProducerSnapshot {
+        self.inner
+            .lock()
+            .expect("document producer fence poisoned")
+            .snapshot(self.fence_id)
+    }
+
+    /// Run an action only while the producer snapshot still exactly matches `expected`.
+    ///
+    /// Producer enqueue and completion remain blocked until `action` returns. The action must be
+    /// small and non-reentrant: calling `begin`, `complete_lease`, `snapshot`,
+    /// `with_matching_snapshot`, or any other operation on this same fence will deadlock. It must
+    /// not dispatch callbacks that can reach the same fence either.
+    pub fn with_matching_snapshot<T>(
+        &self,
+        expected: DocumentProducerSnapshot,
+        action: impl FnOnce() -> T,
+    ) -> Result<T, DocumentProducerSnapshotMismatch> {
+        let state = self.inner.lock().expect("document producer fence poisoned");
+        let observed = state.snapshot(self.fence_id);
+        if observed != expected {
+            return Err(DocumentProducerSnapshotMismatch {
+                observed: Box::new(observed),
+            });
+        }
+        let result = catch_unwind(AssertUnwindSafe(action));
+        drop(state);
+        match result {
+            Ok(result) => Ok(result),
+            Err(payload) => resume_unwind(payload),
+        }
+    }
+
+    /// Return the stable identity bound to this event-loop fence.
+    pub const fn id(&self) -> DocumentProducerFenceId {
+        self.fence_id
+    }
+
+    /// Complete a live lease after its terminal message has been handled.
+    pub fn complete_lease(
+        &self,
+        lease_id: DocumentProducerLeaseId,
+    ) -> Result<(), DocumentProducerFenceError> {
+        if lease_id.fence_id != self.fence_id {
+            return Err(DocumentProducerFenceError::UnknownLease(lease_id));
+        }
+        let mut state = self.inner.lock().expect("document producer fence poisoned");
+        if state.active_leases.get(&lease_id.sequence) != Some(&lease_id.kind) {
+            return Err(DocumentProducerFenceError::UnknownLease(lease_id));
+        }
+        state.active_leases.remove(&lease_id.sequence);
+        let index = lease_id.kind.index();
+
+        // `begin` reserves this revision and every completion count is bounded by its matching
+        // checked enqueue count, so these failures indicate an internal fence invariant bug.
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .expect("reserved document producer completion revision exhausted");
+        state.completed = state
+            .completed
+            .checked_add(1)
+            .expect("document producer completion exceeded enqueue watermark");
+        state.pending = state
+            .pending
+            .checked_sub(1)
+            .expect("document producer ticket completed twice");
+        state.by_kind[index].completed = state.by_kind[index]
+            .completed
+            .checked_add(1)
+            .expect("document producer kind completion exceeded enqueue watermark");
+        state.by_kind[index].pending = state.by_kind[index]
+            .pending
+            .checked_sub(1)
+            .expect("document producer kind ticket completed twice");
+        drop(state);
+        self.notify_state_change();
+        Ok(())
+    }
+
+    fn notify_state_change(&self) {
+        if let Some(notify) = &self.state_change_notifier {
+            // Host wake notification is best effort. In particular, a notifier panic must not
+            // strand a just-admitted lease before `begin` can return its guard, nor may it escape
+            // from the RAII guard's destructor after a valid completion was committed.
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| notify())) {
+                // A custom panic payload may itself panic from `Drop`. This is a host-waker
+                // failure path, so absolute containment is more important than reclaiming that
+                // exceptional allocation.
+                std::mem::forget(payload);
+            }
+        }
+    }
+}
+
+/// A live producer ticket. Dropping it records completion after the guarded callback or task.
+pub struct DocumentProducerGuard {
+    fence: DocumentProducerFence,
+    lease_id: Option<DocumentProducerLeaseId>,
+}
+
+impl DocumentProducerGuard {
+    /// Return this ticket's stable global enqueue sequence.
+    pub const fn sequence(&self) -> DocumentProducerSequence {
+        self.lease_id
+            .expect("a detached document producer guard has no sequence")
+            .sequence
+    }
+
+    /// Transfer completion responsibility to a serializable lease ID.
+    pub fn into_lease_id(mut self) -> DocumentProducerLeaseId {
+        self.lease_id
+            .take()
+            .expect("document producer guard detached twice")
+    }
+}
+
+impl Drop for DocumentProducerGuard {
+    fn drop(&mut self) {
+        if let Some(lease_id) = self.lease_id.take() {
+            self.fence
+                .complete_lease(lease_id)
+                .expect("live document producer guard named an unknown lease");
+        }
+    }
+}
+
+/// A monotonically increasing token created only after an event-loop microtask checkpoint.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Deserialize,
+    Eq,
+    MallocSizeOf,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+)]
+pub struct DocumentProducerCheckpoint(u64);
+
+impl DocumentProducerCheckpoint {
+    /// The initial token before any checkpoint has completed.
+    pub const ZERO: Self = Self(0);
+
+    /// Return the underlying checkpoint sequence.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Advance to the next checkpoint without wrapping.
+    pub fn checked_next(self) -> Result<Self, DocumentProducerFenceError> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or(DocumentProducerFenceError::CounterOverflow)
+    }
+}
+
+/// Mechanical result of one fenced observation after a microtask checkpoint.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum DocumentProducerObservation {
+    /// At least one producer is live.
+    Busy(DocumentProducerSnapshot),
+    /// This is the first empty snapshot at this revision.
+    FirstEmpty(DocumentProducerSnapshot),
+    /// Two fresh checkpoints observed the same empty producer revision.
+    StableEmpty(DocumentProducerSnapshot),
+}
+
+/// Per-driver state that qualifies an empty producer fence only across two fresh checkpoints.
+#[derive(Default)]
+pub struct DocumentProducerObserver {
+    last_checkpoint: Option<DocumentProducerCheckpoint>,
+    last_empty: Option<DocumentProducerSnapshot>,
+}
+
+impl DocumentProducerObserver {
+    /// Observe the fence after `checkpoint` and mechanically qualify stable emptiness.
+    pub fn observe(
+        &mut self,
+        fence: &DocumentProducerFence,
+        checkpoint: DocumentProducerCheckpoint,
+    ) -> Result<DocumentProducerObservation, DocumentProducerFenceError> {
+        if checkpoint == DocumentProducerCheckpoint::ZERO {
+            return Err(DocumentProducerFenceError::CheckpointNotCompleted);
+        }
+        if let Some(previous) = self.last_checkpoint
+            && checkpoint <= previous
+        {
+            return Err(DocumentProducerFenceError::StaleCheckpoint {
+                previous,
+                observed: checkpoint,
+            });
+        }
+        self.last_checkpoint = Some(checkpoint);
+
+        let snapshot = fence.snapshot();
+        if !snapshot.is_empty() {
+            self.last_empty = None;
+            return Ok(DocumentProducerObservation::Busy(snapshot));
+        }
+
+        let stable = self.last_empty == Some(snapshot);
+        self.last_empty = Some(snapshot);
+        if stable {
+            Ok(DocumentProducerObservation::StableEmpty(snapshot))
+        } else {
+            Ok(DocumentProducerObservation::FirstEmpty(snapshot))
+        }
+    }
+}
+
 #[derive(MallocSizeOf)]
 struct ScheduledEvent {
     id: TimerId,
@@ -1031,7 +1559,9 @@ impl TimerScheduler {
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
 
     use serde::Serialize;
     use serde::de::DeserializeOwned;
@@ -1064,6 +1594,417 @@ mod tests {
             callback: Box::new(move || events.lock().unwrap().push(value)),
             duration,
         }
+    }
+
+    #[test]
+    fn producer_fence_requires_two_fresh_unchanged_empty_checkpoints() {
+        let fence = DocumentProducerFence::default();
+        let mut observer = DocumentProducerObserver::default();
+        let first = DocumentProducerCheckpoint::ZERO.checked_next().unwrap();
+        let second = first.checked_next().unwrap();
+
+        assert_eq!(
+            observer.observe(&fence, DocumentProducerCheckpoint::ZERO),
+            Err(DocumentProducerFenceError::CheckpointNotCompleted)
+        );
+        assert!(matches!(
+            observer.observe(&fence, first),
+            Ok(DocumentProducerObservation::FirstEmpty(snapshot)) if snapshot.is_empty()
+        ));
+        assert_eq!(
+            observer.observe(&fence, first),
+            Err(DocumentProducerFenceError::StaleCheckpoint {
+                previous: first,
+                observed: first,
+            })
+        );
+        assert!(matches!(
+            observer.observe(&fence, second),
+            Ok(DocumentProducerObservation::StableEmpty(snapshot)) if snapshot.is_empty()
+        ));
+    }
+
+    #[test]
+    fn observer_switching_fences_requires_a_new_first_empty_observation() {
+        let first_fence = DocumentProducerFence::default();
+        let second_fence = DocumentProducerFence::default();
+        let mut observer = DocumentProducerObserver::default();
+        let first = DocumentProducerCheckpoint::ZERO.checked_next().unwrap();
+        let second = first.checked_next().unwrap();
+        let third = second.checked_next().unwrap();
+
+        assert!(matches!(
+            observer.observe(&first_fence, first),
+            Ok(DocumentProducerObservation::FirstEmpty(snapshot))
+                if snapshot.fence_id() == first_fence.id()
+        ));
+        assert!(matches!(
+            observer.observe(&second_fence, second),
+            Ok(DocumentProducerObservation::FirstEmpty(snapshot))
+                if snapshot.fence_id() == second_fence.id()
+        ));
+        assert!(matches!(
+            observer.observe(&second_fence, third),
+            Ok(DocumentProducerObservation::StableEmpty(snapshot))
+                if snapshot.fence_id() == second_fence.id()
+        ));
+    }
+
+    #[test]
+    fn producer_activity_between_empty_checkpoints_restarts_qualification() {
+        let fence = DocumentProducerFence::default();
+        let mut observer = DocumentProducerObserver::default();
+        let first = DocumentProducerCheckpoint::ZERO.checked_next().unwrap();
+        let second = first.checked_next().unwrap();
+        let third = second.checked_next().unwrap();
+
+        assert!(matches!(
+            observer.observe(&fence, first),
+            Ok(DocumentProducerObservation::FirstEmpty(_))
+        ));
+        let guard = fence.begin(DocumentProducerKind::Resource).unwrap();
+        drop(guard);
+        assert!(matches!(
+            observer.observe(&fence, second),
+            Ok(DocumentProducerObservation::FirstEmpty(snapshot))
+                if snapshot.revision() == 2 && snapshot.enqueued() == 1 && snapshot.completed() == 1
+        ));
+        assert!(matches!(
+            observer.observe(&fence, third),
+            Ok(DocumentProducerObservation::StableEmpty(_))
+        ));
+    }
+
+    #[test]
+    fn busy_observation_clears_the_previous_empty_candidate() {
+        let fence = DocumentProducerFence::default();
+        let mut observer = DocumentProducerObserver::default();
+        let first = DocumentProducerCheckpoint::ZERO.checked_next().unwrap();
+        let second = first.checked_next().unwrap();
+        let third = second.checked_next().unwrap();
+        let fourth = third.checked_next().unwrap();
+
+        assert!(matches!(
+            observer.observe(&fence, first),
+            Ok(DocumentProducerObservation::FirstEmpty(_))
+        ));
+        let guard = fence.begin(DocumentProducerKind::Font).unwrap();
+        assert!(matches!(
+            observer.observe(&fence, second),
+            Ok(DocumentProducerObservation::Busy(snapshot))
+                if snapshot.for_kind(DocumentProducerKind::Font).pending() == 1
+        ));
+        drop(guard);
+        assert!(matches!(
+            observer.observe(&fence, third),
+            Ok(DocumentProducerObservation::FirstEmpty(_))
+        ));
+        assert!(matches!(
+            observer.observe(&fence, fourth),
+            Ok(DocumentProducerObservation::StableEmpty(_))
+        ));
+    }
+
+    #[test]
+    fn producer_watermarks_are_stable_when_tickets_complete_out_of_order() {
+        let fence = DocumentProducerFence::default();
+        let first = fence.begin(DocumentProducerKind::Task).unwrap();
+        let second = fence.begin(DocumentProducerKind::Task).unwrap();
+        let image = fence.begin(DocumentProducerKind::Image).unwrap();
+
+        assert_eq!(first.sequence().get(), 1);
+        assert_eq!(second.sequence().get(), 2);
+        assert_eq!(image.sequence().get(), 3);
+        assert_eq!(fence.snapshot().pending(), 3);
+
+        drop(second);
+        let middle = fence.snapshot();
+        assert_eq!(middle.revision(), 4);
+        assert_eq!(middle.pending(), 2);
+        assert_eq!(
+            middle.for_kind(DocumentProducerKind::Task),
+            DocumentProducerWatermark {
+                enqueued: 2,
+                completed: 1,
+                pending: 1,
+            }
+        );
+
+        drop(first);
+        drop(image);
+        let complete = fence.snapshot();
+        assert!(complete.is_empty());
+        assert_eq!(complete.revision(), 6);
+        assert_eq!(complete.enqueued(), complete.completed());
+        for kind in [
+            DocumentProducerKind::Task,
+            DocumentProducerKind::Resource,
+            DocumentProducerKind::Font,
+            DocumentProducerKind::Image,
+            DocumentProducerKind::ExternalCallback,
+        ] {
+            let watermark = complete.for_kind(kind);
+            assert_eq!(watermark.enqueued(), watermark.completed());
+            assert_eq!(watermark.pending(), 0);
+        }
+    }
+
+    #[test]
+    fn external_callback_handoff_never_exposes_false_empty_state() {
+        let fence = DocumentProducerFence::default();
+
+        let failed_callback = fence.begin(DocumentProducerKind::ExternalCallback).unwrap();
+        assert_eq!(fence.snapshot().pending(), 1);
+        drop(failed_callback);
+        assert!(fence.snapshot().is_empty());
+
+        let callback = fence.begin(DocumentProducerKind::ExternalCallback).unwrap();
+        let task = fence.begin(DocumentProducerKind::Task).unwrap();
+        let during_handoff = fence.snapshot();
+        assert_eq!(during_handoff.pending(), 2);
+        assert_eq!(
+            during_handoff
+                .for_kind(DocumentProducerKind::ExternalCallback)
+                .pending(),
+            1
+        );
+        assert_eq!(
+            during_handoff
+                .for_kind(DocumentProducerKind::Task)
+                .pending(),
+            1
+        );
+
+        drop(callback);
+        assert_eq!(fence.snapshot().pending(), 1);
+        drop(task);
+        assert!(fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn explicit_leases_reject_double_and_foreign_completion() {
+        let first_fence = DocumentProducerFence::default();
+        let second_fence = DocumentProducerFence::default();
+        let first_lease = first_fence
+            .begin(DocumentProducerKind::Resource)
+            .unwrap()
+            .into_lease_id();
+        let second_lease = second_fence
+            .begin(DocumentProducerKind::Resource)
+            .unwrap()
+            .into_lease_id();
+
+        assert_eq!(first_lease.sequence(), second_lease.sequence());
+        assert_eq!(first_lease.kind(), DocumentProducerKind::Resource);
+        assert_eq!(
+            first_fence.complete_lease(second_lease),
+            Err(DocumentProducerFenceError::UnknownLease(second_lease))
+        );
+        assert_eq!(first_fence.snapshot().pending(), 1);
+        assert_eq!(second_fence.snapshot().pending(), 1);
+
+        first_fence.complete_lease(first_lease).unwrap();
+        assert_eq!(
+            first_fence.complete_lease(first_lease),
+            Err(DocumentProducerFenceError::UnknownLease(first_lease))
+        );
+        second_fence.complete_lease(second_lease).unwrap();
+        assert!(first_fence.snapshot().is_empty());
+        assert!(second_fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn enqueue_reserves_capacity_for_infallible_guard_completion() {
+        let state = DocumentProducerFenceState {
+            revision: u64::MAX - 2,
+            ..DocumentProducerFenceState::default()
+        };
+        let fence = DocumentProducerFence {
+            fence_id: DocumentProducerFenceId(0),
+            inner: Arc::new(Mutex::new(state)),
+            state_change_notifier: None,
+        };
+
+        let guard = fence.begin(DocumentProducerKind::Task).unwrap();
+        assert_eq!(fence.snapshot().revision(), u64::MAX - 1);
+        drop(guard);
+        assert_eq!(fence.snapshot().revision(), u64::MAX);
+
+        let before = fence.snapshot();
+        assert!(matches!(
+            fence.begin(DocumentProducerKind::Task),
+            Err(DocumentProducerFenceError::CounterOverflow)
+        ));
+        assert_eq!(fence.snapshot(), before);
+        assert_eq!(
+            DocumentProducerCheckpoint(u64::MAX).checked_next(),
+            Err(DocumentProducerFenceError::CounterOverflow)
+        );
+    }
+
+    #[test]
+    fn producer_notifier_runs_after_unlock_for_each_committed_change() {
+        let holder = Arc::new(Mutex::new(None::<DocumentProducerFence>));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let callback_holder = holder.clone();
+        let callback_observed = observed.clone();
+        let fence = DocumentProducerFence::with_notifier(Some(Arc::new(move || {
+            let fence = callback_holder
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("fence installed before its first mutation")
+                .clone();
+            callback_observed
+                .lock()
+                .unwrap()
+                .push(fence.snapshot().pending());
+        })));
+        *holder.lock().unwrap() = Some(fence.clone());
+
+        let guard = fence.begin(DocumentProducerKind::Task).unwrap();
+        drop(guard);
+
+        assert_eq!(*observed.lock().unwrap(), vec![1, 0]);
+        assert!(fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn panicking_notifier_does_not_interrupt_begin_or_leak_its_guard() {
+        let fence = DocumentProducerFence::with_notifier(Some(Arc::new(|| {
+            panic!("host notifier failed");
+        })));
+
+        let guard = fence
+            .begin(DocumentProducerKind::ExternalCallback)
+            .expect("notifier panic must not replace a successful admission");
+        assert_eq!(fence.snapshot().pending(), 1);
+
+        drop(guard);
+        assert!(fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn panicking_notifier_never_escapes_raii_completion() {
+        let fence = DocumentProducerFence::with_notifier(Some(Arc::new(|| {
+            panic!("host notifier failed");
+        })));
+        let guard = fence.begin(DocumentProducerKind::Task).unwrap();
+
+        let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard)));
+
+        assert!(completion.is_ok());
+        assert!(fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn rejected_lease_completion_does_not_notify() {
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed_notifications = notifications.clone();
+        let fence = DocumentProducerFence::with_notifier(Some(Arc::new(move || {
+            observed_notifications.fetch_add(1, Ordering::SeqCst);
+        })));
+        let foreign_fence = DocumentProducerFence::default();
+        let foreign_lease = foreign_fence
+            .begin(DocumentProducerKind::Font)
+            .unwrap()
+            .into_lease_id();
+
+        assert_eq!(
+            fence.complete_lease(foreign_lease),
+            Err(DocumentProducerFenceError::UnknownLease(foreign_lease))
+        );
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        foreign_fence.complete_lease(foreign_lease).unwrap();
+    }
+
+    #[test]
+    fn matching_snapshot_reports_exact_observed_state_on_mismatch() {
+        let fence = DocumentProducerFence::default();
+        let expected = fence.snapshot();
+        let guard = fence.begin(DocumentProducerKind::Resource).unwrap();
+        let observed = fence.snapshot();
+
+        let mismatch = fence
+            .with_matching_snapshot(expected, || panic!("stale action must not run"))
+            .unwrap_err();
+        assert_eq!(mismatch.observed(), observed);
+        drop(guard);
+    }
+
+    #[test]
+    fn matching_snapshot_rejects_an_identical_snapshot_from_another_fence() {
+        let first_fence = DocumentProducerFence::default();
+        let second_fence = DocumentProducerFence::default();
+        let foreign = first_fence.snapshot();
+        let local = second_fence.snapshot();
+
+        assert_ne!(foreign.fence_id(), local.fence_id());
+        let mismatch = second_fence
+            .with_matching_snapshot(foreign, || panic!("foreign snapshot action must not run"))
+            .unwrap_err();
+        assert_eq!(mismatch.observed(), local);
+    }
+
+    #[test]
+    fn panicking_matching_snapshot_action_releases_lock_without_poisoning() {
+        let fence = DocumentProducerFence::default();
+        let expected = fence.snapshot();
+
+        let action = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fence
+                .with_matching_snapshot(expected, || panic!("guarded action failed"))
+                .unwrap();
+        }));
+        assert!(action.is_err());
+
+        let guard = fence
+            .begin(DocumentProducerKind::Resource)
+            .expect("guarded action panic must not poison the fence");
+        drop(guard);
+        assert!(fence.snapshot().is_empty());
+    }
+
+    #[test]
+    fn matching_snapshot_lock_excludes_new_producers_until_action_finishes() {
+        let fence = DocumentProducerFence::default();
+        let expected = fence.snapshot();
+        let action_fence = fence.clone();
+        let producer_fence = fence.clone();
+        let (locked_sender, locked_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (attempt_sender, attempt_receiver) = mpsc::channel();
+        let (producer_sender, producer_receiver) = mpsc::channel();
+
+        let action = thread::spawn(move || {
+            action_fence
+                .with_matching_snapshot(expected, || {
+                    locked_sender.send(()).unwrap();
+                    release_receiver.recv().unwrap();
+                })
+                .unwrap();
+        });
+        locked_receiver.recv().unwrap();
+        let producer = thread::spawn(move || {
+            attempt_sender.send(()).unwrap();
+            let guard = producer_fence
+                .begin(DocumentProducerKind::Resource)
+                .unwrap();
+            producer_sender.send(()).unwrap();
+            drop(guard);
+        });
+
+        attempt_receiver.recv().unwrap();
+        assert!(
+            producer_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+        release_sender.send(()).unwrap();
+        action.join().unwrap();
+        producer_receiver.recv().unwrap();
+        producer.join().unwrap();
+        assert_eq!(fence.snapshot().revision(), 2);
     }
 
     #[test]

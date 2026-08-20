@@ -44,6 +44,7 @@ mod microtask;
 pub(crate) mod mime;
 pub(crate) mod modules;
 mod navigation;
+pub(crate) mod producer_fence;
 mod realms;
 mod routed_promise;
 pub(crate) mod script_runtime;
