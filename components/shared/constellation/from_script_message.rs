@@ -9,6 +9,10 @@ use std::fmt;
 use content_security_policy::sandboxing_directive::SandboxingFlagSet;
 use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg, WorkerId};
 use embedder_traits::user_contents::UserContentManagerId;
+use embedder_traits::document_control::{
+    DocumentControlCancellationId, DocumentControlOutcome, DocumentControlRequestId,
+};
+use embedder_traits::document_pending::PendingTargetObservation;
 use embedder_traits::{
     AnimationState, FocusSequenceNumber, JSValue, JavaScriptEvaluationError,
     JavaScriptEvaluationId, MediaSessionEvent, ScriptToEmbedderChan, Theme, ViewportDetails,
@@ -821,6 +825,21 @@ pub enum ScriptToConstellationMessage {
     /// aggregate lock count and notify the provider only when the count transitions from N to 0.
     /// <https://w3c.github.io/screen-wake-lock/#dfn-release-wake-lock>
     ReleaseWakeLock(WakeLockType),
+    /// Ordered completion of one priority controlled-document command.
+    ///
+    /// This response shares the ordinary Script-to-Constellation stream with any causal
+    /// navigation messages emitted by the command's turn.
+    #[doc(hidden)]
+    DocumentControlResponse {
+        /// Checked Constellation request identity.
+        request_id: DocumentControlRequestId,
+        /// Exact per-WebView cancellation nonce routed with the command.
+        cancellation_id: DocumentControlCancellationId,
+        /// Immutable target routed with the command.
+        target: Box<PendingTargetObservation>,
+        /// Sole typed command result.
+        outcome: DocumentControlOutcome,
+    },
 }
 
 impl fmt::Debug for ScriptToConstellationMessage {

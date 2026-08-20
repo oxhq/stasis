@@ -106,6 +106,16 @@ use devtools_traits::{
 };
 use embedder_traits::resources::{self, Resource};
 use embedder_traits::user_contents::{UserContentManagerId, UserContents};
+use embedder_traits::document_control::{
+    DocumentControlCancellationId, DocumentControlCommand, DocumentControlError,
+    DocumentControlOutcome, DocumentControlRequestId,
+};
+use embedder_traits::document_pending::{
+    PendingActiveTopLevelPipeline, PendingGenerationTerminal,
+    PendingGenerationTerminalObservation, PendingNavigationRevision,
+    PendingPipelineMembershipRevision, PendingRuntimeTerminals,
+    PendingTargetObservation, PendingTargetTimeTerminalObservation,
+};
 use embedder_traits::{
     AnimationState, DocumentClockConfiguration, EmbedderControlId, EmbedderControlResponse,
     EmbedderProxy, FocusSequenceNumber, GenericEmbedderProxy, InputEvent, InputEventAndId,
@@ -139,7 +149,8 @@ use rand::{RngExt, SeedableRng, make_rng};
 use rustc_hash::{FxHashMap, FxHashSet};
 use script_traits::{
     ConstellationInputEvent, DiscardBrowsingContext, DocumentActivity, MouseButtons,
-    NewPipelineInfo, ProgressiveWebMetricType, ScriptThreadMessage, UpdatePipelineIdReason,
+    NewPipelineInfo, ProgressiveWebMetricType, ScriptThreadControlMessage, ScriptThreadMessage,
+    UpdatePipelineIdReason,
 };
 use servo_background_hang_monitor::HangMonitorRegister;
 use servo_base::generic_channel::{
@@ -199,6 +210,62 @@ struct PendingApprovalNavigation {
     load_data: LoadData,
     history_behaviour: NavigationHistoryBehavior,
     target_snapshot_params: TargetSnapshotParams,
+}
+
+struct PendingDocumentControl {
+    webview_id: WebViewId,
+    route_pipeline_id: PipelineId,
+    event_loop: Weak<EventLoop>,
+    target: PendingTargetObservation,
+    target_terminals: PendingRuntimeTerminals,
+    cancellation_id: DocumentControlCancellationId,
+    command: DocumentControlCommand,
+    owner_response: GenericCallback<DocumentControlOutcome>,
+}
+
+struct CapturedDocumentControlTarget {
+    target: PendingTargetObservation,
+    target_terminals: PendingRuntimeTerminals,
+    route_pipeline_id: PipelineId,
+    event_loop: Rc<EventLoop>,
+}
+
+impl PendingDocumentControl {
+    fn accepts_response(
+        &self,
+        source_webview_id: WebViewId,
+        source_pipeline_id: PipelineId,
+        cancellation_id: DocumentControlCancellationId,
+        target: &PendingTargetObservation,
+    ) -> bool {
+        self.webview_id == source_webview_id &&
+            self.route_pipeline_id == source_pipeline_id &&
+            self.cancellation_id == cancellation_id &&
+            self.target == *target
+    }
+
+    fn send(self, outcome: DocumentControlOutcome) {
+        let _ = self.owner_response.send(outcome);
+    }
+
+    fn send_unresolved(self, observe_error: DocumentControlError) {
+        let outcome = match &self.command {
+            DocumentControlCommand::Observe => DocumentControlOutcome::Rejected(observe_error),
+            DocumentControlCommand::DriveOneTurn => {
+                DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate {
+                    target: Box::new(self.target.clone()),
+                }
+            },
+            DocumentControlCommand::AdvanceTo(token) => {
+                DocumentControlOutcome::AdvanceOutcomeIndeterminate {
+                    token_id: token.id(),
+                    target: Box::new(token.target().clone()),
+                    deadline: token.deadline(),
+                }
+            },
+        };
+        let _ = self.owner_response.send(outcome);
+    }
 }
 
 type PendingApprovalNavigations = FxHashMap<PipelineId, PendingApprovalNavigation>;
@@ -362,6 +429,12 @@ pub struct Constellation<STF, SWF> {
 
     /// Bookkeeping data for all webviews in the constellation.
     webviews: FxHashMap<WebViewId, ConstellationWebView>,
+
+    /// Checked global sequence for priority controlled-document commands.
+    next_document_control_request_id: u64,
+
+    /// Sole embedding-owner callback retained for each routed command.
+    pending_document_controls: FxHashMap<DocumentControlRequestId, PendingDocumentControl>,
 
     /// Channels for the constellation to send messages to the public
     /// resource-related threads. There are two groups of resource threads: one
@@ -701,6 +774,8 @@ where
                     constellation_to_embedder_proxy: state.constellation_to_embedder_proxy,
                     paint_proxy: state.paint_proxy,
                     webviews: Default::default(),
+                    next_document_control_request_id: 0,
+                    pending_document_controls: Default::default(),
                     devtools_sender: state.devtools_sender,
                     script_to_devtools_callback: Default::default(),
                     #[cfg(feature = "bluetooth")]
@@ -1150,6 +1225,9 @@ where
 
         assert!(!self.pipelines.contains_key(&new_pipeline_id));
         self.pipelines.insert(new_pipeline_id, pipeline);
+        if let Some(webview) = self.webviews.get_mut(&webview_id) {
+            webview.note_pipeline_membership_change();
+        }
         true
     }
 
@@ -1552,6 +1630,21 @@ where
             EmbedderToConstellationMessage::SetAccessibilityActive(webview_id, active) => {
                 self.set_accessibility_active(webview_id, active);
             },
+            EmbedderToConstellationMessage::DocumentControl {
+                webview_id,
+                cancellation_id,
+                command,
+                response,
+            } => self.handle_document_control(
+                webview_id,
+                cancellation_id,
+                command,
+                response,
+            ),
+            EmbedderToConstellationMessage::CancelDocumentControl {
+                webview_id,
+                cancellation_id,
+            } => self.handle_cancel_document_control(webview_id, cancellation_id),
         }
     }
 
@@ -1679,6 +1772,396 @@ where
                 evaluation_id,
                 Err(JavaScriptEvaluationError::InternalError),
             );
+        }
+    }
+
+    fn capture_document_control_target(
+        &self,
+        webview_id: WebViewId,
+    ) -> Result<CapturedDocumentControlTarget, DocumentControlError> {
+        let webview = self
+            .webviews
+            .get(&webview_id)
+            .ok_or(DocumentControlError::WebViewUnavailable)?;
+        if webview.document_clock() == DocumentClockConfiguration::Realtime {
+            return Err(DocumentControlError::NotControlled);
+        }
+        let event_loop_id = webview
+            .controlled_event_loop_id()
+            .ok_or(DocumentControlError::EventLoopUnavailable)?;
+
+        let navigation = webview
+            .top_level_navigation_snapshot()
+            .map_err(|_| DocumentControlError::EventLoopUnavailable)?;
+        let (pipeline_membership_revision, pipeline_membership_failure) =
+            webview.pipeline_membership_revision();
+
+        let mut target_terminals = PendingRuntimeTerminals::default();
+        if let Some(unsupported_surface) = webview.document_time_failure() {
+            target_terminals.target_time = Some(PendingTargetTimeTerminalObservation {
+                webview_id,
+                unsupported_surface,
+            });
+        }
+        if webview.navigation_revision_failure().is_some() {
+            target_terminals.navigation_revision = Some(PendingGenerationTerminalObservation {
+                webview_id,
+                error: PendingGenerationTerminal::Exhausted,
+            });
+        }
+        if pipeline_membership_failure.is_some() {
+            target_terminals.pipeline_membership_revision =
+                Some(PendingGenerationTerminalObservation {
+                    webview_id,
+                    error: PendingGenerationTerminal::Exhausted,
+                });
+        }
+
+        let mut pipelines = self
+            .pipelines
+            .values()
+            .filter_map(|pipeline| {
+                (pipeline.webview_id == webview_id).then_some((pipeline.id, &pipeline.event_loop))
+            })
+            .collect::<Vec<_>>();
+        if pipelines.is_empty() {
+            return Err(DocumentControlError::EventLoopUnavailable);
+        }
+        if pipelines
+            .iter()
+            .any(|(_, event_loop)| event_loop.id() != event_loop_id)
+        {
+            return Err(DocumentControlError::MultipleEventLoops);
+        }
+        if self.pipelines.values().any(|pipeline| {
+            pipeline.webview_id != webview_id && pipeline.event_loop.id() == event_loop_id
+        }) {
+            return Err(DocumentControlError::SharedEventLoopWebView);
+        }
+        pipelines.sort_unstable_by_key(|(pipeline_id, _)| *pipeline_id);
+        pipelines.dedup_by_key(|(pipeline_id, _)| *pipeline_id);
+
+        let mut fully_active_pipelines = Vec::new();
+        for browsing_context in self.fully_active_browsing_contexts_iter(webview_id) {
+            let pipeline = self
+                .pipelines
+                .get(&browsing_context.pipeline_id)
+                .ok_or(DocumentControlError::EventLoopUnavailable)?;
+            if pipeline.event_loop.id() != event_loop_id {
+                return Err(DocumentControlError::MultipleEventLoops);
+            }
+            fully_active_pipelines.push(pipeline.id);
+        }
+
+        let active_top_level = navigation.active_pipeline_id.map(|pipeline_id| {
+            PendingActiveTopLevelPipeline {
+                pipeline_id,
+                epoch: navigation.active_pipeline_epoch,
+            }
+        });
+        let target = PendingTargetObservation::new_with_authority(
+            webview_id,
+            event_loop_id,
+            active_top_level,
+            PendingNavigationRevision::new(navigation.navigation_revision),
+            PendingPipelineMembershipRevision::new(pipeline_membership_revision),
+            webview.document_time_failure(),
+            pipelines
+                .iter()
+                .map(|(pipeline_id, _)| *pipeline_id)
+                .collect(),
+            fully_active_pipelines,
+            navigation.pending_pipeline_ids,
+        )
+        .map_err(DocumentControlError::PendingSnapshot)?;
+
+        let route_pipeline_id = target
+            .active_top_level
+            .map(|active| active.pipeline_id)
+            .or_else(|| target.pending_top_level_pipelines().first().copied())
+            .ok_or(DocumentControlError::EventLoopUnavailable)?;
+        let route_pipeline = self
+            .pipelines
+            .get(&route_pipeline_id)
+            .ok_or(DocumentControlError::EventLoopUnavailable)?;
+        if route_pipeline.webview_id != webview_id ||
+            route_pipeline.event_loop.id() != event_loop_id
+        {
+            return Err(DocumentControlError::EventLoopUnavailable);
+        }
+
+        Ok(CapturedDocumentControlTarget {
+            target,
+            target_terminals,
+            route_pipeline_id,
+            event_loop: route_pipeline.event_loop.clone(),
+        })
+    }
+
+    fn next_document_control_request_id(
+        &mut self,
+    ) -> Result<DocumentControlRequestId, DocumentControlError> {
+        let next = self
+            .next_document_control_request_id
+            .checked_add(1)
+            .ok_or(DocumentControlError::RequestSequenceOverflow)?;
+        self.next_document_control_request_id = next;
+        Ok(DocumentControlRequestId::new(next))
+    }
+
+    fn route_document_control(
+        &mut self,
+        webview_id: WebViewId,
+        cancellation_id: DocumentControlCancellationId,
+        command: DocumentControlCommand,
+        owner_response: GenericCallback<DocumentControlOutcome>,
+        captured: CapturedDocumentControlTarget,
+    ) {
+        let request_id = match self.next_document_control_request_id() {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                let _ = owner_response.send(DocumentControlOutcome::Rejected(error));
+                return;
+            },
+        };
+        let pending = PendingDocumentControl {
+            webview_id,
+            route_pipeline_id: captured.route_pipeline_id,
+            event_loop: Rc::downgrade(&captured.event_loop),
+            target: captured.target.clone(),
+            target_terminals: captured.target_terminals.clone(),
+            cancellation_id,
+            command: command.clone(),
+            owner_response,
+        };
+        self.pending_document_controls.insert(request_id, pending);
+        let send_result = captured.event_loop.send_document_control(
+            ScriptThreadControlMessage::Command {
+                request_id,
+                cancellation_id,
+                target: Box::new(captured.target),
+                target_terminals: captured.target_terminals,
+                command,
+            },
+        );
+        if send_result.is_err() &&
+            let Some(pending) = self.pending_document_controls.remove(&request_id)
+        {
+            pending.send(DocumentControlOutcome::Rejected(
+                DocumentControlError::ChannelClosed,
+            ));
+        }
+    }
+
+    fn handle_document_control(
+        &mut self,
+        webview_id: WebViewId,
+        cancellation_id: DocumentControlCancellationId,
+        command: DocumentControlCommand,
+        response: GenericCallback<DocumentControlOutcome>,
+    ) {
+        if self.shutting_down {
+            let _ = response.send(DocumentControlOutcome::Rejected(
+                DocumentControlError::ChannelClosed,
+            ));
+            return;
+        }
+        if self
+            .pending_document_controls
+            .values()
+            .any(|pending| pending.webview_id == webview_id)
+        {
+            let _ = response.send(DocumentControlOutcome::Rejected(
+                DocumentControlError::CommandAlreadyPending,
+            ));
+            return;
+        }
+        let captured = match self.capture_document_control_target(webview_id) {
+            Ok(captured) => captured,
+            Err(error) => {
+                let _ = response.send(DocumentControlOutcome::Rejected(error));
+                return;
+            },
+        };
+        self.route_document_control(
+            webview_id,
+            cancellation_id,
+            command,
+            response,
+            captured,
+        );
+    }
+
+    fn handle_cancel_document_control(
+        &mut self,
+        webview_id: WebViewId,
+        cancellation_id: DocumentControlCancellationId,
+    ) {
+        let request_id = self
+            .pending_document_controls
+            .iter()
+            .find_map(|(request_id, pending)| {
+                (pending.webview_id == webview_id &&
+                    pending.cancellation_id == cancellation_id)
+                    .then_some(*request_id)
+            });
+        let Some(request_id) = request_id else {
+            return;
+        };
+        let Some(pending) = self.pending_document_controls.remove(&request_id) else {
+            return;
+        };
+        if let Some(event_loop) = pending.event_loop.upgrade() {
+            let _ = event_loop.send_document_control(ScriptThreadControlMessage::Cancel {
+                request_id,
+                cancellation_id,
+            });
+        }
+        drop(pending);
+    }
+
+    fn fail_document_controls_for_webview(
+        &mut self,
+        webview_id: WebViewId,
+        error: DocumentControlError,
+    ) {
+        let request_ids = self
+            .pending_document_controls
+            .iter()
+            .filter_map(|(request_id, pending)| {
+                (pending.webview_id == webview_id).then_some(*request_id)
+            })
+            .collect::<Vec<_>>();
+        for request_id in request_ids {
+            let Some(pending) = self.pending_document_controls.remove(&request_id) else {
+                continue;
+            };
+            if let Some(event_loop) = pending.event_loop.upgrade() {
+                let _ = event_loop.send_document_control(ScriptThreadControlMessage::Cancel {
+                    request_id,
+                    cancellation_id: pending.cancellation_id,
+                });
+            }
+            pending.send_unresolved(error.clone());
+        }
+    }
+
+    fn fail_all_document_controls(&mut self, error: DocumentControlError) {
+        let webview_ids = self
+            .pending_document_controls
+            .values()
+            .map(|pending| pending.webview_id)
+            .collect::<FxHashSet<_>>();
+        for webview_id in webview_ids {
+            self.fail_document_controls_for_webview(webview_id, error.clone());
+        }
+    }
+
+    fn handle_document_control_response(
+        &mut self,
+        source_webview_id: WebViewId,
+        source_pipeline_id: PipelineId,
+        request_id: DocumentControlRequestId,
+        cancellation_id: DocumentControlCancellationId,
+        target: PendingTargetObservation,
+        outcome: DocumentControlOutcome,
+    ) {
+        let Some(candidate) = self.pending_document_controls.get(&request_id) else {
+            warn!("Ignoring unknown document-control response {request_id:?}");
+            return;
+        };
+        if !candidate.accepts_response(
+            source_webview_id,
+            source_pipeline_id,
+            cancellation_id,
+            &target,
+        ) {
+            warn!("Ignoring unauthenticated document-control response {request_id:?}");
+            return;
+        }
+        let Some(pending) = self.pending_document_controls.remove(&request_id) else {
+            return;
+        };
+
+        if outcome.validate_for_command(&pending.command).is_err() {
+            // Preserve the malformed same-build payload so the local receiver reports its exact
+            // InvalidOutcome transport fact with command-specific indeterminate semantics.
+            pending.send(outcome);
+            return;
+        }
+
+        if matches!(outcome, DocumentControlOutcome::Rejected(_)) {
+            pending.send(outcome);
+            return;
+        }
+
+        match (&pending.command, &outcome) {
+            (
+                DocumentControlCommand::AdvanceTo(token),
+                DocumentControlOutcome::Completed(_),
+            ) if token.target() == &pending.target => {
+                // Exact guarded success crossed its linearization point. A later navigation must
+                // not retroactively make the committed activation indeterminate.
+                pending.send(outcome);
+            },
+            (
+                DocumentControlCommand::AdvanceTo(_),
+                DocumentControlOutcome::AdvanceOutcomeIndeterminate { .. },
+            ) => pending.send(outcome),
+            (DocumentControlCommand::AdvanceTo(_), _) => pending.send_unresolved(
+                DocumentControlError::ChannelClosed,
+            ),
+            (
+                DocumentControlCommand::DriveOneTurn,
+                DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate { target },
+            ) if target.as_ref() == &pending.target => pending.send(outcome),
+            (DocumentControlCommand::DriveOneTurn, DocumentControlOutcome::Completed(observation)) => {
+                if observation.pending().target != pending.target {
+                    pending.send_unresolved(DocumentControlError::ChannelClosed);
+                    return;
+                }
+                match self.capture_document_control_target(pending.webview_id) {
+                    Ok(captured)
+                        if captured.target == pending.target &&
+                            captured.target_terminals == pending.target_terminals =>
+                    {
+                        pending.send(outcome)
+                    },
+                    _ => pending.send_unresolved(DocumentControlError::ChannelClosed),
+                }
+            },
+            (DocumentControlCommand::DriveOneTurn, _) => pending.send_unresolved(
+                DocumentControlError::ChannelClosed,
+            ),
+            (DocumentControlCommand::Observe, DocumentControlOutcome::Completed(observation)) => {
+                if observation.pending().target != pending.target {
+                    let error = DocumentControlError::TargetChanged {
+                        expected: Box::new(pending.target.clone()),
+                        observed: Box::new(observation.pending().target.clone()),
+                    };
+                    pending.send(DocumentControlOutcome::Rejected(error));
+                    return;
+                }
+                match self.capture_document_control_target(pending.webview_id) {
+                    Ok(captured)
+                        if captured.target == pending.target &&
+                            captured.target_terminals == pending.target_terminals =>
+                    {
+                        pending.send(outcome)
+                    },
+                    Ok(captured) => self.route_document_control(
+                        pending.webview_id,
+                        pending.cancellation_id,
+                        pending.command,
+                        pending.owner_response,
+                        captured,
+                    ),
+                    Err(error) => pending.send_unresolved(error),
+                }
+            },
+            (DocumentControlCommand::Observe, _) => pending.send_unresolved(
+                DocumentControlError::ChannelClosed,
+            ),
         }
     }
 
@@ -2116,6 +2599,19 @@ where
                     }
                 },
             },
+            ScriptToConstellationMessage::DocumentControlResponse {
+                request_id,
+                cancellation_id,
+                target,
+                outcome,
+            } => self.handle_document_control_response(
+                webview_id,
+                source_pipeline_id,
+                request_id,
+                cancellation_id,
+                *target,
+                outcome,
+            ),
         }
     }
 
@@ -2702,6 +3198,7 @@ where
             return;
         }
         self.shutting_down = true;
+        self.fail_all_document_controls(DocumentControlError::ChannelClosed);
 
         self.mem_profiler_chan.send(mem::ProfilerMsg::Exit);
 
@@ -3011,6 +3508,9 @@ where
         let Some(pipeline) = self.pipelines.remove(&pipeline_id) else {
             return;
         };
+        if let Some(webview) = self.webviews.get_mut(&pipeline.webview_id) {
+            webview.note_pipeline_membership_change();
+        }
 
         // Clean up any registered interests for this pipeline.
         self.pipeline_interests.retain(|_, set| {
@@ -3081,6 +3581,10 @@ where
         reason: &String,
         backtrace: &Option<String>,
     ) {
+        self.fail_document_controls_for_webview(
+            webview_id,
+            DocumentControlError::ChannelClosed,
+        );
         let browsing_context_id = BrowsingContextId::from(webview_id);
         self.constellation_to_embedder_proxy
             .send(ConstellationToEmbedderMsg::Panic(
@@ -3399,6 +3903,10 @@ where
     /// <https://html.spec.whatwg.org/multipage/#destroy-a-top-level-traversable>
     fn handle_close_top_level_browsing_context(&mut self, webview_id: WebViewId) {
         debug!("{webview_id}: Closing");
+        self.fail_document_controls_for_webview(
+            webview_id,
+            DocumentControlError::WebViewUnavailable,
+        );
         let browsing_context_id = BrowsingContextId::from(webview_id);
         // Step 5. Remove traversable from the user agent's top-level traversable set.
         let browsing_context =
@@ -3710,6 +4218,9 @@ where
 
         assert!(!self.pipelines.contains_key(&new_pipeline_id));
         self.pipelines.insert(new_pipeline_id, pipeline);
+        if let Some(webview) = self.webviews.get_mut(&webview_id) {
+            webview.note_pipeline_membership_change();
+        }
 
         if let Some(webview) = self.webviews.get_mut(&webview_id) {
             if let Err(error) = webview.add_pending_change(SessionHistoryChange {
@@ -3845,6 +4356,7 @@ where
 
         assert!(!self.pipelines.contains_key(&new_pipeline_id));
         self.pipelines.insert(new_pipeline_id, pipeline);
+        new_webview.note_pipeline_membership_change();
 
         if let Err(error) = new_webview.add_pending_change(SessionHistoryChange {
             webview_id: new_webview_id,

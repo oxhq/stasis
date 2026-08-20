@@ -82,6 +82,8 @@ mod from_embedder {
                 Self::UserContentManagerAction(..) => target!("UserContentManagerAction"),
                 Self::UpdatePinchZoomInfos(..) => target!("UpdatePinchZoomInfos"),
                 Self::SetAccessibilityActive(..) => target!("SetAccessibilityActive"),
+                Self::DocumentControl { .. } => target!("DocumentControl"),
+                Self::CancelDocumentControl { .. } => target!("CancelDocumentControl"),
             }
         }
     }
@@ -199,6 +201,7 @@ mod from_script {
                 Self::TriggerGarbageCollection => target!("TriggerGarbageCollection"),
                 Self::AcquireWakeLock(..) => target!("AcquireWakeLock"),
                 Self::ReleaseWakeLock(..) => target!("ReleaseWakeLock"),
+                Self::DocumentControlResponse { .. } => target!("DocumentControlResponse"),
             }
         }
     }

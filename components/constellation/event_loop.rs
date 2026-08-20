@@ -16,7 +16,7 @@ use ipc_channel::IpcError;
 use layout_api::ScriptThreadFactory;
 use log::error;
 use media::WindowGLContext;
-use script_traits::{InitialScriptState, ScriptThreadMessage};
+use script_traits::{InitialScriptState, ScriptThreadControlMessage, ScriptThreadMessage};
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::{self, GenericReceiver, GenericSender, SendError};
 use servo_base::id::ScriptEventLoopId;
@@ -30,6 +30,7 @@ use crate::{Constellation, UnprivilegedContent};
 /// <https://html.spec.whatwg.org/multipage/#event-loop>
 pub struct EventLoop {
     script_chan: GenericSender<ScriptThreadMessage>,
+    document_control_chan: GenericSender<ScriptThreadControlMessage>,
     id: ScriptEventLoopId,
     document_clock: DocumentClockConfiguration,
     /// When running in another process, this is an `IpcSender` to the BackgroundHangMonitor
@@ -71,6 +72,8 @@ impl EventLoop {
     ) -> Result<Rc<Self>, IpcError> {
         let (script_chan, script_port) =
             servo_base::generic_channel::channel().expect("Pipeline script chan");
+        let (document_control_chan, document_control_port) =
+            servo_base::generic_channel::channel().expect("Document control chan");
 
         let embedder_chan = constellation.embedder_proxy.sender.clone();
         let eventloop_waker = constellation.embedder_proxy.event_loop_waker.clone();
@@ -104,6 +107,8 @@ impl EventLoop {
             memory_profiler_sender: constellation.mem_profiler_chan.clone(),
             constellation_to_script_sender: script_chan,
             constellation_to_script_receiver: script_port,
+            document_control_sender: document_control_chan,
+            document_control_receiver: document_control_port,
             pipeline_namespace_id: constellation.next_pipeline_namespace_id(),
             cross_process_paint_api: constellation.paint_proxy.cross_process_paint_api.clone(),
             #[cfg(feature = "webgl")]
@@ -133,6 +138,7 @@ impl EventLoop {
         initial_script_state: InitialScriptState,
     ) -> Self {
         let script_chan = initial_script_state.constellation_to_script_sender.clone();
+        let document_control_chan = initial_script_state.document_control_sender.clone();
         let id = initial_script_state.id;
         let document_clock = initial_script_state.document_clock;
         let background_hang_monitor_register = constellation
@@ -149,6 +155,7 @@ impl EventLoop {
 
         Self {
             script_chan,
+            document_control_chan,
             id,
             document_clock,
             background_hang_monitor_sender: None,
@@ -161,6 +168,7 @@ impl EventLoop {
         initial_script_state: InitialScriptState,
     ) -> Result<Self, IpcError> {
         let script_chan = initial_script_state.constellation_to_script_sender.clone();
+        let document_control_chan = initial_script_state.document_control_sender.clone();
         let id = initial_script_state.id;
         let document_clock = initial_script_state.document_clock;
 
@@ -188,6 +196,7 @@ impl EventLoop {
 
         Ok(Self {
             script_chan,
+            document_control_chan,
             id,
             document_clock,
             background_hang_monitor_sender: Some(background_hand_monitor_sender),
@@ -206,6 +215,14 @@ impl EventLoop {
     /// Send a message to the event loop.
     pub fn send(&self, msg: ScriptThreadMessage) -> Result<(), SendError> {
         self.script_chan.send(msg)
+    }
+
+    /// Send a priority controlled-document command or exact cancellation.
+    pub(crate) fn send_document_control(
+        &self,
+        msg: ScriptThreadControlMessage,
+    ) -> Result<(), SendError> {
+        self.document_control_chan.send(msg)
     }
 
     /// If this is [`EventLoop`] is in another process, send a message to its `BackgroundHangMonitor`,

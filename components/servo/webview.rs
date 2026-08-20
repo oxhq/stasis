@@ -18,13 +18,17 @@ use embedder_traits::{
     Theme, TraversalId, UrlRequest, ViewportDetails, WebViewPoint, WebViewRect,
     validate_document_clock_configuration,
 };
+use embedder_traits::document_control::{
+    DocumentControlCancellationId, DocumentControlCommand, DocumentControlError,
+    DocumentControlOutcome, DocumentControlReceiver,
+};
 use euclid::{Scale, Size2D};
 use image::RgbaImage;
 use log::debug;
 use paint_api::WebViewTrait;
 use paint_api::rendering_context::RenderingContext;
 use servo_base::Epoch;
-use servo_base::generic_channel::GenericSender;
+use servo_base::generic_channel::{GenericCallback, GenericSender};
 use servo_base::id::WebViewId;
 use servo_config::pref;
 use servo_constellation_traits::{
@@ -119,6 +123,8 @@ pub(crate) struct WebViewInner {
     rendering_context: Rc<dyn RenderingContext>,
     user_content_manager: Option<Rc<UserContentManager>>,
     document_clock: ValidatedDocumentClockConfiguration,
+    /// Checked per-WebView nonce for exact document-control response abandonment.
+    next_document_control_cancellation_id: u64,
     hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
     load_status: LoadStatus,
     status_text: Option<String>,
@@ -201,6 +207,7 @@ impl WebView {
             back_forward_list_index: 0,
             user_content_manager: builder.user_content_manager.clone(),
             document_clock: builder.document_clock,
+            next_document_control_cancellation_id: 0,
         })));
 
         let viewport_details = webview.viewport_details();
@@ -796,6 +803,48 @@ impl WebView {
         );
     }
 
+    /// Submit one hidden mechanical command to this WebView's controlled document event loop.
+    ///
+    /// The returned receiver owns one exact cancellation nonce. Timeout, transport failure,
+    /// explicit cancellation, or drop abandons only that response; it does not roll back page
+    /// work. `response_waker` runs after the sole result is locally pollable, or after callback
+    /// loss has disconnected the receiver.
+    #[doc(hidden)]
+    pub fn submit_document_control(
+        &self,
+        command: DocumentControlCommand,
+        response_waker: impl FnOnce() + Send + 'static,
+    ) -> Result<DocumentControlReceiver, DocumentControlError> {
+        let (response, receiver) =
+            GenericCallback::<DocumentControlOutcome>::new_blocking_notifying(response_waker)
+                .map_err(|_| DocumentControlError::ChannelClosed)?;
+        let (webview_id, cancellation_id, constellation_proxy) = {
+            let mut inner = self.inner_mut();
+            let cancellation_id = next_document_control_cancellation_id(
+                &mut inner.next_document_control_cancellation_id,
+            )?;
+            (
+                inner.id,
+                cancellation_id,
+                inner.servo.constellation_proxy().clone(),
+            )
+        };
+        let cancellation_proxy = constellation_proxy.clone();
+        let receiver = DocumentControlReceiver::new_cancellable(receiver, &command, move || {
+            cancellation_proxy.send(EmbedderToConstellationMessage::CancelDocumentControl {
+                webview_id,
+                cancellation_id,
+            });
+        });
+        constellation_proxy.send(EmbedderToConstellationMessage::DocumentControl {
+            webview_id,
+            cancellation_id,
+            command,
+            response,
+        });
+        Ok(receiver)
+    }
+
     /// Asynchronously take a screenshot of the [`WebView`] contents, given a `rect` or the whole
     /// viewport, if no `rect` is given.
     ///
@@ -1021,6 +1070,16 @@ impl WebView {
     }
 }
 
+fn next_document_control_cancellation_id(
+    sequence: &mut u64,
+) -> Result<DocumentControlCancellationId, DocumentControlError> {
+    let next = sequence
+        .checked_add(1)
+        .ok_or(DocumentControlError::CancellationSequenceOverflow)?;
+    *sequence = next;
+    Ok(DocumentControlCancellationId::new(next))
+}
+
 /// A structure used to expose a view of the [`WebView`] to the Servo
 /// renderer, without having the Servo renderer depend on the embedding layer.
 struct ServoRendererWebView {
@@ -1173,5 +1232,30 @@ impl WebViewBuilder {
     /// Create the [`WebView`] using the configuration specified in this [`WebViewBuilder`].
     pub fn build(self) -> WebView {
         WebView::new(self)
+    }
+}
+
+#[cfg(test)]
+mod document_control_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_nonces_are_checked_and_never_wrap() {
+        let mut sequence = 0;
+        assert_eq!(
+            next_document_control_cancellation_id(&mut sequence),
+            Ok(DocumentControlCancellationId::new(1))
+        );
+        assert_eq!(
+            next_document_control_cancellation_id(&mut sequence),
+            Ok(DocumentControlCancellationId::new(2))
+        );
+
+        sequence = u64::MAX;
+        assert_eq!(
+            next_document_control_cancellation_id(&mut sequence),
+            Err(DocumentControlError::CancellationSequenceOverflow)
+        );
+        assert_eq!(sequence, u64::MAX);
     }
 }

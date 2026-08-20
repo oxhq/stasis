@@ -29,18 +29,17 @@ pub(crate) enum NavigationRevisionError {
     Overflow,
 }
 
+/// A terminal failure of the complete target-pipeline membership revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PipelineMembershipRevisionError {
+    Overflow,
+}
+
 /// A canonical, side-effect-free view of the top-level navigation state owned by a WebView.
 ///
 /// The pending pipeline ids are sorted and deduplicated so callers can compare snapshots without
 /// depending on `pending_changes` insertion or `swap_remove` order.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the upcoming authoritative RawPending capture"
-    )
-)]
 pub(crate) struct TopLevelNavigationSnapshot {
     pub active_pipeline_id: Option<PipelineId>,
     pub active_pipeline_epoch: Epoch,
@@ -72,6 +71,12 @@ pub(crate) struct ConstellationWebView {
 
     /// A sticky terminal failure that prevents revision wraparound and snapshot reuse.
     navigation_revision_failure: Option<NavigationRevisionError>,
+
+    /// A revision for every successful insertion or removal in Constellation's pipeline map.
+    pipeline_membership_revision: u64,
+
+    /// Sticky exhaustion of [`Self::pipeline_membership_revision`].
+    pipeline_membership_revision_failure: Option<PipelineMembershipRevisionError>,
 
     /// When a navigation is performed, we do not immediately update
     /// the session history, instead we ask the event loop to begin loading
@@ -150,6 +155,8 @@ impl ConstellationWebView {
             active_top_level_pipeline_epoch: Epoch::default(),
             navigation_revision: 0,
             navigation_revision_failure: None,
+            pipeline_membership_revision: 0,
+            pipeline_membership_revision_failure: None,
             pending_changes: Default::default(),
             focused_browsing_context_id,
             hovered_browsing_context_id: None,
@@ -226,16 +233,42 @@ impl ConstellationWebView {
         &mut self,
         amount: u64,
     ) -> Result<u64, NavigationRevisionError> {
-        if let Some(error) = self.navigation_revision_failure {
-            return Err(error);
+        if self.navigation_revision_failure.is_some() {
+            return Ok(self.navigation_revision);
         }
 
         let Some(next_revision) = self.navigation_revision.checked_add(amount) else {
             self.navigation_revision_failure = Some(NavigationRevisionError::Overflow);
-            return Err(NavigationRevisionError::Overflow);
+            return Ok(self.navigation_revision);
         };
         self.navigation_revision = next_revision;
         Ok(next_revision)
+    }
+
+    pub(crate) const fn navigation_revision_failure(&self) -> Option<NavigationRevisionError> {
+        self.navigation_revision_failure
+    }
+
+    /// Record a completed pipeline-map membership mutation without ever blocking that mutation.
+    pub(crate) fn note_pipeline_membership_change(&mut self) {
+        if self.pipeline_membership_revision_failure.is_some() {
+            return;
+        }
+        let Some(next) = self.pipeline_membership_revision.checked_add(1) else {
+            self.pipeline_membership_revision_failure =
+                Some(PipelineMembershipRevisionError::Overflow);
+            return;
+        };
+        self.pipeline_membership_revision = next;
+    }
+
+    pub(crate) const fn pipeline_membership_revision(
+        &self,
+    ) -> (u64, Option<PipelineMembershipRevisionError>) {
+        (
+            self.pipeline_membership_revision,
+            self.pipeline_membership_revision_failure,
+        )
     }
 
     fn is_top_level_change(&self, change: &SessionHistoryChange) -> bool {
@@ -243,20 +276,9 @@ impl ConstellationWebView {
     }
 
     /// Return a canonical navigation snapshot without advancing or otherwise driving the runtime.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by the upcoming authoritative RawPending capture"
-        )
-    )]
     pub(crate) fn top_level_navigation_snapshot(
         &self,
     ) -> Result<TopLevelNavigationSnapshot, NavigationRevisionError> {
-        if let Some(error) = self.navigation_revision_failure {
-            return Err(error);
-        }
-
         let mut pending_pipeline_ids = self
             .pending_changes
             .iter()
@@ -843,19 +865,40 @@ mod tests {
                 TEST_BROWSING_CONTEXT_ID,
                 None,
             )),
-            Err(NavigationRevisionError::Overflow)
+            Ok(())
         );
         assert_eq!(webview.navigation_revision, u64::MAX);
-        assert!(!webview.pipeline_is_pending(pipeline_id));
+        assert!(webview.pipeline_is_pending(pipeline_id));
         assert_eq!(
-            webview.top_level_navigation_snapshot(),
-            Err(NavigationRevisionError::Overflow)
+            webview.navigation_revision_failure(),
+            Some(NavigationRevisionError::Overflow)
         );
+        assert!(webview.top_level_navigation_snapshot().is_ok());
         assert!(matches!(
             webview.activate_top_level_pipeline(pipeline_id),
-            Err(NavigationRevisionError::Overflow)
+            Ok(Some(_))
         ));
-        assert_eq!(webview.active_top_level_pipeline(), None);
+        assert_eq!(
+            webview.active_top_level_pipeline().map(|(id, _)| id),
+            Some(pipeline_id)
+        );
+    }
+
+    #[test]
+    fn pipeline_membership_revision_latches_without_blocking_later_mutations() {
+        let mut webview = controlled_webview();
+        webview.pipeline_membership_revision = u64::MAX;
+
+        webview.note_pipeline_membership_change();
+        webview.note_pipeline_membership_change();
+
+        assert_eq!(
+            webview.pipeline_membership_revision(),
+            (
+                u64::MAX,
+                Some(PipelineMembershipRevisionError::Overflow)
+            )
+        );
     }
 }
 

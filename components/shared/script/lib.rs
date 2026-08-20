@@ -15,6 +15,10 @@ use bitflags::bitflags;
 use crossbeam_channel::RecvTimeoutError;
 use devtools_traits::ScriptToDevtoolsControlMsg;
 use embedder_traits::user_contents::{UserContentManagerId, UserContents};
+use embedder_traits::document_control::{
+    DocumentControlCancellationId, DocumentControlCommand, DocumentControlRequestId,
+};
+use embedder_traits::document_pending::{PendingRuntimeTerminals, PendingTargetObservation};
 use embedder_traits::{
     DocumentClockConfiguration, EmbedderControlId, EmbedderControlResponse, FocusSequenceNumber,
     InputEventAndId, JavaScriptEvaluationId, MediaSessionActionType, MouseButton,
@@ -342,6 +346,41 @@ pub enum ScriptThreadMessage {
     TriggerGarbageCollection,
 }
 
+/// Priority control messages sent by the Constellation to one controlled document event loop.
+///
+/// This lane is deliberately separate from [`ScriptThreadMessage`]. A control observation or
+/// cancellation must not sit behind an arbitrary suffix of ordinary page work.
+#[derive(Deserialize, IntoStaticStr, Serialize)]
+pub enum ScriptThreadControlMessage {
+    /// Execute one owner-loop command against an immutable Constellation target.
+    Command {
+        /// Checked Constellation request identity.
+        request_id: DocumentControlRequestId,
+        /// Exact per-WebView cancellation nonce attached by the embedding owner.
+        cancellation_id: DocumentControlCancellationId,
+        /// Immutable target authority captured immediately before routing.
+        target: Box<PendingTargetObservation>,
+        /// Sticky target-owner terminals captured atomically with `target`.
+        target_terminals: PendingRuntimeTerminals,
+        /// Read-only observation, one-turn drive, or guarded timer activation.
+        command: DocumentControlCommand,
+    },
+    /// Abandon a routed command only when both checked identities match.
+    Cancel {
+        /// Checked Constellation request identity.
+        request_id: DocumentControlRequestId,
+        /// Exact per-WebView cancellation nonce.
+        cancellation_id: DocumentControlCancellationId,
+    },
+}
+
+impl fmt::Debug for ScriptThreadControlMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        let variant_string: &'static str = self.into();
+        write!(formatter, "ScriptControlMsg::{variant_string}")
+    }
+}
+
 impl fmt::Debug for ScriptThreadMessage {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         let variant_string: &'static str = self.into();
@@ -455,6 +494,10 @@ pub struct InitialScriptState {
     pub constellation_to_script_sender: GenericSender<ScriptThreadMessage>,
     /// A port on which messages sent by the constellation to script can be received.
     pub constellation_to_script_receiver: GenericReceiver<ScriptThreadMessage>,
+    /// A priority channel for controlled-document commands and exact cancellation.
+    pub document_control_sender: GenericSender<ScriptThreadControlMessage>,
+    /// The priority control receiver paired with [`Self::document_control_sender`].
+    pub document_control_receiver: GenericReceiver<ScriptThreadControlMessage>,
     /// A channel on which messages can be sent to the constellation from script.
     pub script_to_constellation_sender: ScriptToConstellationSender,
     /// A channel which allows script to send messages directly to the Embedder

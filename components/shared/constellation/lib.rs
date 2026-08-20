@@ -17,6 +17,9 @@ use std::fmt;
 use embedder_traits::user_contents::{
     UserContentManagerId, UserScript, UserScriptId, UserStyleSheet, UserStyleSheetId,
 };
+use embedder_traits::document_control::{
+    DocumentControlCancellationId, DocumentControlCommand, DocumentControlOutcome,
+};
 use embedder_traits::{
     EmbedderControlId, EmbedderControlResponse, InputEventAndId, JavaScriptEvaluationId,
     MediaSessionActionType, NewWebViewDetails, PaintHitTestResult, Theme, TraversalId, UrlRequest,
@@ -114,6 +117,26 @@ pub enum EmbedderToConstellationMessage {
     UpdatePinchZoomInfos(PipelineId, PinchZoomInfos),
     /// Activate or deactivate accessibility features for the given `WebView`.
     SetAccessibilityActive(WebViewId, bool),
+    /// Submit one hidden mechanical command to a controlled document event loop.
+    #[doc(hidden)]
+    DocumentControl {
+        /// WebView whose target authority must be captured by the Constellation.
+        webview_id: WebViewId,
+        /// Exact per-WebView cancellation nonce owned by the local receiver.
+        cancellation_id: DocumentControlCancellationId,
+        /// Read-only observation, one-turn drive, or guarded timer activation.
+        command: DocumentControlCommand,
+        /// Sole embedding-owner result callback.
+        response: GenericCallback<DocumentControlOutcome>,
+    },
+    /// Abandon response ownership for one exact hidden document-control request.
+    #[doc(hidden)]
+    CancelDocumentControl {
+        /// WebView which allocated the cancellation nonce.
+        webview_id: WebViewId,
+        /// Exact nonce; stale values must not consume a successor.
+        cancellation_id: DocumentControlCancellationId,
+    },
 }
 
 pub enum UserContentManagerAction {
