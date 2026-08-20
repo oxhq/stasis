@@ -122,7 +122,7 @@ impl PendingTargetObservation {
         self.pipelines.binary_search(&pipeline_id).is_ok()
     }
 
-    fn validate(&self) -> Result<(), PendingSnapshotInvariantError> {
+    pub(crate) fn validate(&self) -> Result<(), PendingSnapshotInvariantError> {
         validate_canonical_pipeline_membership(
             &self.pipelines,
             PendingSnapshotInvariantError::DuplicateTargetPipeline,

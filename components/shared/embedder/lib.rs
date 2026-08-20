@@ -9,6 +9,8 @@
 //! is probably a better fit for the `servo_constellation_traits` crate.
 
 #[doc(hidden)]
+pub mod document_control;
+#[doc(hidden)]
 pub mod document_pending;
 pub mod embedder_controls;
 pub mod input_events;
