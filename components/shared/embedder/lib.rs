@@ -8,6 +8,8 @@
 //! is not exposed in the API or doesn't involve messages sent to the embedding/libservo layer, it
 //! is probably a better fit for the `servo_constellation_traits` crate.
 
+#[doc(hidden)]
+pub mod document_pending;
 pub mod embedder_controls;
 pub mod input_events;
 pub mod resources;
