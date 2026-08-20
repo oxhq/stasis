@@ -1,0 +1,10 @@
+# Source identities for the first Stasis integration branch.
+#
+# Servo is the clean base. Pliego is a read-only implementation donor; it is
+# deliberately not an ancestor of the Stasis branch.
+
+servo_repository = "https://github.com/servo/servo.git"
+servo_revision = "0d579bd5aab6df3764fad805427254751632a6e4"
+pliego_repository = "https://github.com/oxhq/pliego.git"
+pliego_revision = "556c774242b272b11bc60999449c5debff1ad20f"
+pliego_servo_merge_base = "313b6d5ecc113b08010ce434140db3ca5abcc71c"

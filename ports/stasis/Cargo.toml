@@ -1,0 +1,21 @@
+[package]
+name = "stasis-shell"
+version = "0.1.0"
+authors = ["OxHQ"]
+license = "MPL-2.0"
+edition.workspace = true
+publish = false
+rust-version.workspace = true
+description = "Controlled Servo automation shell"
+
+[[bin]]
+name = "stasis"
+path = "src/main.rs"
+
+[dependencies]
+dpi = { workspace = true }
+rustls = { workspace = true, features = ["aws-lc-rs"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+servo = { workspace = true, default-features = false, features = ["baked-in-resources", "bundled_freetype", "js_jit"] }
+url = { workspace = true }
