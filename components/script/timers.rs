@@ -200,12 +200,38 @@ pub(crate) enum DomTimerKind {
     TestBindingCallback,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NonJsTimerKind {
+    XhrTimeout,
+    EventSourceReconnect,
+    RefreshRedirect,
+    RunStepsAfterTimeout,
+    #[cfg(feature = "testbinding")]
+    TestBindingCallback,
+}
+
+impl From<NonJsTimerKind> for DomTimerKind {
+    fn from(kind: NonJsTimerKind) -> Self {
+        match kind {
+            NonJsTimerKind::XhrTimeout => Self::XhrTimeout,
+            NonJsTimerKind::EventSourceReconnect => Self::EventSourceReconnect,
+            NonJsTimerKind::RefreshRedirect => Self::RefreshRedirect,
+            NonJsTimerKind::RunStepsAfterTimeout => Self::RunStepsAfterTimeout,
+            #[cfg(feature = "testbinding")]
+            NonJsTimerKind::TestBindingCallback => Self::TestBindingCallback,
+        }
+    }
+}
+
 /// Stable metadata for a pending logical DOM timer, ordered by deadline then creation sequence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DomTimerMetadata {
     pub(crate) handle: OneshotTimerHandle,
     pub(crate) javascript_handle: Option<i32>,
     pub(crate) creation_sequence: u64,
+    /// Current physical deadline projection. While suspended, the pause that is still in progress
+    /// is added only when the timebase resumes, so this value is diagnostic and never advance
+    /// authority for a suspended timer.
     pub(crate) deadline: DocumentTime,
     pub(crate) suspended: bool,
     /// Whether this timer may be selected in the next controlled turn. A run-steps timer can be
@@ -298,7 +324,7 @@ impl OneshotTimer {
     fn metadata(
         &self,
         timebase: TimerTimebase,
-        eligible_in_controlled_turn: bool,
+        eligible_by_ordering: bool,
     ) -> Result<DomTimerMetadata, DocumentClockError> {
         let (javascript_handle, kind) = match &self.callback {
             OneshotTimerCallback::JsTimer(task) => (
@@ -310,19 +336,21 @@ impl OneshotTimer {
                     IsInterval::NonInterval => DomTimerKind::JsOneShot,
                 },
             ),
-            OneshotTimerCallback::XhrTimeout(_) => (None, DomTimerKind::XhrTimeout),
+            OneshotTimerCallback::XhrTimeout(_) => {
+                (None, NonJsTimerKind::XhrTimeout.into())
+            },
             OneshotTimerCallback::EventSourceTimeout(_) => {
-                (None, DomTimerKind::EventSourceReconnect)
+                (None, NonJsTimerKind::EventSourceReconnect.into())
             },
             OneshotTimerCallback::RefreshRedirectDue(_) => {
-                (None, DomTimerKind::RefreshRedirect)
+                (None, NonJsTimerKind::RefreshRedirect.into())
             },
             OneshotTimerCallback::RunStepsAfterTimeout { .. } => {
-                (None, DomTimerKind::RunStepsAfterTimeout)
+                (None, NonJsTimerKind::RunStepsAfterTimeout.into())
             },
             #[cfg(feature = "testbinding")]
             OneshotTimerCallback::TestBindingCallback(_) => {
-                (None, DomTimerKind::TestBindingCallback)
+                (None, NonJsTimerKind::TestBindingCallback.into())
             },
         };
         Ok(DomTimerMetadata {
@@ -331,7 +359,8 @@ impl OneshotTimer {
             creation_sequence: self.creation_sequence,
             deadline: self.scheduled_for.checked_add(timebase.suspension_offset)?,
             suspended: timebase.suspended_at.is_some(),
-            eligible_in_controlled_turn,
+            eligible_in_controlled_turn: timebase.suspended_at.is_none() &&
+                eligible_by_ordering,
             kind,
         })
     }
@@ -365,6 +394,23 @@ fn select_timer_for_outer<'a>(
     } else {
         timers.back()
     }
+}
+
+fn collect_pending_timer_metadata(
+    timers: &VecDeque<OneshotTimer>,
+    runsteps_queues: &OrderingQueues,
+    timebase: TimerTimebase,
+) -> Result<Vec<DomTimerMetadata>, DocumentClockError> {
+    timers
+        .iter()
+        .rev()
+        .map(|timer| {
+            timer.metadata(
+                timebase,
+                runsteps_timer_is_eligible(timer, runsteps_queues),
+            )
+        })
+        .collect()
 }
 
 fn take_due_timers_for_turn(
@@ -470,7 +516,12 @@ impl OneshotTimers {
         self.terminal_error()
     }
 
-    /// Return stable metadata for pending logical timers in execution order.
+    /// Return stable metadata for pending logical timers in physical deadline and creation order.
+    ///
+    /// The first entry is not necessarily eligible for a controlled turn: an earlier RunSteps
+    /// timer can be blocked by its ordering-identifier queue, and every suspended timer is
+    /// ineligible. Callers must inspect `eligible_in_controlled_turn`; guarded clock-advance
+    /// authority remains the outer scheduler's exact deadline snapshot.
     pub(crate) fn pending_timer_metadata(
         &self,
     ) -> Result<Vec<DomTimerMetadata>, DocumentClockError> {
@@ -479,18 +530,11 @@ impl OneshotTimers {
         }
         let timebase = self.timebase.get();
         let runsteps_queues = self.runsteps_queues.borrow();
-        let metadata = self
-            .timers
-            .borrow()
-            .iter()
-            .rev()
-            .map(|timer| {
-                timer.metadata(
-                    timebase,
-                    runsteps_timer_is_eligible(timer, &runsteps_queues),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>();
+        let metadata = collect_pending_timer_metadata(
+            &self.timers.borrow(),
+            &runsteps_queues,
+            timebase,
+        );
         if let Err(error) = &metadata {
             self.latch_terminal(*error);
         }
@@ -1416,17 +1460,49 @@ mod tests {
         deadline: DocumentTime,
         creation_sequence: u64,
     ) -> OneshotTimer {
-        OneshotTimer {
-            handle: OneshotTimerHandle(handle),
-            source: TimerSource::FromWorker,
-            callback: OneshotTimerCallback::RunStepsAfterTimeout {
+        test_timer_with_callback(
+            handle,
+            deadline,
+            creation_sequence,
+            OneshotTimerCallback::RunStepsAfterTimeout {
                 timer_key: handle,
                 ordering_id: DOMString::new(),
                 milliseconds: 0,
                 completion: Box::new(|_, _| {}),
             },
+        )
+    }
+
+    fn test_timer_with_callback(
+        handle: i32,
+        deadline: DocumentTime,
+        creation_sequence: u64,
+        callback: OneshotTimerCallback,
+    ) -> OneshotTimer {
+        OneshotTimer {
+            handle: OneshotTimerHandle(handle),
+            source: TimerSource::FromWorker,
+            callback,
             scheduled_for: deadline,
             creation_sequence,
+        }
+    }
+
+    fn test_js_timer(handle: i32, is_interval: IsInterval, duration: Duration) -> JsTimerTask {
+        JsTimerTask {
+            handle: JsTimerHandle(handle),
+            source: TimerSource::FromWorker,
+            callback: InternalTimerCallback::StringTimerCallback(
+                DOMString::new(),
+                InitiatingScriptFetchInfo {
+                    fetch_options: ScriptFetchOptions::default_classic_script(),
+                    base_url: ServoUrl::parse("about:blank").unwrap(),
+                },
+            ),
+            is_interval,
+            nesting_level: 0,
+            duration,
+            is_user_interacting: false,
         }
     }
 
@@ -1593,7 +1669,7 @@ mod tests {
         assert_eq!(metadata.creation_sequence, 7);
         assert_eq!(metadata.deadline, DocumentTime::from_nanos(25));
         assert!(metadata.suspended);
-        assert!(metadata.eligible_in_controlled_turn);
+        assert!(!metadata.eligible_in_controlled_turn);
         assert_eq!(metadata.kind, DomTimerKind::RunStepsAfterTimeout);
 
         let overflowing = test_timer(2, DocumentTime::from_nanos(u128::MAX), 8);
@@ -1610,7 +1686,51 @@ mod tests {
     }
 
     #[test]
-    fn metadata_marks_an_earlier_blocked_runsteps_timer_before_the_eligible_outer_target() {
+    fn production_classifiers_keep_persistent_and_finite_timer_kinds_observable() {
+        let interval_timer = test_timer_with_callback(
+            1,
+            DocumentTime::from_nanos(20),
+            0,
+            OneshotTimerCallback::JsTimer(test_js_timer(
+                17,
+                IsInterval::Interval,
+                Duration::from_millis(250),
+            )),
+        );
+        let interval_metadata = interval_timer
+            .metadata(TimerTimebase::default(), true)
+            .unwrap();
+
+        assert_eq!(interval_metadata.javascript_handle, Some(17));
+        assert_eq!(
+            interval_metadata.kind,
+            DomTimerKind::JsInterval {
+                requested_period: Duration::from_millis(250),
+            }
+        );
+
+        let finite_metadata = test_timer(2, DocumentTime::from_nanos(21), 1)
+            .metadata(TimerTimebase::default(), true)
+            .unwrap();
+        assert_eq!(finite_metadata.javascript_handle, None);
+        assert_eq!(finite_metadata.kind, DomTimerKind::RunStepsAfterTimeout);
+
+        let non_js_cases = [
+            (NonJsTimerKind::EventSourceReconnect, DomTimerKind::EventSourceReconnect),
+            (NonJsTimerKind::XhrTimeout, DomTimerKind::XhrTimeout),
+            (NonJsTimerKind::RefreshRedirect, DomTimerKind::RefreshRedirect),
+            (
+                NonJsTimerKind::RunStepsAfterTimeout,
+                DomTimerKind::RunStepsAfterTimeout,
+            ),
+        ];
+        for (source_kind, observable_kind) in non_js_cases {
+            assert_eq!(DomTimerKind::from(source_kind), observable_kind);
+        }
+    }
+
+    #[test]
+    fn pending_metadata_keeps_a_blocked_runsteps_physical_head_observable() {
         let ordering_id = DOMString::new();
         let mut timers = VecDeque::new();
         insert_timer(
@@ -1638,21 +1758,20 @@ mod tests {
             ],
         );
 
-        let metadata = timers
-            .iter()
-            .rev()
-            .map(|timer| {
-                timer
-                    .metadata(
-                        TimerTimebase::default(),
-                        runsteps_timer_is_eligible(timer, &queues),
-                    )
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
+        let metadata = collect_pending_timer_metadata(
+            &timers,
+            &queues,
+            TimerTimebase {
+                suspended_at: None,
+                suspension_offset: Duration::from_nanos(7),
+            },
+        )
+        .unwrap();
         assert_eq!(metadata[0].handle.sequence(), 1);
+        assert_eq!(metadata[0].deadline, DocumentTime::from_nanos(107));
         assert!(!metadata[0].eligible_in_controlled_turn);
         assert_eq!(metadata[1].handle.sequence(), 2);
+        assert_eq!(metadata[1].deadline, DocumentTime::from_nanos(117));
         assert!(metadata[1].eligible_in_controlled_turn);
         assert_eq!(
             select_timer_for_outer(&timers, &queues, true)

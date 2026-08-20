@@ -160,8 +160,8 @@ use crate::script_runtime::ThreadSafeJSContext;
 use crate::tasks::task_manager::TaskManager;
 use crate::tasks::task_source::SendableTaskSource;
 use crate::timers::{
-    IsInterval, OneshotTimerCallback, OneshotTimerHandle, OneshotTimers, TimerCallback,
-    TimerEventId, TimerSource,
+    DomTimerMetadata, IsInterval, OneshotTimerCallback, OneshotTimerHandle, OneshotTimers,
+    TimerCallback, TimerEventId, TimerSource,
 };
 use crate::unminify::unminified_path;
 
@@ -3039,6 +3039,16 @@ impl GlobalScope {
 
     pub(crate) fn latch_timer_error(&self, error: DocumentClockError) {
         self.with_timers(|timers| timers.latch_timer_error(error));
+    }
+
+    /// Return the logical DOM timer authority for this global. Deadlines are physical document
+    /// clock instants; typed callback kinds and raw controlled-turn eligibility are returned
+    /// without applying settlement policy. A checked or sticky timer failure is returned instead
+    /// of a partial snapshot.
+    pub(crate) fn pending_timer_metadata(
+        &self,
+    ) -> Result<Vec<DomTimerMetadata>, DocumentClockError> {
+        self.with_timers(OneshotTimers::pending_timer_metadata)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#timer-initialisation-steps>
