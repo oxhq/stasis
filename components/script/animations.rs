@@ -36,6 +36,176 @@ use crate::dom::node::{Node, NodeDamage, NodeTraits, from_untrusted_node_address
 use crate::dom::transitionevent::TransitionEvent;
 use crate::dom::window::Window;
 
+/// An active CSS animation or transition shape whose terminal behavior cannot be
+/// classified from the retained style animation state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CssAnimationUnsupportedClass {
+    /// A CSS animation has a non-finite start/duration or a negative duration.
+    InvalidAnimationTiming,
+    /// A CSS animation has a non-finite or internally inconsistent iteration state.
+    InvalidAnimationIteration,
+    /// A CSS transition has a non-finite start/duration or a negative duration.
+    InvalidTransitionTiming,
+}
+
+/// Per-class counts of active CSS animations and transitions that cannot be
+/// classified safely.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CssAnimationUnsupportedCounts {
+    pub(crate) invalid_animation_timing: usize,
+    pub(crate) invalid_animation_iteration: usize,
+    pub(crate) invalid_transition_timing: usize,
+}
+
+impl CssAnimationUnsupportedCounts {
+    fn increment(&mut self, class: CssAnimationUnsupportedClass) {
+        let count = match class {
+            CssAnimationUnsupportedClass::InvalidAnimationTiming => {
+                &mut self.invalid_animation_timing
+            },
+            CssAnimationUnsupportedClass::InvalidAnimationIteration => {
+                &mut self.invalid_animation_iteration
+            },
+            CssAnimationUnsupportedClass::InvalidTransitionTiming => {
+                &mut self.invalid_transition_timing
+            },
+        };
+        *count = count
+            .checked_add(1)
+            .expect("a retained animation collection cannot exceed usize::MAX entries");
+    }
+
+    pub(crate) fn count(self, class: CssAnimationUnsupportedClass) -> usize {
+        match class {
+            CssAnimationUnsupportedClass::InvalidAnimationTiming => {
+                self.invalid_animation_timing
+            },
+            CssAnimationUnsupportedClass::InvalidAnimationIteration => {
+                self.invalid_animation_iteration
+            },
+            CssAnimationUnsupportedClass::InvalidTransitionTiming => {
+                self.invalid_transition_timing
+            },
+        }
+    }
+
+    pub(crate) fn checked_total(self) -> Option<usize> {
+        self.invalid_animation_timing
+            .checked_add(self.invalid_animation_iteration)?
+            .checked_add(self.invalid_transition_timing)
+    }
+}
+
+/// A policy-free, copied observation of the CSS animation state retained by one
+/// document.
+///
+/// `infinite_inert` deliberately remains separate from tick-requiring infinite
+/// animations: paused, finished, and canceled entries cannot run merely because a
+/// rendering opportunity occurs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CssAnimationPendingObservation {
+    pub(crate) pending_event_count: usize,
+    pub(crate) finite_pending_or_running: usize,
+    pub(crate) infinite_pending_or_running: usize,
+    pub(crate) infinite_inert: usize,
+    pub(crate) unsupported_pending_or_running: CssAnimationUnsupportedCounts,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CssAnimationPendingClass {
+    FinitePendingOrRunning,
+    InfinitePendingOrRunning,
+    InfiniteInert,
+    Inert,
+    Unsupported(CssAnimationUnsupportedClass),
+}
+
+impl CssAnimationPendingObservation {
+    fn record(&mut self, class: CssAnimationPendingClass) {
+        let count = match class {
+            CssAnimationPendingClass::FinitePendingOrRunning => {
+                &mut self.finite_pending_or_running
+            },
+            CssAnimationPendingClass::InfinitePendingOrRunning => {
+                &mut self.infinite_pending_or_running
+            },
+            CssAnimationPendingClass::InfiniteInert => &mut self.infinite_inert,
+            CssAnimationPendingClass::Inert => return,
+            CssAnimationPendingClass::Unsupported(class) => {
+                self.unsupported_pending_or_running.increment(class);
+                return;
+            },
+        };
+        *count = count
+            .checked_add(1)
+            .expect("a retained animation collection cannot exceed usize::MAX entries");
+    }
+}
+
+fn animation_state_requires_ticks(state: &AnimationState) -> bool {
+    matches!(state, AnimationState::Pending | AnimationState::Running)
+}
+
+fn valid_animation_timing(started_at: f64, duration: f64) -> bool {
+    started_at.is_finite() && duration.is_finite() && duration >= 0.0
+}
+
+fn classify_css_animation(
+    state: &AnimationState,
+    iteration_state: &KeyframesIterationState,
+    started_at: f64,
+    duration: f64,
+) -> CssAnimationPendingClass {
+    let requires_ticks = animation_state_requires_ticks(state);
+    match iteration_state {
+        KeyframesIterationState::Infinite(_) if !requires_ticks => {
+            CssAnimationPendingClass::InfiniteInert
+        },
+        KeyframesIterationState::Finite(_, _) if !requires_ticks => {
+            CssAnimationPendingClass::Inert
+        },
+        _ if !valid_animation_timing(started_at, duration) => {
+            CssAnimationPendingClass::Unsupported(
+                CssAnimationUnsupportedClass::InvalidAnimationTiming,
+            )
+        },
+        KeyframesIterationState::Infinite(current) if current.is_finite() && *current >= 0.0 => {
+            CssAnimationPendingClass::InfinitePendingOrRunning
+        },
+        KeyframesIterationState::Infinite(_) => CssAnimationPendingClass::Unsupported(
+            CssAnimationUnsupportedClass::InvalidAnimationIteration,
+        ),
+        KeyframesIterationState::Finite(current, maximum)
+            if current.is_finite() &&
+                maximum.is_finite() &&
+                *current >= 0.0 &&
+                *maximum >= 0.0 =>
+        {
+            CssAnimationPendingClass::FinitePendingOrRunning
+        },
+        KeyframesIterationState::Finite(_, _) => CssAnimationPendingClass::Unsupported(
+            CssAnimationUnsupportedClass::InvalidAnimationIteration,
+        ),
+    }
+}
+
+fn classify_css_transition(
+    state: &AnimationState,
+    start_time: f64,
+    duration: f64,
+) -> CssAnimationPendingClass {
+    if !animation_state_requires_ticks(state) {
+        return CssAnimationPendingClass::Inert;
+    }
+    if start_time.is_finite() && duration.is_finite() && duration >= 0.0 {
+        CssAnimationPendingClass::FinitePendingOrRunning
+    } else {
+        CssAnimationPendingClass::Unsupported(
+            CssAnimationUnsupportedClass::InvalidTransitionTiming,
+        )
+    }
+}
+
 /// The set of animations for a document.
 #[derive(Default, JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
@@ -215,6 +385,34 @@ impl Animations {
             .values()
             .map(|state| state.running_animation_and_transition_count())
             .sum()
+    }
+
+    /// Copy the retained CSS animation facts without advancing the timeline,
+    /// dispatching events, or holding either collection borrow after this call.
+    pub(crate) fn pending_observation(&self) -> CssAnimationPendingObservation {
+        let mut observation = CssAnimationPendingObservation::default();
+        {
+            let sets = self.sets.sets.read();
+            for set in sets.values() {
+                for animation in &set.animations {
+                    observation.record(classify_css_animation(
+                        &animation.state,
+                        &animation.iteration_state,
+                        animation.started_at,
+                        animation.duration,
+                    ));
+                }
+                for transition in &set.transitions {
+                    observation.record(classify_css_transition(
+                        &transition.state,
+                        transition.start_time,
+                        transition.property_animation.duration,
+                    ));
+                }
+            }
+        }
+        observation.pending_event_count = self.pending_events.borrow().len();
+        observation
     }
 
     /// Walk through the list of pending animations and start all of the ones that
@@ -631,4 +829,127 @@ pub(crate) struct TransitionOrAnimationEvent {
     pub(crate) property_or_animation_name: String,
     /// The elapsed time property to send with this transition event.
     pub(crate) elapsed_time: f64,
+}
+
+#[cfg(test)]
+mod pending_observation_tests {
+    use super::*;
+
+    #[test]
+    fn active_finite_and_infinite_animations_are_distinct_from_inert_infinite_entries() {
+        assert_eq!(
+            classify_css_animation(
+                &AnimationState::Pending,
+                &KeyframesIterationState::Finite(0.0, 2.5),
+                -10.0,
+                20.0,
+            ),
+            CssAnimationPendingClass::FinitePendingOrRunning
+        );
+        assert_eq!(
+            classify_css_animation(
+                &AnimationState::Running,
+                &KeyframesIterationState::Infinite(4.0),
+                10.0,
+                20.0,
+            ),
+            CssAnimationPendingClass::InfinitePendingOrRunning
+        );
+
+        for state in [
+            AnimationState::Paused(0.25),
+            AnimationState::Finished,
+            AnimationState::Canceled,
+        ] {
+            assert_eq!(
+                classify_css_animation(
+                    &state,
+                    &KeyframesIterationState::Infinite(4.0),
+                    10.0,
+                    20.0,
+                ),
+                CssAnimationPendingClass::InfiniteInert
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_active_entries_keep_typed_unsupported_reasons() {
+        let animation_timing = classify_css_animation(
+            &AnimationState::Running,
+            &KeyframesIterationState::Finite(0.0, 1.0),
+            f64::NAN,
+            20.0,
+        );
+        let animation_iteration = classify_css_animation(
+            &AnimationState::Running,
+            &KeyframesIterationState::Finite(-1.0, 1.0),
+            10.0,
+            20.0,
+        );
+        let transition_timing =
+            classify_css_transition(&AnimationState::Pending, 10.0, f64::INFINITY);
+
+        let mut observation = CssAnimationPendingObservation::default();
+        observation.record(animation_timing);
+        observation.record(animation_iteration);
+        observation.record(transition_timing);
+
+        assert_eq!(
+            observation
+                .unsupported_pending_or_running
+                .count(CssAnimationUnsupportedClass::InvalidAnimationTiming),
+            1
+        );
+        assert_eq!(
+            observation
+                .unsupported_pending_or_running
+                .count(CssAnimationUnsupportedClass::InvalidAnimationIteration),
+            1
+        );
+        assert_eq!(
+            observation
+                .unsupported_pending_or_running
+                .count(CssAnimationUnsupportedClass::InvalidTransitionTiming),
+            1
+        );
+        assert_eq!(
+            observation
+                .unsupported_pending_or_running
+                .checked_total(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn paused_or_finished_finite_entries_and_transitions_are_inert() {
+        assert_eq!(
+            classify_css_animation(
+                &AnimationState::Paused(0.5),
+                &KeyframesIterationState::Finite(0.0, 1.0),
+                f64::NAN,
+                f64::NAN,
+            ),
+            CssAnimationPendingClass::Inert
+        );
+        assert_eq!(
+            classify_css_transition(&AnimationState::Finished, f64::NAN, f64::NAN),
+            CssAnimationPendingClass::Inert
+        );
+    }
+
+    #[test]
+    fn lowering_a_running_animation_iteration_limit_remains_finite() {
+        // Stylo deliberately preserves the completed-iteration counter when a style
+        // change lowers the maximum. The next tick deterministically finishes it.
+        assert_eq!(
+            classify_css_animation(
+                &AnimationState::Running,
+                &KeyframesIterationState::Finite(4.0, 1.0),
+                10.0,
+                20.0,
+            ),
+            CssAnimationPendingClass::FinitePendingOrRunning
+        );
+    }
 }

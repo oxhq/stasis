@@ -81,7 +81,7 @@ use time::Duration as TimeDuration;
 use timers::{DocumentRenderingTime, DocumentTimeSurface};
 use url::{Host, Position};
 
-use crate::animations::Animations;
+use crate::animations::{Animations, CssAnimationPendingObservation};
 use crate::css::stylesheet_loader::StylesheetContextId;
 use crate::css::stylesheet_set::StylesheetSetRef;
 use crate::dom::FlatTreeParent;
@@ -374,6 +374,77 @@ bitflags! {
         /// reflects the up-to-date contents.
         const FontReadyPromiseFulfilled = 1 << 2;
     }
+}
+
+/// Copied requestAnimationFrame list facts for one document.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AnimationFramePendingObservation {
+    /// Every retained list slot, including canceled tombstones.
+    pub(crate) retained_slots: usize,
+    /// Slots which still hold a callback that can run at a rendering opportunity.
+    pub(crate) runnable_callbacks: usize,
+    /// Canceled slots retained until the next callback-list snapshot is consumed.
+    pub(crate) canceled_tombstones: usize,
+    /// Whether a callback-list snapshot is currently being invoked.
+    pub(crate) callbacks_running: bool,
+}
+
+/// Mechanical activity and throttle facts used by rendering scheduling.
+///
+/// Activity and throttling are intentionally independent booleans. Collapsing them
+/// into one enum would lose whether a throttled document remains fully active.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DocumentRenderingEligibilityObservation {
+    pub(crate) fully_active: bool,
+    pub(crate) throttled: bool,
+    pub(crate) render_blocked: bool,
+    /// The predicate used when deciding whether CSS animations or rAF callbacks
+    /// justify scheduling another animation tick.
+    pub(crate) animation_tick_eligible: bool,
+    /// Whether an already-ready rendering opportunity can currently process this
+    /// document. Waiting for canvas uploads is supplied separately because it is an
+    /// asynchronous terminal fact, not merely an eligibility bit.
+    pub(crate) rendering_opportunity_eligible: bool,
+}
+
+/// Passive canvas facts available directly from a document.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DocumentCanvasPendingObservation {
+    /// Canvases in the exact dirty list consumed by `update_the_rendering`.
+    pub(crate) dirty_canvas_count: usize,
+    /// Whether paint still owes completion for asynchronous canvas image uploads.
+    pub(crate) waiting_on_canvas_image_updates: bool,
+    /// A complete retained live-canvas inventory is not currently owned by Document.
+    /// `None` must not be interpreted as zero live canvases.
+    pub(crate) live_canvas_count: Option<usize>,
+}
+
+/// Passive non-animated image facts available directly from a document.
+///
+/// The authoritative callback, layout-image, and rasterization maps currently live
+/// privately on `Window`. Until that owner exposes one short-borrow snapshot, each
+/// `None` here means unavailable rather than empty.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DocumentImagePendingObservation {
+    pub(crate) pending_callback_ids: Option<usize>,
+    pub(crate) pending_layout_image_ids: Option<usize>,
+    pub(crate) pending_rasterization_keys: Option<usize>,
+}
+
+/// Policy-free rendering evidence copied from one document without advancing or
+/// dispatching any work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DocumentRenderingPendingObservation {
+    pub(crate) animation_frames: AnimationFramePendingObservation,
+    pub(crate) eligibility: DocumentRenderingEligibilityObservation,
+    /// The exact predicate used by ScriptThread to decide whether document state
+    /// independently requires an update-the-rendering opportunity.
+    pub(crate) needs_rendering_update: bool,
+    pub(crate) css_animations: CssAnimationPendingObservation,
+    pub(crate) canvas: DocumentCanvasPendingObservation,
+    /// FontContext's exact outstanding web-font load count.
+    pub(crate) web_fonts_still_loading: usize,
+    pub(crate) nonanimated_images: DocumentImagePendingObservation,
 }
 
 /// <https://html.spec.whatwg.org/multipage/#document-load-timing-info>
@@ -1854,6 +1925,15 @@ impl Document {
         !self.animation_frame_list.borrow().is_empty()
     }
 
+    fn animation_frame_pending_observation(&self) -> AnimationFramePendingObservation {
+        let mut observation = {
+            let callbacks = self.animation_frame_list.borrow();
+            observe_animation_frame_slots(&callbacks)
+        };
+        observation.callbacks_running = self.running_animation_callbacks.get();
+        observation
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-window-requestanimationframe>
     pub(crate) fn request_animation_frame(&self, callback: AnimationFrameCallback) -> u32 {
         let ident = self.animation_frame_ident.get() + 1;
@@ -3248,6 +3328,45 @@ impl Document {
         }
 
         false
+    }
+
+    /// Copy the document-owned rendering facts without advancing animation time,
+    /// consuming callbacks, dispatching events, or retaining any collection borrow.
+    pub(crate) fn pending_rendering_observation(
+        &self,
+        no_gc: &NoGC,
+    ) -> DocumentRenderingPendingObservation {
+        let fully_active = self.is_fully_active();
+        let throttled = self.window().throttled();
+        let render_blocked = self.is_render_blocked();
+        let waiting_on_canvas_image_updates = self.waiting_on_canvas_image_updates.get();
+        let needs_rendering_update = self.needs_rendering_update(no_gc);
+        let animation_frames = self.animation_frame_pending_observation();
+        let css_animations = self.animations.pending_observation();
+        let canvas = DocumentCanvasPendingObservation {
+            dirty_canvas_count: self.dirty_canvases.borrow().len(),
+            waiting_on_canvas_image_updates,
+            live_canvas_count: None,
+        };
+
+        DocumentRenderingPendingObservation {
+            animation_frames,
+            eligibility: rendering_eligibility_observation(
+                fully_active,
+                throttled,
+                render_blocked,
+                waiting_on_canvas_image_updates,
+            ),
+            needs_rendering_update,
+            css_animations,
+            canvas,
+            web_fonts_still_loading: self.window().font_context().web_fonts_still_loading(),
+            nonanimated_images: DocumentImagePendingObservation {
+                pending_callback_ids: None,
+                pending_layout_image_ids: None,
+                pending_rasterization_keys: None,
+            },
+        }
     }
 
     /// An implementation of step 22 from
@@ -5234,6 +5353,39 @@ impl Document {
     }
 }
 
+fn observe_animation_frame_slots<T>(
+    callbacks: &VecDeque<(u32, Option<T>)>,
+) -> AnimationFramePendingObservation {
+    let retained_slots = callbacks.len();
+    let runnable_callbacks = callbacks
+        .iter()
+        .filter(|(_, callback)| callback.is_some())
+        .count();
+    AnimationFramePendingObservation {
+        retained_slots,
+        runnable_callbacks,
+        canceled_tombstones: retained_slots - runnable_callbacks,
+        callbacks_running: false,
+    }
+}
+
+fn rendering_eligibility_observation(
+    fully_active: bool,
+    throttled: bool,
+    render_blocked: bool,
+    waiting_on_canvas_image_updates: bool,
+) -> DocumentRenderingEligibilityObservation {
+    DocumentRenderingEligibilityObservation {
+        fully_active,
+        throttled,
+        render_blocked,
+        animation_tick_eligible: fully_active && !throttled,
+        rendering_opportunity_eligible: fully_active &&
+            !render_blocked &&
+            !waiting_on_canvas_image_updates,
+    }
+}
+
 fn run_animation_frame_callback_snapshot<T, Timestamp: Copy>(
     callbacks: &DomRefCell<VecDeque<(u32, Option<T>)>>,
     timestamp: Timestamp,
@@ -5280,6 +5432,81 @@ mod animation_frame_callback_tests {
                 thread_state::exit(ThreadState::SCRIPT);
             }
         }
+    }
+
+    #[test]
+    fn passive_callback_observation_separates_runnable_slots_and_tombstones() {
+        let callbacks = VecDeque::from([
+            (1, Some("first")),
+            (2, None),
+            (3, Some("third")),
+            (4, None),
+        ]);
+
+        assert_eq!(
+            observe_animation_frame_slots(&callbacks),
+            AnimationFramePendingObservation {
+                retained_slots: 4,
+                runnable_callbacks: 2,
+                canceled_tombstones: 2,
+                callbacks_running: false,
+            }
+        );
+        assert_eq!(callbacks.len(), 4, "observation must not consume callbacks");
+    }
+
+    #[test]
+    fn activity_and_throttle_remain_independent_facts() {
+        assert_eq!(
+            rendering_eligibility_observation(true, false, false, false),
+            DocumentRenderingEligibilityObservation {
+                fully_active: true,
+                throttled: false,
+                render_blocked: false,
+                animation_tick_eligible: true,
+                rendering_opportunity_eligible: true,
+            }
+        );
+        assert_eq!(
+            rendering_eligibility_observation(true, true, false, false),
+            DocumentRenderingEligibilityObservation {
+                fully_active: true,
+                throttled: true,
+                render_blocked: false,
+                animation_tick_eligible: false,
+                rendering_opportunity_eligible: true,
+            }
+        );
+        assert_eq!(
+            rendering_eligibility_observation(false, false, false, false),
+            DocumentRenderingEligibilityObservation {
+                fully_active: false,
+                throttled: false,
+                render_blocked: false,
+                animation_tick_eligible: false,
+                rendering_opportunity_eligible: false,
+            }
+        );
+        assert_eq!(
+            rendering_eligibility_observation(true, false, true, false),
+            DocumentRenderingEligibilityObservation {
+                fully_active: true,
+                throttled: false,
+                render_blocked: true,
+                animation_tick_eligible: true,
+                rendering_opportunity_eligible: false,
+            }
+        );
+        assert_eq!(
+            rendering_eligibility_observation(true, false, false, true),
+            DocumentRenderingEligibilityObservation {
+                fully_active: true,
+                throttled: false,
+                render_blocked: false,
+                animation_tick_eligible: true,
+                rendering_opportunity_eligible: false,
+            }
+        );
     }
 
     #[test]
