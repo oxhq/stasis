@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Handled HTTP 500</title>
+  </head>
+  <body>
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email">
+    <button id="save" type="button">Save</button>
+    <p id="status"></p>
+    <p id="error" role="alert"></p>
+
+    <script>
+      document.querySelector("#save").addEventListener("click", () => {
+        const email = document.querySelector("#email").value;
+        const status = document.querySelector("#status");
+        const error = document.querySelector("#error");
+
+        status.textContent = "Saving";
+        error.textContent = "";
+
+        fetch("/__stasis__/save", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ email }),
+        })
+          .then((response) => {
+            document.documentElement.dataset.responseStatus = String(
+              response.status,
+            );
+
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status}`);
+            }
+
+            return response.json();
+          })
+          .then(() => {
+            status.textContent = "Saved";
+            document.documentElement.dataset.state = "saved";
+          })
+          .catch(() => {
+            status.textContent = "";
+            error.textContent = "Unable to save";
+            document.documentElement.dataset.state = "failed";
+          });
+      });
+    </script>
+  </body>
+</html>

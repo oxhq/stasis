@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Nested microtasks</title>
+  </head>
+  <body>
+    <button id="start" type="button">Run microtasks</button>
+    <output id="order">idle</output>
+
+    <script>
+      document.querySelector("#start").addEventListener("click", () => {
+        const order = [];
+
+        queueMicrotask(() => {
+          order.push("outer");
+
+          Promise.resolve().then(() => {
+            order.push("inner-promise");
+
+            queueMicrotask(() => {
+              order.push("inner-microtask");
+
+              Promise.resolve().then(() => {
+                order.push("tail-promise");
+                document.querySelector("#order").textContent = order.join(",");
+                document.documentElement.dataset.state = "complete";
+              });
+            });
+          });
+        });
+      });
+    </script>
+  </body>
+</html>

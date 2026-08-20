@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Debounce fetch promise rAF chain</title>
+  </head>
+  <body>
+    <label for="query">Query</label>
+    <input id="query" name="query" type="search">
+    <button id="search" type="button">Search</button>
+    <p id="status">idle</p>
+    <p id="error" role="alert"></p>
+    <section id="results"></section>
+
+    <script>
+      const query = document.querySelector("#query");
+      const results = document.querySelector("#results");
+      const status = document.querySelector("#status");
+      const error = document.querySelector("#error");
+      let debounceTimer = null;
+
+      function renderRows(rows) {
+        results.replaceChildren(
+          ...rows.map((row) => {
+            const result = document.createElement("article");
+            const caseNumber = document.createElement("span");
+            const court = document.createElement("span");
+
+            result.className = "result";
+            caseNumber.className = "case";
+            caseNumber.textContent = row.expediente;
+            court.className = "court";
+            court.textContent = row.juzgado;
+            result.append(caseNumber, court);
+
+            return result;
+          }),
+        );
+        status.textContent = `${rows.length} results`;
+        document.documentElement.dataset.state = "rendered";
+      }
+
+      document.querySelector("#search").addEventListener("click", () => {
+        if (debounceTimer !== null) {
+          clearTimeout(debounceTimer);
+        }
+
+        status.textContent = "debouncing";
+        error.textContent = "";
+        document.documentElement.dataset.state = "debouncing";
+
+        debounceTimer = setTimeout(() => {
+          debounceTimer = null;
+          status.textContent = "loading";
+          document.documentElement.dataset.state = "fetching";
+
+          fetch(`/__stasis__/debounce-search?q=${encodeURIComponent(query.value)}`)
+            .then((response) => {
+              if (!response.ok) {
+                throw new Error(`Unexpected HTTP ${response.status}`);
+              }
+
+              return response.json();
+            })
+            .then((payload) => Promise.resolve().then(() => payload.results))
+            .then(
+              (rows) =>
+                new Promise((resolve) => {
+                  requestAnimationFrame(() => {
+                    renderRows(rows);
+                    resolve();
+                  });
+                }),
+            )
+            .catch((cause) => {
+              error.textContent = cause.message;
+              status.textContent = "failed";
+              document.documentElement.dataset.state = "failed";
+            });
+        }, 800);
+      });
+    </script>
+  </body>
+</html>

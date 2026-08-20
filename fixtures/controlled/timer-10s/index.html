@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Controlled 10 second timer</title>
+  </head>
+  <body>
+    <button id="start" type="button">Start timer</button>
+    <output id="result">idle</output>
+
+    <script>
+      document.querySelector("#start").addEventListener("click", () => {
+        const startedAtDate = Date.now();
+        const startedAtPerformance = performance.now();
+
+        document.documentElement.dataset.state = "scheduled";
+
+        setTimeout(() => {
+          document.documentElement.dataset.dateElapsed = String(
+            Date.now() - startedAtDate,
+          );
+          document.documentElement.dataset.performanceElapsed = String(
+            Math.round(performance.now() - startedAtPerformance),
+          );
+          document.documentElement.dataset.state = "complete";
+          document.querySelector("#result").textContent = "timer complete";
+        }, 10_000);
+      });
+    </script>
+  </body>
+</html>

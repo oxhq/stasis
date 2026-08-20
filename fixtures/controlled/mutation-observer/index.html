@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Mutation observer checkpoint</title>
+  </head>
+  <body>
+    <button id="start" type="button">Mutate target</button>
+    <div id="target" data-state="initial"></div>
+    <output id="observer-count">0</output>
+    <p id="status">idle</p>
+
+    <script>
+      const target = document.querySelector("#target");
+      const observer = new MutationObserver((records) => {
+        document.querySelector("#observer-count").textContent = String(
+          records.length,
+        );
+        document.querySelector("#status").textContent = "observer delivered";
+        document.documentElement.dataset.state = "complete";
+        observer.disconnect();
+      });
+
+      observer.observe(target, {
+        attributes: true,
+        attributeFilter: ["data-state"],
+      });
+
+      document.querySelector("#start").addEventListener("click", () => {
+        Promise.resolve().then(() => {
+          target.dataset.state = "changed";
+        });
+      });
+    </script>
+  </body>
+</html>

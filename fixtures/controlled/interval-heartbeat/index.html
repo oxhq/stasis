@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Persistent interval heartbeat</title>
+  </head>
+  <body>
+    <p>Heartbeat count: <output id="heartbeat-count">0</output></p>
+
+    <script>
+      let heartbeatCount = 0;
+
+      window.__fixtureHeartbeatId = setInterval(function heartbeat() {
+        heartbeatCount += 1;
+        document.querySelector("#heartbeat-count").textContent = String(
+          heartbeatCount,
+        );
+      }, 5_000);
+
+      document.documentElement.dataset.state = "interval-registered";
+    </script>
+  </body>
+</html>
