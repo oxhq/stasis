@@ -809,6 +809,18 @@ pub struct ImageAnimationState {
     pub completed_loops: Option<u32>,
 }
 
+/// A checked failure while interpreting an animated image's document timeline.
+#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
+pub enum ImageAnimationTimelineError {
+    /// The current or retained timeline value was not finite, or their difference could not be
+    /// represented as a standard duration.
+    TimelineValueOutOfRange,
+    /// A finite animation did not retain the loop progress needed to prove completion.
+    FiniteLoopProgressUnavailable,
+    /// Advancing retained loop progress exceeded its integer representation.
+    CompletedLoopCountOverflow,
+}
+
 impl ImageAnimationState {
     pub fn new(image: Arc<RasterImage>, last_update_time: f64) -> Self {
         let completd_loops = match &image.loop_count {
@@ -829,93 +841,129 @@ impl ImageAnimationState {
         self.image.id
     }
 
-    pub fn duration_to_next_frame(&self, now: f64) -> Option<Duration> {
-        if self.is_finished() {
-            return None;
+    pub fn duration_to_next_frame(
+        &self,
+        now: f64,
+    ) -> Result<Option<Duration>, ImageAnimationTimelineError> {
+        if self.image.frames.len() <= 1 || self.is_finished() {
+            return Ok(None);
         }
-        let frame_delay = self
-            .image
-            .frames
-            .get(self.active_frame)
-            .expect("Image frame should always be valid")
-            .delay
-            .unwrap_or_default();
-
-        let time_since_frame_start = (now - self.frame_start_time).max(0.0) * 1000.0;
-        let time_since_frame_start = Duration::from_secs_f64(time_since_frame_start);
-        Some(frame_delay - time_since_frame_start.min(frame_delay))
+        let frame_delay = self.normalized_frame_delay(self.active_frame);
+        let time_since_frame_start = self.checked_time_since_frame_start(now)?;
+        Ok(Some(frame_delay.saturating_sub(time_since_frame_start)))
     }
 
     /// check whether image active frame need to be updated given current time,
     /// return true if there are image that need to be updated.
     /// false otherwise.
-    pub fn update_frame_for_animation_timeline_value(&mut self, now: f64) -> bool {
+    pub fn update_frame_for_animation_timeline_value(
+        &mut self,
+        now: f64,
+    ) -> Result<bool, ImageAnimationTimelineError> {
         if self.image.frames.len() <= 1 || self.is_finished() {
-            return false;
+            return Ok(false);
         }
-        let time_interval_since_last_update = now - self.frame_start_time;
-        let mut remain_time_interval = time_interval_since_last_update -
-            self.image
-                .frames
-                .get(self.active_frame)
-                .unwrap()
-                .delay()
-                .unwrap()
-                .as_secs_f64();
-        let mut next_active_frame_id = self.active_frame;
-
+        let mut remaining = self.checked_time_since_frame_start(now)?;
         let frame_count = self.image.frames.len();
-        while remain_time_interval > 0.0 {
-            next_active_frame_id = (next_active_frame_id + 1) % frame_count;
+        let original_active_frame = self.active_frame;
+        let mut active_frame = self.active_frame;
+        let mut frame_start_time = self.frame_start_time;
+        let mut completed_loops = self.completed_loops;
+
+        loop {
+            let frame_delay = self.normalized_frame_delay(active_frame);
+            if remaining < frame_delay {
+                break;
+            }
+            remaining -= frame_delay;
+            let next_frame_start_time =
+                checked_add_timeline_duration(frame_start_time, frame_delay)?;
+            let next_active_frame = (active_frame + 1) % frame_count;
 
             // If the next active frame is 0, this means the animation is about to loop.
-            if next_active_frame_id == 0 {
-                self.advance_completed_loops();
+            if next_active_frame == 0 {
+                completed_loops = self.checked_advanced_completed_loops(completed_loops)?;
 
                 // If we have just finished the animation, advance to the final frame if
                 // necessary and stop walking through frames.
-                if self.is_finished() {
-                    if self.active_frame == frame_count - 1 {
-                        return false;
-                    }
-                    self.active_frame = frame_count - 1;
-                    self.frame_start_time = now;
-                    return true;
+                if self.is_finished_with_completed_loops(completed_loops) {
+                    active_frame = frame_count - 1;
+                    self.active_frame = active_frame;
+                    self.frame_start_time = frame_start_time;
+                    self.completed_loops = completed_loops;
+                    return Ok(original_active_frame != active_frame);
                 }
             }
+            active_frame = next_active_frame;
+            frame_start_time = next_frame_start_time;
+        }
 
-            remain_time_interval -= self
-                .image
-                .frames
-                .get(next_active_frame_id)
-                .unwrap()
-                .delay()
-                .unwrap()
-                .as_secs_f64();
-        }
-        if self.active_frame == next_active_frame_id {
-            return false;
-        }
-        self.active_frame = next_active_frame_id;
-        self.frame_start_time = now;
-        true
+        self.active_frame = active_frame;
+        self.frame_start_time = frame_start_time;
+        self.completed_loops = completed_loops;
+        Ok(original_active_frame != active_frame)
     }
 
     /// Whether or not this animation has finished looping and has reached its final frame.
     fn is_finished(&self) -> bool {
+        self.is_finished_with_completed_loops(self.completed_loops)
+    }
+
+    fn is_finished_with_completed_loops(&self, completed_loops: Option<u32>) -> bool {
         let Some(Repeat::Finite(maximum_loops)) = self.image.loop_count.as_ref() else {
             return false;
         };
-        self.completed_loops
-            .is_some_and(|completed_loops| completed_loops >= maximum_loops.get())
+        completed_loops.is_some_and(|completed_loops| completed_loops >= maximum_loops.get())
     }
 
-    /// If this animation has a finite number of loops, advance the count of completed loops.
-    fn advance_completed_loops(&mut self) {
-        if let Some(completed_loops) = self.completed_loops.as_mut() {
-            *completed_loops += 1;
+    fn checked_advanced_completed_loops(
+        &self,
+        completed_loops: Option<u32>,
+    ) -> Result<Option<u32>, ImageAnimationTimelineError> {
+        match self.image.loop_count.as_ref() {
+            Some(Repeat::Infinite) => Ok(completed_loops),
+            Some(Repeat::Finite(_)) => completed_loops
+                .ok_or(ImageAnimationTimelineError::FiniteLoopProgressUnavailable)?
+                .checked_add(1)
+                .map(Some)
+                .ok_or(ImageAnimationTimelineError::CompletedLoopCountOverflow),
+            None => Err(ImageAnimationTimelineError::FiniteLoopProgressUnavailable),
         }
     }
+
+    fn normalized_frame_delay(&self, frame: usize) -> Duration {
+        self.image
+            .frames
+            .get(frame)
+            .expect("Image frame should always be valid")
+            .delay()
+            .unwrap_or(Duration::from_millis(100))
+    }
+
+    fn checked_time_since_frame_start(
+        &self,
+        now: f64,
+    ) -> Result<Duration, ImageAnimationTimelineError> {
+        if !now.is_finite() || !self.frame_start_time.is_finite() {
+            return Err(ImageAnimationTimelineError::TimelineValueOutOfRange);
+        }
+        let elapsed = now - self.frame_start_time;
+        if !elapsed.is_finite() {
+            return Err(ImageAnimationTimelineError::TimelineValueOutOfRange);
+        }
+        Duration::try_from_secs_f64(elapsed.max(0.0))
+            .map_err(|_| ImageAnimationTimelineError::TimelineValueOutOfRange)
+    }
+}
+
+fn checked_add_timeline_duration(
+    timeline_value: f64,
+    duration: Duration,
+) -> Result<f64, ImageAnimationTimelineError> {
+    let next = timeline_value + duration.as_secs_f64();
+    (next.is_finite() && next > timeline_value)
+        .then_some(next)
+        .ok_or(ImageAnimationTimelineError::TimelineValueOutOfRange)
 }
 
 /// The result of a hit test query.
@@ -1019,14 +1067,168 @@ pub fn with_layout_state<R>(f: impl FnOnce() -> R) -> R {
 }
 
 #[cfg(test)]
-mod test {
+mod image_animation_tests {
     use std::num::NonZeroU32;
     use std::sync::Arc;
     use std::time::Duration;
 
     use pixels::{CorsStatus, ImageFrame, ImageMetadata, PixelFormat, RasterImage, Repeat};
 
-    use crate::ImageAnimationState;
+    use crate::{ImageAnimationState, ImageAnimationTimelineError};
+
+    fn image_animation_state(frame_delays: &[Duration], loop_count: Repeat) -> ImageAnimationState {
+        let frames = frame_delays
+            .iter()
+            .copied()
+            .map(|delay| ImageFrame {
+                delay: Some(delay),
+                byte_range: 0..1,
+                width: 1,
+                height: 1,
+            })
+            .collect();
+        let image = RasterImage {
+            metadata: ImageMetadata {
+                width: 1,
+                height: 1,
+            },
+            format: PixelFormat::BGRA8,
+            id: None,
+            bytes: Arc::new(vec![1]),
+            frames,
+            cors_status: CorsStatus::Unsafe,
+            loop_count: Some(loop_count),
+            is_opaque: false,
+        };
+        ImageAnimationState::new(Arc::new(image), 0.0)
+    }
+
+    #[test]
+    fn next_frame_duration_uses_seconds_and_normalized_frame_delay() {
+        let normal = image_animation_state(
+            &[Duration::from_millis(100), Duration::from_millis(100)],
+            Repeat::Infinite,
+        );
+        assert_eq!(
+            normal.duration_to_next_frame(0.04),
+            Ok(Some(Duration::from_millis(60))),
+        );
+
+        let normalized = image_animation_state(
+            &[Duration::from_millis(1), Duration::from_millis(1)],
+            Repeat::Infinite,
+        );
+        assert_eq!(
+            normalized.duration_to_next_frame(0.04),
+            Ok(Some(Duration::from_millis(60))),
+        );
+    }
+
+    #[test]
+    fn exact_frame_boundary_advances_once_without_a_zero_delay() {
+        let mut state = image_animation_state(
+            &[Duration::from_millis(100), Duration::from_millis(100)],
+            Repeat::Infinite,
+        );
+
+        assert_eq!(
+            state.update_frame_for_animation_timeline_value(0.1),
+            Ok(true),
+        );
+        assert_eq!(state.active_frame, 1);
+        assert_eq!(state.frame_start_time, 0.1);
+        assert_eq!(
+            state.duration_to_next_frame(0.1),
+            Ok(Some(Duration::from_millis(100))),
+        );
+    }
+
+    #[test]
+    fn finite_completion_has_no_zero_delay_reschedule() {
+        let mut state = image_animation_state(
+            &[Duration::from_millis(100), Duration::from_millis(100)],
+            Repeat::Finite(NonZeroU32::new(1).unwrap()),
+        );
+
+        assert_eq!(
+            state.update_frame_for_animation_timeline_value(0.1),
+            Ok(true),
+        );
+        assert_eq!(
+            state.duration_to_next_frame(0.1),
+            Ok(Some(Duration::from_millis(100))),
+        );
+        assert_eq!(
+            state.update_frame_for_animation_timeline_value(0.2),
+            Ok(false),
+        );
+        assert_eq!(state.active_frame, 1);
+        assert_eq!(state.completed_loops, Some(1));
+        assert_eq!(state.frame_start_time, 0.1);
+        assert_eq!(state.duration_to_next_frame(0.2), Ok(None));
+    }
+
+    #[test]
+    fn late_realtime_update_preserves_frame_phase() {
+        let mut state = image_animation_state(
+            &[
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+            ],
+            Repeat::Infinite,
+        );
+
+        assert_eq!(
+            state.update_frame_for_animation_timeline_value(0.25),
+            Ok(true),
+        );
+        assert_eq!(state.active_frame, 2);
+        assert!((state.frame_start_time - 0.2).abs() < f64::EPSILON);
+        assert_eq!(
+            state.duration_to_next_frame(0.25),
+            Ok(Some(Duration::from_millis(50))),
+        );
+    }
+
+    #[test]
+    fn full_infinite_cycle_commits_phase_even_when_frame_index_is_unchanged() {
+        let mut state = image_animation_state(
+            &[Duration::from_millis(100), Duration::from_millis(100)],
+            Repeat::Infinite,
+        );
+
+        assert_eq!(
+            state.update_frame_for_animation_timeline_value(0.25),
+            Ok(false),
+        );
+        assert_eq!(state.active_frame, 0);
+        assert!((state.frame_start_time - 0.2).abs() < f64::EPSILON);
+        assert_eq!(
+            state.duration_to_next_frame(0.25),
+            Ok(Some(Duration::from_millis(50))),
+        );
+    }
+
+    #[test]
+    fn timeline_overflow_is_checked_and_non_mutating() {
+        let mut state = image_animation_state(
+            &[Duration::from_millis(100), Duration::from_millis(100)],
+            Repeat::Infinite,
+        );
+
+        assert_eq!(
+            state.duration_to_next_frame(f64::MAX),
+            Err(ImageAnimationTimelineError::TimelineValueOutOfRange),
+        );
+        assert_eq!(
+            state.update_frame_for_animation_timeline_value(f64::MAX),
+            Err(ImageAnimationTimelineError::TimelineValueOutOfRange),
+        );
+        assert_eq!(state.active_frame, 0);
+        assert_eq!(state.frame_start_time, 0.0);
+        assert_eq!(state.completed_loops, None);
+    }
 
     #[test]
     fn test_animated_image_update() {
@@ -1057,16 +1259,16 @@ mod test {
         assert_eq!(image_animation_state.frame_start_time, 0.0);
         assert_eq!(
             image_animation_state.update_frame_for_animation_timeline_value(0.101),
-            true
+            Ok(true)
         );
         assert_eq!(image_animation_state.active_frame, 1);
-        assert_eq!(image_animation_state.frame_start_time, 0.101);
+        assert_eq!(image_animation_state.frame_start_time, 0.1);
         assert_eq!(
             image_animation_state.update_frame_for_animation_timeline_value(0.116),
-            false
+            Ok(false)
         );
         assert_eq!(image_animation_state.active_frame, 1);
-        assert_eq!(image_animation_state.frame_start_time, 0.101);
+        assert_eq!(image_animation_state.frame_start_time, 0.1);
     }
 
     #[test]
@@ -1098,17 +1300,17 @@ mod test {
         assert_eq!(image_animation_state.frame_start_time, 0.0);
         assert_eq!(
             image_animation_state.update_frame_for_animation_timeline_value(0.101),
-            true
+            Ok(true)
         );
         assert_eq!(image_animation_state.active_frame, 1);
-        assert_eq!(image_animation_state.frame_start_time, 0.101);
+        assert_eq!(image_animation_state.frame_start_time, 0.1);
         assert_eq!(
             image_animation_state.update_frame_for_animation_timeline_value(0.202),
-            false
+            Ok(false)
         );
         assert_eq!(
             image_animation_state.update_frame_for_animation_timeline_value(0.303),
-            false
+            Ok(false)
         );
 
         assert_eq!(image_animation_state.active_frame, 1);
