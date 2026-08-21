@@ -592,13 +592,15 @@ pub enum DocumentControlOutcome {
 }
 
 impl DocumentControlOutcome {
-    /// Revalidate an observation and indeterminate target after same-build deserialization.
+    /// Revalidate an observation, rejection, or indeterminate target after deserialization.
     pub fn validate(&self) -> Result<(), DocumentControlOutcomeInvariantError> {
         match self {
             Self::Completed(observation) => observation
                 .validate()
                 .map_err(DocumentControlOutcomeInvariantError::Observation),
-            Self::Rejected(_) => Ok(()),
+            Self::Rejected(error) => error
+                .validate()
+                .map_err(DocumentControlOutcomeInvariantError::Rejection),
             Self::DriveOneTurnOutcomeIndeterminate { target }
             | Self::AdvanceOutcomeIndeterminate { target, .. } => target
                 .validate()
@@ -613,6 +615,26 @@ impl DocumentControlOutcome {
     ) -> Result<(), DocumentControlOutcomeInvariantError> {
         self.validate()?;
         match (command, self) {
+            (DocumentControlCommand::DriveOneTurn, Self::Rejected(error))
+                if error.is_pending_capture_failure() =>
+            {
+                Err(
+                    DocumentControlOutcomeInvariantError::PendingCaptureRejectionForMutatingCommand {
+                        command: DocumentControlCommandKind::DriveOneTurn,
+                        error: Box::new(error.clone()),
+                    },
+                )
+            },
+            (DocumentControlCommand::AdvanceTo(_), Self::Rejected(error))
+                if error.is_pending_capture_failure() =>
+            {
+                Err(
+                    DocumentControlOutcomeInvariantError::PendingCaptureRejectionForMutatingCommand {
+                        command: DocumentControlCommandKind::AdvanceTo,
+                        error: Box::new(error.clone()),
+                    },
+                )
+            },
             (_, Self::Rejected(_)) => Ok(()),
             (DocumentControlCommand::Observe, Self::Completed(observation)) => {
                 if observation.action == DocumentControlAction::Observed {
@@ -815,8 +837,17 @@ impl DocumentControlOutcomeKind {
 pub enum DocumentControlOutcomeInvariantError {
     /// A completed observation was structurally invalid.
     Observation(DocumentControlObservationInvariantError),
+    /// A definitive rejection carried a structurally invalid error payload.
+    Rejection(DocumentControlErrorInvariantError),
     /// An indeterminate outcome carried a malformed target authority.
     IndeterminateTarget(PendingSnapshotInvariantError),
+    /// A pending-state capture failure cannot prove a mutating command never acted.
+    PendingCaptureRejectionForMutatingCommand {
+        /// Submitted mutating command class.
+        command: DocumentControlCommandKind,
+        /// Capture error which cannot be treated as definitive for that command.
+        error: Box<DocumentControlError>,
+    },
     /// A completed action did not match the submitted command.
     CompletedActionMismatch {
         /// Submitted command class.
@@ -887,6 +918,37 @@ pub enum DocumentControlOutcomeInvariantError {
     },
 }
 
+/// Authoritative fact required to assemble one normalized pending-state observation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub enum DocumentPendingFact {
+    /// Exact WebView, event-loop, navigation, and pipeline-membership authority.
+    TargetMembership,
+    /// Monotonic generation covering observable runtime state.
+    StateGeneration,
+    /// Monotonic epoch covering DOM mutation.
+    DomMutationEpoch,
+    /// Controlled document-clock identity, mode, and current time.
+    Clock,
+    /// Exact finite scheduler head and scheduler identity.
+    Scheduler,
+    /// Ordinary input revision, readiness, and task inventory.
+    Input,
+    /// Main-event-loop microtask checkpoint coverage.
+    MicrotaskCoverage,
+    /// Asynchronous producer-fence watermarks and stability.
+    Producers,
+    /// Parser and navigation source inventory.
+    Parser,
+    /// Foreground and persistent network inventory.
+    Network,
+    /// Rendering readiness and persistent rendering activity.
+    Rendering,
+    /// Canonical asynchronous-source inventory.
+    Sources,
+    /// Sticky terminal evidence for unsupported or exhausted runtime state.
+    RuntimeTerminals,
+}
+
 /// Typed definitive rejection from routing, observation, turn driving, or guarded advance.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DocumentControlError {
@@ -900,6 +962,17 @@ pub enum DocumentControlError {
     MultipleEventLoops,
     /// The selected ScriptEventLoop also owns a different WebView.
     SharedEventLoopWebView,
+    /// The authoritative owner cannot currently supply a required pending-state fact.
+    PendingFactUnavailable(DocumentPendingFact),
+    /// Authoritative facts could not be normalized into one internally consistent snapshot.
+    PendingSnapshot(PendingSnapshotInvariantError),
+    /// Target authority changed while the owner was capturing a definitive pre-action snapshot.
+    TargetChanged {
+        /// Authority established when the command was admitted.
+        expected: Box<PendingTargetObservation>,
+        /// Live authority observed before any requested page-state mutation began.
+        observed: Box<PendingTargetObservation>,
+    },
     /// Another control command is already in flight for this WebView.
     CommandAlreadyPending,
     /// The checked Constellation request sequence was exhausted.
@@ -936,6 +1009,48 @@ pub enum DocumentControlError {
     ChannelClosed,
     /// The checked per-WebView cancellation sequence was exhausted.
     CancellationSequenceOverflow,
+}
+
+impl DocumentControlError {
+    /// Revalidate any authoritative payload carried by this error after deserialization.
+    pub fn validate(&self) -> Result<(), DocumentControlErrorInvariantError> {
+        let Self::TargetChanged { expected, observed } = self else {
+            return Ok(());
+        };
+        expected
+            .validate()
+            .map_err(DocumentControlErrorInvariantError::TargetChangedExpected)?;
+        observed
+            .validate()
+            .map_err(DocumentControlErrorInvariantError::TargetChangedObserved)?;
+        if expected == observed {
+            return Err(DocumentControlErrorInvariantError::TargetDidNotChange {
+                target: expected.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn is_pending_capture_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::PendingFactUnavailable(_) | Self::PendingSnapshot(_) | Self::TargetChanged { .. }
+        )
+    }
+}
+
+/// A structurally invalid authoritative payload in a definitive control error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DocumentControlErrorInvariantError {
+    /// The target authority established at admission was malformed.
+    TargetChangedExpected(PendingSnapshotInvariantError),
+    /// The live target authority observed during capture was malformed.
+    TargetChangedObserved(PendingSnapshotInvariantError),
+    /// A target-drift error carried identical admission and live authority.
+    TargetDidNotChange {
+        /// Authority which was incorrectly reported as having changed.
+        target: Box<PendingTargetObservation>,
+    },
 }
 
 /// Why the embedding caller's local wait failed to deliver a command outcome.
@@ -1309,7 +1424,7 @@ mod tests {
         completed.validate().unwrap();
         assert_postcard_round_trip(completed);
         assert_postcard_round_trip(DocumentControlOutcome::Rejected(
-            DocumentControlError::ChannelClosed,
+            DocumentControlError::PendingFactUnavailable(DocumentPendingFact::Sources),
         ));
         assert_postcard_round_trip(DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate {
             target: Box::new(token.target().clone()),
@@ -1319,6 +1434,95 @@ mod tests {
             target: Box::new(token.target().clone()),
             deadline: token.deadline(),
         });
+    }
+
+    #[test]
+    fn pending_fact_and_capture_errors_round_trip() {
+        for fact in [
+            DocumentPendingFact::TargetMembership,
+            DocumentPendingFact::StateGeneration,
+            DocumentPendingFact::DomMutationEpoch,
+            DocumentPendingFact::Clock,
+            DocumentPendingFact::Scheduler,
+            DocumentPendingFact::Input,
+            DocumentPendingFact::MicrotaskCoverage,
+            DocumentPendingFact::Producers,
+            DocumentPendingFact::Parser,
+            DocumentPendingFact::Network,
+            DocumentPendingFact::Rendering,
+            DocumentPendingFact::Sources,
+            DocumentPendingFact::RuntimeTerminals,
+        ] {
+            assert_postcard_round_trip(fact);
+            assert_postcard_round_trip(DocumentControlError::PendingFactUnavailable(fact));
+        }
+
+        assert_postcard_round_trip(DocumentControlError::PendingSnapshot(
+            PendingSnapshotInvariantError::ProducerPriorEmptyMissing,
+        ));
+
+        let expected = eligible_pending().target;
+        let mut observed = expected.clone();
+        observed.navigation_revision = PendingNavigationRevision::new(4);
+        observed.validate().unwrap();
+        let error = DocumentControlError::TargetChanged {
+            expected: Box::new(expected),
+            observed: Box::new(observed),
+        };
+        error.validate().unwrap();
+        assert_postcard_round_trip(error);
+    }
+
+    #[test]
+    fn target_changed_error_revalidates_both_authorities_and_actual_drift() {
+        let expected = eligible_pending().target;
+        let mut observed = expected.clone();
+        observed.navigation_revision = PendingNavigationRevision::new(4);
+
+        let mut malformed_expected = expected.clone();
+        malformed_expected.active_top_level = None;
+        let malformed = DocumentControlOutcome::Rejected(DocumentControlError::TargetChanged {
+            expected: Box::new(malformed_expected),
+            observed: Box::new(observed),
+        });
+        assert!(matches!(
+            malformed.validate(),
+            Err(DocumentControlOutcomeInvariantError::Rejection(
+                DocumentControlErrorInvariantError::TargetChangedExpected(
+                    PendingSnapshotInvariantError::FullyActivePipelineWithoutActiveTopLevel(
+                        TEST_PIPELINE_ID
+                    )
+                )
+            ))
+        ));
+
+        let mut malformed_observed = expected.clone();
+        malformed_observed.active_top_level = None;
+        let malformed = DocumentControlOutcome::Rejected(DocumentControlError::TargetChanged {
+            expected: Box::new(expected.clone()),
+            observed: Box::new(malformed_observed),
+        });
+        assert!(matches!(
+            malformed.validate(),
+            Err(DocumentControlOutcomeInvariantError::Rejection(
+                DocumentControlErrorInvariantError::TargetChangedObserved(
+                    PendingSnapshotInvariantError::FullyActivePipelineWithoutActiveTopLevel(
+                        TEST_PIPELINE_ID
+                    )
+                )
+            ))
+        ));
+
+        let unchanged = DocumentControlOutcome::Rejected(DocumentControlError::TargetChanged {
+            expected: Box::new(expected.clone()),
+            observed: Box::new(expected.clone()),
+        });
+        assert!(matches!(
+            unchanged.validate(),
+            Err(DocumentControlOutcomeInvariantError::Rejection(
+                DocumentControlErrorInvariantError::TargetDidNotChange { target }
+            )) if *target == expected
+        ));
     }
 
     #[test]
@@ -1800,13 +2004,13 @@ mod tests {
             cancellable_receiver(&DocumentControlCommand::Observe, &cancellations);
         response
             .send(DocumentControlOutcome::Rejected(
-                DocumentControlError::ChannelClosed,
+                DocumentControlError::PendingFactUnavailable(DocumentPendingFact::Rendering),
             ))
             .unwrap();
         assert!(matches!(
             receiver.recv_timeout(Duration::from_secs(1)),
             DocumentControlReceiveOutcome::CommandOutcome(DocumentControlOutcome::Rejected(
-                DocumentControlError::ChannelClosed
+                DocumentControlError::PendingFactUnavailable(DocumentPendingFact::Rendering)
             ))
         ));
         assert_eq!(cancellations.load(Ordering::SeqCst), 1);
@@ -1822,8 +2026,27 @@ mod tests {
     }
 
     #[test]
-    fn receiver_rejects_invalid_decoded_outcomes_with_command_specific_semantics() {
+    fn receiver_preserves_capture_failure_semantics_by_command() {
         let cancellations = Arc::new(AtomicUsize::new(0));
+
+        let (response, receiver) =
+            cancellable_receiver(&DocumentControlCommand::Observe, &cancellations);
+        response
+            .send(DocumentControlOutcome::Rejected(
+                DocumentControlError::PendingSnapshot(
+                    PendingSnapshotInvariantError::ProducerPriorEmptyMissing,
+                ),
+            ))
+            .unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            DocumentControlReceiveOutcome::CommandOutcome(DocumentControlOutcome::Rejected(
+                DocumentControlError::PendingSnapshot(
+                    PendingSnapshotInvariantError::ProducerPriorEmptyMissing
+                )
+            ))
+        ));
+        assert_eq!(cancellations.load(Ordering::SeqCst), 0);
 
         let (response, receiver) =
             cancellable_receiver(&DocumentControlCommand::Observe, &cancellations);
@@ -1849,21 +2072,30 @@ mod tests {
         ));
         assert_eq!(cancellations.load(Ordering::SeqCst), 1);
 
+        // Once a Drive or Advance handler may have acted, an invalid capture cannot be
+        // represented as a definitive rejection. The receiver preserves that uncertainty.
         let (response, receiver) =
             cancellable_receiver(&DocumentControlCommand::DriveOneTurn, &cancellations);
-        response
-            .send(completed_outcome(
-                DocumentControlAction::Observed,
-                eligible_pending(),
-            ))
-            .unwrap();
+        let capture_rejection = DocumentControlOutcome::Rejected(
+            DocumentControlError::PendingFactUnavailable(DocumentPendingFact::Network),
+        );
+        assert!(matches!(
+            capture_rejection.validate_for_command(&DocumentControlCommand::DriveOneTurn),
+            Err(
+                DocumentControlOutcomeInvariantError::PendingCaptureRejectionForMutatingCommand {
+                    command: DocumentControlCommandKind::DriveOneTurn,
+                    ..
+                }
+            )
+        ));
+        response.send(capture_rejection).unwrap();
         assert!(matches!(
             receiver.recv_timeout(Duration::from_secs(1)),
             DocumentControlReceiveOutcome::DriveOneTurnOutcomeIndeterminate(
                 DocumentControlTransportFailure::InvalidOutcome(error)
             ) if matches!(
                 *error,
-                DocumentControlOutcomeInvariantError::CompletedActionMismatch {
+                DocumentControlOutcomeInvariantError::PendingCaptureRejectionForMutatingCommand {
                     command: DocumentControlCommandKind::DriveOneTurn,
                     ..
                 }
@@ -1874,12 +2106,20 @@ mod tests {
         let token = token();
         let command = DocumentControlCommand::AdvanceTo(Box::new(token.clone()));
         let (response, receiver) = cancellable_receiver(&command, &cancellations);
-        response
-            .send(completed_outcome(
-                DocumentControlAction::Observed,
-                eligible_pending(),
-            ))
-            .unwrap();
+        let capture_rejection =
+            DocumentControlOutcome::Rejected(DocumentControlError::PendingSnapshot(
+                PendingSnapshotInvariantError::ProducerPriorEmptyMissing,
+            ));
+        assert!(matches!(
+            capture_rejection.validate_for_command(&command),
+            Err(
+                DocumentControlOutcomeInvariantError::PendingCaptureRejectionForMutatingCommand {
+                    command: DocumentControlCommandKind::AdvanceTo,
+                    ..
+                }
+            )
+        ));
+        response.send(capture_rejection).unwrap();
         assert!(matches!(
             receiver.recv_timeout(Duration::from_secs(1)),
             DocumentControlReceiveOutcome::CommandOutcome(
