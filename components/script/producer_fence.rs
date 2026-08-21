@@ -144,6 +144,10 @@ pub(crate) fn fence_fetch_until_eof(
 }
 
 /// Keep an image ticket live through its terminal callback's event-loop enqueue.
+///
+/// `enqueue` must return the untouched envelope when its queue is closed. A successful return is
+/// the commit boundary: ownership of that envelope has transferred to the event loop. The enqueue
+/// operation must not synchronously re-enter this image-cache callback.
 pub(crate) fn fence_image_callback(
     fence: &DocumentProducerFence,
     enqueue: impl Fn(
