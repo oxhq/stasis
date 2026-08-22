@@ -1,0 +1,1512 @@
+name: Stasis package and promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_run_id:
+        description: Successful Stasis package push run ID; leave both inputs empty to package this SHA
+        required: false
+        type: string
+      release_tag:
+        description: Exact v-prefixed Stasis version for promotion, for example v0.1.0-alpha.0
+        required: false
+        type: string
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stasis-release-${{ github.event_name }}-${{ github.ref }}-${{ inputs.release_tag || 'package' }}
+  cancel-in-progress: ${{ inputs.package_run_id == '' }}
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  STASIS_ALPHA_VERSION: 0.1.0-alpha.0
+  STASIS_PLATFORM: macos-aarch64
+
+jobs:
+  validate-invocation:
+    name: Select package or promotion mode
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - id: mode
+        name: Validate workflow inputs
+        shell: bash
+        env:
+          PACKAGE_RUN_ID: ${{ inputs.package_run_id || '' }}
+          RELEASE_TAG: ${{ inputs.release_tag || '' }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$PACKAGE_RUN_ID" && -z "$RELEASE_TAG" ]]; then
+            echo 'mode=package' >> "$GITHUB_OUTPUT"
+          elif [[ -n "$PACKAGE_RUN_ID" && -n "$RELEASE_TAG" && "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
+            echo 'mode=promote' >> "$GITHUB_OUTPUT"
+          else
+            echo 'package_run_id and release_tag must either both be empty or both be set for a manual promotion' >&2
+            exit 1
+          fi
+
+  archive-contract:
+    name: Release archive contract
+    needs: validate-invocation
+    if: needs.validate-invocation.outputs.mode == 'package'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Verify source identity and archive contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("ports/stasis/Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')
+          test "$version" = "$STASIS_ALPHA_VERSION"
+          python3 etc/ci/stasis/release_archive.py self-test
+          python3 etc/ci/stasis/npm_release.py self-test
+          node --check etc/ci/stasis/verify_registry_sdk.mjs
+
+  package:
+    name: Package and gate macOS Apple Silicon
+    needs:
+      - validate-invocation
+      - archive-contract
+    if: |
+      needs.validate-invocation.outputs.mode == 'package'
+        && needs.archive-contract.result == 'success'
+    runs-on: macos-15
+    timeout-minutes: 120
+    outputs:
+      native_artifact_name: ${{ steps.package-names.outputs.native_artifact_name }}
+      native_proof_artifact_name: ${{ steps.package-names.outputs.native_proof_artifact_name }}
+      package_run_attempt: ${{ steps.package-names.outputs.package_run_attempt }}
+      sdk_artifact_name: ${{ steps.package-names.outputs.sdk_artifact_name }}
+    permissions:
+      contents: read
+    env:
+      STASIS_REVISION: ${{ github.sha }}
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - id: package-names
+        name: Resolve immutable package names
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = 'Darwin'
+          test "$(uname -m)" = 'arm64'
+          test "$(sysctl -n hw.optional.arm64)" = '1'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("ports/stasis/Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')
+          test "$version" = "$STASIS_ALPHA_VERSION"
+          bundle="stasis-${version}-${STASIS_PLATFORM}"
+          {
+            echo "STASIS_VERSION=$version"
+            echo "STASIS_BUNDLE=$bundle"
+            echo "STASIS_ARCHIVE=${bundle}.tar.gz"
+            echo "STASIS_BINARY_SHA256=${bundle}.binary.sha256"
+            echo "STASIS_GATE_PROOF=${bundle}-act-settle-inspect.json"
+          } >> "$GITHUB_ENV"
+          {
+            echo "native_artifact_name=stasis-macos-aarch64-attempt-$GITHUB_RUN_ATTEMPT"
+            echo "native_proof_artifact_name=stasis-macos-aarch64-act-settle-inspect-proof-attempt-$GITHUB_RUN_ATTEMPT"
+            echo "package_run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "sdk_artifact_name=stasis-typescript-alpha-attempt-$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare and measure the ephemeral macOS runner
+        shell: bash
+        run: bash etc/ci/stasis/prepare_macos_runner.sh prepare 10485760
+
+      - name: Set up pinned Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+
+      - name: Set up pinned uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.16"
+          enable-cache: false
+
+      - name: Bootstrap macOS build dependencies
+        run: ./mach bootstrap --yes --skip-lints --skip-nextest
+
+      - name: Build the exact-SHA Stasis executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$STASIS_REVISION" = "$GITHUB_SHA"
+          cargo build --locked -p stasis-shell --profile production-stripped
+          bash etc/ci/stasis/prepare_macos_runner.sh check 4194304
+
+      - name: Build and verify the release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 etc/ci/stasis/release_archive.py create \
+            --binary target/production-stripped/stasis \
+            --dist dist \
+            --version "$STASIS_VERSION" \
+            --platform "$STASIS_PLATFORM" \
+            --revision "$GITHUB_SHA" \
+            --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --source-root .
+          python3 etc/ci/stasis/release_archive.py verify \
+            --asset-directory dist \
+            --version "$STASIS_VERSION" \
+            --platform "$STASIS_PLATFORM" \
+            --revision "$GITHUB_SHA" \
+            --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --source-root . \
+            --extract-to "$RUNNER_TEMP/stasis-release-gate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+
+      - name: Gate the extracted artifact with act-settle-inspect
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/stasis-release-gate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/$STASIS_BUNDLE/stasis"
+          binary_sha256=$(awk '{print $1}' "dist/$STASIS_BINARY_SHA256")
+          gate_log="$RUNNER_TEMP/stasis-act-settle-inspect.log"
+          STASIS_RELEASE_BINARY="$binary" \
+          STASIS_RELEASE_ARCHIVE="$GITHUB_WORKSPACE/dist/$STASIS_ARCHIVE" \
+          STASIS_RELEASE_REVISION="$GITHUB_SHA" \
+          STASIS_RELEASE_SHA256="$binary_sha256" \
+            cargo test --locked --profile production-stripped -p stasis-shell --test controlled_mvp \
+              release_gate_published_binary_completes_act_settle_inspect \
+              -- --ignored --exact --test-threads=1 --show-output \
+              2>&1 | tee "$gate_log"
+          grep -F 'test release_gate_published_binary_completes_act_settle_inspect ... ok' "$gate_log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$gate_log"
+          python3 etc/ci/stasis/release_archive.py gate-proof \
+            --proof "dist/$STASIS_GATE_PROOF" \
+            --gate-log "$gate_log" \
+            --asset-directory dist \
+            --version "$STASIS_VERSION" \
+            --platform "$STASIS_PLATFORM" \
+            --revision "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Recheck runner disk after the native release gate
+        shell: bash
+        run: bash etc/ci/stasis/prepare_macos_runner.sh check 2097152
+
+      - name: Set up Node for the SDK release preflight
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install, typecheck, test, build, and pack the SDK
+        shell: bash
+        working-directory: sdk/typescript
+        run: |
+          set -euo pipefail
+          corepack enable pnpm
+          corepack prepare pnpm@9.12.3 --activate
+          test "$(pnpm --version)" = '9.12.3'
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm test
+          pnpm build
+          mkdir "$GITHUB_WORKSPACE/dist/sdk"
+          pnpm pack --pack-destination "$GITHUB_WORKSPACE/dist/sdk"
+          shopt -s nullglob
+          packages=("$GITHUB_WORKSPACE"/dist/sdk/*.tgz)
+          if [[ ${#packages[@]} -ne 1 ]]; then
+            echo "pnpm pack produced ${#packages[@]} tarballs, expected exactly one" >&2
+            exit 1
+          fi
+          {
+            echo "STASIS_SDK_TARBALL=${packages[0]}"
+            echo "STASIS_SDK_TARBALL_NAME=$(basename "${packages[0]}")"
+            echo "STASIS_SDK_PROOF=stasis-${STASIS_VERSION}-typescript-act-settle-inspect.json"
+          } >> "$GITHUB_ENV"
+
+      - name: Gate the packed SDK against the extracted native artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          consumer="$RUNNER_TEMP/stasis-package-sdk-consumer"
+          mkdir "$consumer"
+          (
+            cd "$consumer"
+            pnpm init
+            pnpm add --ignore-scripts "$STASIS_SDK_TARBALL"
+          )
+          sdk_gate_log="$RUNNER_TEMP/stasis-sdk-act-settle-inspect.log"
+          node etc/ci/stasis/verify_registry_sdk.mjs \
+            --binary "$RUNNER_TEMP/stasis-release-gate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/$STASIS_BUNDLE/stasis" \
+            --fixture ports/stasis/tests/fixtures/timer_10s.html \
+            --consumer-root "$consumer" \
+            --package "$STASIS_SDK_TARBALL" \
+            --revision "$GITHUB_SHA" \
+            --version "$STASIS_VERSION" \
+            2>&1 | tee "$sdk_gate_log"
+          binary_sha256=$(awk '{print $1}' "dist/$STASIS_BINARY_SHA256")
+          python3 etc/ci/stasis/npm_release.py create-proof \
+            --package "$STASIS_SDK_TARBALL" \
+            --gate-log "$sdk_gate_log" \
+            --output "dist/sdk/$STASIS_SDK_PROOF" \
+            --version "$STASIS_VERSION" \
+            --revision "$GITHUB_SHA" \
+            --native-binary-sha256 "$binary_sha256" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Recheck runner disk after all package gates
+        shell: bash
+        run: bash etc/ci/stasis/prepare_macos_runner.sh check 1048576
+
+      - name: Upload exact release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.package-names.outputs.native_artifact_name }}
+          path: |
+            dist/${{ env.STASIS_ARCHIVE }}
+            dist/${{ env.STASIS_ARCHIVE }}.sha256
+            dist/${{ env.STASIS_BINARY_SHA256 }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload artifact-bound gate proof
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.package-names.outputs.native_proof_artifact_name }}
+          path: dist/${{ env.STASIS_GATE_PROOF }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload the pre-gated TypeScript package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.package-names.outputs.sdk_artifact_name }}
+          path: |
+            dist/sdk/${{ env.STASIS_SDK_TARBALL_NAME }}
+            dist/sdk/${{ env.STASIS_SDK_PROOF }}
+          if-no-files-found: error
+          retention-days: 90
+
+  attest-package:
+    name: Attest exact credential-free package outputs
+    needs:
+      - validate-invocation
+      - package
+    if: |
+      needs.validate-invocation.outputs.mode == 'package'
+        && needs.package.result == 'success'
+        && github.event_name == 'push'
+        && github.ref == 'refs/heads/main'
+        && github.repository == 'oxhq/stasis'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      PACKAGE_RUN_ATTEMPT: ${{ needs.package.outputs.package_run_attempt }}
+    steps:
+      - name: Download native files from this exact run attempt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.package.outputs.native_artifact_name }}
+          path: release-assets
+
+      - name: Download native gate proof from this exact run attempt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.package.outputs.native_proof_artifact_name }}
+          path: gate-proof
+
+      - name: Download SDK files from this exact run attempt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.package.outputs.sdk_artifact_name }}
+          path: sdk-proof
+
+      - name: Recheck exact identities and digests without repository code
+        shell: bash
+        env:
+          STASIS_VERSION: 0.1.0-alpha.0
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import io
+          import json
+          import math
+          import os
+          import pathlib
+          import posixpath
+          import re
+          import tarfile
+          import tempfile
+          import zlib
+
+          version = os.environ["STASIS_VERSION"]
+          revision = os.environ["GITHUB_SHA"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          run_attempt = os.environ["PACKAGE_RUN_ATTEMPT"]
+          platform = "macos-aarch64"
+          bundle = f"stasis-{version}-{platform}"
+          archive_name = f"{bundle}.tar.gz"
+          archive_sidecar_name = f"{archive_name}.sha256"
+          binary_sidecar_name = f"{bundle}.binary.sha256"
+          native_proof_name = f"{bundle}-act-settle-inspect.json"
+          sdk_name = f"oxhq-stasis-{version}.tgz"
+          sdk_proof_name = f"stasis-{version}-typescript-act-settle-inspect.json"
+          source = {
+              "servo_repository": "https://github.com/servo/servo.git",
+              "servo_revision": "0d579bd5aab6df3764fad805427254751632a6e4",
+              "pliego_repository": "https://github.com/oxhq/pliego.git",
+              "pliego_revision": "556c774242b272b11bc60999449c5debff1ad20f",
+              "pliego_servo_merge_base": "313b6d5ecc113b08010ce434140db3ca5abcc71c",
+              "stasis_repository": "https://github.com/oxhq/stasis.git",
+              "stasis_revision": revision,
+          }
+
+          max_tarball_bytes = 32 * 1024 * 1024
+          max_member_bytes = 16 * 1024 * 1024
+          max_total_member_bytes = 64 * 1024 * 1024
+          max_tar_members = 256
+          max_expanded_tar_bytes = max_total_member_bytes + 4 * 1024 * 1024
+          stream_chunk_bytes = 1024 * 1024
+          install_hooks = {
+              "preinstall", "install", "postinstall", "prepublish",
+              "preprepare", "prepare", "postprepare",
+          }
+          windows_reserved = {
+              "con", "prn", "aux", "nul",
+              *(f"com{number}" for number in range(1, 10)),
+              *(f"lpt{number}" for number in range(1, 10)),
+          }
+          windows_forbidden = set('<>:"\\|?*')
+
+          def strict_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate object key {key!r}")
+                  value[key] = item
+              return value
+
+          def strict_float(value):
+              parsed = float(value)
+              if not math.isfinite(parsed):
+                  raise ValueError(f"non-finite number {value!r}")
+              return parsed
+
+          def strict_constant(value):
+              raise ValueError(f"non-finite number {value!r}")
+
+          def strict_json_loads(source_bytes, context):
+              if isinstance(source_bytes, bytes):
+                  try:
+                      source_bytes = source_bytes.decode("utf-8")
+                  except UnicodeError as error:
+                      raise SystemExit(f"{context} is not UTF-8: {error}") from error
+              try:
+                  return json.loads(
+                      source_bytes,
+                      object_pairs_hook=strict_object,
+                      parse_float=strict_float,
+                      parse_constant=strict_constant,
+                  )
+              except (ValueError, RecursionError) as error:
+                  raise SystemExit(f"{context} is invalid strict JSON: {error}") from error
+
+          def exact_tarball_binding(value, expected):
+              return (
+                  isinstance(value, dict)
+                  and set(value) == {"name", "sha256", "integrity"}
+                  and all(
+                      isinstance(value.get(field), str)
+                      for field in ("name", "sha256", "integrity")
+                  )
+                  and value == expected
+              )
+
+          def canonical_member_path(member):
+              name = member.name
+              if not name or not name.isascii():
+                  raise SystemExit(f"SDK tarball contains a non-ASCII or empty member: {name!r}")
+              if member.isdir() and name.endswith("/"):
+                  canonical = name[:-1]
+                  if not canonical or canonical.endswith("/"):
+                      raise SystemExit(f"SDK tarball contains a non-canonical member: {name!r}")
+              else:
+                  canonical = name
+              if (
+                  not canonical
+                  or canonical.startswith("/")
+                  or (name != canonical and name != canonical + "/")
+                  or "\\" in canonical
+                  or posixpath.normpath(canonical) != canonical
+              ):
+                  raise SystemExit(f"SDK tarball contains a non-canonical member: {name!r}")
+              components = canonical.split("/")
+              for component in components:
+                  if (
+                      not component
+                      or component in {".", ".."}
+                      or component != component.strip()
+                      or component.endswith(".")
+                      or any(ord(character) < 32 or ord(character) == 127 for character in component)
+                      or windows_forbidden.intersection(component)
+                      or component.split(".", 1)[0].lower() in windows_reserved
+                  ):
+                      raise SystemExit(
+                          f"SDK tarball member is not portable across supported filesystems: {name!r}"
+                      )
+              return canonical, "/".join(component.lower() for component in components)
+
+          def copy_bounded_gzip(package, destination):
+              expanded_bytes = 0
+              try:
+                  with package.open("rb") as source_file:
+                      if source_file.read(3) != b"\x1f\x8b\x08":
+                          raise SystemExit("SDK tarball is not a gzip stream")
+                      source_file.seek(0)
+                      decompressor = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
+                      while chunk := source_file.read(stream_chunk_bytes):
+                          pending = chunk
+                          while pending:
+                              remaining = max_expanded_tar_bytes - expanded_bytes
+                              decompressed = decompressor.decompress(
+                                  pending, min(stream_chunk_bytes, remaining + 1)
+                              )
+                              expanded_bytes += len(decompressed)
+                              if expanded_bytes > max_expanded_tar_bytes:
+                                  raise SystemExit("SDK tarball exceeds the expanded tar-stream limit")
+                              destination.write(decompressed)
+                              pending = decompressor.unconsumed_tail
+                              if decompressor.eof:
+                                  break
+                          if decompressor.eof:
+                              if decompressor.unused_data or source_file.read(1):
+                                  raise SystemExit("SDK tarball has trailing data or another gzip member")
+                              break
+                      flushed = decompressor.flush(
+                          min(stream_chunk_bytes, max_expanded_tar_bytes - expanded_bytes + 1)
+                      )
+                      expanded_bytes += len(flushed)
+                      if expanded_bytes > max_expanded_tar_bytes:
+                          raise SystemExit("SDK tarball exceeds the expanded tar-stream limit")
+                      destination.write(flushed)
+                      if not decompressor.eof:
+                          raise SystemExit("SDK tarball gzip stream ended before its validated trailer")
+              except SystemExit:
+                  raise
+              except (EOFError, OSError, zlib.error) as error:
+                  raise SystemExit(f"SDK tarball is not a valid bounded gzip stream: {error}") from error
+              if expanded_bytes == 0:
+                  raise SystemExit("SDK tarball expands to an empty tar stream")
+              destination.seek(0)
+
+          def verify_sdk_tarball(package, selected_version):
+              if package.is_symlink() or not package.is_file():
+                  raise SystemExit("SDK tarball is not a regular file")
+              package_size = package.stat().st_size
+              if package_size <= 0 or package_size > max_tarball_bytes:
+                  raise SystemExit("SDK tarball compressed size is outside the release limit")
+              file_names = set()
+              directory_names = set()
+              paths = {}
+              metadata_bytes = None
+              total_member_bytes = 0
+              member_count = 0
+              with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b") as expanded:
+                  copy_bounded_gzip(package, expanded)
+                  try:
+                      with tarfile.open(fileobj=expanded, mode="r:") as archive:
+                          for member in archive:
+                              member_count += 1
+                              if member_count > max_tar_members:
+                                  raise SystemExit("SDK tarball exceeds the member-count limit")
+                              canonical, collision_key = canonical_member_path(member)
+                              if collision_key in paths:
+                                  raise SystemExit(
+                                      f"SDK tarball contains a cross-platform path collision: "
+                                      f"{paths[collision_key][0]!r} and {member.name!r}"
+                                  )
+                              if not member.isfile() and not member.isdir():
+                                  raise SystemExit(f"SDK tarball has an unsupported entry: {member.name!r}")
+                              paths[collision_key] = (
+                                  canonical, "file" if member.isfile() else "directory"
+                              )
+                              if member.size < 0 or member.size > max_member_bytes:
+                                  raise SystemExit(f"SDK tarball member size is invalid: {member.name!r}")
+                              if member.isdir():
+                                  if member.size != 0:
+                                      raise SystemExit(f"SDK tarball directory has a nonzero size: {member.name!r}")
+                                  directory_names.add(canonical)
+                                  continue
+                              total_member_bytes += member.size
+                              if total_member_bytes > max_total_member_bytes:
+                                  raise SystemExit("SDK tarball exceeds the total member-size limit")
+                              member_source = archive.extractfile(member)
+                              if member_source is None:
+                                  raise SystemExit(f"SDK tarball member cannot be read: {member.name!r}")
+                              captured = bytearray() if canonical == "package/package.json" else None
+                              actual_size = 0
+                              while chunk := member_source.read(stream_chunk_bytes):
+                                  actual_size += len(chunk)
+                                  if actual_size > member.size or actual_size > max_member_bytes:
+                                      raise SystemExit(f"SDK tarball member exceeds its size: {member.name!r}")
+                                  if captured is not None:
+                                      captured.extend(chunk)
+                              if actual_size != member.size:
+                                  raise SystemExit(f"SDK tarball member is truncated: {member.name!r}")
+                              if captured is not None:
+                                  metadata_bytes = bytes(captured)
+                              file_names.add(canonical)
+                          payload_end = archive.offset
+                          expanded.seek(0, 2)
+                          expanded_size = expanded.tell()
+                          trailing_size = expanded_size - payload_end
+                          if (
+                              expanded_size < 1024
+                              or expanded_size % 512 != 0
+                              or payload_end > expanded_size
+                              or trailing_size < 1024
+                              or trailing_size % 512 != 0
+                          ):
+                              raise SystemExit("SDK tar stream has non-canonical framing")
+                          expanded.seek(payload_end)
+                          while trailing := expanded.read(stream_chunk_bytes):
+                              if any(trailing):
+                                  raise SystemExit(
+                                      "SDK tar stream contains nonzero data after its final member"
+                                  )
+                  except SystemExit:
+                      raise
+                  except (EOFError, OSError, tarfile.TarError) as error:
+                      raise SystemExit(f"SDK tarball is not a valid bounded tar stream: {error}") from error
+              for collision_key in paths:
+                  components = collision_key.split("/")
+                  for index in range(1, len(components)):
+                      parent = "/".join(components[:index])
+                      if parent in paths and paths[parent][1] == "file":
+                          raise SystemExit(f"SDK tarball file is also a parent directory: {paths[parent][0]!r}")
+              if directory_names - {"package", "package/dist"}:
+                  raise SystemExit("SDK tarball has an unknown directory")
+              required = {
+                  "package/package.json", "package/README.md", "package/LICENSE",
+                  "package/dist/index.js", "package/dist/index.d.ts",
+              }
+              if not required.issubset(file_names):
+                  raise SystemExit("SDK tarball is missing a required public file")
+              if any(
+                  name not in required and not name.startswith("package/dist/")
+                  for name in file_names
+              ):
+                  raise SystemExit("SDK tarball has a development-only or unknown file")
+              if metadata_bytes is None:
+                  raise SystemExit("SDK package metadata cannot be read")
+              metadata = strict_json_loads(metadata_bytes, "SDK package metadata")
+              if not isinstance(metadata, dict):
+                  raise SystemExit("SDK package metadata is not an object")
+              if "tag" in metadata:
+                  raise SystemExit("SDK package metadata overrides the publish dist-tag")
+              if metadata.get("name") != "@oxhq/stasis" or metadata.get("version") != selected_version:
+                  raise SystemExit("SDK package name/version changed")
+              if metadata.get("repository") != {"type": "git", "url": "https://github.com/oxhq/stasis.git"}:
+                  raise SystemExit("SDK package repository changed")
+              publish = metadata.get("publishConfig")
+              if (
+                  not isinstance(publish, dict)
+                  or set(publish) != {"access", "tag", "provenance"}
+                  or publish.get("access") != "public"
+                  or publish.get("tag") != "alpha"
+                  or publish.get("provenance") is not True
+              ):
+                  raise SystemExit("SDK package publication policy changed")
+              scripts = metadata.get("scripts", {})
+              if not isinstance(scripts, dict) or install_hooks.intersection(scripts):
+                  raise SystemExit("SDK package defines an install lifecycle script")
+              runtime_fields = {
+                  "dependencies", "optionalDependencies", "peerDependencies",
+                  "bundledDependencies", "bundleDependencies",
+              }
+              if any(metadata.get(field) not in (None, {}, []) for field in runtime_fields):
+                  raise SystemExit("SDK package adds a runtime dependency field")
+              entrypoints = {
+                  "type": "module", "main": "./dist/index.js", "types": "./dist/index.d.ts",
+                  "exports": {".": {"types": "./dist/index.d.ts", "import": "./dist/index.js"}},
+              }
+              if any(metadata.get(key) != value for key, value in entrypoints.items()):
+                  raise SystemExit("SDK package entrypoint metadata changed")
+              return metadata
+
+          def exact_directory(name, expected):
+              directory = pathlib.Path(name)
+              entries = list(directory.iterdir())
+              if any(item.is_symlink() or not item.is_file() for item in entries):
+                  raise SystemExit(f"{name} contains a non-regular entry")
+              actual = {item.name for item in entries}
+              if actual != expected:
+                  raise SystemExit(f"{name} inventory changed: {sorted(actual)}")
+              return directory
+
+          def sha256(filename):
+              digest = hashlib.sha256()
+              with filename.open("rb") as source_file:
+                  for chunk in iter(lambda: source_file.read(stream_chunk_bytes), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def sha512_integrity(filename):
+              digest = hashlib.sha512()
+              with filename.open("rb") as source_file:
+                  for chunk in iter(lambda: source_file.read(stream_chunk_bytes), b""):
+                      digest.update(chunk)
+              return "sha512-" + base64.b64encode(digest.digest()).decode("ascii")
+
+          def checksum(filename, label):
+              if filename.stat().st_size <= 0 or filename.stat().st_size > 1024:
+                  raise SystemExit(f"checksum sidecar size is outside the release limit: {filename}")
+              match = re.fullmatch(r"([0-9a-f]{64})  ([^\r\n]+)\n", filename.read_text(encoding="ascii"))
+              if match is None or match.group(2) != label:
+                  raise SystemExit(f"invalid checksum sidecar: {filename}")
+              return match.group(1)
+
+          native_max_compressed_bytes = 512 * 1024 * 1024
+          native_max_binary_bytes = 512 * 1024 * 1024
+          native_max_text_bytes = 8 * 1024 * 1024
+          native_max_expanded_bytes = 600 * 1024 * 1024
+          native_gzip_header = bytes.fromhex("1f8b08000000000002ff")
+          native_files = {
+              "stasis", "INSTALL.txt", "LICENSE", "LICENSE_WHATWG_SPECS",
+              "SOURCE.txt", "STASIS_UPSTREAM.toml", "THIRD_PARTY_LICENSES.html",
+              "VERSION.txt",
+          }
+
+          def decompress_native_archive(archive, destination):
+              expanded_bytes = 0
+              try:
+                  with archive.open("rb") as source_file:
+                      if source_file.read(len(native_gzip_header)) != native_gzip_header:
+                          raise SystemExit("native archive does not use the canonical gzip header")
+                      source_file.seek(0)
+                      decompressor = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
+                      while chunk := source_file.read(stream_chunk_bytes):
+                          pending = chunk
+                          while pending:
+                              remaining = native_max_expanded_bytes - expanded_bytes
+                              decompressed = decompressor.decompress(
+                                  pending, min(4 * 1024 * 1024, remaining + 1)
+                              )
+                              expanded_bytes += len(decompressed)
+                              if expanded_bytes > native_max_expanded_bytes:
+                                  raise SystemExit("native archive exceeds the expanded-size limit")
+                              destination.write(decompressed)
+                              pending = decompressor.unconsumed_tail
+                              if decompressor.eof:
+                                  break
+                          if decompressor.eof:
+                              if decompressor.unused_data or source_file.read(1):
+                                  raise SystemExit(
+                                      "native archive has trailing data or another gzip member"
+                                  )
+                              break
+                      flushed = decompressor.flush(
+                          min(4 * 1024 * 1024, native_max_expanded_bytes - expanded_bytes + 1)
+                      )
+                      expanded_bytes += len(flushed)
+                      if expanded_bytes > native_max_expanded_bytes:
+                          raise SystemExit("native archive exceeds the expanded-size limit")
+                      destination.write(flushed)
+                      if not decompressor.eof:
+                          raise SystemExit(
+                              "native archive gzip stream ended before its validated trailer"
+                          )
+              except SystemExit:
+                  raise
+              except (EOFError, OSError, zlib.error) as error:
+                  raise SystemExit(
+                      f"native archive is not a valid bounded gzip stream: {error}"
+                  ) from error
+              if expanded_bytes == 0:
+                  raise SystemExit("native archive expands to an empty tar stream")
+              destination.seek(0)
+
+          def normalized_native_info(name, *, directory, executable=False):
+              info = tarfile.TarInfo(name)
+              info.type = tarfile.DIRTYPE if directory else tarfile.REGTYPE
+              info.mode = 0o755 if directory or executable else 0o644
+              info.uid = 0
+              info.gid = 0
+              info.uname = ""
+              info.gname = ""
+              info.mtime = 0
+              return info
+
+          class HashingReader:
+              def __init__(self, source_file):
+                  self.source_file = source_file
+                  self.digest = hashlib.sha256()
+                  self.bytes_read = 0
+
+              def read(self, size=-1):
+                  chunk = self.source_file.read(size)
+                  self.digest.update(chunk)
+                  self.bytes_read += len(chunk)
+                  if self.bytes_read > native_max_binary_bytes:
+                      raise SystemExit("native archive binary exceeds its size limit")
+                  return chunk
+
+          def streams_equal(left, right):
+              left.seek(0)
+              right.seek(0)
+              while True:
+                  left_chunk = left.read(stream_chunk_bytes)
+                  right_chunk = right.read(stream_chunk_bytes)
+                  if left_chunk != right_chunk:
+                      return False
+                  if not left_chunk:
+                      return True
+
+          def verify_native_archive(archive, selected_bundle, expected_binary_digest):
+              archive_size = archive.stat().st_size
+              if archive_size <= 0 or archive_size > native_max_compressed_bytes:
+                  raise SystemExit("native archive compressed size is outside the release limit")
+              expected_order = [
+                  selected_bundle,
+                  *(f"{selected_bundle}/{name}" for name in sorted(native_files)),
+              ]
+              binary_reader = None
+              with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b") as expanded:
+                  decompress_native_archive(archive, expanded)
+                  with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b") as canonical:
+                      try:
+                          with tarfile.open(fileobj=expanded, mode="r:") as package:
+                              members = []
+                              for member in package:
+                                  if len(members) == len(expected_order):
+                                      raise SystemExit(
+                                          "native archive exceeds the exact member-count limit"
+                                      )
+                                  members.append(member)
+                              if [member.name for member in members] != expected_order:
+                                  raise SystemExit(
+                                      "native archive member order or inventory is not canonical"
+                                  )
+                              by_name = {member.name: member for member in members}
+                              root = by_name[selected_bundle]
+                              if (
+                                  not root.isdir()
+                                  or root.size != 0
+                                  or root.mode != 0o755
+                                  or root.uid != 0
+                                  or root.gid != 0
+                                  or root.uname
+                                  or root.gname
+                                  or root.mtime != 0
+                              ):
+                                  raise SystemExit("native archive root metadata is not normalized")
+                              total_member_bytes = 0
+                              for name in sorted(native_files):
+                                  member = by_name[f"{selected_bundle}/{name}"]
+                                  maximum = (
+                                      native_max_binary_bytes
+                                      if name == "stasis"
+                                      else native_max_text_bytes
+                                  )
+                                  expected_mode = 0o755 if name == "stasis" else 0o644
+                                  if (
+                                      not member.isfile()
+                                      or member.size < 0
+                                      or member.size > maximum
+                                      or member.mode != expected_mode
+                                      or member.uid != 0
+                                      or member.gid != 0
+                                      or member.uname
+                                      or member.gname
+                                      or member.mtime != 0
+                                  ):
+                                      raise SystemExit(
+                                          f"native archive member metadata is not normalized: {member.name}"
+                                      )
+                                  total_member_bytes += member.size
+                              if total_member_bytes > native_max_expanded_bytes:
+                                  raise SystemExit("native archive exceeds the total member-size limit")
+
+                              with tarfile.open(
+                                  fileobj=canonical, mode="w", format=tarfile.USTAR_FORMAT
+                              ) as normalized:
+                                  normalized.addfile(
+                                      normalized_native_info(selected_bundle, directory=True)
+                                  )
+                                  for name in sorted(native_files):
+                                      member = by_name[f"{selected_bundle}/{name}"]
+                                      member_source = package.extractfile(member)
+                                      if member_source is None:
+                                          raise SystemExit(
+                                              f"native archive member cannot be read: {member.name}"
+                                          )
+                                      reader = member_source
+                                      if name == "stasis":
+                                          binary_reader = HashingReader(member_source)
+                                          reader = binary_reader
+                                      info = normalized_native_info(
+                                          member.name,
+                                          directory=False,
+                                          executable=name == "stasis",
+                                      )
+                                      info.size = member.size
+                                      normalized.addfile(info, reader)
+                      except SystemExit:
+                          raise
+                      except (EOFError, OSError, tarfile.TarError) as error:
+                          raise SystemExit(
+                              f"native archive is not a valid bounded tar stream: {error}"
+                          ) from error
+                      if binary_reader is None or binary_reader.bytes_read != by_name[
+                          f"{selected_bundle}/stasis"
+                      ].size:
+                          raise SystemExit("native archive binary is truncated")
+                      if binary_reader.digest.hexdigest() != expected_binary_digest:
+                          raise SystemExit("native archive binary digest changed")
+                      if not streams_equal(expanded, canonical):
+                          raise SystemExit(
+                              "native archive tar bytes are not the canonical normalized serialization"
+                          )
+
+          native = exact_directory(
+              "release-assets", {archive_name, archive_sidecar_name, binary_sidecar_name}
+          )
+          gate = exact_directory("gate-proof", {native_proof_name})
+          sdk = exact_directory("sdk-proof", {sdk_name, sdk_proof_name})
+          archive = native / archive_name
+          if archive.stat().st_size <= 0 or archive.stat().st_size > native_max_compressed_bytes:
+              raise SystemExit("native archive compressed size is outside the release limit")
+          binary_label = f"{bundle}/stasis"
+          binary_digest = checksum(native / binary_sidecar_name, binary_label)
+          verify_native_archive(archive, bundle, binary_digest)
+          archive_digest = sha256(archive)
+          if checksum(native / archive_sidecar_name, archive_name) != archive_digest:
+              raise SystemExit("archive sidecar changed after the credential-free build")
+
+          native_proof_file = gate / native_proof_name
+          if native_proof_file.stat().st_size <= 0 or native_proof_file.stat().st_size > 64 * 1024:
+              raise SystemExit("native gate proof size is outside the release limit")
+          native_proof = strict_json_loads(
+              native_proof_file.read_text(encoding="utf-8"), "native gate proof"
+          )
+          expected_native = {
+              "schema": 2,
+              "gate": "act-settle-inspect",
+              "test": "release_gate_published_binary_completes_act_settle_inspect",
+              "version": version,
+              "platform": platform,
+              "revision": revision,
+              "workflowRunId": run_id,
+              "workflowRunAttempt": run_attempt,
+              "archive": {"name": archive_name, "sha256": archive_digest},
+              "binary": {"path": binary_label, "sha256": binary_digest},
+              "source": source,
+          }
+          if (
+              not isinstance(native_proof, dict)
+              or set(native_proof) != set(expected_native) | {"gateLogSha256"}
+              or type(native_proof.get("schema")) is not int
+          ):
+              raise SystemExit("native gate proof schema changed")
+          for field, keys in (("archive", {"name", "sha256"}), ("binary", {"path", "sha256"})):
+              binding = native_proof.get(field)
+              if (
+                  not isinstance(binding, dict)
+                  or set(binding) != keys
+                  or any(not isinstance(binding.get(key), str) for key in keys)
+              ):
+                  raise SystemExit(f"native gate proof {field} binding has invalid types")
+          if any(native_proof.get(key) != value for key, value in expected_native.items()):
+              raise SystemExit("native gate proof identity changed")
+          native_log_digest = native_proof.get("gateLogSha256")
+          if (
+              not isinstance(native_log_digest, str)
+              or re.fullmatch(r"[0-9a-f]{64}", native_log_digest) is None
+          ):
+              raise SystemExit("native gate proof log digest is invalid")
+
+          sdk_tarball = sdk / sdk_name
+          verify_sdk_tarball(sdk_tarball, version)
+          sdk_sha256 = sha256(sdk_tarball)
+          sdk_integrity = sha512_integrity(sdk_tarball)
+
+          sdk_proof_file = sdk / sdk_proof_name
+          if sdk_proof_file.stat().st_size <= 0 or sdk_proof_file.stat().st_size > 64 * 1024:
+              raise SystemExit("SDK gate proof size is outside the release limit")
+          sdk_proof = strict_json_loads(
+              sdk_proof_file.read_text(encoding="utf-8"), "SDK gate proof"
+          )
+          expected_sdk = {
+              "schema": 2,
+              "gate": "sdk-act-settle-inspect",
+              "package": f"@oxhq/stasis@{version}",
+              "revision": revision,
+              "workflowRunId": run_id,
+              "workflowRunAttempt": run_attempt,
+              "source": source,
+              "tarball": {"name": sdk_name, "sha256": sdk_sha256, "integrity": sdk_integrity},
+              "nativeBinarySha256": binary_digest,
+          }
+          if (
+              not isinstance(sdk_proof, dict)
+              or set(sdk_proof) != set(expected_sdk) | {"gateLogSha256"}
+              or type(sdk_proof.get("schema")) is not int
+          ):
+              raise SystemExit("SDK gate proof schema changed")
+          if not exact_tarball_binding(sdk_proof.get("tarball"), expected_sdk["tarball"]):
+              raise SystemExit("SDK gate proof tarball binding has invalid types")
+          if (
+              not isinstance(sdk_proof.get("nativeBinarySha256"), str)
+              or re.fullmatch(r"[0-9a-f]{64}", sdk_proof["nativeBinarySha256"]) is None
+          ):
+              raise SystemExit("SDK gate proof native digest is invalid")
+          if any(sdk_proof.get(key) != value for key, value in expected_sdk.items()):
+              raise SystemExit("SDK gate proof identity changed")
+          sdk_log_digest = sdk_proof.get("gateLogSha256")
+          if (
+              not isinstance(sdk_log_digest, str)
+              or re.fullmatch(r"[0-9a-f]{64}", sdk_log_digest) is None
+          ):
+              raise SystemExit("SDK gate proof log digest is invalid")
+          PY
+
+      - name: Generate GitHub build provenance for all six outputs
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: |
+            release-assets/stasis-0.1.0-alpha.0-macos-aarch64.tar.gz
+            release-assets/stasis-0.1.0-alpha.0-macos-aarch64.tar.gz.sha256
+            release-assets/stasis-0.1.0-alpha.0-macos-aarch64.binary.sha256
+            gate-proof/stasis-0.1.0-alpha.0-macos-aarch64-act-settle-inspect.json
+            sdk-proof/oxhq-stasis-0.1.0-alpha.0.tgz
+            sdk-proof/stasis-0.1.0-alpha.0-typescript-act-settle-inspect.json
+
+  verify-promotion:
+    name: Verify immutable promotion inputs
+    needs: validate-invocation
+    if: needs.validate-invocation.outputs.mode == 'promote'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      attestations: read
+    outputs:
+      head_sha: ${{ steps.selected-run.outputs.head_sha }}
+      head_branch: ${{ steps.selected-run.outputs.head_branch }}
+      run_attempt: ${{ steps.selected-run.outputs.run_attempt }}
+      staged_gate_artifact_name: ${{ steps.stage-names.outputs.gate_artifact_name }}
+      staged_release_artifact_name: ${{ steps.stage-names.outputs.release_artifact_name }}
+      version: ${{ steps.selected-run.outputs.version }}
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      GH_TOKEN: ${{ github.token }}
+      RUN_ID: ${{ inputs.package_run_id }}
+      TAG: ${{ inputs.release_tag }}
+    steps:
+      - id: selected-run
+        name: Verify the selected successful package run
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != 'oxhq/stasis' ]]; then
+            echo 'promotion is restricted to oxhq/stasis' >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" != 'branch' || "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
+            echo 'promotion must be dispatched from the default branch' >&2
+            exit 1
+          fi
+          if [[ ! "$RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'package_run_id must be a positive integer' >&2
+            exit 1
+          fi
+          if [[ "$TAG" != "v$STASIS_ALPHA_VERSION" ]]; then
+            echo "the first alpha promotion tag must be v$STASIS_ALPHA_VERSION" >&2
+            exit 1
+          fi
+
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > run.json
+          read -r head_sha head_branch overall_run_attempt < <(
+            jq -er --arg repository "$GITHUB_REPOSITORY" --arg default_branch "$DEFAULT_BRANCH" '
+              select(.repository.full_name == $repository)
+              | select(.head_repository.full_name == $repository)
+              | select(.name == "Stasis package and promote")
+              | select(.path == ".github/workflows/stasis-package.yml")
+              | select(.event == "push")
+              | select(.status == "completed" and .conclusion == "success")
+              | select(.head_branch == $default_branch)
+              | [.head_sha, .head_branch, (.run_attempt | tostring)] | @tsv
+            ' run.json
+          )
+          if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ || ! "$overall_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'selected package run did not resolve to an exact commit and attempt' >&2
+            exit 1
+          fi
+
+          gh api "repos/$GITHUB_REPOSITORY/compare/$head_sha...$DEFAULT_BRANCH" > ancestry.json
+          jq -e --arg head_sha "$head_sha" '
+            .merge_base_commit.sha == $head_sha
+            and (.status == "ahead" or .status == "identical")
+          ' ancestry.json > /dev/null
+
+          gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/$GITHUB_REPOSITORY/contents/ports/stasis/Cargo.toml?ref=$head_sha" \
+            > stasis-Cargo.toml
+          version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("stasis-Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')
+          if [[ "$version" != "$STASIS_ALPHA_VERSION" || "$TAG" != "v$version" ]]; then
+            echo "tag $TAG does not exactly match Stasis version $version at $head_sha" >&2
+            exit 1
+          fi
+
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" > artifacts.json
+          producer_attempt=$(
+            RUN_ID="$RUN_ID" OVERALL_RUN_ATTEMPT="$overall_run_attempt" python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          run_id = int(os.environ["RUN_ID"])
+          overall_attempt = int(os.environ["OVERALL_RUN_ATTEMPT"])
+          document = json.load(open("artifacts.json", encoding="utf-8"))
+          artifacts = document.get("artifacts")
+          if not isinstance(artifacts, list) or document.get("total_count") != len(artifacts):
+              raise SystemExit("package artifact response is incomplete or malformed")
+
+          prefixes = (
+              "stasis-macos-aarch64",
+              "stasis-macos-aarch64-act-settle-inspect-proof",
+              "stasis-typescript-alpha",
+          )
+          patterns = tuple(
+              (prefix, re.compile(rf"^{re.escape(prefix)}-attempt-([1-9][0-9]*)$"))
+              for prefix in prefixes
+          )
+          by_attempt = {}
+          for artifact in artifacts:
+              if artifact.get("expired") is True:
+                  continue
+              if artifact.get("expired") is not False or artifact.get("workflow_run", {}).get("id") != run_id:
+                  raise SystemExit("package artifact identity is malformed")
+              name = artifact.get("name")
+              if not isinstance(name, str):
+                  raise SystemExit("package artifact name is malformed")
+              matched = next(((prefix, pattern.fullmatch(name)) for prefix, pattern in patterns if pattern.fullmatch(name)), None)
+              if matched is None:
+                  raise SystemExit(f"unexpected active package artifact: {name!r}")
+              attempt = int(matched[1].group(1))
+              if attempt > overall_attempt:
+                  raise SystemExit("package artifact claims a future run attempt")
+              by_attempt.setdefault(attempt, []).append(name)
+
+          candidates = []
+          for attempt, names in by_attempt.items():
+              expected = sorted(f"{prefix}-attempt-{attempt}" for prefix in prefixes)
+              if sorted(names) == expected:
+                  candidates.append(attempt)
+          if not candidates:
+              raise SystemExit("no complete nonexpired package producer attempt exists")
+          print(max(candidates))
+          PY
+          )
+          if [[ ! "$producer_attempt" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'package producer attempt is invalid' >&2
+            exit 1
+          fi
+
+          {
+            echo "HEAD_SHA=$head_sha"
+            echo "HEAD_BRANCH=$head_branch"
+            echo "RUN_ATTEMPT=$producer_attempt"
+            echo "STASIS_VERSION=$version"
+          } >> "$GITHUB_ENV"
+          {
+            echo "head_sha=$head_sha"
+            echo "head_branch=$head_branch"
+            echo "run_attempt=$producer_attempt"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "eligible package run: $RUN_ID producer attempt $producer_attempt (overall attempt $overall_run_attempt) at $head_sha"
+
+      - name: Check out the exact packaged source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ steps.selected-run.outputs.head_sha }}
+
+      - name: Download the exact package and gate proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          native_artifact="stasis-macos-aarch64-attempt-$RUN_ATTEMPT"
+          proof_artifact="stasis-macos-aarch64-act-settle-inspect-proof-attempt-$RUN_ATTEMPT"
+          sdk_artifact="stasis-typescript-alpha-attempt-$RUN_ATTEMPT"
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$native_artifact" --dir release-assets
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$proof_artifact" --dir gate-proof
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$sdk_artifact" --dir sdk-proof
+
+      - name: Verify exact contents, checksums, gate proof, and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 etc/ci/stasis/release_archive.py verify \
+            --asset-directory release-assets \
+            --version "$STASIS_VERSION" \
+            --platform "$STASIS_PLATFORM" \
+            --revision "$HEAD_SHA" \
+            --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --source-root .
+          python3 etc/ci/stasis/release_archive.py verify-gate-proof \
+            --proof-directory gate-proof \
+            --asset-directory release-assets \
+            --version "$STASIS_VERSION" \
+            --platform "$STASIS_PLATFORM" \
+            --revision "$HEAD_SHA" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT"
+          binary_sha256=$(awk '{print $1}' "release-assets/stasis-${STASIS_VERSION}-${STASIS_PLATFORM}.binary.sha256")
+          python3 etc/ci/stasis/npm_release.py verify-proof \
+            --directory sdk-proof \
+            --version "$STASIS_VERSION" \
+            --revision "$HEAD_SHA" \
+            --native-binary-sha256 "$binary_sha256" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT"
+          for release_asset in release-assets/* gate-proof/* sdk-proof/*; do
+            gh attestation verify "$release_asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
+              --source-digest "$HEAD_SHA" \
+              --source-ref "refs/heads/$HEAD_BRANCH" \
+              --deny-self-hosted-runners
+          done
+
+      - id: stage-names
+        name: Resolve this promotion attempt's handoff names
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "release_artifact_name=verified-stasis-release-assets-attempt-$GITHUB_RUN_ATTEMPT"
+            echo "gate_artifact_name=verified-stasis-gate-proof-attempt-$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Stage verified release assets for the credentialed job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.stage-names.outputs.release_artifact_name }}
+          path: |
+            release-assets/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Stage verified gate proof for the credentialed job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.stage-names.outputs.gate_artifact_name }}
+          path: |
+            gate-proof/*
+          if-no-files-found: error
+          retention-days: 90
+
+  promote:
+    name: Create immutable draft prerelease
+    needs:
+      - validate-invocation
+      - verify-promotion
+    if: |
+      needs.validate-invocation.outputs.mode == 'promote'
+        && needs.verify-promotion.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: release
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HEAD_SHA: ${{ needs.verify-promotion.outputs.head_sha }}
+      HEAD_BRANCH: ${{ needs.verify-promotion.outputs.head_branch }}
+      RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.run_attempt }}
+      RUN_ID: ${{ inputs.package_run_id }}
+      STASIS_VERSION: ${{ needs.verify-promotion.outputs.version }}
+      TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Recheck selected commit is on the current default branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_default_branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')
+          if [[ -z "$current_default_branch" ]]; then
+            echo 'repository has no current default branch' >&2
+            exit 1
+          fi
+          if [[ "$current_default_branch" != "$HEAD_BRANCH" ]]; then
+            echo 'repository default branch changed after promotion verification' >&2
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/compare/$HEAD_SHA...$current_default_branch" > ancestry.json
+          jq -e --arg head_sha "$HEAD_SHA" '
+            .merge_base_commit.sha == $head_sha
+            and (.status == "ahead" or .status == "identical")
+          ' ancestry.json > /dev/null
+
+      - name: Download release assets verified by the read-only job
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.verify-promotion.outputs.staged_release_artifact_name }}
+          path: release-assets
+
+      - name: Download gate proof verified by the read-only job
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.verify-promotion.outputs.staged_gate_artifact_name }}
+          path: gate-proof
+
+      - name: Recheck staged identities and provenance without candidate code
+        shell: bash
+        run: |
+          set -euo pipefail
+          export STASIS_PLATFORM
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import math
+          import os
+          import pathlib
+          import re
+
+          version = os.environ["STASIS_VERSION"]
+          platform = os.environ["STASIS_PLATFORM"]
+          revision = os.environ["HEAD_SHA"]
+          run_id = os.environ["RUN_ID"]
+          run_attempt = os.environ["RUN_ATTEMPT"]
+          bundle = f"stasis-{version}-{platform}"
+          archive_name = f"{bundle}.tar.gz"
+          binary_sidecar_name = f"{bundle}.binary.sha256"
+          proof_name = f"{bundle}-act-settle-inspect.json"
+          assets = pathlib.Path("release-assets")
+          proof_directory = pathlib.Path("gate-proof")
+          expected_assets = {archive_name, f"{archive_name}.sha256", binary_sidecar_name}
+          actual_assets = {item.name for item in assets.iterdir() if item.is_file()}
+          actual_proofs = {item.name for item in proof_directory.iterdir() if item.is_file()}
+          if actual_assets != expected_assets or actual_proofs != {proof_name}:
+              raise SystemExit("staged promotion inventory changed after read-only verification")
+
+          def strict_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate object key {key!r}")
+                  value[key] = item
+              return value
+
+          def strict_float(value):
+              parsed = float(value)
+              if not math.isfinite(parsed):
+                  raise ValueError(f"non-finite number {value!r}")
+              return parsed
+
+          def strict_constant(value):
+              raise ValueError(f"non-finite number {value!r}")
+
+          def strict_json_loads(document, context):
+              try:
+                  return json.loads(
+                      document,
+                      object_pairs_hook=strict_object,
+                      parse_float=strict_float,
+                      parse_constant=strict_constant,
+                  )
+              except (ValueError, RecursionError) as error:
+                  raise SystemExit(f"{context} is invalid strict JSON: {error}") from error
+
+          def checksum(filename: pathlib.Path, label: str) -> str:
+              if filename.stat().st_size <= 0 or filename.stat().st_size > 1024:
+                  raise SystemExit(f"checksum sidecar size is outside the release limit: {filename}")
+              match = re.fullmatch(r"([0-9a-f]{64})  ([^\r\n]+)\n", filename.read_text(encoding="ascii"))
+              if match is None or match.group(2) != label:
+                  raise SystemExit(f"invalid checksum sidecar: {filename}")
+              return match.group(1)
+
+          archive = assets / archive_name
+          archive_digest_state = hashlib.sha256()
+          with archive.open("rb") as archive_source:
+              for chunk in iter(lambda: archive_source.read(1024 * 1024), b""):
+                  archive_digest_state.update(chunk)
+          archive_digest = archive_digest_state.hexdigest()
+          if checksum(assets / f"{archive_name}.sha256", archive_name) != archive_digest:
+              raise SystemExit("staged archive digest changed")
+          binary_label = f"{bundle}/stasis"
+          binary_digest = checksum(assets / binary_sidecar_name, binary_label)
+          proof_file = proof_directory / proof_name
+          if proof_file.stat().st_size <= 0 or proof_file.stat().st_size > 64 * 1024:
+              raise SystemExit("staged native gate proof size is outside the release limit")
+          proof = strict_json_loads(
+              proof_file.read_text(encoding="utf-8"), "staged native gate proof"
+          )
+          expected = {
+              "schema": 2,
+              "gate": "act-settle-inspect",
+              "test": "release_gate_published_binary_completes_act_settle_inspect",
+              "version": version,
+              "platform": platform,
+              "revision": revision,
+              "workflowRunId": run_id,
+              "workflowRunAttempt": run_attempt,
+              "archive": {"name": archive_name, "sha256": archive_digest},
+              "binary": {"path": binary_label, "sha256": binary_digest},
+              "source": {
+                  "servo_repository": "https://github.com/servo/servo.git",
+                  "servo_revision": "0d579bd5aab6df3764fad805427254751632a6e4",
+                  "pliego_repository": "https://github.com/oxhq/pliego.git",
+                  "pliego_revision": "556c774242b272b11bc60999449c5debff1ad20f",
+                  "pliego_servo_merge_base": "313b6d5ecc113b08010ce434140db3ca5abcc71c",
+                  "stasis_repository": "https://github.com/oxhq/stasis.git",
+                  "stasis_revision": revision,
+              },
+          }
+          if (
+              not isinstance(proof, dict)
+              or set(proof) != set(expected) | {"gateLogSha256"}
+              or type(proof.get("schema")) is not int
+          ):
+              raise SystemExit("staged gate proof schema changed after read-only verification")
+          for field, keys in (("archive", {"name", "sha256"}), ("binary", {"path", "sha256"})):
+              binding = proof.get(field)
+              if (
+                  not isinstance(binding, dict)
+                  or set(binding) != keys
+                  or any(not isinstance(binding.get(key), str) for key in keys)
+              ):
+                  raise SystemExit(f"staged gate proof {field} binding has invalid types")
+          for key, value in expected.items():
+              if proof.get(key) != value:
+                  raise SystemExit(f"staged gate proof field changed: {key}")
+          gate_log_digest = proof.get("gateLogSha256")
+          if (
+              not isinstance(gate_log_digest, str)
+              or re.fullmatch(r"[0-9a-f]{64}", gate_log_digest) is None
+          ):
+              raise SystemExit("staged gate proof has no canonical log digest")
+          PY
+          for release_asset in release-assets/* gate-proof/*; do
+            gh attestation verify "$release_asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
+              --source-digest "$HEAD_SHA" \
+              --source-ref "refs/heads/$HEAD_BRANCH" \
+              --deny-self-hosted-runners
+          done
+
+      - name: Verify immutable tag and release state
+        shell: bash
+        run: |
+          set -euo pipefail
+          get_or_404() {
+            local endpoint=$1
+            local output=$2
+            local response status
+            set +e
+            response=$(gh api "$endpoint" 2>&1)
+            status=$?
+            set -e
+            if [[ $status -eq 0 ]]; then
+              printf '%s\n' "$response" > "$output"
+              return 0
+            fi
+            if [[ "$response" == *'HTTP 404'* ]]; then
+              return 1
+            fi
+            echo "$response" >&2
+            exit "$status"
+          }
+
+          if get_or_404 "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" release.json; then
+            echo "release $TAG already exists; refusing to mutate it" >&2
+            exit 1
+          fi
+
+          create_tag=true
+          if get_or_404 "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" tag.json; then
+            read -r tag_type tag_sha < <(jq -er '[.object.type, .object.sha] | @tsv' tag.json)
+            if [[ "$tag_type" != 'commit' || "$tag_sha" != "$HEAD_SHA" ]]; then
+              echo "existing tag $TAG is not a lightweight tag at $HEAD_SHA" >&2
+              exit 1
+            fi
+            create_tag=false
+          fi
+          echo "CREATE_TAG=$create_tag" >> "$GITHUB_ENV"
+
+      - name: Create the exact-SHA lightweight tag
+        if: env.CREATE_TAG == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          created=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$TAG" \
+            -f sha="$HEAD_SHA")
+          test "$(jq -er '.object.type' <<< "$created")" = 'commit'
+          test "$(jq -er '.object.sha' <<< "$created")" = "$HEAD_SHA"
+
+      - name: Create the draft prerelease with exact assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<EOF
+          # Stasis $TAG
+
+          First controlled-time Servo runtime alpha for the act-settle-inspect MVP.
+
+          - Exact source commit: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$HEAD_SHA
+          - Package and gate run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID
+          - Native platform: macOS Apple Silicon only
+          - Signing: unsigned and not Apple-notarized
+
+          This alpha controls Stasis time and explicit settlement. It does not
+          virtualize live network content, ambient operating-system state, or randomness.
+
+          This draft contains one native archive, its archive and binary SHA-256 sidecars,
+          and the artifact-bound act-settle-inspect proof. GitHub build provenance is
+          available through the GitHub CLI attestation verifier for every asset.
+          EOF
+          gh release create "$TAG" release-assets/* gate-proof/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --prerelease \
+            --verify-tag \
+            --title "Stasis $TAG" \
+            --notes-file release-notes.md

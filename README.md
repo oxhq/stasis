@@ -1,4 +1,16 @@
-# The Servo Parallel Browser Engine Project
+# Stasis
+
+Stasis is an experimental Servo-based runtime for executing a supported web
+application as a controlled event system. The first alpha exposes the
+`open -> act -> settle -> inspect` loop through a native NDJSON shell and the
+matching `@oxhq/stasis` TypeScript client.
+
+Start with [STASIS.md](STASIS.md) for the product boundary and
+[the alpha protocol](docs/stasis/protocol-v1.md) for the exact shipped methods,
+typed outcomes, and unsupported surfaces. Build and release operators should
+also read [the release runbook](docs/stasis/releases.md).
+
+## Servo foundation
 
 Servo is a prototype web browser engine written in the
 [Rust](https://github.com/rust-lang/rust) language. It is currently developed on
@@ -9,7 +21,7 @@ Servo welcomes contribution from everyone. Check out:
 - The [Servo Book](https://book.servo.org) for documentation
 - [servo.org](https://servo.org/) for news and guides
 
-Coordination of Servo development happens:
+Coordination of upstream Servo development happens:
 - Here in the Github Issues
 - On the [Servo Zulip](https://servo.zulipchat.com/)
 - In video calls advertised in the [Servo Project](https://github.com/servo/project/issues) repo.
