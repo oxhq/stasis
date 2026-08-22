@@ -4,25 +4,50 @@ on:
   release:
     types:
       - published
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Immutable prerelease tag to verify
+        required: true
+        default: v0.1.0-alpha.0
+        type: string
+      publication_run_id:
+        description: Release-event workflow run that published the npm package
+        required: true
+        type: string
+      publication_run_attempt:
+        description: Exact attempt of the release-event publication run
+        required: true
+        type: string
 
 permissions: {}
 
 concurrency:
-  group: stasis-npm-${{ github.event.release.tag_name }}
+  group: stasis-npm-${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
   cancel-in-progress: false
 
 env:
   NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
   STASIS_PLATFORM: macos-aarch64
+  STASIS_RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
 
 jobs:
   verify:
     name: Verify native release and pre-gate exact SDK
     if: |
       github.repository == 'oxhq/stasis'
-        && github.event.release.draft == false
-        && github.event.release.prerelease == true
-        && github.event.release.tag_name == 'v0.1.0-alpha.0'
+        && (
+          (
+            github.event_name == 'release'
+              && github.event.release.draft == false
+              && github.event.release.prerelease == true
+              && github.event.release.tag_name == 'v0.1.0-alpha.0'
+          )
+          || (
+            github.event_name == 'workflow_dispatch'
+              && inputs.release_tag == 'v0.1.0-alpha.0'
+          )
+        )
     runs-on: macos-15
     timeout-minutes: 45
     permissions:
@@ -34,6 +59,9 @@ jobs:
       package_run_attempt: ${{ steps.inputs.outputs.package_run_attempt }}
       package_run_id: ${{ steps.inputs.outputs.package_run_id }}
       prepublish_run_attempt: ${{ steps.prepublish_gate.outputs.run_attempt }}
+      publication_run_attempt: ${{ steps.release.outputs.publication_run_attempt }}
+      publication_run_id: ${{ steps.release.outputs.publication_run_id }}
+      release_id: ${{ steps.release.outputs.release_id }}
       revision: ${{ steps.release.outputs.revision }}
       staged_artifact_name: ${{ steps.inputs.outputs.staged_artifact_name }}
       version: ${{ steps.release.outputs.version }}
@@ -46,7 +74,7 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ env.STASIS_RELEASE_TAG }}
 
       - name: Require space for bounded native archive verification
         shell: bash
@@ -62,7 +90,9 @@ jobs:
         name: Verify exact release, tag, commit, and asset inventory
         shell: bash
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          RECOVERY_PUBLICATION_RUN_ATTEMPT: ${{ inputs.publication_run_attempt }}
+          RECOVERY_PUBLICATION_RUN_ID: ${{ inputs.publication_run_id }}
+          TAG: ${{ env.STASIS_RELEASE_TAG }}
         run: |
           set -euo pipefail
           test "$(uname -s)" = 'Darwin'
@@ -83,7 +113,43 @@ jobs:
             echo "$TAG is not an exact lightweight commit tag" >&2
             exit 1
           fi
-          test "$tag_sha" = "$GITHUB_SHA"
+          if [[ "$GITHUB_EVENT_NAME" == 'release' ]]; then
+            test "$tag_sha" = "$GITHUB_SHA"
+            publication_run_id=$GITHUB_RUN_ID
+            publication_run_attempt=$GITHUB_RUN_ATTEMPT
+          else
+            if [[ "$GITHUB_REF_TYPE" != 'branch' || "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
+              echo 'recovery verification must be dispatched from the default branch' >&2
+              exit 1
+            fi
+            if [[ ! "$RECOVERY_PUBLICATION_RUN_ID" =~ ^[1-9][0-9]*$ \
+              || ! "$RECOVERY_PUBLICATION_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+              echo 'recovery publication run identity is invalid' >&2
+              exit 1
+            fi
+            publication_run_id=$RECOVERY_PUBLICATION_RUN_ID
+            publication_run_attempt=$RECOVERY_PUBLICATION_RUN_ATTEMPT
+            gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$publication_run_id/attempts/$publication_run_attempt" \
+              > publication-run.json
+            jq -e \
+              --arg tag "$TAG" \
+              --arg revision "$tag_sha" \
+              --argjson run_id "$publication_run_id" \
+              --argjson run_attempt "$publication_run_attempt" '
+                .id == $run_id
+                and .run_attempt == $run_attempt
+                and .event == "release"
+                and .status == "completed"
+                and (.conclusion == "success" or .conclusion == "failure")
+                and .head_branch == $tag
+                and .head_sha == $revision
+                and .path == ".github/workflows/stasis-publish-npm.yml"
+                and .name == "Publish @oxhq/stasis alpha"
+                and .repository.full_name == "oxhq/stasis"
+                and .head_repository.full_name == "oxhq/stasis"
+              ' publication-run.json > /dev/null
+          fi
           test "$(git rev-parse HEAD)" = "$tag_sha"
 
           cargo_version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("ports/stasis/Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')
@@ -107,7 +173,11 @@ jobs:
             echo "STASIS_BINARY_SHA256=${bundle}.binary.sha256"
             echo "STASIS_GATE_PROOF=${bundle}-act-settle-inspect.json"
           } >> "$GITHUB_ENV"
+          release_id=$(jq -er '.id | select(type == "number" and . > 0)' release.json)
           {
+            echo "publication_run_id=$publication_run_id"
+            echo "publication_run_attempt=$publication_run_attempt"
+            echo "release_id=$release_id"
             echo "version=$version"
             echo "revision=$tag_sha"
           } >> "$GITHUB_OUTPUT"
@@ -116,7 +186,7 @@ jobs:
         name: Download and verify native and SDK package-run inputs
         shell: bash
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ env.STASIS_RELEASE_TAG }}
         run: |
           set -euo pipefail
           mkdir release-assets gate-proof
@@ -305,7 +375,7 @@ jobs:
   publish:
     name: Publish the exact pre-gated SDK
     needs: verify
-    if: needs.verify.result == 'success'
+    if: needs.verify.result == 'success' && github.event_name == 'release'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment:
@@ -321,8 +391,8 @@ jobs:
       PACKAGE_RUN_ATTEMPT: ${{ needs.verify.outputs.package_run_attempt }}
       PACKAGE_RUN_ID: ${{ needs.verify.outputs.package_run_id }}
       PREPUBLISH_RUN_ATTEMPT: ${{ needs.verify.outputs.prepublish_run_attempt }}
-      RELEASE_ID: ${{ github.event.release.id }}
-      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      RELEASE_ID: ${{ needs.verify.outputs.release_id }}
+      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
       STASIS_NATIVE_BINARY_SHA256: ${{ needs.verify.outputs.native_binary_sha256 }}
       STASIS_REVISION: ${{ needs.verify.outputs.revision }}
       STASIS_VERSION: ${{ needs.verify.outputs.version }}
@@ -687,7 +757,7 @@ jobs:
               raise SystemExit("invalid staged SDK version")
           if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
               raise SystemExit("invalid staged SDK revision")
-          if revision != os.environ["GITHUB_SHA"]:
+          if os.environ["GITHUB_EVENT_NAME"] == "release" and revision != os.environ["GITHUB_SHA"]:
               raise SystemExit("staged SDK revision differs from the release-event provenance SHA")
           if re.fullmatch(r"[1-9][0-9]*", run_id) is None or re.fullmatch(r"[1-9][0-9]*", run_attempt) is None:
               raise SystemExit("invalid staged package run identity")
@@ -898,7 +968,7 @@ jobs:
           fi
 
       - name: Recheck immutable release identity immediately before npm mutation
-        if: steps.npm-state.outputs.publish_required == 'true'
+        if: github.event_name == 'release' && steps.npm-state.outputs.publish_required == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -926,7 +996,7 @@ jobs:
           fi
 
       - name: Publish with npm OIDC or the one-time seed token
-        if: steps.npm-state.outputs.publish_required == 'true'
+        if: github.event_name == 'release' && steps.npm-state.outputs.publish_required == 'true'
         shell: bash
         env:
           NPM_BOOTSTRAP_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -938,12 +1008,12 @@ jobs:
           npm publish "$NPM_TARBALL" --ignore-scripts --access public --tag alpha --provenance \
             --registry="$NPM_CONFIG_REGISTRY"
 
-      - name: Require registry convergence to exact bytes and only the alpha tag
+      - name: Require registry convergence to exact bytes and npm tag aliases
         shell: bash
         run: |
           set -euo pipefail
           matched=false
-          for attempt in {1..24}; do
+          for attempt in {1..60}; do
             set +e
             registry_version=$(npm view "@oxhq/stasis@$STASIS_VERSION" version --json \
               --registry="$NPM_CONFIG_REGISTRY" 2>/dev/null)
@@ -965,7 +1035,11 @@ jobs:
                   ? Object.keys(tags).sort()
                   : [];
                 process.stdout.write(String(
-                  keys.length === 1 && keys[0] === "alpha" && tags.alpha === process.argv[2]
+                  keys.length === 2
+                    && keys[0] === "alpha"
+                    && keys[1] === "latest"
+                    && tags.alpha === process.argv[2]
+                    && tags.latest === process.argv[2]
                 ));
               ' "$dist_tags" "$STASIS_VERSION")
               if [[ "$registry_version" == "$STASIS_VERSION" \
@@ -978,7 +1052,7 @@ jobs:
             sleep 10
           done
           if [[ "$matched" != 'true' ]]; then
-            echo 'npm registry did not converge to the exact alpha version and integrity' >&2
+            echo 'npm registry did not converge to the exact alpha bytes and tag aliases' >&2
             exit 1
           fi
           mkdir "$RUNNER_TEMP/stasis-registry-pack"
@@ -990,12 +1064,85 @@ jobs:
           test ${#registry_packages[@]} -eq 1
           cmp "$NPM_TARBALL" "${registry_packages[0]}"
 
+  recover_published:
+    name: Recover verification of the exact published SDK
+    needs: verify
+    if: needs.verify.result == 'success' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    env:
+      STASIS_VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - name: Set up Node without publication credentials
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Download the exact SDK staged by recovery verification
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.verify.outputs.staged_artifact_name }}
+          path: verified-sdk
+
+      - name: Require exact public bytes and npm tag aliases without mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global npm@11.19.0 --registry="$NPM_CONFIG_REGISTRY"
+          test "$(npm --version)" = '11.19.0'
+          npm_tarball="$GITHUB_WORKSPACE/verified-sdk/oxhq-stasis-${STASIS_VERSION}.tgz"
+          test -f "$npm_tarball"
+          local_integrity=$(node -e '
+            const crypto = require("node:crypto");
+            const fs = require("node:fs");
+            process.stdout.write("sha512-" + crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));
+          ' "$npm_tarball")
+          registry_version=$(npm view "@oxhq/stasis@$STASIS_VERSION" version --json \
+            --registry="$NPM_CONFIG_REGISTRY")
+          registry_integrity=$(npm view "@oxhq/stasis@$STASIS_VERSION" dist.integrity --json \
+            --registry="$NPM_CONFIG_REGISTRY")
+          dist_tags=$(npm view '@oxhq/stasis' dist-tags --json \
+            --registry="$NPM_CONFIG_REGISTRY")
+          registry_version=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]))' "$registry_version")
+          registry_integrity=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]))' "$registry_integrity")
+          node -e '
+            const assert = require("node:assert/strict");
+            const tags = JSON.parse(process.argv[1]);
+            assert.deepEqual(Object.keys(tags).sort(), ["alpha", "latest"]);
+            assert.equal(tags.alpha, process.argv[2]);
+            assert.equal(tags.latest, process.argv[2]);
+          ' "$dist_tags" "$STASIS_VERSION"
+          test "$registry_version" = "$STASIS_VERSION"
+          test "$registry_integrity" = "$local_integrity"
+          mkdir "$RUNNER_TEMP/stasis-registry-recovery"
+          npm pack "@oxhq/stasis@$STASIS_VERSION" --ignore-scripts \
+            --pack-destination "$RUNNER_TEMP/stasis-registry-recovery" \
+            --registry="$NPM_CONFIG_REGISTRY"
+          shopt -s nullglob
+          registry_packages=("$RUNNER_TEMP"/stasis-registry-recovery/*.tgz)
+          test ${#registry_packages[@]} -eq 1
+          cmp "$npm_tarball" "${registry_packages[0]}"
+
   verify-registry:
     name: Verify registry-installed SDK end to end
     needs:
       - verify
       - publish
-    if: needs.verify.result == 'success' && needs.publish.result == 'success'
+      - recover_published
+    if: |
+      always()
+        && needs.verify.result == 'success'
+        && (
+          (github.event_name == 'release' && needs.publish.result == 'success')
+          || (
+            github.event_name == 'workflow_dispatch'
+              && needs.recover_published.result == 'success'
+          )
+        )
     runs-on: macos-15
     timeout-minutes: 20
     permissions:
@@ -1006,6 +1153,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       PACKAGE_RUN_ATTEMPT: ${{ needs.verify.outputs.package_run_attempt }}
       PACKAGE_RUN_ID: ${{ needs.verify.outputs.package_run_id }}
+      PUBLICATION_RUN_ATTEMPT: ${{ github.event_name == 'release' && github.run_attempt || needs.verify.outputs.publication_run_attempt }}
+      PUBLICATION_RUN_ID: ${{ github.event_name == 'release' && github.run_id || needs.verify.outputs.publication_run_id }}
       STASIS_NATIVE_BINARY_SHA256: ${{ needs.verify.outputs.native_binary_sha256 }}
       STASIS_REVISION: ${{ needs.verify.outputs.revision }}
       STASIS_VERSION: ${{ needs.verify.outputs.version }}
@@ -1015,7 +1164,7 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ env.STASIS_RELEASE_TAG }}
 
       - name: Require space for bounded public artifact verification
         shell: bash
@@ -1030,7 +1179,7 @@ jobs:
       - name: Download and recheck the exact published native inputs
         shell: bash
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ env.STASIS_RELEASE_TAG }}
         run: |
           set -euo pipefail
           test "$(uname -s)" = 'Darwin'
@@ -1131,7 +1280,10 @@ jobs:
               --registry="$NPM_CONFIG_REGISTRY")
             node -e '
               const assert = require("node:assert/strict");
-              assert.deepEqual(JSON.parse(process.argv[1]), { alpha: process.argv[2] });
+              const tags = JSON.parse(process.argv[1]);
+              assert.deepEqual(Object.keys(tags).sort(), ["alpha", "latest"]);
+              assert.equal(tags.alpha, process.argv[2]);
+              assert.equal(tags.latest, process.argv[2]);
             ' "$dist_tags" "$STASIS_VERSION"
             test "$(npm view "@oxhq/stasis@$STASIS_VERSION" dist.integrity \
               --registry="$NPM_CONFIG_REGISTRY")" = "$expected_integrity"
@@ -1205,8 +1357,8 @@ jobs:
           revision = os.environ["STASIS_REVISION"]
           repository = os.environ["GITHUB_REPOSITORY"]
           server_url = os.environ["GITHUB_SERVER_URL"]
-          run_id = os.environ["GITHUB_RUN_ID"]
-          current_attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
+          run_id = os.environ["PUBLICATION_RUN_ID"]
+          expected_attempt = int(os.environ["PUBLICATION_RUN_ATTEMPT"])
 
           verified = audit.get("verified")
           if not isinstance(verified, list) or len(verified) != 1:
@@ -1297,10 +1449,18 @@ jobs:
           prefix = f"{server_url}/{repository}/actions/runs/{run_id}/attempts/"
           match = re.fullmatch(re.escape(prefix) + r"([1-9][0-9]*)", metadata["invocationId"])
           if match is None:
-              raise SystemExit("npm provenance invocation is not this exact workflow run")
+              raise SystemExit("npm provenance invocation is not the selected publication run")
           provenance_attempt = int(match.group(1))
-          if provenance_attempt > current_attempt:
+          if (
+              os.environ["GITHUB_EVENT_NAME"] == "release"
+              and provenance_attempt > expected_attempt
+          ):
               raise SystemExit("npm provenance claims a future workflow attempt")
+          if (
+              os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+              and provenance_attempt != expected_attempt
+          ):
+              raise SystemExit("npm provenance invocation is not the selected publication attempt")
           print(
               f"verified exact npm provenance for {repository}@{revision} "
               f"run {run_id} attempt {provenance_attempt}"

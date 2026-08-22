@@ -146,6 +146,11 @@ draft only; maintainer publication is the deliberate boundary after inspection.
 Publishing the GitHub draft triggers `stasis-publish-npm.yml`. Published-release
 events trigger the workflow broadly, but its verification and publication jobs
 proceed only for the published `v0.1.0-alpha.0` prerelease in `oxhq/stasis`.
+A manual dispatch is a read-only recovery path, not a promotion path. It must run
+from the default branch and name the exact immutable tag plus the original
+release-event publication run ID and attempt. Recovery verifies that historical
+run, skips the protected npm environment and every publication step, and repeats
+the public-byte, signature, provenance, install, and fixture checks.
 
 The workflow has three credential boundaries:
 
@@ -154,7 +159,8 @@ retained for 90 days.
 
 1. A read-only verification job has no protected environment and no OIDC token.
    It requires the live release to be immutable and the lightweight tag to equal
-   the release-event SHA,
+   the release-event SHA during publication, or the checked-out tag SHA during a
+   read-only recovery,
    then verifies the exact four native release assets, native gate proof, and
    provenance. The native proof identifies the exact package-run ID and attempt;
    the job downloads that run's two-file SDK artifact and verifies its proof and
@@ -206,14 +212,16 @@ retained for 90 days.
 3. A final read-only macOS job has neither the `npm` environment nor OIDC write
    permission. It downloads the registry tarball, requires byte identity with the
    staged tarball, pins every request to `https://registry.npmjs.org/`, requires the
-   complete dist-tag map to be exactly `{alpha: 0.1.0-alpha.0}` with no `latest`,
+   complete dist-tag map to contain exactly `alpha` and npm's mandatory `latest`
+   alias, with both pointing to `0.1.0-alpha.0`,
    and requires npm's JSON signature audit to contain exactly one
    verified `@oxhq/stasis@0.1.0-alpha.0` entry and no invalid or missing entries.
    It decodes the signature-verified DSSE payload and binds its in-toto subject
    digest, GitHub workflow/repository/tag ref, source commit, hosted builder, and
-   invocation to this exact workflow run. A provenance attempt from an earlier
-   attempt of the same run is accepted for safe postpublication retries; a
-   different run ID or a future attempt is not. It then installs the public registry package in a
+   invocation to the selected release-event publication run. During a release, a
+   provenance attempt from an earlier attempt of the same run is accepted for safe
+   postpublication retries; recovery requires the exact explicitly selected run
+   and attempt. It then installs the public registry package in a
    clean consumer. That bare package import must repeat the real act-settle-inspect
    fixture against the verified released binary, including graceful close and EOF.
 
@@ -336,8 +344,10 @@ first promotion.
 ### npm: seed the first alpha, then require OIDC
 
 npm requires a package to exist before a trusted-publisher relationship can be
-created. Do not publish a dummy setup version and do not leave setup bytes on the
-`latest` dist-tag. Instead, use this one-time sequence for `0.1.0-alpha.0`:
+created. Do not publish a dummy setup version. npm assigns its required `latest`
+alias to the first real version, so the first-alpha verifier requires both `alpha`
+and `latest` to identify the same exact release bytes. Use this one-time sequence
+for `0.1.0-alpha.0`:
 
 1. From an OxHQ npm owner account authorized to create public packages in the
    `@oxhq` scope, create a minimum-expiry granular token. Select only the `@oxhq`
@@ -350,7 +360,8 @@ created. Do not publish a dummy setup version and do not leave setup bytes on th
 3. Publish the inspected GitHub prerelease. After every credential-free gate passes,
    the minimal publish job exposes the secret as `NODE_AUTH_TOKEN` only to its
    lifecycle-disabled publish process. The version is created directly under the
-   `alpha` dist-tag with provenance; no `latest` tag is assigned.
+   `alpha` dist-tag with provenance. npm also assigns its mandatory `latest` alias
+   to this same first real version; do not move either alias to different bytes.
 4. Immediately after registry verification succeeds, open a local interactive
    shell as an OxHQ package owner with account-level 2FA. Do not authenticate this
    operation with the bypass-2FA seed token; npm trust endpoints reject that token
