@@ -59,6 +59,10 @@ use stylo_dom::ElementState;
 
 const DEFAULT_SELECT_SIZE: u32 = 0;
 
+const fn embedder_control_dispatch_opens_select<T>(control_id: &Option<T>) -> bool {
+    control_id.is_some()
+}
+
 const SELECT_BOX_STYLE: &str = "
     display: flex;
     align-items: center;
@@ -457,7 +461,8 @@ impl HTMLSelectElement {
             .map(|(index, _)| index)
             .collect();
 
-        self.owner_document()
+        let control_id = self
+            .owner_document()
             .embedder_controls()
             .show_embedder_control(
                 ControlElement::Select(Dom::from_ref(self)),
@@ -468,7 +473,8 @@ impl HTMLSelectElement {
                 }),
                 None,
             );
-        self.upcast::<Element>().set_open_state(true);
+        self.upcast::<Element>()
+            .set_open_state(embedder_control_dispatch_opens_select(&control_id));
     }
 
     pub(crate) fn handle_embedder_response(&self, cx: &mut JSContext, selected_values: Vec<usize>) {
@@ -1028,5 +1034,16 @@ where
             Choice3::Second(ref j) => j.size_hint(),
             Choice3::Third(ref k) => k.size_hint(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::embedder_control_dispatch_opens_select;
+
+    #[test]
+    fn select_opens_only_after_embedder_control_dispatch() {
+        assert!(!embedder_control_dispatch_opens_select(&None::<()>));
+        assert!(embedder_control_dispatch_opens_select(&Some(())));
     }
 }

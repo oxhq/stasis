@@ -49,6 +49,7 @@ use style::stylist::Stylist;
 use style::values::computed::FontVariantAlternates;
 use style::values::computed::font::{FamilyName, FontFamilyNameSyntax, SingleFontFamily};
 use style::values::specified::font::VariantAlternates;
+use timers::{DocumentClock, DocumentTimeSurface};
 use url::Url;
 use uuid::Uuid;
 use webrender_api::{FontInstanceFlags, FontInstanceKey, FontKey, FontVariation};
@@ -146,13 +147,35 @@ pub trait NetworkTimingHandler: Send + std::fmt::Debug + MallocSizeOf {
 }
 
 /// Document-specific data required to fetch a web font.
-#[derive(Debug, MallocSizeOf)]
+#[derive(MallocSizeOf)]
 pub struct WebFontDocumentContext {
     pub policy_container: PolicyContainer,
     pub request_client: RequestClient,
     pub document_url: ServoUrl,
     pub csp_handler: Box<dyn CspViolationHandler>,
     pub network_timing_handler: Box<dyn NetworkTimingHandler>,
+    pub document_clock: DocumentClock,
+}
+
+impl WebFontDocumentContext {
+    fn require_remote_font_io(&self) -> Result<(), timers::DocumentClockError> {
+        self.document_clock
+            .require_surface(DocumentTimeSurface::ResourceThreadIo)
+    }
+}
+
+impl std::fmt::Debug for WebFontDocumentContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebFontDocumentContext")
+            .field("policy_container", &self.policy_container)
+            .field("request_client", &self.request_client)
+            .field("document_url", &self.document_url)
+            .field("csp_handler", &self.csp_handler)
+            .field("network_timing_handler", &self.network_timing_handler)
+            .field("document_clock_id", &self.document_clock.id())
+            .finish()
+    }
 }
 
 impl Clone for WebFontDocumentContext {
@@ -163,6 +186,7 @@ impl Clone for WebFontDocumentContext {
             document_url: self.document_url.clone(),
             csp_handler: self.csp_handler.clone(),
             network_timing_handler: self.network_timing_handler.clone(),
+            document_clock: self.document_clock.clone(),
         }
     }
 }
@@ -1307,14 +1331,28 @@ impl RemoteWebFontDownloader {
         state: WebFontDownloadState,
     ) {
         // https://drafts.csswg.org/css-fonts/#font-fetching-requirements
-        let Some((url, state)) = resolve_url_source_or_continue(&url_source, state, |state| {
-            font_context.process_next_web_font_source(state);
-        }) else {
+        let document_context = state.document_context.clone();
+        let Some(prepared) =
+            prepare_remote_font_download(&url_source, state, &document_context, |state| {
+                font_context.process_next_web_font_source(state)
+            })
+        else {
             return;
+        };
+        let (url, state) = match prepared {
+            Ok(prepared) => prepared,
+            Err((error, state)) => {
+                // Remote web fonts use the raw net-traits fetch callback and are not yet joined
+                // to the document producer fence. Refuse the request before fetch dispatch and
+                // finish the logical font load as failed; the controlled clock keeps the exact
+                // unsupported surface sticky for settlement.
+                log::error!("refusing uncontrolled remote web-font fetch: {error}");
+                state.handle_web_font_load_failure();
+                return;
+            },
         };
 
         let webview_id = state.webview_id;
-        let document_context = state.document_context.clone();
         if !font_context.handle_web_font_request_started(url.clone().into(), state) {
             // This URL is already being fetched for another font, and we will be
             // notified when that request completes.
@@ -1454,6 +1492,21 @@ fn resolve_url_source_or_continue<T>(
     };
 
     Some((url.clone(), state))
+}
+
+type PreparedRemoteFontDownload<T> = Result<(ServoArc<Url>, T), (timers::DocumentClockError, T)>;
+
+fn prepare_remote_font_download<T>(
+    url_source: &UrlSource,
+    state: T,
+    document_context: &WebFontDocumentContext,
+    continue_with: impl FnOnce(T),
+) -> Option<PreparedRemoteFontDownload<T>> {
+    let (url, state) = resolve_url_source_or_continue(url_source, state, continue_with)?;
+    Some(match document_context.require_remote_font_io() {
+        Ok(()) => Ok((url, state)),
+        Err(error) => Err((error, state)),
+    })
 }
 
 #[derive(Debug, Eq, Hash, MallocSizeOf, PartialEq)]
@@ -1725,6 +1778,7 @@ mod tests {
             document_url: ServoUrl::parse("https://example.test/").unwrap(),
             csp_handler: Box::new(IgnoreCspViolations),
             network_timing_handler: Box::new(IgnoreNetworkTiming),
+            document_clock: DocumentClock::default(),
         }
     }
 
@@ -1782,21 +1836,93 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_url_source_continues_to_fallback() {
+    fn controlled_remote_font_io_is_rejected_and_realtime_is_unchanged() {
+        let mut controlled = test_document_context();
+        controlled.document_clock =
+            DocumentClock::new(timers::DocumentClockConfiguration::Controlled {
+                initial_time_ns: 0,
+                unix_time_origin_ns: timers::DocumentUnixTime::from_nanos(0),
+            });
+        assert!(controlled.require_remote_font_io().is_err());
+        assert_eq!(
+            controlled.document_clock.unsupported_surface(),
+            Some(DocumentTimeSurface::ResourceThreadIo)
+        );
+
+        let realtime = test_document_context();
+        assert!(realtime.require_remote_font_io().is_ok());
+        assert_eq!(realtime.document_clock.unsupported_surface(), None);
+    }
+
+    #[test]
+    fn controlled_unresolved_url_continues_to_fallback_without_latching_io() {
+        let mut document_context = test_document_context();
+        document_context.document_clock =
+            DocumentClock::new(timers::DocumentClockConfiguration::Controlled {
+                initial_time_ns: 0,
+                unix_time_origin_ns: timers::DocumentUnixTime::from_nanos(0),
+            });
         let fallback = local_source("Fallback");
         let fallback_was_attempted = Cell::new(false);
 
-        let resolved = resolve_url_source_or_continue(
+        let prepared = prepare_remote_font_download(
             &url_source(""),
             vec![fallback.clone()],
+            &document_context,
             |mut remaining_sources| {
                 assert_eq!(remaining_sources.pop(), Some(fallback));
                 fallback_was_attempted.set(true);
             },
         );
 
-        assert!(resolved.is_none());
+        assert!(prepared.is_none());
         assert!(fallback_was_attempted.get());
+        assert_eq!(document_context.document_clock.unsupported_surface(), None);
+    }
+
+    #[test]
+    fn realtime_resolved_url_remains_ready_for_fetch_dispatch() {
+        let document_context = test_document_context();
+        let prepared = prepare_remote_font_download(
+            &url_source("https://example.test/font.woff2"),
+            (),
+            &document_context,
+            |_| panic!("a resolved URL must not continue to the fallback source"),
+        );
+
+        assert!(matches!(prepared, Some(Ok((_url, ())))));
+        assert_eq!(document_context.document_clock.unsupported_surface(), None);
+    }
+
+    #[test]
+    fn controlled_resolved_remote_font_fails_before_fetch_dispatch() {
+        let font_context = test_font_context();
+        let completions = Arc::new(AtomicUsize::new(0));
+        let mut state = script_download_state(font_context.clone(), completions.clone());
+        let controlled_clock = DocumentClock::new(timers::DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: timers::DocumentUnixTime::from_nanos(0),
+        });
+        state.document_context.document_clock = controlled_clock.clone();
+        let web_font_family_name = state.css_font_face_descriptors.family_name.clone();
+        font_context
+            .number_of_loading_web_fonts
+            .store(1, Ordering::SeqCst);
+
+        RemoteWebFontDownloader::download(
+            url_source("https://example.test/font.woff2"),
+            font_context.clone(),
+            web_font_family_name,
+            state,
+        );
+
+        assert_eq!(
+            controlled_clock.unsupported_surface(),
+            Some(DocumentTimeSurface::ResourceThreadIo)
+        );
+        assert_eq!(completions.load(Ordering::SeqCst), 1);
+        assert_eq!(font_context.web_fonts_still_loading(), 0);
+        assert!(font_context.currently_downloading_fonts.lock().is_empty());
     }
 
     #[test]

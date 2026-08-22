@@ -1,8 +1,12 @@
-# Execution journal contract 0.1
+# Execution journal design contract 0.1 (future surface)
 
-The journal is append-only execution evidence, not replay or time travel.
+> **Status:** Design history and future direction. Execution journals are not
+> advertised or published by `v0.1.0-alpha.0`; the alpha has no journal or
+> artifact method. See `protocol-v1.md` for the exact shipped method surface.
 
-Every entry contains:
+The proposed journal is append-only execution evidence, not replay or time travel.
+
+In this design, every entry contains:
 
 ```text
 seq                 exact monotonic decimal string
@@ -15,16 +19,17 @@ domEpoch            DOM mutation generation
 attributes          bounded, event-specific metadata
 ```
 
-Automation actions are causal roots. Timers, producer tickets, network
+Automation actions would be causal roots. Timers, producer tickets, network
 lifecycle, task dispatch, individual microtasks, rendering/rAF, DOM mutations,
-settlement outcomes, and typed failures record lifecycle entries. Missing
-parentage is represented honestly as `null`; the journal never invents a
-causal edge to make a diagnostic prettier.
+settlement outcomes, and typed failures would record lifecycle entries. Missing
+parentage would be represented honestly as `null`; the journal would never
+invent a causal edge to make a diagnostic prettier.
 
-Inputs and network metadata are redacted or hashed by default. The 0.1 journal
-does not store full response bodies, full DOM snapshots, JS heap state, or a
-screenshot per event. Size/event limits terminate recording with explicit
-metadata rather than silently truncating a digestible journal.
+Inputs and network metadata would be redacted or hashed by default. The
+proposed journal would not store full response bodies, full DOM snapshots, JS
+heap state, or a screenshot per event. Size/event limits would terminate
+recording with explicit metadata rather than silently truncating a digestible
+journal.
 
 `journalDigest` hashes a versioned canonical encoding of journal entries.
 `domDigest` hashes a versioned canonical top-level DOM projection at the

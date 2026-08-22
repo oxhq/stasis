@@ -1969,7 +1969,8 @@ impl HTMLInputElement {
                 return;
             };
 
-            self.owner_document()
+            let _ = self
+                .owner_document()
                 .embedder_controls()
                 .show_embedder_control(
                     ControlElement::Ime(Dom::from_ref(self.upcast())),

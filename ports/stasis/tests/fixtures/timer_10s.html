@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Stasis controlled ten second timer</title>
+  </head>
+  <body>
+    <button id="start" type="button">Start</button>
+    <output id="result">idle</output>
+    <output id="date-elapsed">unset</output>
+    <output id="performance-elapsed">unset</output>
+
+    <script>
+      document.querySelector("#start").addEventListener("click", () => {
+        const dateStarted = Date.now();
+        const performanceStarted = performance.now();
+
+        setTimeout(() => {
+          document.querySelector("#date-elapsed").textContent = String(
+            Date.now() - dateStarted,
+          );
+          document.querySelector("#performance-elapsed").textContent = String(
+            Math.round(performance.now() - performanceStarted),
+          );
+          document.querySelector("#result").textContent = "timer complete";
+        }, 10_000);
+      });
+    </script>
+  </body>
+</html>

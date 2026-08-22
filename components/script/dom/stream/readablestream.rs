@@ -61,7 +61,7 @@ use crate::dom::types::DefaultTeeUnderlyingSource;
 use crate::dom::stream::underlyingsourcecontainer::UnderlyingSourceType;
 use crate::dom::stream::writablestreamdefaultwriter::WritableStreamDefaultWriter;
 use script_bindings::codegen::GenericBindings::MessagePortBinding::MessagePortMethods;
-use crate::dom::messageport::MessagePort;
+use crate::dom::messageport::{MessagePort, require_transfer_receive_admission};
 use crate::realms::{enter_auto_realm};
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
 use crate::dom::bindings::transferable::Transferable;
@@ -2475,6 +2475,7 @@ impl Transferable for ReadableStream {
         }
 
         let global = self.global();
+        global.require_external_subscription()?;
         let mut realm = enter_auto_realm(cx, &*global);
         let mut realm = realm.current_realm();
         let cx = &mut realm;
@@ -2512,7 +2513,9 @@ impl Transferable for ReadableStream {
         owner: &GlobalScope,
         id: MessagePortId,
         port_impl: MessagePortImpl,
-    ) -> Result<DomRoot<Self>, ()> {
+    ) -> Fallible<DomRoot<Self>> {
+        require_transfer_receive_admission(owner, [(id, &port_impl)])?;
+
         // Their transfer-receiving steps, given dataHolder and value, are:
         // Note: dataHolder is used in `structuredclone.rs`, and value is created here.
         let value = ReadableStream::new_with_proto(cx, owner, None);

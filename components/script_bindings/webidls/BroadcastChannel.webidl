@@ -8,7 +8,7 @@
 
 [Exposed=(Window,Worker)]
 interface BroadcastChannel : EventTarget {
-  constructor(DOMString name);
+  [Throws] constructor(DOMString name);
 
   readonly attribute DOMString name;
   [Throws] undefined postMessage(any message);

@@ -178,7 +178,7 @@ impl SpecificInputType for FileInputType {
         };
 
         let accept_current_paths_for_testing = test_paths.is_some();
-        input
+        let _ = input
             .owner_document()
             .embedder_controls()
             .show_embedder_control(

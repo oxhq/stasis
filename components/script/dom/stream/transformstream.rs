@@ -33,7 +33,7 @@ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::bindings::transferable::Transferable;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::messageport::MessagePort;
+use crate::dom::messageport::{MessagePort, require_transfer_receive_admission};
 use crate::dom::promise::Promise;
 use crate::dom::promisenativehandler::Callback;
 use crate::dom::readablestream::{ReadableStream, create_readable_stream};
@@ -1072,6 +1072,7 @@ impl Transferable for TransformStream {
     /// <https://streams.spec.whatwg.org/#ref-for-transfer-steps②>
     fn transfer(&self, cx: &mut JSContext) -> Fallible<(MessagePortId, TransformStreamData)> {
         let global = self.global();
+        global.require_external_subscription()?;
         let mut realm = enter_auto_realm(cx, &*global);
         let mut realm = realm.current_realm();
         let cx = &mut realm;
@@ -1137,7 +1138,15 @@ impl Transferable for TransformStream {
         owner: &GlobalScope,
         _id: MessagePortId,
         data: TransformStreamData,
-    ) -> Result<DomRoot<Self>, ()> {
+    ) -> Fallible<DomRoot<Self>> {
+        require_transfer_receive_admission(
+            owner,
+            [
+                (data.readable.0, &data.readable.1),
+                (data.writable.0, &data.writable.1),
+            ],
+        )?;
+
         let port1 = MessagePort::transfer_receive(cx, owner, data.readable.0, data.readable.1)?;
         let port2 = MessagePort::transfer_receive(cx, owner, data.writable.0, data.writable.1)?;
 

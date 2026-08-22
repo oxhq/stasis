@@ -73,6 +73,11 @@ impl MediaSession {
         self.media_instance.set(Some(media_instance));
     }
 
+    /// Passive controlled-pending observation. This never creates or invokes a handler.
+    pub(crate) fn pending_action_handler_present(&self) -> bool {
+        pending_action_handler_present(self.action_handlers.borrow().0.len())
+    }
+
     pub(crate) fn handle_action(
         &self,
         cx: &mut js::context::JSContext,
@@ -111,6 +116,9 @@ impl MediaSession {
 
     pub(crate) fn send_event(&self, event: MediaSessionEvent) {
         let global = self.global();
+        if global.require_native_media().is_err() {
+            return;
+        }
         let window = global.as_window();
         let pipeline_id = window.pipeline_id();
         window.send_to_constellation(ScriptToConstellationMessage::MediaSessionEvent(
@@ -134,6 +142,22 @@ impl MediaSession {
         self.send_event(MediaSessionEvent::SetMetadata(
             metadata.as_ref().unwrap().clone(),
         ));
+    }
+}
+
+const fn pending_action_handler_present(handler_count: usize) -> bool {
+    handler_count != 0
+}
+
+#[cfg(test)]
+mod pending_observation_tests {
+    use super::pending_action_handler_present;
+
+    #[test]
+    fn action_handler_presence_is_exact_for_empty_and_nonempty_maps() {
+        assert!(!pending_action_handler_present(0));
+        assert!(pending_action_handler_present(1));
+        assert!(pending_action_handler_present(usize::MAX));
     }
 }
 
@@ -197,6 +221,10 @@ impl MediaSessionMethods<crate::DomTypeHolder> for MediaSession {
         action: MediaSessionAction,
         handler: Option<Rc<MediaSessionActionHandler>>,
     ) {
+        if handler.is_some() && self.global().require_native_media().is_err() {
+            return;
+        }
+
         match handler {
             Some(handler) => self
                 .action_handlers

@@ -202,7 +202,7 @@ impl SpecificInputType for ColorInputType {
             green: (current_color.components.1 * 255.0).round() as u8,
             blue: (current_color.components.2 * 255.0).round() as u8,
         };
-        document.embedder_controls().show_embedder_control(
+        let _ = document.embedder_controls().show_embedder_control(
             ControlElement::ColorInput(Dom::from_ref(input)),
             EmbedderControlRequest::ColorPicker(current_color),
             None,

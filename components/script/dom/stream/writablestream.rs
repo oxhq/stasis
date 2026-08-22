@@ -38,7 +38,7 @@ use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::bindings::transferable::Transferable;
 use crate::dom::domexception::{DOMErrorName, DOMException};
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::messageport::MessagePort;
+use crate::dom::messageport::{MessagePort, require_transfer_receive_admission};
 use crate::dom::promise::Promise;
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
 use crate::dom::readablestream::{ReadableStream, get_type_and_value_from_message};
@@ -1200,6 +1200,7 @@ impl Transferable for WritableStream {
         }
 
         let global = self.global();
+        global.require_external_subscription()?;
         let mut realm = enter_auto_realm(cx, &*global);
         let mut realm = realm.current_realm();
         let cx = &mut realm;
@@ -1237,7 +1238,9 @@ impl Transferable for WritableStream {
         owner: &GlobalScope,
         id: MessagePortId,
         port_impl: MessagePortImpl,
-    ) -> Result<DomRoot<Self>, ()> {
+    ) -> Fallible<DomRoot<Self>> {
+        require_transfer_receive_admission(owner, [(id, &port_impl)])?;
+
         // Their transfer-receiving steps, given dataHolder and value, are:
         // Note: dataHolder is used in `structuredclone.rs`, and value is created here.
         let value = WritableStream::new_with_proto(cx, owner, None);

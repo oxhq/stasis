@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Stasis controlled animation-frame timestamp</title>
+  </head>
+  <body>
+    <button id="start" type="button">Start</button>
+    <output id="raf-timestamp">unset</output>
+    <output id="performance-now">unset</output>
+    <output id="date-elapsed">unset</output>
+    <output id="performance-elapsed">unset</output>
+
+    <script>
+      document.querySelector("#start").addEventListener("click", () => {
+        const dateStarted = Date.now();
+        const performanceStarted = performance.now();
+
+        requestAnimationFrame((timestamp) => {
+          const performanceObserved = performance.now();
+          document.querySelector("#raf-timestamp").textContent = String(timestamp);
+          document.querySelector("#performance-now").textContent = String(
+            performanceObserved,
+          );
+          document.querySelector("#date-elapsed").textContent = String(
+            Date.now() - dateStarted,
+          );
+          document.querySelector("#performance-elapsed").textContent = String(
+            Math.round(performanceObserved - performanceStarted),
+          );
+        });
+      });
+    </script>
+  </body>
+</html>

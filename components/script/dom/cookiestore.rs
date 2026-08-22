@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -44,10 +45,14 @@ struct DroppableCookieStore {
     store_id: CookieStoreId,
     #[no_trace]
     unregister_channel: GenericSender<CoreResourceMsg>,
+    registered: Cell<bool>,
 }
 
 impl Drop for DroppableCookieStore {
     fn drop(&mut self) {
+        if !self.registered.get() {
+            return;
+        }
         let res = self
             .unregister_channel
             .send(CoreResourceMsg::RemoveCookieListener(self.store_id));
@@ -119,6 +124,7 @@ impl CookieStore {
             droppable: DroppableCookieStore {
                 store_id: CookieStoreId::new(),
                 unregister_channel,
+                registered: Cell::new(false),
             },
         }
     }
@@ -136,6 +142,13 @@ impl CookieStore {
     }
 
     fn setup_route(&self) {
+        // Registering this callback gives the resource thread a future ingress into the Window.
+        // Until that lifetime is represented in controlled pending state, reject the surface
+        // before creating or publishing the callback.
+        if self.global().require_resource_thread_io().is_err() {
+            return;
+        }
+
         let context = Trusted::new(self);
         let cs_listener = CookieListener {
             task_source: self
@@ -162,6 +175,22 @@ impl CookieStore {
             ));
         if res.is_err() {
             error!("Failed to send cookiestore message to resource threads");
+        } else {
+            self.droppable.registered.set(true);
+        }
+    }
+
+    fn reject_if_resource_thread_io_is_unsupported(
+        &self,
+        cx: &mut JSContext,
+        promise: &Promise,
+    ) -> bool {
+        match self.global().require_resource_thread_io() {
+            Ok(()) => false,
+            Err(error) => {
+                promise.reject_error(cx, error);
+                true
+            },
         }
     }
 }
@@ -190,6 +219,9 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 5. Let p be a new promise.
         let p = Promise::new(cx, &global);
+        if self.reject_if_resource_thread_io_is_unsupported(cx, &p) {
+            return p;
+        }
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
@@ -233,6 +265,9 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 7. Let p be a new promise.
         let p = Promise::new(cx, &global);
+        if self.reject_if_resource_thread_io_is_unsupported(cx, &p) {
+            return p;
+        }
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
@@ -314,6 +349,9 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 5. Let p be a new promise.
         let p = Promise::new(cx, &global);
+        if self.reject_if_resource_thread_io_is_unsupported(cx, &p) {
+            return p;
+        }
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
@@ -357,6 +395,9 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 6. Let p be a new promise.
         let p = Promise::new(cx, &global);
+        if self.reject_if_resource_thread_io_is_unsupported(cx, &p) {
+            return p;
+        }
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
@@ -432,6 +473,9 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 9. Let p be a new promise.
         let p = Promise::new(cx, &global);
+        if self.reject_if_resource_thread_io_is_unsupported(cx, &p) {
+            return p;
+        }
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
@@ -488,6 +532,9 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 5. Let p be a new promise.
         let p = Promise::new(cx, &global);
+        if self.reject_if_resource_thread_io_is_unsupported(cx, &p) {
+            return p;
+        }
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
@@ -537,6 +584,9 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 5. Let p be a new promise.
         let p = Promise::new(cx, &global);
+        if self.reject_if_resource_thread_io_is_unsupported(cx, &p) {
+            return p;
+        }
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
@@ -575,6 +625,9 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 5. Let p be a new promise.
         let p = Promise::new(cx, &global);
+        if self.reject_if_resource_thread_io_is_unsupported(cx, &p) {
+            return p;
+        }
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {

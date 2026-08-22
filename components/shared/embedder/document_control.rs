@@ -18,17 +18,23 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::{GenericReceiver, ReceiveError, TryReceiveError};
+use servo_base::id::PipelineId;
 use timers::{
     DocumentClockError, DocumentClockId, DocumentProducerFenceError, DocumentTime,
     DocumentTimeSurface, TimerControlError, TimerDeadlineSnapshot, TimerSchedulerId,
 };
 
+use crate::document_automation::{
+    DocumentAutomationError, DocumentAutomationOperation, DocumentAutomationOperationKind,
+    DocumentAutomationRequest, DocumentAutomationResult,
+};
 use crate::document_pending::{
     PendingClockMode, PendingExternalIoObservation, PendingExternalIoPhase,
-    PendingInputObservation, PendingMicrotaskObservation, PendingParserPhase,
-    PendingParserSourceObservation, PendingPipelineRenderingObservation,
-    PendingProducerObservation, PendingProducerStability, PendingSnapshotInvariantError,
-    PendingTargetObservation, RawPendingSnapshot, RuntimeStateGeneration,
+    PendingInputObservation, PendingLogicalTimerObservation, PendingMicrotaskObservation,
+    PendingNavigationRevision, PendingParserPhase, PendingParserSourceObservation,
+    PendingPipelineRenderingObservation, PendingProducerObservation, PendingProducerStability,
+    PendingSnapshotInvariantError, PendingTargetObservation, RawPendingSnapshot,
+    RuntimeStateGeneration,
 };
 
 /// Stable identity for one in-flight document-control request.
@@ -281,11 +287,13 @@ impl DocumentAdvanceAuthority {
             .scheduler
             .next_deadline
             .ok_or(DocumentAdvanceTokenInvariantError::NoFiniteDeadline)?;
-        if deadline.deadline <= pending.clock.now {
-            return Err(DocumentAdvanceTokenInvariantError::DeadlineNotInFuture {
-                now: pending.clock.now,
-                deadline,
-            });
+        if deadline.deadline < pending.clock.now {
+            return Err(
+                DocumentAdvanceTokenInvariantError::DeadlineBeforeCurrentTime {
+                    now: pending.clock.now,
+                    deadline,
+                },
+            );
         }
         if pending.input.intake_saturated {
             return Err(DocumentAdvanceTokenInvariantError::InputIntakeSaturated {
@@ -321,6 +329,15 @@ impl DocumentAdvanceAuthority {
 }
 
 fn authoritative_ready_work(pending: &RawPendingSnapshot) -> Option<DocumentAdvanceReadyWork> {
+    if let Some(timer) = pending
+        .logical_timers
+        .timers()
+        .iter()
+        .copied()
+        .find(|timer| timer.delivery_ready)
+    {
+        return Some(DocumentAdvanceReadyWork::LogicalTimer(timer));
+    }
     if let Some(source) = pending.parser.sources().iter().copied().find(|source| {
         matches!(
             source.phase,
@@ -341,11 +358,11 @@ fn authoritative_ready_work(pending: &RawPendingSnapshot) -> Option<DocumentAdva
     if pending.rendering.opportunity_ready {
         return Some(DocumentAdvanceReadyWork::RenderingOpportunity);
     }
-    let rendering_opportunity_is_future = pending
-        .rendering
-        .scheduled_opportunity
-        .is_some_and(|opportunity| opportunity.deadline > pending.clock.now);
-    if rendering_opportunity_is_future {
+    // A retained rendering-opportunity scheduler entry is not ready work, including when its
+    // deadline is exactly `now`. Controlled schedulers detach/activate that entry only through an
+    // authorized AdvanceTo; an ordinary turn cannot consume it. A genuinely stale (past) head is
+    // still rejected below by the token's deadline invariant.
+    if pending.rendering.scheduled_opportunity.is_some() {
         return None;
     }
     pending
@@ -360,6 +377,8 @@ fn authoritative_ready_work(pending: &RawPendingSnapshot) -> Option<DocumentAdva
 /// Policy-neutral authoritative work which must run before virtual time advances.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DocumentAdvanceReadyWork {
+    /// A detached outer wake has already made one logical DOM-timer delivery ready.
+    LogicalTimer(PendingLogicalTimerObservation),
     /// A parser or top-level navigation is runnable or awaiting its commit turn.
     Parser(PendingParserSourceObservation),
     /// A network operation has already queued its terminal event-loop delivery.
@@ -385,11 +404,12 @@ pub enum DocumentAdvanceTokenInvariantError {
     AuthoritativeReadyWork(DocumentAdvanceReadyWork),
     /// No finite scheduler head existed to bind.
     NoFiniteDeadline,
-    /// A due timer must be processed as ready work instead of advancing time.
-    DeadlineNotInFuture {
+    /// A scheduler head behind current document time is stale. An exact-now head remains eligible:
+    /// its zero-delta guarded advance detaches exactly one same-timestamp callback.
+    DeadlineBeforeCurrentTime {
         /// Current document time.
         now: DocumentTime,
-        /// Scheduler head which is already due.
+        /// Scheduler head which is behind current document time.
         deadline: TimerDeadlineSnapshot,
     },
     /// Bounded ordinary-input intake may have left unseen channel input.
@@ -478,8 +498,54 @@ pub enum DocumentControlCommand {
     /// Control messages do not count as the ordinary turn. Accepting this command invalidates any
     /// retained advance token before page work begins.
     DriveOneTurn,
+    /// Admit the one initial async fetch-backed root pipeline identified by a preceding passive
+    /// Observe readiness rejection.
+    BootstrapInitialPipeline {
+        /// Exact pending root pipeline which must still be the strictly qualified front event.
+        pipeline_id: PipelineId,
+    },
+    /// Execute one bounded native operation against the exact target and state generation carried
+    /// by the request.
+    ///
+    /// Read-only operations can fail definitively after execution. `Fill` and `Activate` can run
+    /// page handlers, so a lost response or post-action observation is explicitly indeterminate.
+    Automate(Box<DocumentAutomationRequest>),
     /// Conditionally advance to and activate the exact deadline bound by a fresh token.
     AdvanceTo(Box<DocumentAdvanceToken>),
+}
+
+/// Return whether `after` is the one exact Constellation transition authorized while admitting
+/// the first async fetch-backed root document.
+///
+/// The pipeline remains the sole event-loop member. Only top-level navigation authority changes:
+/// the pending row is removed and the same pipeline becomes active and fully active. The two
+/// owner mutations each advance the checked navigation revision once, preventing an
+/// identical-looking remove/reinsert sequence from being accepted as this handoff.
+#[doc(hidden)]
+pub fn is_exact_initial_pipeline_activation_transition(
+    before: &PendingTargetObservation,
+    after: &PendingTargetObservation,
+    pipeline_id: PipelineId,
+) -> bool {
+    before.active_top_level.is_none() &&
+        before.pipelines() == [pipeline_id] &&
+        before.fully_active_pipelines().is_empty() &&
+        before.pending_top_level_pipelines() == [pipeline_id] &&
+        after.webview_id == before.webview_id &&
+        after.event_loop_id == before.event_loop_id &&
+        after
+            .active_top_level
+            .is_some_and(|active| active.pipeline_id == pipeline_id) &&
+        after.pipelines() == [pipeline_id] &&
+        after.fully_active_pipelines() == [pipeline_id] &&
+        after.pending_top_level_pipelines().is_empty() &&
+        after.pipeline_membership_revision == before.pipeline_membership_revision &&
+        after.unsupported_time_surface == before.unsupported_time_surface &&
+        before
+            .navigation_revision
+            .checked_next()
+            .and_then(PendingNavigationRevision::checked_next) ==
+            Some(after.navigation_revision)
 }
 
 /// Mechanical action completed immediately before an authoritative observation.
@@ -497,8 +563,61 @@ pub enum DocumentControlAction {
         /// Whether the turn completed a new microtask checkpoint.
         microtask_checkpoint_advanced: bool,
     },
+    /// One bounded native automation operation completed before this observation.
+    Automated(DocumentControlAutomationKind),
     /// Exactly one timer callback was activated; resulting page work has not run yet.
     TimerActivated(TimerDeadlineSnapshot),
+}
+
+/// Stable operation class used to bind automation requests, results, and indeterminate outcomes.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum DocumentControlAutomationKind {
+    QueryCount,
+    TextContent,
+    InnerHtml,
+    Extract,
+    Fill,
+    Activate,
+}
+
+impl DocumentControlAutomationKind {
+    /// Return the operation class carried by a target-bound request.
+    pub const fn from_request(request: &DocumentAutomationRequest) -> Self {
+        Self::from_operation(request.operation())
+    }
+
+    /// Return the operation class carried by a native automation operation.
+    pub const fn from_operation(operation: &DocumentAutomationOperation) -> Self {
+        match operation {
+            DocumentAutomationOperation::QueryCount { .. } => Self::QueryCount,
+            DocumentAutomationOperation::TextContent { .. } => Self::TextContent,
+            DocumentAutomationOperation::InnerHtml { .. } => Self::InnerHtml,
+            DocumentAutomationOperation::Extract(_) => Self::Extract,
+            DocumentAutomationOperation::Fill { .. } => Self::Fill,
+            DocumentAutomationOperation::Activate { .. } => Self::Activate,
+        }
+    }
+
+    /// Whether execution may synchronously mutate the document or invoke page handlers.
+    pub const fn is_mutating(self) -> bool {
+        matches!(self, Self::Fill | Self::Activate)
+    }
+
+    fn matches_result(self, result: &DocumentAutomationResult) -> bool {
+        matches!(
+            (self, result),
+            (
+                Self::QueryCount,
+                DocumentAutomationResult::QueryCount { .. }
+            ) | (
+                Self::TextContent,
+                DocumentAutomationResult::TextContent { .. }
+            ) | (Self::InnerHtml, DocumentAutomationResult::InnerHtml { .. }) |
+                (Self::Extract, DocumentAutomationResult::Extract { .. }) |
+                (Self::Fill, DocumentAutomationResult::Filled) |
+                (Self::Activate, DocumentAutomationResult::Activated)
+        )
+    }
 }
 
 /// Authoritative post-command state from one controlled event loop.
@@ -573,6 +692,12 @@ pub enum DocumentControlObservationInvariantError {
 pub enum DocumentControlOutcome {
     /// The command completed and returned an authoritative observation.
     Completed(Box<DocumentControlObservation>),
+    /// A bounded native automation operation completed and returned authoritative post-action
+    /// state. The observation action names the same operation class as `result`.
+    AutomationCompleted {
+        result: DocumentAutomationResult,
+        observation: Box<DocumentControlObservation>,
+    },
     /// The command was definitively rejected before its page-state mutation.
     Rejected(DocumentControlError),
     /// The runtime cannot determine whether one ordinary turn completed.
@@ -589,6 +714,13 @@ pub enum DocumentControlOutcome {
         /// Exact scheduler entry which may or may not have been activated.
         deadline: TimerDeadlineSnapshot,
     },
+    /// The runtime cannot determine whether a mutating native automation operation completed.
+    AutomationOutcomeIndeterminate {
+        /// Exact target bound when the command was routed.
+        target: Box<PendingTargetObservation>,
+        /// Mutating operation which may or may not have committed.
+        operation: DocumentControlAutomationKind,
+    },
 }
 
 impl DocumentControlOutcome {
@@ -598,13 +730,50 @@ impl DocumentControlOutcome {
             Self::Completed(observation) => observation
                 .validate()
                 .map_err(DocumentControlOutcomeInvariantError::Observation),
+            Self::AutomationCompleted {
+                result,
+                observation,
+            } => {
+                observation
+                    .validate()
+                    .map_err(DocumentControlOutcomeInvariantError::Observation)?;
+                let DocumentControlAction::Automated(operation) = observation.action else {
+                    return Err(
+                        DocumentControlOutcomeInvariantError::CompletedActionMismatch {
+                            command: DocumentControlCommandKind::Automate,
+                            observed: observation.action,
+                        },
+                    );
+                };
+                if !operation.matches_result(result) {
+                    return Err(
+                        DocumentControlOutcomeInvariantError::AutomationResultMismatch {
+                            expected: operation,
+                        },
+                    );
+                }
+                Ok(())
+            },
             Self::Rejected(error) => error
                 .validate()
                 .map_err(DocumentControlOutcomeInvariantError::Rejection),
-            Self::DriveOneTurnOutcomeIndeterminate { target }
-            | Self::AdvanceOutcomeIndeterminate { target, .. } => target
+            Self::DriveOneTurnOutcomeIndeterminate { target } |
+            Self::AdvanceOutcomeIndeterminate { target, .. } => target
                 .validate()
                 .map_err(DocumentControlOutcomeInvariantError::IndeterminateTarget),
+            Self::AutomationOutcomeIndeterminate { target, operation } => {
+                target
+                    .validate()
+                    .map_err(DocumentControlOutcomeInvariantError::IndeterminateTarget)?;
+                if !operation.is_mutating() {
+                    return Err(
+                        DocumentControlOutcomeInvariantError::ReadOnlyAutomationIndeterminate {
+                            operation: *operation,
+                        },
+                    );
+                }
+                Ok(())
+            },
         }
     }
 
@@ -615,6 +784,42 @@ impl DocumentControlOutcome {
     ) -> Result<(), DocumentControlOutcomeInvariantError> {
         self.validate()?;
         match (command, self) {
+            (
+                command,
+                Self::Rejected(DocumentControlError::InitialPipelineBootstrapRequired {
+                    pipeline_id,
+                }),
+            ) if !matches!(command, DocumentControlCommand::Observe) => Err(
+                DocumentControlOutcomeInvariantError::InitialPipelineBootstrapRejectionForCommand {
+                    command: DocumentControlCommandKind::from_command(command),
+                    pipeline_id: *pipeline_id,
+                },
+            ),
+            (
+                DocumentControlCommand::BootstrapInitialPipeline {
+                    pipeline_id: expected,
+                },
+                Self::Rejected(DocumentControlError::InitialPipelineBootstrapUnavailable {
+                    pipeline_id: observed,
+                }),
+            ) if expected == observed => Ok(()),
+            (
+                command,
+                Self::Rejected(DocumentControlError::InitialPipelineBootstrapUnavailable {
+                    pipeline_id: observed,
+                }),
+            ) => Err(
+                DocumentControlOutcomeInvariantError::InitialPipelineBootstrapUnavailableForCommand {
+                    command: DocumentControlCommandKind::from_command(command),
+                    expected: match command {
+                        DocumentControlCommand::BootstrapInitialPipeline { pipeline_id } => {
+                            Some(*pipeline_id)
+                        },
+                        _ => None,
+                    },
+                    observed: *observed,
+                },
+            ),
             (DocumentControlCommand::DriveOneTurn, Self::Rejected(error))
                 if error.is_pending_capture_failure() =>
             {
@@ -625,12 +830,43 @@ impl DocumentControlOutcome {
                     },
                 )
             },
+            (DocumentControlCommand::BootstrapInitialPipeline { .. }, Self::Rejected(error))
+                if error.is_pending_capture_failure() =>
+            {
+                Err(
+                    DocumentControlOutcomeInvariantError::PendingCaptureRejectionForMutatingCommand {
+                        command: DocumentControlCommandKind::BootstrapInitialPipeline,
+                        error: Box::new(error.clone()),
+                    },
+                )
+            },
             (DocumentControlCommand::AdvanceTo(_), Self::Rejected(error))
                 if error.is_pending_capture_failure() =>
             {
                 Err(
                     DocumentControlOutcomeInvariantError::PendingCaptureRejectionForMutatingCommand {
                         command: DocumentControlCommandKind::AdvanceTo,
+                        error: Box::new(error.clone()),
+                    },
+                )
+            },
+            (DocumentControlCommand::Automate(request), Self::Rejected(error))
+                if DocumentControlAutomationKind::from_request(request).is_mutating()
+                    && error.is_pending_capture_failure() =>
+            {
+                Err(
+                    DocumentControlOutcomeInvariantError::PendingCaptureRejectionForMutatingCommand {
+                        command: DocumentControlCommandKind::Automate,
+                        error: Box::new(error.clone()),
+                    },
+                )
+            },
+            (DocumentControlCommand::Automate(request), Self::Rejected(error))
+                if automation_rejection_may_follow_mutation(request, error) =>
+            {
+                Err(
+                    DocumentControlOutcomeInvariantError::AutomationMutationRejection {
+                        operation: DocumentControlAutomationKind::from_request(request),
                         error: Box::new(error.clone()),
                     },
                 )
@@ -663,6 +899,66 @@ impl DocumentControlOutcome {
                         },
                     )
                 }
+            },
+            (
+                DocumentControlCommand::BootstrapInitialPipeline { .. },
+                Self::Completed(observation),
+            ) => {
+                if matches!(observation.action, DocumentControlAction::TurnProcessed { .. }) {
+                    Ok(())
+                } else {
+                    Err(
+                        DocumentControlOutcomeInvariantError::CompletedActionMismatch {
+                            command: DocumentControlCommandKind::BootstrapInitialPipeline,
+                            observed: observation.action,
+                        },
+                    )
+                }
+            },
+            (
+                DocumentControlCommand::Automate(request),
+                Self::AutomationCompleted {
+                    result,
+                    observation,
+                },
+            ) => {
+                let expected_kind = DocumentControlAutomationKind::from_request(request);
+                let DocumentControlAction::Automated(observed_kind) = observation.action else {
+                    return Err(
+                        DocumentControlOutcomeInvariantError::CompletedActionMismatch {
+                            command: DocumentControlCommandKind::Automate,
+                            observed: observation.action,
+                        },
+                    );
+                };
+                if observed_kind != expected_kind {
+                    return Err(
+                        DocumentControlOutcomeInvariantError::AutomationOperationMismatch {
+                            expected: expected_kind,
+                            observed: observed_kind,
+                        },
+                    );
+                }
+                if !expected_kind.matches_result(result) {
+                    return Err(DocumentControlOutcomeInvariantError::AutomationResultMismatch {
+                        expected: expected_kind,
+                    });
+                }
+                if &observation.pending.target != request.target() {
+                    return Err(DocumentControlOutcomeInvariantError::AutomationTargetMismatch {
+                        expected: Box::new(request.target().clone()),
+                        observed: Box::new(observation.pending.target.clone()),
+                    });
+                }
+                if observation.pending.state_generation < request.expected_generation() {
+                    return Err(
+                        DocumentControlOutcomeInvariantError::AutomationStateGenerationRegressed {
+                            expected_at_least: request.expected_generation(),
+                            observed: observation.pending.state_generation,
+                        },
+                    );
+                }
+                Ok(())
             },
             (DocumentControlCommand::AdvanceTo(token), Self::Completed(observation)) => {
                 let DocumentControlAction::TimerActivated(observed_deadline) = observation.action
@@ -721,7 +1017,8 @@ impl DocumentControlOutcome {
                 Ok(())
             },
             (
-                DocumentControlCommand::DriveOneTurn,
+                DocumentControlCommand::DriveOneTurn
+                | DocumentControlCommand::BootstrapInitialPipeline { .. },
                 Self::DriveOneTurnOutcomeIndeterminate { .. },
             ) => Ok(()),
             (
@@ -743,6 +1040,34 @@ impl DocumentControlOutcome {
                 validate_advance_target(token, target)?;
                 validate_advance_deadline(token, *deadline)
             },
+            (
+                DocumentControlCommand::Automate(request),
+                Self::AutomationOutcomeIndeterminate { target, operation },
+            ) => {
+                let expected = DocumentControlAutomationKind::from_request(request);
+                if !expected.is_mutating() {
+                    return Err(
+                        DocumentControlOutcomeInvariantError::ReadOnlyAutomationIndeterminate {
+                            operation: expected,
+                        },
+                    );
+                }
+                if *operation != expected {
+                    return Err(
+                        DocumentControlOutcomeInvariantError::AutomationOperationMismatch {
+                            expected,
+                            observed: *operation,
+                        },
+                    );
+                }
+                if &**target != request.target() {
+                    return Err(DocumentControlOutcomeInvariantError::AutomationTargetMismatch {
+                        expected: Box::new(request.target().clone()),
+                        observed: target.clone(),
+                    });
+                }
+                Ok(())
+            },
             _ => Err(
                 DocumentControlOutcomeInvariantError::OutcomeCommandMismatch {
                     command: DocumentControlCommandKind::from_command(command),
@@ -751,6 +1076,21 @@ impl DocumentControlOutcome {
             ),
         }
     }
+}
+
+fn automation_rejection_may_follow_mutation(
+    request: &DocumentAutomationRequest,
+    error: &DocumentControlError,
+) -> bool {
+    matches!(
+        (request.operation(), error),
+        (
+            DocumentAutomationOperation::Fill { .. },
+            DocumentControlError::Automation(DocumentAutomationError::DomOperationFailed {
+                operation: DocumentAutomationOperationKind::Fill,
+            })
+        )
+    )
 }
 
 fn validate_advance_target(
@@ -790,6 +1130,10 @@ pub enum DocumentControlCommandKind {
     Observe,
     /// Drive one ordinary turn.
     DriveOneTurn,
+    /// Admit the strictly qualified initial root pipeline.
+    BootstrapInitialPipeline,
+    /// Execute one bounded native automation operation.
+    Automate,
     /// Activate one token-bound timer.
     AdvanceTo,
 }
@@ -799,6 +1143,10 @@ impl DocumentControlCommandKind {
         match command {
             DocumentControlCommand::Observe => Self::Observe,
             DocumentControlCommand::DriveOneTurn => Self::DriveOneTurn,
+            DocumentControlCommand::BootstrapInitialPipeline { .. } => {
+                Self::BootstrapInitialPipeline
+            },
+            DocumentControlCommand::Automate(_) => Self::Automate,
             DocumentControlCommand::AdvanceTo(_) => Self::AdvanceTo,
         }
     }
@@ -809,24 +1157,32 @@ impl DocumentControlCommandKind {
 pub enum DocumentControlOutcomeKind {
     /// A completed observation.
     Completed,
+    /// A completed native automation operation.
+    AutomationCompleted,
     /// A definitive rejection.
     Rejected,
     /// An indeterminate driven turn.
     DriveOneTurnOutcomeIndeterminate,
     /// An indeterminate guarded advance.
     AdvanceOutcomeIndeterminate,
+    /// An indeterminate mutating automation operation.
+    AutomationOutcomeIndeterminate,
 }
 
 impl DocumentControlOutcomeKind {
     fn from_outcome(outcome: &DocumentControlOutcome) -> Self {
         match outcome {
             DocumentControlOutcome::Completed(_) => Self::Completed,
+            DocumentControlOutcome::AutomationCompleted { .. } => Self::AutomationCompleted,
             DocumentControlOutcome::Rejected(_) => Self::Rejected,
             DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate { .. } => {
                 Self::DriveOneTurnOutcomeIndeterminate
             },
             DocumentControlOutcome::AdvanceOutcomeIndeterminate { .. } => {
                 Self::AdvanceOutcomeIndeterminate
+            },
+            DocumentControlOutcome::AutomationOutcomeIndeterminate { .. } => {
+                Self::AutomationOutcomeIndeterminate
             },
         }
     }
@@ -848,12 +1204,58 @@ pub enum DocumentControlOutcomeInvariantError {
         /// Capture error which cannot be treated as definitive for that command.
         error: Box<DocumentControlError>,
     },
+    /// Initial pipeline bootstrap is a passive readiness rejection emitted only for Observe.
+    InitialPipelineBootstrapRejectionForCommand {
+        /// Command which incorrectly carried the readiness rejection.
+        command: DocumentControlCommandKind,
+        /// Root pipeline awaiting its one explicit bootstrap turn.
+        pipeline_id: PipelineId,
+    },
+    /// A bootstrap-unavailable rejection belonged to another command or pipeline.
+    InitialPipelineBootstrapUnavailableForCommand {
+        /// Submitted command class.
+        command: DocumentControlCommandKind,
+        /// Pipeline bound by a bootstrap command, or `None` for another command class.
+        expected: Option<PipelineId>,
+        /// Pipeline carried by the rejection.
+        observed: PipelineId,
+    },
+    /// A definitive rejection named a native failure which can occur after a mutation began.
+    AutomationMutationRejection {
+        /// Mutating operation whose outcome can no longer be proven definitive.
+        operation: DocumentControlAutomationKind,
+        /// Rejection which crossed the mutation boundary.
+        error: Box<DocumentControlError>,
+    },
     /// A completed action did not match the submitted command.
     CompletedActionMismatch {
         /// Submitted command class.
         command: DocumentControlCommandKind,
         /// Action carried by the decoded observation.
         observed: DocumentControlAction,
+    },
+    /// An automation completion or indeterminate outcome named another operation class.
+    AutomationOperationMismatch {
+        expected: DocumentControlAutomationKind,
+        observed: DocumentControlAutomationKind,
+    },
+    /// An automation completion carried a result belonging to another operation class.
+    AutomationResultMismatch {
+        expected: DocumentControlAutomationKind,
+    },
+    /// An automation completion or indeterminate outcome named another target.
+    AutomationTargetMismatch {
+        expected: Box<PendingTargetObservation>,
+        observed: Box<PendingTargetObservation>,
+    },
+    /// Authoritative post-action state regressed behind the request precondition.
+    AutomationStateGenerationRegressed {
+        expected_at_least: RuntimeStateGeneration,
+        observed: RuntimeStateGeneration,
+    },
+    /// A read-only native automation operation cannot have an indeterminate page mutation.
+    ReadOnlyAutomationIndeterminate {
+        operation: DocumentControlAutomationKind,
     },
     /// An indeterminate outcome belonged to a different command class.
     OutcomeCommandMismatch {
@@ -941,6 +1343,8 @@ pub enum DocumentPendingFact {
     Parser,
     /// Foreground and persistent network inventory.
     Network,
+    /// Stable logical DOM timers and their exact coalesced outer-wake bindings.
+    LogicalTimers,
     /// Rendering readiness and persistent rendering activity.
     Rendering,
     /// Canonical asynchronous-source inventory.
@@ -962,6 +1366,16 @@ pub enum DocumentControlError {
     MultipleEventLoops,
     /// The selected ScriptEventLoop also owns a different WebView.
     SharedEventLoopWebView,
+    /// The exact initial fetch-backed root SpawnPipeline is ready for one explicit bootstrap turn.
+    InitialPipelineBootstrapRequired {
+        /// Pending root pipeline which the bootstrap turn must admit.
+        pipeline_id: PipelineId,
+    },
+    /// The requested initial root bootstrap is no longer the exact qualified front event.
+    InitialPipelineBootstrapUnavailable {
+        /// Pipeline named by the rejected one-shot bootstrap command.
+        pipeline_id: PipelineId,
+    },
     /// The authoritative owner cannot currently supply a required pending-state fact.
     PendingFactUnavailable(DocumentPendingFact),
     /// Authoritative facts could not be normalized into one internally consistent snapshot.
@@ -997,6 +1411,9 @@ pub enum DocumentControlError {
     AdvancePrecondition(DocumentAdvanceTokenInvariantError),
     /// A controlled-time surface escaped this runtime slice.
     UnsupportedSurface(DocumentTimeSurface),
+    /// A bounded native automation request was definitively rejected before an uncertain
+    /// mutation, or a read-only operation failed without mutating the page.
+    Automation(DocumentAutomationError),
     /// A checked document-clock operation failed.
     Clock(DocumentClockError),
     /// An exact finite-deadline operation failed.
@@ -1100,6 +1517,8 @@ pub enum DocumentControlReceiveOutcome {
     CommandOutcome(DocumentControlOutcome),
     /// Observe ran no page turn and performed no guarded clock mutation, but no snapshot arrived.
     ObserveTransportFailure(DocumentControlTransportFailure),
+    /// A read-only automation command cannot have mutated the page, but no typed result arrived.
+    AutomationTransportFailure(DocumentControlTransportFailure),
     /// The caller cannot know whether the requested ordinary turn completed.
     DriveOneTurnOutcomeIndeterminate(DocumentControlTransportFailure),
 }
@@ -1212,6 +1631,23 @@ impl DocumentControlReceiver {
             DocumentControlCommand::DriveOneTurn => {
                 DocumentControlReceiveOutcome::DriveOneTurnOutcomeIndeterminate(failure)
             },
+            DocumentControlCommand::BootstrapInitialPipeline { .. } => {
+                DocumentControlReceiveOutcome::DriveOneTurnOutcomeIndeterminate(failure)
+            },
+            DocumentControlCommand::Automate(request) => {
+                let operation = DocumentControlAutomationKind::from_request(request);
+                if operation.is_mutating() {
+                    let _ = failure;
+                    DocumentControlReceiveOutcome::CommandOutcome(
+                        DocumentControlOutcome::AutomationOutcomeIndeterminate {
+                            target: Box::new(request.target().clone()),
+                            operation,
+                        },
+                    )
+                } else {
+                    DocumentControlReceiveOutcome::AutomationTransportFailure(failure)
+                }
+            },
             DocumentControlCommand::AdvanceTo(token) => {
                 let _ = failure;
                 DocumentControlReceiveOutcome::CommandOutcome(
@@ -1248,19 +1684,24 @@ mod tests {
     use serde::de::DeserializeOwned;
     use servo_base::Epoch;
     use servo_base::generic_channel::GenericCallback;
-    use servo_base::id::{TEST_PIPELINE_ID, TEST_SCRIPT_EVENT_LOOP_ID, TEST_WEBVIEW_ID};
+    use servo_base::id::{
+        Index, TEST_NAMESPACE, TEST_PIPELINE_ID, TEST_SCRIPT_EVENT_LOOP_ID, TEST_WEBVIEW_ID,
+    };
     use timers::{
         DocumentClock, DocumentClockConfiguration, DocumentProducerCheckpoint,
         DocumentProducerFence, DocumentUnixTime, TimerEventRequest, TimerScheduler,
     };
 
     use super::*;
+    use crate::document_automation::DocumentAutomationLimits;
     use crate::document_pending::{
         DomEpoch, PendingActiveTopLevelPipeline, PendingAnimatedImageObservation,
         PendingCanvasObservation, PendingExternalIoEvidence, PendingExternalIoLoadBlocking,
-        PendingExternalIoOwner, PendingMicrotaskCheckpoint, PendingNavigationRevision,
+        PendingExternalIoOwner, PendingLogicalTimerKind, PendingLogicalTimerSnapshot,
+        PendingLogicalTimerStableId, PendingMicrotaskCheckpoint, PendingNavigationRevision,
         PendingNetworkKind, PendingNetworkObservation, PendingParserObservation,
-        PendingParserSourceKind, PendingPipelineRenderingObservation, PendingRenderingObservation,
+        PendingParserSourceKind, PendingPipelineMembershipRevision,
+        PendingPipelineRenderingObservation, PendingRenderingObservation,
         PendingRenderingPipelineActivity, PendingRuntimeTerminals, PendingSchedulerObservation,
         PendingSourceDisposition, PendingSourceEpoch, PendingSourceId, PendingSourceKind,
         PendingSourceObservation, PendingSourceSnapshot, PendingTaskObservation,
@@ -1388,6 +1829,7 @@ mod tests {
             producers,
             parser: PendingParserObservation::default(),
             network: PendingNetworkObservation::default(),
+            logical_timers: crate::document_pending::PendingLogicalTimerSnapshot::default(),
             rendering: rendering(),
             sources: PendingSourceSnapshot::default(),
             terminals: PendingRuntimeTerminals::default(),
@@ -1401,6 +1843,19 @@ mod tests {
             .unwrap()
     }
 
+    fn automation_command(operation: DocumentAutomationOperation) -> DocumentControlCommand {
+        let pending = eligible_pending();
+        DocumentControlCommand::Automate(Box::new(
+            DocumentAutomationRequest::new_internal(
+                pending.target,
+                pending.state_generation,
+                operation,
+                DocumentAutomationLimits::MVP,
+            )
+            .unwrap(),
+        ))
+    }
+
     #[test]
     fn raw_bound_token_command_and_outcomes_round_trip() {
         let pending = eligible_pending();
@@ -1412,6 +1867,13 @@ mod tests {
         assert_postcard_round_trip(token.clone());
         assert_postcard_round_trip(DocumentControlCommand::Observe);
         assert_postcard_round_trip(DocumentControlCommand::DriveOneTurn);
+        assert_postcard_round_trip(DocumentControlCommand::BootstrapInitialPipeline {
+            pipeline_id: TEST_PIPELINE_ID,
+        });
+        let text_command = automation_command(DocumentAutomationOperation::TextContent {
+            selector: "#status".into(),
+        });
+        assert_postcard_round_trip(text_command.clone());
         assert_postcard_round_trip(DocumentControlCommand::AdvanceTo(Box::new(token.clone())));
 
         let observation = DocumentControlObservation::new_internal(
@@ -1434,6 +1896,30 @@ mod tests {
             target: Box::new(token.target().clone()),
             deadline: token.deadline(),
         });
+
+        let DocumentControlCommand::Automate(request) = text_command else {
+            unreachable!();
+        };
+        let observation = DocumentControlObservation::new_internal(
+            DocumentControlAction::Automated(DocumentControlAutomationKind::TextContent),
+            Box::new(eligible_pending()),
+            None,
+        )
+        .unwrap();
+        let completed = DocumentControlOutcome::AutomationCompleted {
+            result: DocumentAutomationResult::TextContent {
+                value: "ready".into(),
+            },
+            observation: Box::new(observation),
+        };
+        completed
+            .validate_for_command(&DocumentControlCommand::Automate(request))
+            .unwrap();
+        assert_postcard_round_trip(completed);
+        assert_postcard_round_trip(DocumentControlOutcome::AutomationOutcomeIndeterminate {
+            target: Box::new(token.target().clone()),
+            operation: DocumentControlAutomationKind::Activate,
+        });
     }
 
     #[test]
@@ -1449,6 +1935,7 @@ mod tests {
             DocumentPendingFact::Producers,
             DocumentPendingFact::Parser,
             DocumentPendingFact::Network,
+            DocumentPendingFact::LogicalTimers,
             DocumentPendingFact::Rendering,
             DocumentPendingFact::Sources,
             DocumentPendingFact::RuntimeTerminals,
@@ -1471,6 +1958,152 @@ mod tests {
         };
         error.validate().unwrap();
         assert_postcard_round_trip(error);
+    }
+
+    #[test]
+    fn initial_pipeline_bootstrap_is_an_observe_only_definitive_rejection() {
+        let rejection = DocumentControlOutcome::Rejected(
+            DocumentControlError::InitialPipelineBootstrapRequired {
+                pipeline_id: TEST_PIPELINE_ID,
+            },
+        );
+        rejection
+            .validate_for_command(&DocumentControlCommand::Observe)
+            .unwrap();
+        assert!(matches!(
+            rejection.validate_for_command(&DocumentControlCommand::DriveOneTurn),
+            Err(
+                DocumentControlOutcomeInvariantError::InitialPipelineBootstrapRejectionForCommand {
+                    command: DocumentControlCommandKind::DriveOneTurn,
+                    pipeline_id: TEST_PIPELINE_ID,
+                }
+            )
+        ));
+        assert_postcard_round_trip(rejection);
+    }
+
+    #[test]
+    fn bootstrap_unavailable_is_bound_to_the_exact_bootstrap_command() {
+        let command = DocumentControlCommand::BootstrapInitialPipeline {
+            pipeline_id: TEST_PIPELINE_ID,
+        };
+        let rejection = DocumentControlOutcome::Rejected(
+            DocumentControlError::InitialPipelineBootstrapUnavailable {
+                pipeline_id: TEST_PIPELINE_ID,
+            },
+        );
+        rejection.validate_for_command(&command).unwrap();
+        assert!(matches!(
+            rejection.validate_for_command(&DocumentControlCommand::DriveOneTurn),
+            Err(
+                DocumentControlOutcomeInvariantError::InitialPipelineBootstrapUnavailableForCommand {
+                    command: DocumentControlCommandKind::DriveOneTurn,
+                    expected: None,
+                    observed: TEST_PIPELINE_ID,
+                }
+            )
+        ));
+        let other_pipeline_id = PipelineId {
+            namespace_id: TEST_NAMESPACE,
+            index: Index::new(TEST_PIPELINE_ID.index.0.get() + 1).unwrap(),
+        };
+        assert!(matches!(
+            rejection.validate_for_command(&DocumentControlCommand::BootstrapInitialPipeline {
+                pipeline_id: other_pipeline_id,
+            }),
+            Err(
+                DocumentControlOutcomeInvariantError::InitialPipelineBootstrapUnavailableForCommand {
+                    command: DocumentControlCommandKind::BootstrapInitialPipeline,
+                    expected: Some(expected),
+                    observed: TEST_PIPELINE_ID,
+                }
+            ) if expected == other_pipeline_id
+        ));
+        completed_outcome(
+            DocumentControlAction::TurnProcessed {
+                microtask_checkpoint_advanced: true,
+            },
+            eligible_pending(),
+        )
+        .validate_for_command(&command)
+        .unwrap();
+        assert!(matches!(
+            completed_outcome(
+                DocumentControlAction::CheckpointTurnProcessed {
+                    microtask_checkpoint_advanced: true,
+                },
+                eligible_pending(),
+            )
+            .validate_for_command(&command),
+            Err(
+                DocumentControlOutcomeInvariantError::CompletedActionMismatch {
+                    command: DocumentControlCommandKind::BootstrapInitialPipeline,
+                    ..
+                }
+            )
+        ));
+        assert_postcard_round_trip(rejection);
+    }
+
+    #[test]
+    fn initial_pipeline_activation_transition_is_exact_and_aba_safe() {
+        let before = PendingTargetObservation::new_with_authority(
+            TEST_WEBVIEW_ID,
+            TEST_SCRIPT_EVENT_LOOP_ID,
+            None,
+            PendingNavigationRevision::new(3),
+            PendingPipelineMembershipRevision::new(9),
+            None,
+            vec![TEST_PIPELINE_ID],
+            Vec::new(),
+            vec![TEST_PIPELINE_ID],
+        )
+        .unwrap();
+        let after = PendingTargetObservation::new_with_authority(
+            TEST_WEBVIEW_ID,
+            TEST_SCRIPT_EVENT_LOOP_ID,
+            Some(PendingActiveTopLevelPipeline {
+                pipeline_id: TEST_PIPELINE_ID,
+                epoch: Epoch(8),
+            }),
+            PendingNavigationRevision::new(5),
+            PendingPipelineMembershipRevision::new(9),
+            None,
+            vec![TEST_PIPELINE_ID],
+            vec![TEST_PIPELINE_ID],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(is_exact_initial_pipeline_activation_transition(
+            &before,
+            &after,
+            TEST_PIPELINE_ID,
+        ));
+
+        let mut one_revision_only = after.clone();
+        one_revision_only.navigation_revision = PendingNavigationRevision::new(4);
+        assert!(!is_exact_initial_pipeline_activation_transition(
+            &before,
+            &one_revision_only,
+            TEST_PIPELINE_ID,
+        ));
+
+        let mut membership_aba = after.clone();
+        membership_aba.pipeline_membership_revision = PendingPipelineMembershipRevision::new(10);
+        assert!(!is_exact_initial_pipeline_activation_transition(
+            &before,
+            &membership_aba,
+            TEST_PIPELINE_ID,
+        ));
+
+        let mut unsupported_surface_changed = after;
+        unsupported_surface_changed.unsupported_time_surface =
+            Some(DocumentTimeSurface::SameEventLoopIframe);
+        assert!(!is_exact_initial_pipeline_activation_transition(
+            &before,
+            &unsupported_surface_changed,
+            TEST_PIPELINE_ID,
+        ));
     }
 
     #[test]
@@ -1651,6 +2284,147 @@ mod tests {
     }
 
     #[test]
+    fn token_issuance_allows_exact_now_and_rejects_only_past_deadlines() {
+        let mut pending = eligible_pending();
+        let deadline = pending.scheduler.next_deadline.unwrap();
+        pending.clock.now = deadline.deadline;
+        let token =
+            DocumentAdvanceToken::new_internal(DocumentAdvanceTokenId::new(1), &pending).unwrap();
+        assert_eq!(token.now(), deadline.deadline);
+        assert_eq!(token.deadline(), deadline);
+
+        pending.clock.now = DocumentTime::from_nanos(deadline.deadline.as_nanos() + 1);
+        assert_eq!(
+            DocumentAdvanceToken::new_internal(DocumentAdvanceTokenId::new(2), &pending),
+            Err(
+                DocumentAdvanceTokenInvariantError::DeadlineBeforeCurrentTime {
+                    now: pending.clock.now,
+                    deadline,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn token_issuance_rejects_a_delivery_ready_logical_timer() {
+        let mut pending = eligible_pending();
+        let source_id = PendingSourceId::new(43);
+        let timer = PendingLogicalTimerObservation {
+            source_id,
+            pipeline_id: TEST_PIPELINE_ID,
+            stable_id: PendingLogicalTimerStableId::JavaScriptHandle(17),
+            creation_sequence: 9,
+            kind: PendingLogicalTimerKind::JavaScriptOneShot,
+            logical_deadline: pending.clock.now,
+            suspended: false,
+            eligible_in_controlled_turn: true,
+            is_ordering_head: true,
+            delivery_ready: true,
+            outer_wake: None,
+        };
+        pending.logical_timers = PendingLogicalTimerSnapshot::new(vec![timer]).unwrap();
+        pending.sources = PendingSourceSnapshot::new(
+            PendingSourceEpoch::new(1),
+            vec![PendingSourceObservation {
+                id: source_id,
+                kind: PendingSourceKind::Timer,
+                disposition: PendingSourceDisposition::Ready,
+            }],
+        )
+        .unwrap();
+        pending.validate().unwrap();
+
+        assert_eq!(
+            DocumentAdvanceToken::new_internal(DocumentAdvanceTokenId::new(1), &pending),
+            Err(DocumentAdvanceTokenInvariantError::AuthoritativeReadyWork(
+                DocumentAdvanceReadyWork::LogicalTimer(timer)
+            ))
+        );
+    }
+
+    #[test]
+    fn completed_zero_delta_advance_accepts_consumed_head_and_advanced_state() {
+        let mut pending = eligible_pending();
+        let deadline = pending.scheduler.next_deadline.unwrap();
+        pending.clock.now = deadline.deadline;
+        let token =
+            DocumentAdvanceToken::new_internal(DocumentAdvanceTokenId::new(7), &pending).unwrap();
+        let command = DocumentControlCommand::AdvanceTo(Box::new(token.clone()));
+
+        let mut completed = pending;
+        completed.state_generation = RuntimeStateGeneration::new(10);
+        completed.scheduler.next_deadline = None;
+        completed_outcome(DocumentControlAction::TimerActivated(deadline), completed)
+            .validate_for_command(&command)
+            .unwrap();
+    }
+
+    #[test]
+    fn automation_operation_kinds_and_mutability_are_exact() {
+        for (operation, expected, mutating) in [
+            (
+                DocumentAutomationOperation::QueryCount {
+                    selector: "div".into(),
+                },
+                DocumentControlAutomationKind::QueryCount,
+                false,
+            ),
+            (
+                DocumentAutomationOperation::TextContent {
+                    selector: "div".into(),
+                },
+                DocumentControlAutomationKind::TextContent,
+                false,
+            ),
+            (
+                DocumentAutomationOperation::InnerHtml {
+                    selector: "div".into(),
+                },
+                DocumentControlAutomationKind::InnerHtml,
+                false,
+            ),
+            (
+                DocumentAutomationOperation::Extract(
+                    crate::document_automation::DocumentExtractionPlan::new_internal(
+                        ".row".into(),
+                        vec![
+                            crate::document_automation::DocumentExtractionField::new_internal(
+                                "name".into(),
+                                ".name".into(),
+                                crate::document_automation::DocumentExtractionRead::TextContent,
+                            ),
+                        ],
+                    ),
+                ),
+                DocumentControlAutomationKind::Extract,
+                false,
+            ),
+            (
+                DocumentAutomationOperation::Fill {
+                    selector: "input".into(),
+                    value: "value".into(),
+                },
+                DocumentControlAutomationKind::Fill,
+                true,
+            ),
+            (
+                DocumentAutomationOperation::Activate {
+                    selector: "button".into(),
+                },
+                DocumentControlAutomationKind::Activate,
+                true,
+            ),
+        ] {
+            assert_eq!(
+                DocumentControlAutomationKind::from_operation(&operation),
+                expected
+            );
+            assert_eq!(expected.is_mutating(), mutating);
+            assert_eq!(operation.may_mutate_document(), mutating);
+        }
+    }
+
+    #[test]
     fn token_issuance_rejects_ready_parser_and_navigation_phases() {
         for phase in [
             PendingParserPhase::Ready,
@@ -1757,6 +2531,21 @@ mod tests {
         assert_eq!(token.deadline(), deadline);
     }
 
+    #[test]
+    fn token_issuance_allows_required_rendering_bound_to_exact_now_scheduler_head() {
+        let mut pending = eligible_pending();
+        let deadline = pending.scheduler.next_deadline.unwrap();
+        pending.clock.now = deadline.deadline;
+        let mut pipeline = pending.rendering.pipelines()[0];
+        pipeline.document_update_required = true;
+        pending.rendering =
+            PendingRenderingObservation::new(Some(deadline), false, vec![pipeline]).unwrap();
+
+        let token =
+            DocumentAdvanceToken::new_internal(DocumentAdvanceTokenId::new(1), &pending).unwrap();
+        assert_eq!(token.deadline(), deadline);
+    }
+
     fn completed_outcome(
         action: DocumentControlAction,
         pending: RawPendingSnapshot,
@@ -1764,6 +2553,156 @@ mod tests {
         DocumentControlOutcome::Completed(Box::new(
             DocumentControlObservation::new_internal(action, Box::new(pending), None).unwrap(),
         ))
+    }
+
+    fn automation_completed_outcome(
+        operation: DocumentControlAutomationKind,
+        result: DocumentAutomationResult,
+        pending: RawPendingSnapshot,
+    ) -> DocumentControlOutcome {
+        DocumentControlOutcome::AutomationCompleted {
+            result,
+            observation: Box::new(
+                DocumentControlObservation::new_internal(
+                    DocumentControlAction::Automated(operation),
+                    Box::new(pending),
+                    None,
+                )
+                .unwrap(),
+            ),
+        }
+    }
+
+    #[test]
+    fn automation_completion_binds_action_result_target_and_generation() {
+        let command = automation_command(DocumentAutomationOperation::TextContent {
+            selector: "#status".into(),
+        });
+        let completed = automation_completed_outcome(
+            DocumentControlAutomationKind::TextContent,
+            DocumentAutomationResult::TextContent {
+                value: "ready".into(),
+            },
+            eligible_pending(),
+        );
+        completed.validate_for_command(&command).unwrap();
+
+        let wrong_action = automation_completed_outcome(
+            DocumentControlAutomationKind::QueryCount,
+            DocumentAutomationResult::QueryCount { count: 1 },
+            eligible_pending(),
+        );
+        assert!(matches!(
+            wrong_action.validate_for_command(&command),
+            Err(DocumentControlOutcomeInvariantError::AutomationOperationMismatch { .. })
+        ));
+
+        let wrong_result = automation_completed_outcome(
+            DocumentControlAutomationKind::TextContent,
+            DocumentAutomationResult::QueryCount { count: 1 },
+            eligible_pending(),
+        );
+        assert!(matches!(
+            wrong_result.validate_for_command(&command),
+            Err(DocumentControlOutcomeInvariantError::AutomationResultMismatch { .. })
+        ));
+
+        let mut changed_target = eligible_pending();
+        changed_target.target.navigation_revision = PendingNavigationRevision::new(4);
+        let changed_target = automation_completed_outcome(
+            DocumentControlAutomationKind::TextContent,
+            DocumentAutomationResult::TextContent {
+                value: "ready".into(),
+            },
+            changed_target,
+        );
+        assert!(matches!(
+            changed_target.validate_for_command(&command),
+            Err(DocumentControlOutcomeInvariantError::AutomationTargetMismatch { .. })
+        ));
+
+        let mut regressed = eligible_pending();
+        regressed.state_generation = RuntimeStateGeneration::new(8);
+        let regressed = automation_completed_outcome(
+            DocumentControlAutomationKind::TextContent,
+            DocumentAutomationResult::TextContent {
+                value: "ready".into(),
+            },
+            regressed,
+        );
+        assert!(matches!(
+            regressed.validate_for_command(&command),
+            Err(DocumentControlOutcomeInvariantError::AutomationStateGenerationRegressed { .. })
+        ));
+
+        let DocumentControlCommand::Automate(request) = &command else {
+            unreachable!();
+        };
+        let read_only_indeterminate = DocumentControlOutcome::AutomationOutcomeIndeterminate {
+            target: Box::new(request.target().clone()),
+            operation: DocumentControlAutomationKind::TextContent,
+        };
+        assert!(matches!(
+            read_only_indeterminate.validate_for_command(&command),
+            Err(
+                DocumentControlOutcomeInvariantError::ReadOnlyAutomationIndeterminate {
+                    operation: DocumentControlAutomationKind::TextContent,
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn standalone_automation_outcomes_validate_action_result_and_mutability() {
+        let wrong_result = automation_completed_outcome(
+            DocumentControlAutomationKind::TextContent,
+            DocumentAutomationResult::QueryCount { count: 1 },
+            eligible_pending(),
+        );
+        assert!(matches!(
+            wrong_result.validate(),
+            Err(
+                DocumentControlOutcomeInvariantError::AutomationResultMismatch {
+                    expected: DocumentControlAutomationKind::TextContent,
+                }
+            )
+        ));
+
+        let wrong_action = DocumentControlOutcome::AutomationCompleted {
+            result: DocumentAutomationResult::TextContent {
+                value: "ready".into(),
+            },
+            observation: Box::new(
+                DocumentControlObservation::new_internal(
+                    DocumentControlAction::Observed,
+                    Box::new(eligible_pending()),
+                    None,
+                )
+                .unwrap(),
+            ),
+        };
+        assert!(matches!(
+            wrong_action.validate(),
+            Err(
+                DocumentControlOutcomeInvariantError::CompletedActionMismatch {
+                    command: DocumentControlCommandKind::Automate,
+                    observed: DocumentControlAction::Observed,
+                }
+            )
+        ));
+
+        let read_only_indeterminate = DocumentControlOutcome::AutomationOutcomeIndeterminate {
+            target: Box::new(eligible_pending().target),
+            operation: DocumentControlAutomationKind::TextContent,
+        };
+        assert!(matches!(
+            read_only_indeterminate.validate(),
+            Err(
+                DocumentControlOutcomeInvariantError::ReadOnlyAutomationIndeterminate {
+                    operation: DocumentControlAutomationKind::TextContent,
+                }
+            )
+        ));
     }
 
     #[test]
@@ -1970,6 +2909,17 @@ mod tests {
             )
         );
 
+        let bootstrap = DocumentControlCommand::BootstrapInitialPipeline {
+            pipeline_id: TEST_PIPELINE_ID,
+        };
+        let (_response, receiver) = cancellable_receiver(&bootstrap, &cancellations);
+        assert_eq!(
+            receiver.recv_timeout(Duration::ZERO),
+            DocumentControlReceiveOutcome::DriveOneTurnOutcomeIndeterminate(
+                DocumentControlTransportFailure::TimedOut
+            )
+        );
+
         let token = token();
         let command = DocumentControlCommand::AdvanceTo(Box::new(token.clone()));
         let (_response, receiver) = cancellable_receiver(&command, &cancellations);
@@ -1984,7 +2934,102 @@ mod tests {
             ) if token_id == token.id() && *target == *token.target() &&
                 deadline == token.deadline()
         ));
-        assert_eq!(cancellations.load(Ordering::SeqCst), 3);
+        assert_eq!(cancellations.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn receiver_distinguishes_read_only_and_mutating_automation_failure() {
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let read_only = automation_command(DocumentAutomationOperation::TextContent {
+            selector: "#status".into(),
+        });
+        let (_response, receiver) = cancellable_receiver(&read_only, &cancellations);
+        assert_eq!(
+            receiver.recv_timeout(Duration::ZERO),
+            DocumentControlReceiveOutcome::AutomationTransportFailure(
+                DocumentControlTransportFailure::TimedOut
+            )
+        );
+
+        let mutating = automation_command(DocumentAutomationOperation::Activate {
+            selector: "#start".into(),
+        });
+        let (_response, receiver) = cancellable_receiver(&mutating, &cancellations);
+        let DocumentControlCommand::Automate(request) = &mutating else {
+            unreachable!();
+        };
+        assert!(matches!(
+            receiver.recv_timeout(Duration::ZERO),
+            DocumentControlReceiveOutcome::CommandOutcome(
+                DocumentControlOutcome::AutomationOutcomeIndeterminate {
+                    target,
+                    operation: DocumentControlAutomationKind::Activate,
+                }
+            ) if *target == request.target().clone()
+        ));
+        assert_eq!(cancellations.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn mutating_automation_capture_and_post_mutation_errors_cannot_be_definitive() {
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let activate = automation_command(DocumentAutomationOperation::Activate {
+            selector: "#start".into(),
+        });
+        let capture_rejection = DocumentControlOutcome::Rejected(
+            DocumentControlError::PendingFactUnavailable(DocumentPendingFact::Rendering),
+        );
+        assert!(matches!(
+            capture_rejection.validate_for_command(&activate),
+            Err(
+                DocumentControlOutcomeInvariantError::PendingCaptureRejectionForMutatingCommand {
+                    command: DocumentControlCommandKind::Automate,
+                    ..
+                }
+            )
+        ));
+        let (response, receiver) = cancellable_receiver(&activate, &cancellations);
+        response.send(capture_rejection).unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            DocumentControlReceiveOutcome::CommandOutcome(
+                DocumentControlOutcome::AutomationOutcomeIndeterminate {
+                    operation: DocumentControlAutomationKind::Activate,
+                    ..
+                }
+            )
+        ));
+
+        let fill = automation_command(DocumentAutomationOperation::Fill {
+            selector: "#name".into(),
+            value: "Ada".into(),
+        });
+        let mutation_rejection = DocumentControlOutcome::Rejected(
+            DocumentControlError::Automation(DocumentAutomationError::DomOperationFailed {
+                operation: DocumentAutomationOperationKind::Fill,
+            }),
+        );
+        assert!(matches!(
+            mutation_rejection.validate_for_command(&fill),
+            Err(
+                DocumentControlOutcomeInvariantError::AutomationMutationRejection {
+                    operation: DocumentControlAutomationKind::Fill,
+                    ..
+                }
+            )
+        ));
+        let (response, receiver) = cancellable_receiver(&fill, &cancellations);
+        response.send(mutation_rejection).unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            DocumentControlReceiveOutcome::CommandOutcome(
+                DocumentControlOutcome::AutomationOutcomeIndeterminate {
+                    operation: DocumentControlAutomationKind::Fill,
+                    ..
+                }
+            )
+        ));
+        assert_eq!(cancellations.load(Ordering::SeqCst), 2);
     }
 
     #[test]

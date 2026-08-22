@@ -8220,6 +8220,7 @@ dependencies = [
  "servo-net-traits",
  "servo-paint-api",
  "servo-profile-traits",
+ "servo-timers",
  "servo-tracing",
  "servo-url",
  "servo_arc",
@@ -9789,13 +9790,16 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stasis-shell"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "dpi",
  "rustls",
  "serde",
  "serde_json",
  "servo",
+ "servo-base",
+ "servo-embedder-traits",
+ "servo-timers",
  "url",
 ]
 

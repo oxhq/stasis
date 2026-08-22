@@ -40,7 +40,7 @@ where
         owner: &GlobalScope,
         id: NamespaceIndex<Self::Index>,
         serialized: Self::Data,
-    ) -> Result<DomRoot<Self>, ()>;
+    ) -> Fallible<DomRoot<Self>>;
 
     fn serialized_storage<'a>(
         data: StructuredData<'a, '_>,

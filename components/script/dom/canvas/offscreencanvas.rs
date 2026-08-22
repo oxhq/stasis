@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
@@ -14,7 +14,6 @@ use js::rust::{HandleObject, HandleValue};
 use pixels::{EncodedImageType, Snapshot};
 use rustc_hash::FxHashMap;
 use script_bindings::cell::{DomRefCell, Ref};
-#[cfg(feature = "webgl")]
 use script_bindings::inheritance::Castable;
 #[cfg(feature = "webgl")]
 use script_bindings::reflector::DomObject;
@@ -34,6 +33,7 @@ use crate::dom::bindings::codegen::Bindings::OffscreenCanvasBinding::{
 };
 #[cfg(feature = "webgl")]
 use crate::dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::WebGLContextAttributes;
+use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::codegen::UnionTypes::HTMLCanvasElementOrOffscreenCanvas as RootedHTMLCanvasElementOrOffscreenCanvas;
 #[cfg(feature = "webgl")]
 use crate::dom::bindings::conversions::ConversionResult;
@@ -44,6 +44,7 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::bindings::transferable::Transferable;
 use crate::dom::blob::Blob;
+use crate::dom::document::WindowOffscreenCanvasRegistration;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmlcanvaselement::HTMLCanvasElement;
@@ -52,7 +53,8 @@ use crate::dom::imagebitmaprenderingcontext::ImageBitmapRenderingContext;
 use crate::dom::offscreencanvasrenderingcontext2d::OffscreenCanvasRenderingContext2D;
 use crate::dom::promise::Promise;
 #[cfg(feature = "webgl")]
-use crate::dom::types::{WebGLRenderingContext, Window};
+use crate::dom::types::WebGLRenderingContext;
+use crate::dom::types::Window;
 #[cfg(feature = "webgl")]
 use crate::dom::webgl::webgl2renderingcontext::WebGL2RenderingContext;
 
@@ -71,6 +73,12 @@ pub(crate) struct OffscreenCanvas {
 
     /// <https://html.spec.whatwg.org/multipage/#offscreencanvas-placeholder>
     placeholder: Option<WeakRef<HTMLCanvasElement>>,
+
+    /// Exact Window-document live-inventory authority. Worker/worklet owners are gated by their
+    /// own pending-runtime observations and therefore intentionally have no registration here.
+    #[no_trace]
+    #[ignore_malloc_size_of = "Passive shared counter registration"]
+    window_registration: RefCell<Option<WindowOffscreenCanvasRegistration>>,
 }
 
 impl OffscreenCanvas {
@@ -78,6 +86,7 @@ impl OffscreenCanvas {
         width: u64,
         height: u64,
         placeholder: Option<WeakRef<HTMLCanvasElement>>,
+        window_registration: Option<WindowOffscreenCanvasRegistration>,
     ) -> OffscreenCanvas {
         OffscreenCanvas {
             eventtarget: EventTarget::new_inherited(),
@@ -85,6 +94,7 @@ impl OffscreenCanvas {
             height: Cell::new(height),
             context: DomRefCell::new(None),
             placeholder,
+            window_registration: RefCell::new(window_registration),
         }
     }
 
@@ -96,9 +106,17 @@ impl OffscreenCanvas {
         height: u64,
         placeholder: Option<WeakRef<HTMLCanvasElement>>,
     ) -> DomRoot<OffscreenCanvas> {
+        let window_registration = global
+            .downcast::<Window>()
+            .map(|window| window.Document().register_window_offscreen_canvas());
         reflect_dom_object_with_proto(
             cx,
-            Box::new(OffscreenCanvas::new_inherited(width, height, placeholder)),
+            Box::new(OffscreenCanvas::new_inherited(
+                width,
+                height,
+                placeholder,
+                window_registration,
+            )),
             global,
             proto,
         )
@@ -320,6 +338,10 @@ impl Transferable for OffscreenCanvas {
 
         // Step 2. Set value's context mode to detached.
         *self.context.safe_borrow_mut(cx.no_gc()) = Some(OffscreenRenderingContext::Detached);
+        // A detached Window object can no longer mutate its bitmap. Its transfer receiver is
+        // registered independently if the new owner is another Window; worker/worklet ownership
+        // is handled by the separate worker/worklet control gate.
+        self.window_registration.borrow_mut().take();
 
         // Step 3. Let width and height be the dimensions of value's bitmap.
         // Step 5. Unset value's bitmap.
@@ -349,7 +371,7 @@ impl Transferable for OffscreenCanvas {
         owner: &GlobalScope,
         _: OffscreenCanvasId,
         transferred: TransferableOffscreenCanvas,
-    ) -> Result<DomRoot<Self>, ()> {
+    ) -> Fallible<DomRoot<Self>> {
         // Step 1. Initialize value's bitmap to a rectangular array of
         // transparent black pixels with width given by dataHolder.[[Width]] and
         // height given by dataHolder.[[Height]].

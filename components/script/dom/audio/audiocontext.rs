@@ -118,6 +118,7 @@ impl AudioContextMethods<crate::DomTypeHolder> for AudioContext {
         proto: Option<HandleObject>,
         options: &AudioContextOptions,
     ) -> Fallible<DomRoot<AudioContext>> {
+        window.as_global_scope().require_native_media()?;
         AudioContext::new(cx, window, proto, options)
     }
 

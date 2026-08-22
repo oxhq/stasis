@@ -213,6 +213,9 @@ impl URLMethods<crate::DomTypeHolder> for URL {
             url.fragment().is_none() &&
             let Ok(id) = parse_blob_url(&url)
         {
+            if global.require_resource_thread_io().is_err() {
+                return;
+            }
             let resource_threads = global.resource_threads();
             let (tx, rx) = generic_channel::channel(global.time_profiler_chan().clone()).unwrap();
             let msg = FileManagerThreadMsg::RevokeBlobURL(id, origin, tx);

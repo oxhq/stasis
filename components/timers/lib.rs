@@ -187,8 +187,8 @@ fn checked_javascript_date_time_microseconds(
     for anchor in [exact_candidate_microseconds, millisecond_anchor] {
         for candidate in [anchor, f64_next_down(anchor), f64_next_up(anchor)] {
             let observed_time_clip = simulated_javascript_date_time_clip(candidate);
-            if !observed_time_clip.is_finite()
-                || observed_time_clip as i128 != expected_milliseconds
+            if !observed_time_clip.is_finite() ||
+                observed_time_clip as i128 != expected_milliseconds
             {
                 continue;
             }
@@ -283,6 +283,14 @@ pub enum DocumentTimeSurface {
     CrossEventLoopNavigation,
     /// An auxiliary WebView that would share or replace a controlled event-loop authority.
     AuxiliaryWebView,
+    /// Resource-thread I/O whose callback or blocking lifecycle is not yet controlled.
+    ResourceThreadIo,
+    /// An externally-driven subscription whose lifecycle is not yet controlled.
+    ExternalSubscription,
+    /// A native media backend or callback lifecycle that is not yet controlled.
+    NativeMedia,
+    /// An embedder-owned control or dialog lifecycle that is not yet controlled.
+    EmbedderControl,
 }
 
 impl DocumentTimeSurface {
@@ -305,6 +313,10 @@ impl DocumentTimeSurface {
             11 => Some(Self::CrossEventLoopIframe),
             12 => Some(Self::CrossEventLoopNavigation),
             13 => Some(Self::AuxiliaryWebView),
+            14 => Some(Self::ResourceThreadIo),
+            15 => Some(Self::ExternalSubscription),
+            16 => Some(Self::NativeMedia),
+            17 => Some(Self::EmbedderControl),
             _ => None,
         }
     }
@@ -692,15 +704,15 @@ impl DocumentClock {
     /// this clock. Declaring a future surface early would let a controlled page leak host time
     /// without leaving fail-closed evidence.
     pub fn require_surface(&self, surface: DocumentTimeSurface) -> Result<(), DocumentClockError> {
-        if !self.is_controlled()
-            || matches!(
+        if !self.is_controlled() ||
+            matches!(
                 surface,
-                DocumentTimeSurface::WindowTimers
-                    | DocumentTimeSurface::JavaScriptDate
-                    | DocumentTimeSurface::Performance
-                    | DocumentTimeSurface::UpdateRendering
-                    | DocumentTimeSurface::AnimationFrame
-                    | DocumentTimeSurface::DocumentTimeline
+                DocumentTimeSurface::WindowTimers |
+                    DocumentTimeSurface::JavaScriptDate |
+                    DocumentTimeSurface::Performance |
+                    DocumentTimeSurface::UpdateRendering |
+                    DocumentTimeSurface::AnimationFrame |
+                    DocumentTimeSurface::DocumentTimeline
             )
         {
             Ok(())
@@ -1318,8 +1330,8 @@ impl DocumentProducerObserver {
         if checkpoint == DocumentProducerCheckpoint::ZERO {
             return Err(DocumentProducerFenceError::CheckpointNotCompleted);
         }
-        if let Some(previous) = self.last_checkpoint
-            && checkpoint <= previous
+        if let Some(previous) = self.last_checkpoint &&
+            checkpoint <= previous
         {
             return Err(DocumentProducerFenceError::StaleCheckpoint {
                 previous,
@@ -3097,6 +3109,28 @@ mod tests {
     }
 
     #[test]
+    fn controlled_resource_thread_io_is_sticky_and_realtime_is_unchanged() {
+        let controlled = controlled_clock(0);
+        assert_eq!(
+            controlled.require_surface(DocumentTimeSurface::ResourceThreadIo),
+            Err(DocumentClockError::UnsupportedSurface(
+                DocumentTimeSurface::ResourceThreadIo,
+            ))
+        );
+        assert_eq!(
+            controlled.unsupported_surface(),
+            Some(DocumentTimeSurface::ResourceThreadIo)
+        );
+
+        let realtime = DocumentClock::default();
+        assert_eq!(
+            realtime.require_surface(DocumentTimeSurface::ResourceThreadIo),
+            Ok(())
+        );
+        assert_eq!(realtime.unsupported_surface(), None);
+    }
+
+    #[test]
     fn sticky_clock_terminal_rejects_new_and_already_due_timer_callbacks() {
         let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
             initial_time_ns: 0,
@@ -3236,6 +3270,10 @@ mod tests {
             DocumentTimeSurface::CrossEventLoopIframe,
             DocumentTimeSurface::CrossEventLoopNavigation,
             DocumentTimeSurface::AuxiliaryWebView,
+            DocumentTimeSurface::ResourceThreadIo,
+            DocumentTimeSurface::ExternalSubscription,
+            DocumentTimeSurface::NativeMedia,
+            DocumentTimeSurface::EmbedderControl,
         ]
         .into_iter()
         .enumerate()

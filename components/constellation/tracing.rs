@@ -178,7 +178,7 @@ mod from_script {
                 Self::ScriptLoadedURLInIFrame(..) => target!("ScriptLoadedURLInIFrame"),
                 Self::ScriptNewIFrame(..) => target!("ScriptNewIFrame"),
                 Self::CreateAuxiliaryWebView(..) => target!("ScriptNewAuxiliary"),
-                Self::ActivateDocument => target!("ActivateDocument"),
+                Self::ActivateDocument(..) => target!("ActivateDocument"),
                 Self::SetFinalUrl(..) => target!("SetFinalUrl"),
                 Self::LogEntry(..) => target!("LogEntry"),
                 Self::DiscardDocument => target!("DiscardDocument"),

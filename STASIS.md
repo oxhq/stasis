@@ -24,12 +24,21 @@ boundary.
 Current status:
 
 - Servo base and Pliego donor revisions are pinned in `STASIS_UPSTREAM.toml`.
-- `ports/stasis` provides the first wake-driven embedded baseline over NDJSON:
-  `protocol.initialize`, `session.open`, `dom.evaluate`, and `session.close`.
-  Its owner-loop progress contains no polling sleeps; this is not a claim about
-  every shutdown path inherited from upstream Servo.
-- Controlled time, pending-work snapshots, settlement, actions, and the
-  TypeScript SDK are not claimed by this baseline yet.
+- `ports/stasis` ships the `v0.1.0-alpha.0` wake-driven NDJSON runtime. Real
+  sessions support initialization, open, evaluation, and close. Controlled
+  sessions add exact pending-work snapshots, bounded settlement and virtual
+  advancement, generation-bound activation and text inspection, and
+  cancellation.
+- Controlled document time covers DOM timers, `Date`, Performance, rAF, and
+  the document timeline inside the alpha's audited single-top-level-document
+  support boundary. Unsupported or open-ended work is reported as a typed
+  outcome instead of silently falling back to uncontrolled progress.
+- `sdk/typescript` provides the matching `@oxhq/stasis` client, while the
+  release workflows bind the SDK and native archive to one source revision and
+  verify the act-settle-inspect fixture before promotion.
+- The owner-loop progress path contains no polling sleeps; this is not a claim
+  about every shutdown path inherited from upstream Servo. The exact shipped
+  methods and exclusions are defined in `docs/stasis/protocol-v1.md`.
 
 See:
 

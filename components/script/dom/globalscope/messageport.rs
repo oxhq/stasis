@@ -16,7 +16,7 @@ use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue};
 use rustc_hash::FxHashMap;
 use script_bindings::reflector::reflect_weak_referenceable_dom_object;
 use servo_base::id::{MessagePortId, MessagePortIndex};
-use servo_constellation_traits::{MessagePortImpl, PortMessageTask};
+use servo_constellation_traits::{MessagePortImpl, PortMessageTask, ScriptToConstellationMessage};
 
 use crate::dom::bindings::codegen::Bindings::EventHandlerBinding::EventHandlerNonNull;
 use crate::dom::bindings::codegen::Bindings::MessagePortBinding::{
@@ -258,6 +258,8 @@ impl Transferable for MessagePort {
             return Err(Error::DataClone(None));
         }
 
+        self.global().require_external_subscription()?;
+
         self.detached.set(true);
         let id = self.message_port_id();
 
@@ -273,7 +275,9 @@ impl Transferable for MessagePort {
         owner: &GlobalScope,
         id: MessagePortId,
         port_impl: MessagePortImpl,
-    ) -> Result<DomRoot<Self>, ()> {
+    ) -> Fallible<DomRoot<Self>> {
+        require_transfer_receive_admission(owner, [(id, &port_impl)])?;
+
         let transferred_port =
             MessagePort::new_transferred(cx, owner, id, port_impl.entangled_port_id());
         owner.track_message_port(&transferred_port, Some(port_impl));
@@ -286,6 +290,111 @@ impl Transferable for MessagePort {
         match data {
             StructuredData::Reader(r) => &mut r.port_impls,
             StructuredData::Writer(w) => &mut w.ports,
+        }
+    }
+}
+
+/// Require admission for incoming transfer data that owns one or more in-flight ports.
+///
+/// The sender detached each port and marked it as transferred before the receiver reached these
+/// steps. If this realm cannot admit the asynchronous subscription, every owned port must still be
+/// disposed so the constellation cannot retain it in `TransferInProgress` indefinitely.
+pub(crate) fn require_transfer_receive_admission<const N: usize>(
+    owner: &GlobalScope,
+    ports: [(MessagePortId, &MessagePortImpl); N],
+) -> Fallible<()> {
+    if let Err(error) = owner.require_external_subscription() {
+        send_rejected_transfer_cleanup_messages(owner, rejected_transfer_cleanup_messages(ports));
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(crate) fn send_rejected_transfer_cleanup_messages(
+    owner: &GlobalScope,
+    messages: impl IntoIterator<Item = ScriptToConstellationMessage>,
+) {
+    for message in messages {
+        // Continue through the entire owned set even if the constellation channel is already gone.
+        let _ = owner.script_to_constellation_chan().send(message);
+    }
+}
+
+fn rejected_transfer_cleanup_messages<const N: usize>(
+    ports: [(MessagePortId, &MessagePortImpl); N],
+) -> [ScriptToConstellationMessage; N] {
+    ports.map(|(id, port_impl)| rejected_transfer_cleanup_message(id, port_impl))
+}
+
+pub(crate) fn rejected_transfer_cleanup_message(
+    id: MessagePortId,
+    port_impl: &MessagePortImpl,
+) -> ScriptToConstellationMessage {
+    ScriptToConstellationMessage::DisentanglePorts(id, port_impl.entangled_port_id())
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use servo_base::id::{Index, MessagePortId, MessagePortIndex, PipelineNamespaceId};
+    use servo_constellation_traits::{MessagePortImpl, ScriptToConstellationMessage};
+
+    use super::{rejected_transfer_cleanup_message, rejected_transfer_cleanup_messages};
+
+    fn message_port_id(index: u32) -> MessagePortId {
+        MessagePortId {
+            namespace_id: PipelineNamespaceId(7),
+            index: Index::<MessagePortIndex>::new(index).unwrap(),
+        }
+    }
+
+    #[test]
+    fn rejected_incoming_transfer_disentangles_initiator_and_peer() {
+        let transferred = message_port_id(1);
+        let peer = message_port_id(2);
+        let mut port_impl = MessagePortImpl::new(transferred);
+        port_impl.entangle(peer);
+
+        match rejected_transfer_cleanup_message(transferred, &port_impl) {
+            ScriptToConstellationMessage::DisentanglePorts(actual, Some(actual_peer)) => {
+                assert_eq!(actual, transferred);
+                assert_eq!(actual_peer, peer);
+            },
+            _ => panic!("rejected transfer must dispose of the in-flight port and its peer"),
+        }
+    }
+
+    #[test]
+    fn rejected_transform_stream_transfer_cleans_both_embedded_ports() {
+        let readable = message_port_id(1);
+        let readable_peer = message_port_id(2);
+        let writable = message_port_id(3);
+        let writable_peer = message_port_id(4);
+
+        let mut readable_impl = MessagePortImpl::new(readable);
+        readable_impl.entangle(readable_peer);
+        let mut writable_impl = MessagePortImpl::new(writable);
+        writable_impl.entangle(writable_peer);
+
+        let [readable_cleanup, writable_cleanup] = rejected_transfer_cleanup_messages([
+            (readable, &readable_impl),
+            (writable, &writable_impl),
+        ]);
+
+        assert_cleanup_message(readable_cleanup, readable, readable_peer);
+        assert_cleanup_message(writable_cleanup, writable, writable_peer);
+    }
+
+    fn assert_cleanup_message(
+        message: ScriptToConstellationMessage,
+        expected_port: MessagePortId,
+        expected_peer: MessagePortId,
+    ) {
+        match message {
+            ScriptToConstellationMessage::DisentanglePorts(port, Some(peer)) => {
+                assert_eq!(port, expected_port);
+                assert_eq!(peer, expected_peer);
+            },
+            _ => panic!("rejected transfer must dispose of each in-flight port and its peer"),
         }
     }
 }

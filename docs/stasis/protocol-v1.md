@@ -38,42 +38,77 @@ not automatically retry an indeterminate effect.
 spawned -> initialized -> session_open -> closing -> exited
 ```
 
-`protocol.initialize` is the first request. `session.open` succeeds once.
+`protocol.initialize` is the first request. For `v0.1.0-alpha.0`, it identifies
+the native implementation as `stasis-shell` version `0.1.0-alpha.0`, binds the
+exact Stasis source revision and the Servo/Pliego pins from
+`STASIS_UPSTREAM.toml`, and names the source repository as
+`https://github.com/oxhq/stasis.git`. The matching npm client is
+`@oxhq/stasis@0.1.0-alpha.0`; the npm name is not the native implementation
+name. `session.open` succeeds once.
 `session.close` is terminal and its response is the last frame before EOF.
 Unexpected process exit rejects all pending SDK operations.
 
-The baseline implemented in `ports/stasis` currently supports tagged JavaScript
-values and these methods:
+The `v0.1.0-alpha.0` baseline implemented in `ports/stasis` advertises exactly
+these methods:
 
 ```text
 protocol.initialize
 session.open
 dom.evaluate
+runtime.pending
+runtime.settle
+runtime.advance_to_next
+action.activate
+dom.text
+protocol.cancel
 session.close
 ```
 
-It intentionally advertises only those capabilities. The planned release-v1
-surface is:
+The session clock mode is immutable:
 
-| Area | Methods |
-| --- | --- |
-| Lifecycle | `protocol.initialize`, `protocol.cancel`, `session.open`, `session.close` |
-| Navigation | `document.navigate` |
-| Runtime | `runtime.pending`, `runtime.settle`, `runtime.advance`, `runtime.advance_to_next` |
-| DOM | `dom.evaluate`, `dom.query`, `dom.text`, `dom.html`, `dom.extract` |
-| Actions | `action.fill`, `action.activate`, `action.click` |
-| Artifacts | `artifact.screenshot`, `journal.export` |
+- `session.open {"url": ...}` selects Real mode, blocks through ordinary load
+  completion, and permits `dom.evaluate`.
+- Controlled mode uses the flat open shape
+  `{"url": ..., "clockMode":"controlled", "initialVirtualTimeNs":"0",
+  "unixTimeOriginNs":"0"}`. Both time fields default to zero when omitted.
+  It enables `runtime.pending`, `runtime.settle`,
+  `runtime.advance_to_next`, `action.activate`, and `dom.text`.
+- Controlled runtime, action, and native DOM methods reject Real sessions with
+  `controlled_clock_required`. `dom.evaluate` rejects Controlled sessions
+  because it is a blocking Real-mode helper.
+
+The `v0.1.0-alpha.0` Controlled open bootstrap is limited to an audited,
+fetch-backed top-level `http:` or `https:` navigation. The shell may submit
+exactly one dedicated internal bootstrap command for the validated root
+`SpawnPipeline` event before returning `controlled_ready`; ordinary runtime
+drives cannot authorize that transition. This boundary establishes controlled
+event-loop authority but does not promise an active DOM. `runtime.settle`
+subsequently waits for resource input and drives the correlated navigation
+response that activates the document; action or DOM methods issued earlier can
+be definitively rejected as not yet actionable.
+Synchronous `about:blank`, `srcdoc`, `javascript:` result documents, iframe
+bootstrap, multiple candidate pipelines, and an already-active document are
+not eligible for that bootstrap path; clients must not assume those inputs are
+supported by Controlled `session.open` in this release.
+
+`action.activate` and `dom.text` require a canonical decimal-string
+`expectedGeneration`. The shell first performs a passive Observe, binds the
+client data to that private target authority, and then submits one native
+operation. Mutating activation is never retried when its outcome is
+indeterminate. `dom.query`, `dom.extract`, fill, navigation, and artifact
+methods are not advertised in this alpha baseline.
 
 The conditional advance token never crosses NDJSON. Each public advance asks
 the engine to observe, mint, validate, and consume a fresh single-use token.
 
 ## Concurrency
 
-Version 0.1 serializes ordinary engine commands and permits one active engine
-request. A dedicated stdin/control lane must remain live while settlement waits
-on external I/O. Cancellation is cooperative, never rolls back page effects,
-and cannot preempt JavaScript already executing synchronously.
+Protocol v1 in `v0.1.0-alpha.0` serializes ordinary engine commands and permits
+one active engine request. A dedicated stdin/control lane must remain live while
+settlement waits on external I/O. Cancellation is cooperative, never rolls back
+page effects, and cannot preempt JavaScript already executing synchronously.
 
-The planned v1 transport for large HTML, extraction results, screenshots, and
-journals uses session-owned filesystem artifacts with media type, byte length,
-and SHA-256 metadata instead of base64 frames.
+A future extension may transport large HTML, extraction results, screenshots,
+and journals through session-owned filesystem artifacts with media type, byte
+length, and SHA-256 metadata instead of base64 frames. Those methods are not
+part of `v0.1.0-alpha.0`.

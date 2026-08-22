@@ -6,6 +6,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::mem;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
 use base64::engine::general_purpose;
@@ -121,6 +122,11 @@ pub(crate) use html::serialize_html_fragment;
 /// ```
 pub(crate) struct ServoParser {
     reflector: Reflector,
+    /// Process-lifetime identity of this exact parser owner. This is deliberately independent of
+    /// pipeline identity so a replacement parser cannot inherit pending-state authority from the
+    /// parser object it replaced.
+    #[no_trace]
+    owner_id: ServoParserId,
     /// The document associated with this parser.
     document: Dom<Document>,
     /// The decoder used for the network input.
@@ -163,6 +169,28 @@ pub(crate) struct ServoParser {
     // The whole input as a string, if needed for the devtools Sources panel.
     // TODO: use a faster type for concatenating strings?
     content_for_devtools: Option<DomRefCell<String>>,
+}
+
+/// Process-lifetime identity of one exact [`ServoParser`] object.
+#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ServoParserId(u64);
+
+impl ServoParserId {
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+static NEXT_SERVO_PARSER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_servo_parser_id() -> ServoParserId {
+    let id = NEXT_SERVO_PARSER_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("process-lifetime ServoParser owner IDs exhausted");
+    debug_assert_ne!(id, 0);
+    ServoParserId(id)
 }
 
 pub(crate) struct ElementAttribute {
@@ -444,6 +472,11 @@ impl ServoParser {
         )
     }
 
+    /// Return the stable identity of this exact live parser owner.
+    pub(crate) const fn pending_owner_id(&self) -> ServoParserId {
+        self.owner_id
+    }
+
     /// Corresponds to the latter part of the "Otherwise" branch of the 'An end
     /// tag whose tag name is "script"' of
     /// <https://html.spec.whatwg.org/multipage/#parsing-main-incdata>
@@ -597,6 +630,7 @@ impl ServoParser {
 
         ServoParser {
             reflector: Reflector::new(),
+            owner_id: next_servo_parser_id(),
             document: Dom::from_ref(document),
             network_decoder: DomRefCell::new(NetworkDecoderState::new(
                 encoding_hint_from_content_type,
@@ -696,7 +730,10 @@ impl ServoParser {
         // suggests that no content should be preloaded in such a case.
         // We're conservative, and only prefetch for documents
         // with browsing contexts.
-        self.document.browsing_context().is_some()
+        parser_prefetch_permitted(
+            self.document.browsing_context().is_some(),
+            self.document.global().document_clock().is_controlled(),
+        )
     }
 
     fn push_string_input_chunk(&self, chunk: String) {
@@ -867,6 +904,14 @@ impl ServoParser {
             ));
         }
     }
+}
+
+/// Speculative parser fetches have no response callback that can hold a document Resource ticket.
+/// They are only a cache optimization, so Controlled execution disables them and lets the ordinary
+/// script/image/stylesheet loader perform the producer-fenced request when the main parser reaches
+/// the element.
+const fn parser_prefetch_permitted(has_browsing_context: bool, controlled: bool) -> bool {
+    has_browsing_context && !controlled
 }
 
 struct FragmentParsingResult<I>
@@ -1710,6 +1755,24 @@ pub(crate) struct FragmentContext<'a> {
 mod pending_state_tests {
     use super::*;
 
+    #[test]
+    fn controlled_parser_disables_unfenced_speculative_fetches() {
+        assert!(parser_prefetch_permitted(true, false));
+        assert!(!parser_prefetch_permitted(true, true));
+        assert!(!parser_prefetch_permitted(false, false));
+        assert!(!parser_prefetch_permitted(false, true));
+    }
+
+    #[test]
+    fn parser_owner_ids_are_nonzero_monotonic_and_instance_distinguishing() {
+        let first = next_servo_parser_id();
+        let second = next_servo_parser_id();
+
+        assert_ne!(first.get(), 0);
+        assert_eq!(first.get().checked_add(1), Some(second.get()));
+        assert_ne!(first, second);
+    }
+
     fn state(
         script_created: bool,
         suspended: bool,
@@ -1748,12 +1811,8 @@ mod pending_state_tests {
         for suspended in [false, true] {
             for end_of_input_received in [false, true] {
                 for has_buffered_input in [false, true] {
-                    let observed = state(
-                        false,
-                        suspended,
-                        end_of_input_received,
-                        has_buffered_input,
-                    );
+                    let observed =
+                        state(false, suspended, end_of_input_received, has_buffered_input);
 
                     assert_eq!(observed.is_suspended(), suspended);
                     assert_eq!(observed.end_of_input_received(), end_of_input_received);
@@ -1796,7 +1855,11 @@ mod pending_state_tests {
         ]
         .map(|_ready_state| pending_state_from_flags(false, false, false, false, false, false));
 
-        assert!(observations.into_iter().all(|observation| observation.is_some()));
+        assert!(
+            observations
+                .into_iter()
+                .all(|observation| observation.is_some())
+        );
     }
 }
 

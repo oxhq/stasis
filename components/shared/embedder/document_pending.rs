@@ -613,6 +613,35 @@ impl PendingRuntimeTerminals {
         })
     }
 
+    /// Add independently captured per-pipeline timer terminals without discarding fixed owner
+    /// slots or timer terminals already supplied by another authority.
+    ///
+    /// The combined inventories are canonicalized and duplicate pipeline owners are rejected.
+    /// Consuming `self` keeps a failed merge transactional for callers assembling one snapshot.
+    pub fn with_additional_timer_terminals(
+        mut self,
+        logical_timers: Vec<PendingLogicalTimerTerminalObservation>,
+        image_timers: Vec<PendingImageTimerTerminalObservation>,
+    ) -> Result<Self, PendingSnapshotInvariantError> {
+        self.logical_timers.extend(logical_timers);
+        self.image_timers.extend(image_timers);
+        self.logical_timers
+            .sort_unstable_by_key(|terminal| terminal.pipeline_id);
+        self.image_timers
+            .sort_unstable_by_key(|terminal| terminal.pipeline_id);
+        validate_unique_terminal_pipelines(
+            &self.logical_timers,
+            |terminal| terminal.pipeline_id,
+            PendingSnapshotInvariantError::DuplicateLogicalTimerTerminal,
+        )?;
+        validate_unique_terminal_pipelines(
+            &self.image_timers,
+            |terminal| terminal.pipeline_id,
+            PendingSnapshotInvariantError::DuplicateImageTimerTerminal,
+        )?;
+        Ok(self)
+    }
+
     /// Return logical-timer terminals in canonical pipeline order.
     pub fn logical_timers(&self) -> &[PendingLogicalTimerTerminalObservation] {
         &self.logical_timers
@@ -625,20 +654,20 @@ impl PendingRuntimeTerminals {
 
     /// Return whether no independent runtime owner has latched a terminal.
     pub fn is_empty(&self) -> bool {
-        self.clock.is_none()
-            && self.target_time.is_none()
-            && self.outer_scheduler.is_none()
-            && self.producer.is_none()
-            && self.microtask.is_none()
-            && self.input_revision.is_none()
-            && self.source_id.is_none()
-            && self.logical_timers.is_empty()
-            && self.image_timers.is_empty()
-            && self.dom_generation.is_none()
-            && self.state_generation.is_none()
-            && self.navigation_revision.is_none()
-            && self.pipeline_membership_revision.is_none()
-            && self.source_epoch.is_none()
+        self.clock.is_none() &&
+            self.target_time.is_none() &&
+            self.outer_scheduler.is_none() &&
+            self.producer.is_none() &&
+            self.microtask.is_none() &&
+            self.input_revision.is_none() &&
+            self.source_id.is_none() &&
+            self.logical_timers.is_empty() &&
+            self.image_timers.is_empty() &&
+            self.dom_generation.is_none() &&
+            self.state_generation.is_none() &&
+            self.navigation_revision.is_none() &&
+            self.pipeline_membership_revision.is_none() &&
+            self.source_epoch.is_none()
     }
 
     fn validate(&self) -> Result<(), PendingSnapshotInvariantError> {
@@ -913,10 +942,10 @@ impl PendingProducerObservation {
                 return Err(PendingSnapshotInvariantError::ProducerPriorEmptyMissing);
             },
             (PendingProducerStability::StableEmpty, Some(prior)) => {
-                if prior.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
-                    || prior.microtask_checkpoint >= self.microtask_checkpoint
-                    || prior.checkpoint == DocumentProducerCheckpoint::ZERO
-                    || prior.checkpoint >= self.checkpoint
+                if prior.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO ||
+                    prior.microtask_checkpoint >= self.microtask_checkpoint ||
+                    prior.checkpoint == DocumentProducerCheckpoint::ZERO ||
+                    prior.checkpoint >= self.checkpoint
                 {
                     return Err(
                         PendingSnapshotInvariantError::ProducerPriorEmptyCheckpointMismatch,
@@ -938,8 +967,8 @@ impl PendingProducerObservation {
         }
         match self.stability {
             PendingProducerStability::NotCheckpointed => {
-                if self.checkpoint != DocumentProducerCheckpoint::ZERO
-                    || self.microtask_checkpoint != PendingMicrotaskCheckpoint::ZERO
+                if self.checkpoint != DocumentProducerCheckpoint::ZERO ||
+                    self.microtask_checkpoint != PendingMicrotaskCheckpoint::ZERO
                 {
                     return Err(PendingSnapshotInvariantError::ProducerCheckpointMismatch {
                         microtask_checkpoint: self.microtask_checkpoint,
@@ -949,8 +978,8 @@ impl PendingProducerObservation {
                 }
             },
             PendingProducerStability::Busy => {
-                if self.checkpoint == DocumentProducerCheckpoint::ZERO
-                    || self.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
+                if self.checkpoint == DocumentProducerCheckpoint::ZERO ||
+                    self.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
                 {
                     return Err(PendingSnapshotInvariantError::ProducerCheckpointMismatch {
                         microtask_checkpoint: self.microtask_checkpoint,
@@ -966,8 +995,8 @@ impl PendingProducerObservation {
                 }
             },
             PendingProducerStability::Unqualified => {
-                if self.checkpoint == DocumentProducerCheckpoint::ZERO
-                    || self.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
+                if self.checkpoint == DocumentProducerCheckpoint::ZERO ||
+                    self.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
                 {
                     return Err(PendingSnapshotInvariantError::ProducerCheckpointMismatch {
                         microtask_checkpoint: self.microtask_checkpoint,
@@ -977,8 +1006,8 @@ impl PendingProducerObservation {
                 }
             },
             PendingProducerStability::FirstEmpty | PendingProducerStability::StableEmpty => {
-                if self.checkpoint == DocumentProducerCheckpoint::ZERO
-                    || self.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
+                if self.checkpoint == DocumentProducerCheckpoint::ZERO ||
+                    self.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
                 {
                     return Err(PendingSnapshotInvariantError::ProducerCheckpointMismatch {
                         microtask_checkpoint: self.microtask_checkpoint,
@@ -1028,8 +1057,8 @@ fn validate_producer_snapshot_conservation(
     if snapshot.completed().checked_add(snapshot.pending()) != Some(snapshot.enqueued()) {
         return Err(PendingSnapshotInvariantError::ProducerGlobalConservationMismatch);
     }
-    if (summed_enqueued, summed_completed, summed_pending)
-        != (
+    if (summed_enqueued, summed_completed, summed_pending) !=
+        (
             snapshot.enqueued(),
             snapshot.completed(),
             snapshot.pending(),
@@ -1051,12 +1080,12 @@ fn validate_producer_snapshot_conservation(
     {
         let observed_sequence = lease_id.sequence().get();
         let resource = snapshot.for_kind(DocumentProducerKind::Resource);
-        if lease_id.fence_id() != snapshot.fence_id()
-            || lease_id.kind() != DocumentProducerKind::Resource
-            || observed_sequence == 0
-            || observed_sequence > snapshot.enqueued()
-            || resource.enqueued() == 0
-            || resource.completed() == 0
+        if lease_id.fence_id() != snapshot.fence_id() ||
+            lease_id.kind() != DocumentProducerKind::Resource ||
+            observed_sequence == 0 ||
+            observed_sequence > snapshot.enqueued() ||
+            resource.enqueued() == 0 ||
+            resource.completed() == 0
         {
             return Err(
                 PendingSnapshotInvariantError::ProducerAbandonedLeaseMismatch {
@@ -1126,14 +1155,14 @@ impl PendingParserSourceObservation {
                 PendingSourceDisposition::AwaitingExternalIo(_)
             ),
             PendingParserPhase::AwaitingScriptInput => {
-                self.disposition
-                    == PendingSourceDisposition::Unsupported(
+                self.disposition ==
+                    PendingSourceDisposition::Unsupported(
                         PendingUnsupportedSourceReason::ScriptCreatedParserInput,
                     )
             },
             PendingParserPhase::Suspended => {
-                self.disposition
-                    == PendingSourceDisposition::Unsupported(
+                self.disposition ==
+                    PendingSourceDisposition::Unsupported(
                         PendingUnsupportedSourceReason::SuspendedParser,
                     )
             },
@@ -1147,7 +1176,7 @@ impl PendingParserSourceObservation {
     }
 }
 
-/// Canonical authoritative parser and top-level navigation source inventory.
+/// Canonical authoritative inventory of live owner-backed parser/navigation phase facts.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PendingParserObservation {
     sources: Vec<PendingParserSourceObservation>,
@@ -1156,9 +1185,11 @@ pub struct PendingParserObservation {
 impl PendingParserObservation {
     /// Canonicalize parser/navigation sources and reject duplicate source identities.
     ///
-    /// Integration must collect live document parsers and deduped, target-filtered Constellation
-    /// navigation contexts. ScriptThread's `incomplete_loads` collection is deliberately not
-    /// represented because it overlaps other facts and can retain stale entries.
+    /// Integration must collect only live owners which expose an exact lifecycle phase. Pending
+    /// top-level membership remains authoritative in [`PendingTargetObservation`]; absence of a
+    /// `TopLevelNavigation` row here does not assert that no navigation exists or infer its phase.
+    /// ScriptThread's `incomplete_loads` collection is deliberately not represented because it
+    /// overlaps membership facts and can retain stale entries.
     pub fn new(
         mut sources: Vec<PendingParserSourceObservation>,
     ) -> Result<Self, PendingSnapshotInvariantError> {
@@ -1263,6 +1294,8 @@ pub enum PendingNetworkKind {
     Script = 6,
     /// A resource class not yet distinguished by the observer.
     Other = 7,
+    /// Conservative producer-fence fallback when no physical network identity can be joined.
+    ProducerFallback = 8,
 }
 
 /// Lifecycle phase of an active external network operation.
@@ -1402,6 +1435,299 @@ fn duplicate_external_io_source_id(
         .windows(2)
         .find(|pair| pair[0].source_id == pair[1].source_id)
         .map(|pair| pair[0].source_id)
+}
+
+/// Policy-neutral semantic class of one pending logical DOM timer.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum PendingLogicalTimerKind {
+    /// A JavaScript `setTimeout` registration.
+    JavaScriptOneShot,
+    /// A JavaScript `setInterval` registration with its requested recurrence period.
+    JavaScriptInterval {
+        /// Requested period before engine clamping or nesting adjustments.
+        requested_period: Duration,
+    },
+    /// XMLHttpRequest timeout delivery.
+    XmlHttpRequestTimeout,
+    /// EventSource reconnect delay.
+    EventSourceReconnect,
+    /// Refresh-header or meta-refresh redirect.
+    RefreshRedirect,
+    /// HTML's run-steps-after-a-timeout algorithm.
+    RunStepsAfterTimeout,
+    /// Test-only callback class retained in same-build observations.
+    TestBindingCallback,
+}
+
+/// Stable registration identity which survives a JavaScript interval's physical rescheduling.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum PendingLogicalTimerStableId {
+    /// Stable ID from the Window timer map for `setTimeout` and `setInterval`.
+    JavaScriptHandle(i32),
+    /// Stable internal handle for a non-JavaScript logical timer registration.
+    EngineHandle(i32),
+}
+
+/// One stable logical timer and its exact coalesced outer-wake relationship.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PendingLogicalTimerObservation {
+    /// Stable identity shared with the canonical source inventory.
+    pub source_id: PendingSourceId,
+    /// Pipeline-owned Window timer queue which retains this timer.
+    pub pipeline_id: PipelineId,
+    /// Registration identity; unlike creation order, this survives interval recurrence.
+    pub stable_id: PendingLogicalTimerStableId,
+    /// Stable creation order within the owning logical timer queue.
+    pub creation_sequence: u64,
+    /// Semantic source and recurrence class.
+    pub kind: PendingLogicalTimerKind,
+    /// Nominal document-time deadline used by the logical queue's ordering rule.
+    ///
+    /// This can precede the live outer wake when an ordering-blocked timer becomes eligible after
+    /// its nominal deadline. In that case `outer_wake.deadline` is the effective scheduler wake.
+    pub logical_deadline: DocumentTime,
+    /// Whether the whole owning logical timer queue is suspended.
+    pub suspended: bool,
+    /// Whether this row may be selected in the next controlled turn.
+    pub eligible_in_controlled_turn: bool,
+    /// Whether this row is the one coalesced ordering head for its owning queue.
+    pub is_ordering_head: bool,
+    /// The outer wake was consumed and its delivery task is already ready on the event loop.
+    ///
+    /// This is mutually exclusive with `outer_wake`: scheduler activation detaches the physical
+    /// timer ID before the DOM timer task consumes the still-retained logical head.
+    pub delivery_ready: bool,
+    /// Exact live outer scheduler entry representing the coalesced ordering head.
+    ///
+    /// Behind timers intentionally have no independent outer entry. A nonempty unsuspended owner
+    /// has one ordering head represented either by this binding or by `delivery_ready` after the
+    /// scheduler consumed the binding; a suspended owner has neither.
+    pub outer_wake: Option<TimerDeadlineSnapshot>,
+}
+
+/// Canonical stable logical-timer inventory for one event-loop target.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PendingLogicalTimerSnapshot {
+    timers: Vec<PendingLogicalTimerObservation>,
+}
+
+impl PendingLogicalTimerSnapshot {
+    /// Canonicalize logical timers and validate each coalesced per-pipeline owner.
+    pub fn new(
+        mut timers: Vec<PendingLogicalTimerObservation>,
+    ) -> Result<Self, PendingSnapshotInvariantError> {
+        timers.sort_unstable_by_key(|timer| timer.source_id);
+        let snapshot = Self { timers };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Return logical timers in canonical stable-source order.
+    pub fn timers(&self) -> &[PendingLogicalTimerObservation] {
+        &self.timers
+    }
+
+    fn validate(&self) -> Result<(), PendingSnapshotInvariantError> {
+        if !self
+            .timers
+            .windows(2)
+            .all(|pair| pair[0].source_id < pair[1].source_id)
+        {
+            if let Some(source_id) = self
+                .timers
+                .windows(2)
+                .find(|pair| pair[0].source_id == pair[1].source_id)
+                .map(|pair| pair[0].source_id)
+            {
+                return Err(PendingSnapshotInvariantError::DuplicateLogicalTimerSource(
+                    source_id,
+                ));
+            }
+            return Err(PendingSnapshotInvariantError::NonCanonicalLogicalTimers);
+        }
+        for (index, timer) in self.timers.iter().enumerate() {
+            let stable_handle = match timer.stable_id {
+                PendingLogicalTimerStableId::JavaScriptHandle(handle) |
+                PendingLogicalTimerStableId::EngineHandle(handle) => handle,
+            };
+            if stable_handle <= 0 {
+                return Err(
+                    PendingSnapshotInvariantError::InvalidLogicalTimerStableIdentity {
+                        pipeline_id: timer.pipeline_id,
+                        stable_id: timer.stable_id,
+                    },
+                );
+            }
+            let stable_kind_matches = matches!(
+                (timer.kind, timer.stable_id),
+                (
+                    PendingLogicalTimerKind::JavaScriptOneShot |
+                        PendingLogicalTimerKind::JavaScriptInterval { .. },
+                    PendingLogicalTimerStableId::JavaScriptHandle(_),
+                ) | (
+                    PendingLogicalTimerKind::XmlHttpRequestTimeout |
+                        PendingLogicalTimerKind::EventSourceReconnect |
+                        PendingLogicalTimerKind::RefreshRedirect |
+                        PendingLogicalTimerKind::RunStepsAfterTimeout |
+                        PendingLogicalTimerKind::TestBindingCallback,
+                    PendingLogicalTimerStableId::EngineHandle(_),
+                )
+            );
+            if !stable_kind_matches {
+                return Err(
+                    PendingSnapshotInvariantError::LogicalTimerStableIdentityKindMismatch {
+                        source_id: timer.source_id,
+                        stable_id: timer.stable_id,
+                        kind: timer.kind,
+                    },
+                );
+            }
+            if self.timers[..index].iter().any(|prior| {
+                prior.pipeline_id == timer.pipeline_id && prior.stable_id == timer.stable_id
+            }) {
+                return Err(
+                    PendingSnapshotInvariantError::DuplicateLogicalTimerStableIdentity {
+                        pipeline_id: timer.pipeline_id,
+                        stable_id: timer.stable_id,
+                    },
+                );
+            }
+            if self.timers[..index].iter().any(|prior| {
+                prior.pipeline_id == timer.pipeline_id &&
+                    prior.creation_sequence == timer.creation_sequence
+            }) {
+                return Err(
+                    PendingSnapshotInvariantError::DuplicateLogicalTimerCreationIdentity {
+                        pipeline_id: timer.pipeline_id,
+                        creation_sequence: timer.creation_sequence,
+                    },
+                );
+            }
+            if timer.suspended && timer.eligible_in_controlled_turn {
+                return Err(
+                    PendingSnapshotInvariantError::SuspendedLogicalTimerEligible(timer.source_id),
+                );
+            }
+            if timer.outer_wake.is_some() && timer.delivery_ready {
+                return Err(PendingSnapshotInvariantError::LogicalTimerDeliveryConflict(
+                    timer.source_id,
+                ));
+            }
+            if timer.is_ordering_head != (timer.outer_wake.is_some() || timer.delivery_ready) {
+                return Err(
+                    PendingSnapshotInvariantError::LogicalTimerHeadDeliveryMismatch(
+                        timer.source_id,
+                    ),
+                );
+            }
+            if timer.delivery_ready && !timer.eligible_in_controlled_turn {
+                return Err(PendingSnapshotInvariantError::LogicalTimerReadyNotEligible(
+                    timer.source_id,
+                ));
+            }
+            if let Some(wake) = timer.outer_wake &&
+                wake.deadline < timer.logical_deadline
+            {
+                return Err(
+                    PendingSnapshotInvariantError::LogicalTimerWakeBeforeLogicalDeadline {
+                        source_id: timer.source_id,
+                        logical: timer.logical_deadline,
+                        outer: wake.deadline,
+                    },
+                );
+            }
+        }
+        for (index, timer) in self.timers.iter().enumerate() {
+            if self.timers[..index]
+                .iter()
+                .any(|prior| prior.pipeline_id == timer.pipeline_id)
+            {
+                continue;
+            }
+            let owner: Vec<_> = self
+                .timers
+                .iter()
+                .filter(|candidate| candidate.pipeline_id == timer.pipeline_id)
+                .collect();
+            let suspended = owner[0].suspended;
+            if owner
+                .iter()
+                .any(|candidate| candidate.suspended != suspended)
+            {
+                return Err(
+                    PendingSnapshotInvariantError::LogicalTimerOwnerSuspensionMismatch(
+                        timer.pipeline_id,
+                    ),
+                );
+            }
+            let head_count = owner
+                .iter()
+                .filter(|candidate| candidate.is_ordering_head)
+                .count();
+            let expected_heads = usize::from(!suspended);
+            if head_count != expected_heads {
+                return Err(PendingSnapshotInvariantError::LogicalTimerOwnerHeadCount {
+                    pipeline_id: timer.pipeline_id,
+                    expected: u64::try_from(expected_heads)
+                        .expect("logical timer head count is at most one"),
+                    observed: u64::try_from(head_count)
+                        .expect("an in-memory timer inventory cannot exceed u64::MAX entries"),
+                });
+            }
+            if !suspended {
+                let selected = owner
+                    .iter()
+                    .copied()
+                    .filter(|candidate| candidate.eligible_in_controlled_turn)
+                    .min_by_key(|candidate| {
+                        (candidate.logical_deadline, candidate.creation_sequence)
+                    })
+                    .ok_or(
+                        PendingSnapshotInvariantError::LogicalTimerOwnerHasNoEligibleHead(
+                            timer.pipeline_id,
+                        ),
+                    )?;
+                let observed = owner
+                    .iter()
+                    .copied()
+                    .find(|candidate| candidate.is_ordering_head)
+                    .expect("active owner head count was validated above");
+                if observed.source_id != selected.source_id {
+                    return Err(
+                        PendingSnapshotInvariantError::LogicalTimerOrderingHeadMismatch {
+                            pipeline_id: timer.pipeline_id,
+                            expected: selected.source_id,
+                            observed: observed.source_id,
+                        },
+                    );
+                }
+            }
+        }
+        for (index, timer) in self.timers.iter().enumerate() {
+            let Some(wake) = timer.outer_wake else {
+                continue;
+            };
+            if self.timers[..index]
+                .iter()
+                .filter_map(|prior| prior.outer_wake)
+                .any(|prior| prior.scheduler_id == wake.scheduler_id && prior.id == wake.id)
+            {
+                return Err(
+                    PendingSnapshotInvariantError::DuplicateLogicalTimerOuterWake {
+                        source_id: timer.source_id,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn get(&self, source_id: PendingSourceId) -> Option<&PendingLogicalTimerObservation> {
+        self.timers
+            .binary_search_by_key(&source_id, |timer| timer.source_id)
+            .ok()
+            .map(|index| &self.timers[index])
+    }
 }
 
 /// Why active animated images could not be split into finite and infinite loop classes.
@@ -1657,30 +1983,30 @@ impl PendingRenderingObservation {
     /// are authoritative aggregates and are not required to have unstable one-to-one source IDs
     /// in this type-only foundation.
     pub fn has_observed_work(&self) -> bool {
-        self.scheduled_opportunity.is_some()
-            || self.opportunity_ready
-            || self.pipelines.iter().any(|observation| {
+        self.scheduled_opportunity.is_some() ||
+            self.opportunity_ready ||
+            self.pipelines.iter().any(|observation| {
                 let images = observation.animated_images;
                 let canvas = observation.canvas;
-                observation.retained_animation_frame_callbacks != 0
-                    || observation.runnable_animation_frame_callbacks != 0
-                    || observation.document_update_required
-                    || observation.pending_animation_events != 0
-                    || observation.finite_animations != 0
-                    || observation.infinite_animations != 0
-                    || observation.unsupported_animations != 0
-                    || images.finite_images != 0
-                    || images.infinite_images != 0
-                    || images.unsupported.checked_total() != Some(0)
-                    || images.update_ready
-                    || images.scheduled_timer.is_some()
-                    || canvas.dirty_contexts != 0
-                    || canvas.awaiting_async_upload
-                    || canvas.unsupported.live_source_inventory_unavailable != 0
-                    || canvas.unsupported.offscreen_execution != 0
-                    || canvas.unsupported.mutation_generation_unbound != 0
-                    || observation.pending_fonts != 0
-                    || observation.pending_images != 0
+                observation.retained_animation_frame_callbacks != 0 ||
+                    observation.runnable_animation_frame_callbacks != 0 ||
+                    observation.document_update_required ||
+                    observation.pending_animation_events != 0 ||
+                    observation.finite_animations != 0 ||
+                    observation.infinite_animations != 0 ||
+                    observation.unsupported_animations != 0 ||
+                    images.finite_images != 0 ||
+                    images.infinite_images != 0 ||
+                    images.unsupported.checked_total() != Some(0) ||
+                    images.update_ready ||
+                    images.scheduled_timer.is_some() ||
+                    canvas.dirty_contexts != 0 ||
+                    canvas.awaiting_async_upload ||
+                    canvas.unsupported.live_source_inventory_unavailable != 0 ||
+                    canvas.unsupported.offscreen_execution != 0 ||
+                    canvas.unsupported.mutation_generation_unbound != 0 ||
+                    observation.pending_fonts != 0 ||
+                    observation.pending_images != 0
             })
     }
 
@@ -1745,8 +2071,11 @@ pub enum PendingSourceKind {
 /// Why a visible source can continue without a finite terminal opportunity.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum PendingOpenEndedSourceReason {
-    /// A JavaScript interval remains registered with its effective repeat period.
-    Interval { period: Duration },
+    /// A JavaScript interval remains registered with its requested repeat period.
+    ///
+    /// The engine may clamp an individual firing; this value is registration metadata, not an
+    /// effective scheduler cadence.
+    Interval { requested_period: Duration },
     /// A CSS or Web Animation has no finite iteration bound.
     InfiniteAnimation,
     /// A WebSocket can receive messages indefinitely.
@@ -1945,6 +2274,8 @@ pub struct RawPendingSnapshot {
     pub parser: PendingParserObservation,
     /// Canonical external network-I/O evidence.
     pub network: PendingNetworkObservation,
+    /// Canonical logical DOM timers and their coalesced outer-scheduler bindings.
+    pub logical_timers: PendingLogicalTimerSnapshot,
     /// Independently authoritative rendering, animation-frame, font, and image evidence.
     pub rendering: PendingRenderingObservation,
     /// Auxiliary canonical source inventory; absence does not replace rendering inspection.
@@ -1967,6 +2298,7 @@ impl RawPendingSnapshot {
         self.producers.validate()?;
         self.parser.validate()?;
         self.network.validate()?;
+        self.logical_timers.validate()?;
         self.rendering.validate()?;
         self.sources.validate()?;
         self.terminals.validate()?;
@@ -1997,9 +2329,8 @@ impl RawPendingSnapshot {
                     parser.pipeline_id,
                 ));
             }
-            if parser.kind == PendingParserSourceKind::TopLevelNavigation
-                && self
-                    .target
+            if parser.kind == PendingParserSourceKind::TopLevelNavigation &&
+                self.target
                     .pending_top_level_pipelines()
                     .binary_search(&parser.pipeline_id)
                     .is_err()
@@ -2026,35 +2357,6 @@ impl RawPendingSnapshot {
                 return Err(PendingSnapshotInvariantError::MissingParserObservation(
                     source.id,
                 ));
-            }
-        }
-
-        for pipeline_id in self.target.pending_top_level_pipelines() {
-            match self
-                .parser
-                .sources()
-                .iter()
-                .filter(|source| {
-                    source.kind == PendingParserSourceKind::TopLevelNavigation
-                        && source.pipeline_id == *pipeline_id
-                })
-                .count()
-            {
-                1 => {},
-                0 => {
-                    return Err(
-                        PendingSnapshotInvariantError::MissingPendingNavigationObservation(
-                            *pipeline_id,
-                        ),
-                    );
-                },
-                _ => {
-                    return Err(
-                        PendingSnapshotInvariantError::DuplicatePendingNavigationObservation(
-                            *pipeline_id,
-                        ),
-                    );
-                },
             }
         }
 
@@ -2189,6 +2491,150 @@ impl RawPendingSnapshot {
             }
         }
 
+        for timer in self.logical_timers.timers() {
+            if !self.target.contains_pipeline(timer.pipeline_id) {
+                return Err(
+                    PendingSnapshotInvariantError::LogicalTimerPipelineOutsideTarget {
+                        source_id: timer.source_id,
+                        pipeline_id: timer.pipeline_id,
+                    },
+                );
+            }
+            let Some(source) = self.sources.get(timer.source_id) else {
+                return Err(PendingSnapshotInvariantError::MissingLogicalTimerSource(
+                    timer.source_id,
+                ));
+            };
+            if source.kind != PendingSourceKind::Timer {
+                return Err(
+                    PendingSnapshotInvariantError::LogicalTimerSourceKindMismatch {
+                        source_id: timer.source_id,
+                        observed: source.kind,
+                    },
+                );
+            }
+            if timer.delivery_ready && timer.logical_deadline > self.clock.now {
+                return Err(
+                    PendingSnapshotInvariantError::LogicalTimerDeliveryBeforeDeadline {
+                        source_id: timer.source_id,
+                        deadline: timer.logical_deadline,
+                        now: self.clock.now,
+                    },
+                );
+            }
+            if let Some(wake) = timer.outer_wake {
+                let expected = timer.logical_deadline.max(self.clock.now);
+                if wake.deadline != expected {
+                    return Err(
+                        PendingSnapshotInvariantError::LogicalTimerWakeDeadlineMismatch {
+                            source_id: timer.source_id,
+                            expected,
+                            observed: wake.deadline,
+                        },
+                    );
+                }
+            }
+            let disposition_matches = if timer.suspended {
+                source.disposition == PendingSourceDisposition::Inert
+            } else if timer.delivery_ready {
+                source.disposition == PendingSourceDisposition::Ready
+            } else {
+                match timer.kind {
+                    PendingLogicalTimerKind::JavaScriptInterval { requested_period } => {
+                        source.disposition ==
+                            PendingSourceDisposition::OpenEnded(
+                                PendingOpenEndedSourceReason::Interval { requested_period },
+                            )
+                    },
+                    PendingLogicalTimerKind::EventSourceReconnect => {
+                        source.disposition ==
+                            PendingSourceDisposition::OpenEnded(
+                                PendingOpenEndedSourceReason::EventSource,
+                            )
+                    },
+                    PendingLogicalTimerKind::JavaScriptOneShot |
+                    PendingLogicalTimerKind::XmlHttpRequestTimeout |
+                    PendingLogicalTimerKind::RefreshRedirect |
+                    PendingLogicalTimerKind::RunStepsAfterTimeout |
+                    PendingLogicalTimerKind::TestBindingCallback => {
+                        let effective_deadline = timer
+                            .outer_wake
+                            .map_or(timer.logical_deadline, |wake| wake.deadline);
+                        source.disposition ==
+                            PendingSourceDisposition::FiniteDeadline(effective_deadline)
+                    },
+                }
+            };
+            if !disposition_matches {
+                return Err(
+                    PendingSnapshotInvariantError::LogicalTimerSourceDispositionMismatch(
+                        timer.source_id,
+                    ),
+                );
+            }
+            if let Some(wake) = timer.outer_wake &&
+                wake.scheduler_id != self.scheduler.scheduler_id
+            {
+                return Err(
+                    PendingSnapshotInvariantError::LogicalTimerSchedulerIdentityMismatch {
+                        source_id: timer.source_id,
+                        expected: self.scheduler.scheduler_id,
+                        observed: wake.scheduler_id,
+                    },
+                );
+            }
+        }
+
+        let mut scheduler_entry_owners = Vec::new();
+        scheduler_entry_owners.extend(
+            self.logical_timers
+                .timers()
+                .iter()
+                .filter_map(|timer| timer.outer_wake),
+        );
+        scheduler_entry_owners.extend(self.rendering.scheduled_opportunity);
+        scheduler_entry_owners.extend(
+            self.rendering
+                .pipelines()
+                .iter()
+                .filter_map(|rendering| rendering.animated_images.scheduled_timer),
+        );
+        for (index, claimed) in scheduler_entry_owners.iter().copied().enumerate() {
+            if scheduler_entry_owners[..index]
+                .iter()
+                .any(|prior| prior.scheduler_id == claimed.scheduler_id && prior.id == claimed.id)
+            {
+                return Err(PendingSnapshotInvariantError::SchedulerEntryOwnerConflict(
+                    claimed,
+                ));
+            }
+            let Some(head) = self.scheduler.next_deadline else {
+                return Err(PendingSnapshotInvariantError::SchedulerEntryOwnerWithoutHead(claimed));
+            };
+            if claimed.id == head.id && claimed != head {
+                return Err(
+                    PendingSnapshotInvariantError::SchedulerEntryOwnerHeadMismatch {
+                        claimed,
+                        head,
+                    },
+                );
+            }
+            if (claimed.deadline, claimed.id.sequence()) < (head.deadline, head.id.sequence()) {
+                return Err(
+                    PendingSnapshotInvariantError::SchedulerEntryOwnerBeforeHead { claimed, head },
+                );
+            }
+        }
+        for source in self.sources.sources() {
+            if source.kind == PendingSourceKind::Timer &&
+                self.logical_timers.get(source.id).is_none()
+            {
+                return Err(
+                    PendingSnapshotInvariantError::MissingLogicalTimerObservation(source.id),
+                );
+            }
+        }
+
         if self
             .terminals
             .clock
@@ -2201,14 +2647,14 @@ impl RawPendingSnapshot {
             self.terminals.target_time,
         ) {
             (Some(surface), Some(terminal))
-                if terminal.webview_id == self.target.webview_id
-                    && terminal.unsupported_surface == surface => {},
+                if terminal.webview_id == self.target.webview_id &&
+                    terminal.unsupported_surface == surface => {},
             (None, None) => {},
             _ => return Err(PendingSnapshotInvariantError::TargetTimeTerminalMismatch),
         }
         if self.terminals.outer_scheduler.is_some_and(|terminal| {
-            terminal.event_loop_id != self.target.event_loop_id
-                || terminal.scheduler_id != self.scheduler.scheduler_id
+            terminal.event_loop_id != self.target.event_loop_id ||
+                terminal.scheduler_id != self.scheduler.scheduler_id
         }) {
             return Err(PendingSnapshotInvariantError::SchedulerTerminalIdentityMismatch);
         }
@@ -2221,8 +2667,8 @@ impl RawPendingSnapshot {
         }
         match (self.terminals.microtask, self.microtasks.terminal) {
             (Some(terminal), Some(error))
-                if terminal.event_loop_id == self.target.event_loop_id
-                    && terminal.error == error => {},
+                if terminal.event_loop_id == self.target.event_loop_id &&
+                    terminal.error == error => {},
             (None, None) => {},
             _ => return Err(PendingSnapshotInvariantError::MicrotaskTerminalMismatch),
         }
@@ -2276,13 +2722,13 @@ impl RawPendingSnapshot {
         if self.terminals.state_generation.is_some() && self.state_generation.get() != u64::MAX {
             return Err(PendingSnapshotInvariantError::GenerationTerminalBeforeExhaustion);
         }
-        if self.terminals.navigation_revision.is_some()
-            && self.target.navigation_revision.get() != u64::MAX
+        if self.terminals.navigation_revision.is_some() &&
+            self.target.navigation_revision.get() != u64::MAX
         {
             return Err(PendingSnapshotInvariantError::GenerationTerminalBeforeExhaustion);
         }
-        if self.terminals.pipeline_membership_revision.is_some()
-            && self.target.pipeline_membership_revision.get() != u64::MAX
+        if self.terminals.pipeline_membership_revision.is_some() &&
+            self.target.pipeline_membership_revision.get() != u64::MAX
         {
             return Err(PendingSnapshotInvariantError::GenerationTerminalBeforeExhaustion);
         }
@@ -2338,10 +2784,6 @@ pub enum PendingSnapshotInvariantError {
     ParserPipelineOutsideTarget(PipelineId),
     /// A top-level navigation parser source did not name a pending top-level pipeline.
     ParserNavigationNotPending(PipelineId),
-    /// A pending top-level pipeline had no authoritative navigation source.
-    MissingPendingNavigationObservation(PipelineId),
-    /// A pending top-level pipeline had more than one authoritative navigation source.
-    DuplicatePendingNavigationObservation(PipelineId),
     /// Parser evidence had no matching canonical source entry.
     MissingParserSource(PendingSourceId),
     /// Parser evidence and its canonical source entry disagreed.
@@ -2438,6 +2880,132 @@ pub enum PendingSnapshotInvariantError {
     DuplicateSource(PendingSourceId),
     /// Source entries were not in canonical identity order.
     NonCanonicalSourceInventory,
+    /// Two logical-timer rows used the same stable source identity.
+    DuplicateLogicalTimerSource(PendingSourceId),
+    /// Logical-timer rows were not in canonical source-identity order.
+    NonCanonicalLogicalTimers,
+    /// A logical timer used a zero or negative registration handle which cannot be live.
+    InvalidLogicalTimerStableIdentity {
+        /// Pipeline-owned logical timer queue.
+        pipeline_id: PipelineId,
+        /// Invalid registration identity.
+        stable_id: PendingLogicalTimerStableId,
+    },
+    /// Timer semantic kind and stable registration-identity class disagreed.
+    LogicalTimerStableIdentityKindMismatch {
+        /// Stable source identity of the invalid row.
+        source_id: PendingSourceId,
+        /// Registration identity supplied by the owner.
+        stable_id: PendingLogicalTimerStableId,
+        /// Semantic timer kind supplied by the owner.
+        kind: PendingLogicalTimerKind,
+    },
+    /// Two logical timers reused one pipeline-local stable registration identity.
+    DuplicateLogicalTimerStableIdentity {
+        /// Pipeline-owned logical timer queue.
+        pipeline_id: PipelineId,
+        /// Reused stable timer registration identity.
+        stable_id: PendingLogicalTimerStableId,
+    },
+    /// Two logical timers reused one pipeline-local creation identity.
+    DuplicateLogicalTimerCreationIdentity {
+        /// Pipeline-owned logical timer queue.
+        pipeline_id: PipelineId,
+        /// Reused stable creation sequence.
+        creation_sequence: u64,
+    },
+    /// A suspended logical timer was marked eligible for a controlled turn.
+    SuspendedLogicalTimerEligible(PendingSourceId),
+    /// An ordering head had neither a live outer wake nor an already-ready delivery task, or a
+    /// non-head row claimed one of those delivery representations.
+    LogicalTimerHeadDeliveryMismatch(PendingSourceId),
+    /// One logical head simultaneously claimed a live outer wake and ready delivery task.
+    LogicalTimerDeliveryConflict(PendingSourceId),
+    /// A logical timer with an already-ready delivery task was not eligible for this turn.
+    LogicalTimerReadyNotEligible(PendingSourceId),
+    /// A logical timer claimed a ready delivery task before its nominal deadline was due.
+    LogicalTimerDeliveryBeforeDeadline {
+        /// Stable logical timer source.
+        source_id: PendingSourceId,
+        /// Nominal logical ordering deadline.
+        deadline: DocumentTime,
+        /// Document clock observed by the same raw snapshot.
+        now: DocumentTime,
+    },
+    /// A coalesced outer wake preceded the nominal deadline of its logical head.
+    LogicalTimerWakeBeforeLogicalDeadline {
+        /// Stable logical timer source.
+        source_id: PendingSourceId,
+        /// Nominal logical timer ordering deadline.
+        logical: DocumentTime,
+        /// Effective deadline retained by the joined outer scheduler entry.
+        outer: DocumentTime,
+    },
+    /// A live coalesced wake did not equal the logical deadline, or current time when overdue.
+    LogicalTimerWakeDeadlineMismatch {
+        /// Stable logical timer source.
+        source_id: PendingSourceId,
+        /// Exact scheduler deadline implied by the logical timer and captured document clock.
+        expected: DocumentTime,
+        /// Deadline carried by the joined outer scheduler entry.
+        observed: DocumentTime,
+    },
+    /// Timers in one pipeline-owned queue disagreed about whole-queue suspension.
+    LogicalTimerOwnerSuspensionMismatch(PipelineId),
+    /// A nonempty logical timer owner had the wrong number of coalesced ordering heads.
+    LogicalTimerOwnerHeadCount {
+        /// Pipeline-owned logical timer queue.
+        pipeline_id: PipelineId,
+        /// Required head count: one while active, zero while suspended.
+        expected: u64,
+        /// Observed head count.
+        observed: u64,
+    },
+    /// An active logical-timer owner had no row eligible under the controlled selector.
+    LogicalTimerOwnerHasNoEligibleHead(PipelineId),
+    /// The claimed ordering head was not the earliest eligible deadline and creation order.
+    LogicalTimerOrderingHeadMismatch {
+        /// Pipeline-owned logical timer queue.
+        pipeline_id: PipelineId,
+        /// Stable source selected by the authoritative ordering rule.
+        expected: PendingSourceId,
+        /// Stable source which incorrectly claimed the outer wake or ready delivery.
+        observed: PendingSourceId,
+    },
+    /// Two logical timer owners claimed the same live outer scheduler entry.
+    DuplicateLogicalTimerOuterWake {
+        /// Later logical timer source which duplicated an existing binding.
+        source_id: PendingSourceId,
+    },
+    /// A logical timer named a pipeline outside the immutable target.
+    LogicalTimerPipelineOutsideTarget {
+        /// Stable logical timer source.
+        source_id: PendingSourceId,
+        /// Out-of-target owner pipeline.
+        pipeline_id: PipelineId,
+    },
+    /// A logical timer had no matching canonical source entry.
+    MissingLogicalTimerSource(PendingSourceId),
+    /// A canonical timer source had no authoritative logical-timer row.
+    MissingLogicalTimerObservation(PendingSourceId),
+    /// A logical timer row referenced a non-timer source class.
+    LogicalTimerSourceKindMismatch {
+        /// Identity shared by the timer and source inventories.
+        source_id: PendingSourceId,
+        /// Source class found in the canonical inventory.
+        observed: PendingSourceKind,
+    },
+    /// Logical timer kind, suspension, deadline, or period disagreed with source disposition.
+    LogicalTimerSourceDispositionMismatch(PendingSourceId),
+    /// A logical timer outer wake belonged to a different scheduler.
+    LogicalTimerSchedulerIdentityMismatch {
+        /// Stable logical timer source.
+        source_id: PendingSourceId,
+        /// Scheduler captured by the raw pending owner.
+        expected: TimerSchedulerId,
+        /// Scheduler embedded in the joined outer wake.
+        observed: TimerSchedulerId,
+    },
     /// Two external-I/O entries used the same stable source identity.
     DuplicateExternalIoSource(PendingSourceId),
     /// External-I/O entries were not in canonical identity order.
@@ -2511,6 +3079,24 @@ pub enum PendingSnapshotInvariantError {
         expected: TimerSchedulerId,
         /// Kernel scheduler identity embedded in the deadline snapshot.
         observed: TimerSchedulerId,
+    },
+    /// Two independent runtime owners claimed the same physical scheduler entry.
+    SchedulerEntryOwnerConflict(TimerDeadlineSnapshot),
+    /// A runtime owner retained a live scheduler entry while the scheduler reported no head.
+    SchedulerEntryOwnerWithoutHead(TimerDeadlineSnapshot),
+    /// An owner and the scheduler head gave different deadlines for one scheduler-local ID.
+    SchedulerEntryOwnerHeadMismatch {
+        /// Entry retained by a logical timer, rendering opportunity, or animated image.
+        claimed: TimerDeadlineSnapshot,
+        /// Global scheduler head carrying the same physical identity.
+        head: TimerDeadlineSnapshot,
+    },
+    /// A claimed live scheduler entry ordered before the scheduler's reported global head.
+    SchedulerEntryOwnerBeforeHead {
+        /// Entry retained by a logical timer, rendering opportunity, or animated image.
+        claimed: TimerDeadlineSnapshot,
+        /// Global scheduler head from the same snapshot.
+        head: TimerDeadlineSnapshot,
     },
     /// The rendering-opportunity timer belonged to a different outer scheduler.
     RenderingSchedulerIdentityMismatch {
@@ -2817,6 +3403,7 @@ mod tests {
             )])
             .unwrap(),
             network: PendingNetworkObservation::default(),
+            logical_timers: PendingLogicalTimerSnapshot::default(),
             rendering: rendering_for(active_pipeline),
             sources: PendingSourceSnapshot::new(
                 PendingSourceEpoch::ZERO,
@@ -2830,6 +3417,42 @@ mod tests {
             terminals: PendingRuntimeTerminals::default(),
         };
         snapshot.validate().unwrap();
+        snapshot
+    }
+
+    fn raw_with_logical_timer(
+        clock: &DocumentClock,
+        scheduler: PendingSchedulerObservation,
+        timer: PendingLogicalTimerObservation,
+        disposition: PendingSourceDisposition,
+    ) -> RawPendingSnapshot {
+        let mut snapshot = minimal_raw_snapshot();
+        let pending_pipeline = snapshot.target.pending_top_level_pipelines()[0];
+        snapshot.clock = PendingClockObservation {
+            clock_id: clock.id(),
+            mode: PendingClockMode::Controlled,
+            now: clock.now(),
+            unsupported_surface: None,
+        };
+        snapshot.scheduler = scheduler;
+        snapshot.sources = PendingSourceSnapshot::new(
+            PendingSourceEpoch::new(1),
+            vec![
+                source(
+                    100,
+                    PendingSourceKind::Parser,
+                    PendingSourceDisposition::Ready,
+                ),
+                PendingSourceObservation {
+                    id: timer.source_id,
+                    kind: PendingSourceKind::Timer,
+                    disposition,
+                },
+            ],
+        )
+        .unwrap();
+        assert!(snapshot.target.contains_pipeline(pending_pipeline));
+        snapshot.logical_timers = PendingLogicalTimerSnapshot::new(vec![timer]).unwrap();
         snapshot
     }
 
@@ -2853,7 +3476,7 @@ mod tests {
                     30,
                     PendingSourceKind::Timer,
                     PendingSourceDisposition::OpenEnded(PendingOpenEndedSourceReason::Interval {
-                        period: Duration::from_secs(5),
+                        requested_period: Duration::from_secs(5),
                     }),
                 ),
                 source(
@@ -2929,6 +3552,37 @@ mod tests {
             scheduler_id,
             error: TimerControlError::SequenceExhausted,
         });
+        let logical_timers = PendingLogicalTimerSnapshot::new(vec![
+            PendingLogicalTimerObservation {
+                source_id: PendingSourceId::new(10),
+                pipeline_id: active_pipeline,
+                stable_id: PendingLogicalTimerStableId::JavaScriptHandle(1),
+                creation_sequence: 1,
+                kind: PendingLogicalTimerKind::JavaScriptOneShot,
+                logical_deadline: next_deadline.deadline,
+                suspended: false,
+                eligible_in_controlled_turn: true,
+                is_ordering_head: true,
+                delivery_ready: false,
+                outer_wake: Some(next_deadline),
+            },
+            PendingLogicalTimerObservation {
+                source_id: PendingSourceId::new(30),
+                pipeline_id: active_pipeline,
+                stable_id: PendingLogicalTimerStableId::JavaScriptHandle(2),
+                creation_sequence: 2,
+                kind: PendingLogicalTimerKind::JavaScriptInterval {
+                    requested_period: Duration::from_secs(5),
+                },
+                logical_deadline: DocumentTime::from_nanos(next_deadline.deadline.as_nanos() + 1),
+                suspended: false,
+                eligible_in_controlled_turn: true,
+                is_ordering_head: false,
+                delivery_ready: false,
+                outer_wake: None,
+            },
+        ])
+        .unwrap();
         let snapshot = RawPendingSnapshot {
             target,
             state_generation: RuntimeStateGeneration::new(8),
@@ -2963,12 +3617,490 @@ mod tests {
             producers: empty_producers(event_loop_id),
             parser,
             network,
+            logical_timers,
             rendering: rendering_for(active_pipeline),
             sources,
             terminals,
         };
         snapshot.validate().unwrap();
         assert_postcard_round_trip(snapshot);
+    }
+
+    #[test]
+    fn logical_timer_snapshot_accepts_detached_ready_delivery_head() {
+        let pipeline_id = pipeline_id(1);
+        let source_id = PendingSourceId::new(1);
+        let snapshot = PendingLogicalTimerSnapshot::new(vec![PendingLogicalTimerObservation {
+            source_id,
+            pipeline_id,
+            stable_id: PendingLogicalTimerStableId::JavaScriptHandle(17),
+            creation_sequence: 9,
+            kind: PendingLogicalTimerKind::JavaScriptOneShot,
+            logical_deadline: DocumentTime::from_nanos(10),
+            suspended: false,
+            eligible_in_controlled_turn: true,
+            is_ordering_head: true,
+            delivery_ready: true,
+            outer_wake: None,
+        }])
+        .unwrap();
+
+        assert!(snapshot.timers()[0].delivery_ready);
+    }
+
+    #[test]
+    fn logical_timer_snapshot_retains_finite_work_behind_an_interval_head() {
+        let clock = controlled_clock();
+        let mut scheduler = TimerScheduler::with_clock(clock);
+        scheduler.schedule_timer(TimerEventRequest {
+            callback: Box::new(|| {}),
+            duration: Duration::from_nanos(10),
+        });
+        let outer_wake = scheduler.finite_deadline_snapshot().unwrap().unwrap();
+        let pipeline_id = pipeline_id(1);
+        let snapshot = PendingLogicalTimerSnapshot::new(vec![
+            PendingLogicalTimerObservation {
+                source_id: PendingSourceId::new(1),
+                pipeline_id,
+                stable_id: PendingLogicalTimerStableId::JavaScriptHandle(1),
+                creation_sequence: 1,
+                kind: PendingLogicalTimerKind::JavaScriptInterval {
+                    requested_period: Duration::from_secs(1),
+                },
+                logical_deadline: outer_wake.deadline,
+                suspended: false,
+                eligible_in_controlled_turn: true,
+                is_ordering_head: true,
+                delivery_ready: false,
+                outer_wake: Some(outer_wake),
+            },
+            PendingLogicalTimerObservation {
+                source_id: PendingSourceId::new(2),
+                pipeline_id,
+                stable_id: PendingLogicalTimerStableId::JavaScriptHandle(2),
+                creation_sequence: 2,
+                kind: PendingLogicalTimerKind::JavaScriptOneShot,
+                logical_deadline: outer_wake
+                    .deadline
+                    .checked_add(Duration::from_nanos(10))
+                    .unwrap(),
+                suspended: false,
+                eligible_in_controlled_turn: true,
+                is_ordering_head: false,
+                delivery_ready: false,
+                outer_wake: None,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(snapshot.timers().len(), 2);
+        assert!(snapshot.timers()[0].is_ordering_head);
+        assert!(matches!(
+            snapshot.timers()[0].kind,
+            PendingLogicalTimerKind::JavaScriptInterval { .. }
+        ));
+        assert_eq!(
+            snapshot.timers()[1].kind,
+            PendingLogicalTimerKind::JavaScriptOneShot
+        );
+        assert_eq!(snapshot.timers()[1].outer_wake, None);
+    }
+
+    #[test]
+    fn raw_pending_accepts_an_overdue_logical_head_with_its_effective_outer_wake() {
+        let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 110,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        });
+        let mut scheduler = TimerScheduler::with_clock(clock.clone());
+        scheduler.schedule_timer(TimerEventRequest {
+            callback: Box::new(|| {}),
+            duration: Duration::ZERO,
+        });
+        let outer_wake = scheduler.finite_deadline_snapshot().unwrap().unwrap();
+        let source_id = PendingSourceId::new(200);
+        let active_pipeline = pending_target().active_top_level.unwrap().pipeline_id;
+        let snapshot = raw_with_logical_timer(
+            &clock,
+            PendingSchedulerObservation {
+                scheduler_id: scheduler.id(),
+                next_deadline: Some(outer_wake),
+            },
+            PendingLogicalTimerObservation {
+                source_id,
+                pipeline_id: active_pipeline,
+                stable_id: PendingLogicalTimerStableId::EngineHandle(1),
+                creation_sequence: 1,
+                kind: PendingLogicalTimerKind::RunStepsAfterTimeout,
+                logical_deadline: DocumentTime::from_nanos(100),
+                suspended: false,
+                eligible_in_controlled_turn: true,
+                is_ordering_head: true,
+                delivery_ready: false,
+                outer_wake: Some(outer_wake),
+            },
+            PendingSourceDisposition::FiniteDeadline(outer_wake.deadline),
+        );
+
+        snapshot.validate().unwrap();
+    }
+
+    #[test]
+    fn event_source_reconnect_is_open_ended_even_with_a_live_outer_wake() {
+        let clock = controlled_clock();
+        let mut scheduler = TimerScheduler::with_clock(clock.clone());
+        scheduler.schedule_timer(TimerEventRequest {
+            callback: Box::new(|| {}),
+            duration: Duration::from_nanos(10),
+        });
+        let outer_wake = scheduler.finite_deadline_snapshot().unwrap().unwrap();
+        let source_id = PendingSourceId::new(200);
+        let active_pipeline = pending_target().active_top_level.unwrap().pipeline_id;
+        let timer = PendingLogicalTimerObservation {
+            source_id,
+            pipeline_id: active_pipeline,
+            stable_id: PendingLogicalTimerStableId::EngineHandle(1),
+            creation_sequence: 1,
+            kind: PendingLogicalTimerKind::EventSourceReconnect,
+            logical_deadline: outer_wake.deadline,
+            suspended: false,
+            eligible_in_controlled_turn: true,
+            is_ordering_head: true,
+            delivery_ready: false,
+            outer_wake: Some(outer_wake),
+        };
+        let scheduler = PendingSchedulerObservation {
+            scheduler_id: scheduler.id(),
+            next_deadline: Some(outer_wake),
+        };
+
+        raw_with_logical_timer(
+            &clock,
+            scheduler,
+            timer,
+            PendingSourceDisposition::OpenEnded(PendingOpenEndedSourceReason::EventSource),
+        )
+        .validate()
+        .unwrap();
+        assert_eq!(
+            raw_with_logical_timer(
+                &clock,
+                scheduler,
+                timer,
+                PendingSourceDisposition::FiniteDeadline(outer_wake.deadline),
+            )
+            .validate(),
+            Err(PendingSnapshotInvariantError::LogicalTimerSourceDispositionMismatch(source_id))
+        );
+    }
+
+    #[test]
+    fn raw_pending_rejects_a_logical_head_bound_to_the_wrong_effective_deadline() {
+        let clock = controlled_clock();
+        let mut scheduler = TimerScheduler::with_clock(clock.clone());
+        scheduler.schedule_timer(TimerEventRequest {
+            callback: Box::new(|| {}),
+            duration: Duration::from_nanos(10),
+        });
+        let live = scheduler.finite_deadline_snapshot().unwrap().unwrap();
+        let observed = TimerDeadlineSnapshot {
+            deadline: live.deadline.checked_add(Duration::from_nanos(1)).unwrap(),
+            ..live
+        };
+        let source_id = PendingSourceId::new(200);
+        let active_pipeline = pending_target().active_top_level.unwrap().pipeline_id;
+        let snapshot = raw_with_logical_timer(
+            &clock,
+            PendingSchedulerObservation {
+                scheduler_id: scheduler.id(),
+                next_deadline: Some(observed),
+            },
+            PendingLogicalTimerObservation {
+                source_id,
+                pipeline_id: active_pipeline,
+                stable_id: PendingLogicalTimerStableId::JavaScriptHandle(1),
+                creation_sequence: 1,
+                kind: PendingLogicalTimerKind::JavaScriptOneShot,
+                logical_deadline: live.deadline,
+                suspended: false,
+                eligible_in_controlled_turn: true,
+                is_ordering_head: true,
+                delivery_ready: false,
+                outer_wake: Some(observed),
+            },
+            PendingSourceDisposition::FiniteDeadline(observed.deadline),
+        );
+
+        assert_eq!(
+            snapshot.validate(),
+            Err(
+                PendingSnapshotInvariantError::LogicalTimerWakeDeadlineMismatch {
+                    source_id,
+                    expected: live.deadline,
+                    observed: observed.deadline,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn raw_pending_rejects_a_future_detached_logical_delivery() {
+        let clock = controlled_clock();
+        let scheduler = TimerScheduler::with_clock(clock.clone());
+        let source_id = PendingSourceId::new(200);
+        let active_pipeline = pending_target().active_top_level.unwrap().pipeline_id;
+        let snapshot = raw_with_logical_timer(
+            &clock,
+            PendingSchedulerObservation {
+                scheduler_id: scheduler.id(),
+                next_deadline: None,
+            },
+            PendingLogicalTimerObservation {
+                source_id,
+                pipeline_id: active_pipeline,
+                stable_id: PendingLogicalTimerStableId::JavaScriptHandle(1),
+                creation_sequence: 1,
+                kind: PendingLogicalTimerKind::JavaScriptOneShot,
+                logical_deadline: DocumentTime::from_nanos(10),
+                suspended: false,
+                eligible_in_controlled_turn: true,
+                is_ordering_head: true,
+                delivery_ready: true,
+                outer_wake: None,
+            },
+            PendingSourceDisposition::Ready,
+        );
+
+        assert_eq!(
+            snapshot.validate(),
+            Err(
+                PendingSnapshotInvariantError::LogicalTimerDeliveryBeforeDeadline {
+                    source_id,
+                    deadline: DocumentTime::from_nanos(10),
+                    now: DocumentTime::from_nanos(5),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn raw_pending_rejects_cross_owner_scheduler_entry_aliasing() {
+        let clock = controlled_clock();
+        let mut scheduler = TimerScheduler::with_clock(clock.clone());
+        scheduler.schedule_timer(TimerEventRequest {
+            callback: Box::new(|| {}),
+            duration: Duration::from_nanos(10),
+        });
+        let outer_wake = scheduler.finite_deadline_snapshot().unwrap().unwrap();
+        let active_pipeline = pending_target().active_top_level.unwrap().pipeline_id;
+        let mut snapshot = raw_with_logical_timer(
+            &clock,
+            PendingSchedulerObservation {
+                scheduler_id: scheduler.id(),
+                next_deadline: Some(outer_wake),
+            },
+            PendingLogicalTimerObservation {
+                source_id: PendingSourceId::new(200),
+                pipeline_id: active_pipeline,
+                stable_id: PendingLogicalTimerStableId::JavaScriptHandle(1),
+                creation_sequence: 1,
+                kind: PendingLogicalTimerKind::JavaScriptOneShot,
+                logical_deadline: outer_wake.deadline,
+                suspended: false,
+                eligible_in_controlled_turn: true,
+                is_ordering_head: true,
+                delivery_ready: false,
+                outer_wake: Some(outer_wake),
+            },
+            PendingSourceDisposition::FiniteDeadline(outer_wake.deadline),
+        );
+        snapshot.rendering = PendingRenderingObservation::new(
+            Some(outer_wake),
+            snapshot.rendering.opportunity_ready,
+            snapshot.rendering.pipelines().to_vec(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot.validate(),
+            Err(PendingSnapshotInvariantError::SchedulerEntryOwnerConflict(
+                outer_wake
+            ))
+        );
+    }
+
+    #[test]
+    fn raw_pending_requires_live_owner_entries_to_follow_the_scheduler_head() {
+        let clock = controlled_clock();
+        let mut scheduler = TimerScheduler::with_clock(clock.clone());
+        let first_id = scheduler.schedule_timer(TimerEventRequest {
+            callback: Box::new(|| {}),
+            duration: Duration::from_nanos(10),
+        });
+        let second_id = scheduler.schedule_timer(TimerEventRequest {
+            callback: Box::new(|| {}),
+            duration: Duration::from_nanos(20),
+        });
+        let joined = scheduler
+            .join_live_deadlines(scheduler.id(), &[first_id, second_id])
+            .unwrap();
+        let first = TimerDeadlineSnapshot {
+            scheduler_id: scheduler.id(),
+            id: first_id,
+            deadline: joined[0].deadline.unwrap(),
+        };
+        let second = TimerDeadlineSnapshot {
+            scheduler_id: scheduler.id(),
+            id: second_id,
+            deadline: joined[1].deadline.unwrap(),
+        };
+        let active_pipeline = pending_target().active_top_level.unwrap().pipeline_id;
+        let make_snapshot = |next_deadline| {
+            raw_with_logical_timer(
+                &clock,
+                PendingSchedulerObservation {
+                    scheduler_id: scheduler.id(),
+                    next_deadline,
+                },
+                PendingLogicalTimerObservation {
+                    source_id: PendingSourceId::new(200),
+                    pipeline_id: active_pipeline,
+                    stable_id: PendingLogicalTimerStableId::JavaScriptHandle(1),
+                    creation_sequence: 1,
+                    kind: PendingLogicalTimerKind::JavaScriptOneShot,
+                    logical_deadline: first.deadline,
+                    suspended: false,
+                    eligible_in_controlled_turn: true,
+                    is_ordering_head: true,
+                    delivery_ready: false,
+                    outer_wake: Some(first),
+                },
+                PendingSourceDisposition::FiniteDeadline(first.deadline),
+            )
+        };
+
+        assert_eq!(
+            make_snapshot(None).validate(),
+            Err(PendingSnapshotInvariantError::SchedulerEntryOwnerWithoutHead(first))
+        );
+        assert_eq!(
+            make_snapshot(Some(second)).validate(),
+            Err(
+                PendingSnapshotInvariantError::SchedulerEntryOwnerBeforeHead {
+                    claimed: first,
+                    head: second,
+                }
+            )
+        );
+        let same_id_wrong_deadline = TimerDeadlineSnapshot {
+            deadline: second.deadline,
+            ..first
+        };
+        assert_eq!(
+            make_snapshot(Some(same_id_wrong_deadline)).validate(),
+            Err(
+                PendingSnapshotInvariantError::SchedulerEntryOwnerHeadMismatch {
+                    claimed: first,
+                    head: same_id_wrong_deadline,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn logical_timer_snapshot_rejects_reused_stable_registration_identity() {
+        let pipeline_id = pipeline_id(1);
+        let stable_id = PendingLogicalTimerStableId::JavaScriptHandle(17);
+        let make_timer = |source, creation_sequence, head| PendingLogicalTimerObservation {
+            source_id: PendingSourceId::new(source),
+            pipeline_id,
+            stable_id,
+            creation_sequence,
+            kind: PendingLogicalTimerKind::JavaScriptOneShot,
+            logical_deadline: DocumentTime::from_nanos(10 + u128::from(source)),
+            suspended: false,
+            eligible_in_controlled_turn: true,
+            is_ordering_head: head,
+            delivery_ready: head,
+            outer_wake: None,
+        };
+
+        assert_eq!(
+            PendingLogicalTimerSnapshot::new(
+                vec![make_timer(1, 1, true), make_timer(2, 2, false),]
+            ),
+            Err(
+                PendingSnapshotInvariantError::DuplicateLogicalTimerStableIdentity {
+                    pipeline_id,
+                    stable_id,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn logical_timer_snapshot_rejects_a_later_detached_delivery_head() {
+        let pipeline_id = pipeline_id(1);
+        let make_timer =
+            |source, deadline, creation_sequence, head| PendingLogicalTimerObservation {
+                source_id: PendingSourceId::new(source),
+                pipeline_id,
+                stable_id: PendingLogicalTimerStableId::JavaScriptHandle(source as i32),
+                creation_sequence,
+                kind: PendingLogicalTimerKind::JavaScriptOneShot,
+                logical_deadline: DocumentTime::from_nanos(deadline),
+                suspended: false,
+                eligible_in_controlled_turn: true,
+                is_ordering_head: head,
+                delivery_ready: head,
+                outer_wake: None,
+            };
+
+        assert_eq!(
+            PendingLogicalTimerSnapshot::new(vec![
+                make_timer(1, 10, 1, false),
+                make_timer(2, 20, 2, true),
+            ]),
+            Err(
+                PendingSnapshotInvariantError::LogicalTimerOrderingHeadMismatch {
+                    pipeline_id,
+                    expected: PendingSourceId::new(1),
+                    observed: PendingSourceId::new(2),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn raw_pending_requires_one_logical_observation_per_timer_source() {
+        let mut snapshot = minimal_raw_snapshot();
+        let pending_pipeline = snapshot.target.pending_top_level_pipelines()[0];
+        snapshot.sources = PendingSourceSnapshot::new(
+            PendingSourceEpoch::new(1),
+            vec![
+                source(
+                    100,
+                    PendingSourceKind::Parser,
+                    PendingSourceDisposition::Ready,
+                ),
+                source(
+                    200,
+                    PendingSourceKind::Timer,
+                    PendingSourceDisposition::Inert,
+                ),
+            ],
+        )
+        .unwrap();
+        assert!(snapshot.target.contains_pipeline(pending_pipeline));
+
+        assert_eq!(
+            snapshot.validate(),
+            Err(
+                PendingSnapshotInvariantError::MissingLogicalTimerObservation(
+                    PendingSourceId::new(200),
+                )
+            )
+        );
     }
 
     #[test]
@@ -3000,6 +4132,7 @@ mod tests {
         }
         assert_eq!(PendingExternalIoOwner::TopLevelNavigation as u8, 0);
         assert_eq!(PendingExternalIoLoadBlocking::Blocking as u8, 0);
+        assert_eq!(PendingNetworkKind::ProducerFallback as u8, 8);
         assert_eq!(PendingParserSourceKind::DocumentParser as u8, 0);
         assert_eq!(PendingParserPhase::Ready as u8, 0);
         assert_eq!(PendingParserPhase::AwaitingExternalInput as u8, 1);
@@ -3473,51 +4606,80 @@ mod tests {
     }
 
     #[test]
-    fn raw_snapshot_requires_exactly_one_navigation_per_pending_pipeline() {
-        let mut snapshot = minimal_raw_snapshot();
-        let pending_pipeline = snapshot.target.pending_top_level_pipelines()[0];
-        snapshot.parser = PendingParserObservation::default();
-        snapshot.sources = PendingSourceSnapshot::default();
-        assert_eq!(
-            snapshot.validate(),
-            Err(
-                PendingSnapshotInvariantError::MissingPendingNavigationObservation(
-                    pending_pipeline,
-                ),
-            ),
-        );
-
-        let first = PendingSourceId::new(101);
-        let second = PendingSourceId::new(102);
-        snapshot.parser = PendingParserObservation::new(vec![
-            top_level_navigation(first, pending_pipeline),
-            top_level_navigation(second, pending_pipeline),
-        ])
-        .unwrap();
-        snapshot.sources = PendingSourceSnapshot::new(
-            PendingSourceEpoch::new(1),
-            vec![
-                source(
-                    first.get(),
-                    PendingSourceKind::Parser,
-                    PendingSourceDisposition::Ready,
-                ),
-                source(
-                    second.get(),
-                    PendingSourceKind::Parser,
-                    PendingSourceDisposition::Ready,
-                ),
-            ],
+    fn runtime_terminals_merge_timer_owners_without_losing_fixed_slots() {
+        let first = pipeline_id(1);
+        let second = pipeline_id(2);
+        let clock = controlled_clock();
+        let clock_terminal = PendingClockTerminalObservation {
+            clock_id: clock.id(),
+            error: PendingClockTerminal::Overflow,
+        };
+        let mut terminals = PendingRuntimeTerminals::new(
+            vec![PendingLogicalTimerTerminalObservation {
+                pipeline_id: second,
+                error: DocumentClockError::Overflow,
+            }],
+            Vec::new(),
         )
         .unwrap();
+        terminals.clock = Some(clock_terminal);
+
+        let terminals = terminals
+            .with_additional_timer_terminals(
+                vec![PendingLogicalTimerTerminalObservation {
+                    pipeline_id: first,
+                    error: DocumentClockError::RealtimeClock,
+                }],
+                vec![
+                    PendingImageTimerTerminalObservation {
+                        pipeline_id: second,
+                        error: TimerControlError::SequenceExhausted,
+                    },
+                    PendingImageTimerTerminalObservation {
+                        pipeline_id: first,
+                        error: TimerControlError::DeadlineOverflow,
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(terminals.clock, Some(clock_terminal));
         assert_eq!(
-            snapshot.validate(),
-            Err(
-                PendingSnapshotInvariantError::DuplicatePendingNavigationObservation(
-                    pending_pipeline,
-                ),
-            ),
+            terminals
+                .logical_timers()
+                .iter()
+                .map(|terminal| terminal.pipeline_id)
+                .collect::<Vec<_>>(),
+            vec![first, second],
         );
+        assert_eq!(
+            terminals
+                .image_timers()
+                .iter()
+                .map(|terminal| terminal.pipeline_id)
+                .collect::<Vec<_>>(),
+            vec![first, second],
+        );
+        assert_eq!(
+            terminals.with_additional_timer_terminals(
+                Vec::new(),
+                vec![PendingImageTimerTerminalObservation {
+                    pipeline_id: first,
+                    error: TimerControlError::Clock(DocumentClockError::Overflow),
+                }],
+            ),
+            Err(PendingSnapshotInvariantError::DuplicateImageTimerTerminal(
+                first,
+            )),
+        );
+    }
+
+    #[test]
+    fn raw_snapshot_allows_pending_membership_without_an_invented_navigation_phase() {
+        let mut snapshot = minimal_raw_snapshot();
+        snapshot.parser = PendingParserObservation::default();
+        snapshot.sources = PendingSourceSnapshot::default();
+        assert_eq!(snapshot.validate(), Ok(()));
     }
 
     #[test]
@@ -3830,6 +4992,18 @@ mod tests {
             duration: Duration::from_nanos(1),
         });
         let deadline = scheduler.finite_deadline_snapshot().unwrap().unwrap();
+        let image_timer_id = scheduler.schedule_timer(TimerEventRequest {
+            callback: Box::new(|| {}),
+            duration: Duration::from_nanos(2),
+        });
+        let image_timer_join = scheduler
+            .join_live_deadlines(scheduler.id(), &[image_timer_id])
+            .unwrap()[0];
+        let image_deadline = TimerDeadlineSnapshot {
+            scheduler_id: image_timer_join.scheduler_id,
+            id: image_timer_join.id,
+            deadline: image_timer_join.deadline.unwrap(),
+        };
         let actual = deadline.scheduler_id;
         let mut foreign_scheduler = TimerScheduler::with_clock(controlled_clock());
         foreign_scheduler.schedule_timer(TimerEventRequest {
@@ -3874,7 +5048,7 @@ mod tests {
 
         snapshot.rendering.pipelines[0]
             .animated_images
-            .scheduled_timer = Some(deadline);
+            .scheduled_timer = Some(image_deadline);
         snapshot.validate().unwrap();
 
         snapshot.scheduler.scheduler_id = foreign;
@@ -3933,6 +5107,7 @@ mod tests {
             )])
             .unwrap(),
             network,
+            logical_timers: PendingLogicalTimerSnapshot::default(),
             rendering: rendering_for(pipeline_id),
             sources: PendingSourceSnapshot::new(
                 PendingSourceEpoch::ZERO,

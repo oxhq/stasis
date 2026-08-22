@@ -8,6 +8,7 @@ use js::rust::HandleObject;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 
 use crate::dom::bindings::codegen::Bindings::MessageChannelBinding::MessageChannelMethods;
+use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::messageport::MessagePort;
@@ -62,8 +63,9 @@ impl MessageChannelMethods<crate::DomTypeHolder> for MessageChannel {
         cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-    ) -> DomRoot<MessageChannel> {
-        MessageChannel::new(cx, global, proto)
+    ) -> Fallible<DomRoot<MessageChannel>> {
+        global.require_external_subscription()?;
+        Ok(MessageChannel::new(cx, global, proto))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-messagechannel-port1>

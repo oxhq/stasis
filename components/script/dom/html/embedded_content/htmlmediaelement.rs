@@ -2120,6 +2120,8 @@ impl HTMLMediaElement {
     }
 
     fn create_media_player(&self, resource: &Resource) -> Result<(), ()> {
+        self.owner_global().require_native_media().map_err(|_| ())?;
+
         let stream_type = match *resource {
             Resource::Object => {
                 if let Some(ref src_object) = *self.src_object.borrow() {
@@ -2968,6 +2970,9 @@ impl HTMLMediaElement {
 
     fn send_media_session_event(&self, cx: &mut JSContext, event: MediaSessionEvent) {
         let global = self.global();
+        if global.require_native_media().is_err() {
+            return;
+        }
         let media_session = global.as_window().Navigator(cx).MediaSession(cx);
 
         media_session.register_media_instance(self);

@@ -54,6 +54,11 @@ impl MediaDevicesMethods<crate::DomTypeHolder> for MediaDevices {
         constraints: &MediaStreamConstraints,
     ) -> Rc<Promise> {
         let p = Promise::new_in_realm(cx);
+        if let Err(error) = self.global().require_native_media() {
+            p.reject_error(cx, error);
+            return p;
+        }
+
         let media = ServoMedia::get();
         let stream = MediaStream::new(cx, &self.global());
         if let Some(constraints) = convert_constraints(&constraints.audio) &&
@@ -78,6 +83,10 @@ impl MediaDevicesMethods<crate::DomTypeHolder> for MediaDevices {
         // Step 1.
         let mut realm = CurrentRealm::assert(cx);
         let p = Promise::new_in_realm(&mut realm);
+        if let Err(error) = self.global().require_native_media() {
+            p.reject_error(&mut realm, error);
+            return p;
+        }
 
         // Step 2.
         // XXX These steps should be run in parallel.

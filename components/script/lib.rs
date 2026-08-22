@@ -21,6 +21,7 @@ extern crate malloc_size_of_derive;
 extern crate stylo_atoms;
 
 mod animations;
+pub(crate) mod automation;
 #[macro_use]
 mod tasks;
 

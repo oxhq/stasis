@@ -119,14 +119,16 @@ impl HTMLCanvasElement {
         document: &Document,
         proto: Option<HandleObject>,
     ) -> DomRoot<HTMLCanvasElement> {
-        Node::reflect_weak_referenceable_node_with_proto(
+        let canvas = Node::reflect_weak_referenceable_node_with_proto(
             cx,
             Rc::new(HTMLCanvasElement::new_inherited(
                 local_name, prefix, document,
             )),
             document,
             proto,
-        )
+        );
+        document.register_html_canvas_element(&canvas);
+        canvas
     }
 
     fn recreate_contexts_after_resize(&self) {

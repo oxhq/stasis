@@ -8,11 +8,11 @@ use std::fmt;
 
 use content_security_policy::sandboxing_directive::SandboxingFlagSet;
 use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg, WorkerId};
-use embedder_traits::user_contents::UserContentManagerId;
 use embedder_traits::document_control::{
     DocumentControlCancellationId, DocumentControlOutcome, DocumentControlRequestId,
 };
 use embedder_traits::document_pending::PendingTargetObservation;
+use embedder_traits::user_contents::UserContentManagerId;
 use embedder_traits::{
     AnimationState, FocusSequenceNumber, JSValue, JavaScriptEvaluationError,
     JavaScriptEvaluationId, MediaSessionEvent, ScriptToEmbedderChan, Theme, ViewportDetails,
@@ -57,6 +57,40 @@ use crate::{
 
 pub type ScriptToConstellationSender =
     GenericSender<(WebViewId, PipelineId, ScriptToConstellationMessage)>;
+
+/// Exact priority-command identity for the initial response-headers activation handoff.
+///
+/// This correlation is deliberately constructible only for the ordinary `DriveOneTurn` phase.
+/// `BootstrapInitialPipeline` has already completed after admitting `SpawnPipeline` and must never
+/// authorize the later pending-to-active transition.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InitialPipelineActivationCorrelation {
+    request_id: DocumentControlRequestId,
+    cancellation_id: DocumentControlCancellationId,
+}
+
+impl InitialPipelineActivationCorrelation {
+    /// Bind an activation emitted inside one already-linearized `DriveOneTurn` command.
+    pub fn new_for_drive_one_turn(
+        request_id: DocumentControlRequestId,
+        cancellation_id: DocumentControlCancellationId,
+    ) -> Self {
+        Self {
+            request_id,
+            cancellation_id,
+        }
+    }
+
+    /// Return the exact in-flight `DriveOneTurn` request identity.
+    pub const fn request_id(self) -> DocumentControlRequestId {
+        self.request_id
+    }
+
+    /// Return the exact cancellation nonce paired with the in-flight request.
+    pub const fn cancellation_id(self) -> DocumentControlCancellationId {
+        self.cancellation_id
+    }
+}
 
 /// A Script to Constellation channel.
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -772,8 +806,9 @@ pub enum ScriptToConstellationMessage {
     ScriptNewIFrame(IFrameLoadInfoWithData),
     /// Script has opened a new auxiliary browsing context.
     CreateAuxiliaryWebView(AuxiliaryWebViewCreationRequest),
-    /// Mark a new document as active
-    ActivateDocument,
+    /// Mark a new document as active, optionally correlating the first controlled
+    /// response-headers turn with its exact in-flight `DriveOneTurn` command.
+    ActivateDocument(Option<InitialPipelineActivationCorrelation>),
     /// Update the pipeline Url, which can change after redirections.
     SetFinalUrl(ServoUrl),
     /// A log entry, with the top-level browsing context id and thread name
@@ -886,4 +921,27 @@ pub enum RemoteFocusOperation {
     /// Do sequential focus navigation using the `<iframe>` element with the given
     /// [`BrowsingContextId`] as the starting point and in the given direction.
     Sequential(SequentialFocusDirection, Option<BrowsingContextId>),
+}
+
+#[cfg(test)]
+mod document_control_tests {
+    use super::*;
+
+    #[test]
+    fn initial_activation_correlation_is_bound_to_the_drive_phase() {
+        let request_id = DocumentControlRequestId::new(7);
+        let cancellation_id = DocumentControlCancellationId::new(11);
+        let correlation = InitialPipelineActivationCorrelation::new_for_drive_one_turn(
+            request_id,
+            cancellation_id,
+        );
+
+        assert_eq!(correlation.request_id(), request_id);
+        assert_eq!(correlation.cancellation_id(), cancellation_id);
+        assert!(matches!(
+            ScriptToConstellationMessage::ActivateDocument(Some(correlation)),
+            ScriptToConstellationMessage::ActivateDocument(Some(observed))
+                if observed == correlation
+        ));
+    }
 }

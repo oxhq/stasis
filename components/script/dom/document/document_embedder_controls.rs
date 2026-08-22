@@ -105,7 +105,26 @@ impl DocumentEmbedderControls {
         element: ControlElement,
         request: EmbedderControlRequest,
         point: Option<DevicePoint>,
-    ) -> EmbedderControlId {
+    ) -> Option<EmbedderControlId> {
+        if !matches!(&request, EmbedderControlRequest::FilePicker(_)) &&
+            self.window
+                .as_global_scope()
+                .require_embedder_control()
+                .is_err()
+        {
+            // Leave a sticky terminal without publishing an owner or sending an embedder request.
+            return None;
+        }
+        if matches!(&request, EmbedderControlRequest::FilePicker(_)) &&
+            self.window
+                .as_global_scope()
+                .require_resource_thread_io()
+                .is_err()
+        {
+            // Do not publish a visible-control owner or a native callback when controlled pending
+            // authority cannot represent the FileManager request.
+            return None;
+        }
         let id = self.next_control_id();
         let rect = point
             .map(|point| DeviceIntRect::from_origin_and_size(point.to_i32(), Size2D::zero()))
@@ -131,7 +150,7 @@ impl DocumentEmbedderControls {
             .insert(id.index.into(), element);
 
         self.send_embedder_control_request(request, id, rect);
-        id
+        Some(id)
     }
 
     fn send_embedder_control_request(
@@ -390,7 +409,7 @@ impl DocumentEmbedderControls {
             },
         ]);
 
-        self.show_embedder_control(
+        let _ = self.show_embedder_control(
             ControlElement::ContextMenu(ContextMenuNodes {
                 node: hit_test_result.node.as_traced(),
                 anchor_element: anchor_element.map(|element| element.as_traced()),

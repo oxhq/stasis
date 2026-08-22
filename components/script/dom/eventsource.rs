@@ -49,6 +49,49 @@ use crate::timers::OneshotTimerCallback;
 
 const DEFAULT_RECONNECTION_TIME: Duration = Duration::from_millis(5000);
 
+fn validate_event_source_url_then_require_subscription<T, E>(
+    parsed_url: Result<T, E>,
+    require_subscription: impl FnOnce() -> Fallible<()>,
+) -> Fallible<T> {
+    let url_record = parsed_url.map_err(|_| Error::Syntax(None))?;
+    // Invalid URLs must throw SyntaxError without latching a controlled-clock surface. Once URL
+    // validation succeeds, refuse the asynchronous subscription before constructing or fetching.
+    require_subscription()?;
+    Ok(url_record)
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use std::cell::Cell;
+
+    use super::validate_event_source_url_then_require_subscription;
+    use crate::dom::bindings::error::Error;
+
+    #[test]
+    fn invalid_event_source_url_does_not_run_subscription_guard() {
+        let guard_ran = Cell::new(false);
+        let result = validate_event_source_url_then_require_subscription(Err::<(), ()>(()), || {
+            guard_ran.set(true);
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(Error::Syntax(_))));
+        assert!(!guard_ran.get());
+    }
+
+    #[test]
+    fn valid_event_source_url_runs_subscription_guard() {
+        let guard_ran = Cell::new(false);
+        let result = validate_event_source_url_then_require_subscription(Ok::<_, ()>(()), || {
+            guard_ran.set(true);
+            Ok(())
+        });
+
+        assert!(result.is_ok());
+        assert!(guard_ran.get());
+    }
+}
+
 #[derive(Clone, Copy, Debug, JSTraceable, MallocSizeOf, PartialEq)]
 struct GenerationId(u32);
 
@@ -584,11 +627,11 @@ impl EventSourceMethods<crate::DomTypeHolder> for EventSource {
         // Step 2. Let settings be the relevant settings object for the `EventSource` constructor.
         // Bindings pass that environment as `global`.
         // Step 3. Let urlRecord be the result of encoding-parsing a URL given url, relative to settings.
-        let url_record = match global.encoding_parse_a_url(&url.str()) {
-            Ok(u) => u,
-            // Step 4 If urlRecord is failure, then throw a "SyntaxError" DOMException.
-            Err(_) => return Err(Error::Syntax(None)),
-        };
+        // Step 4 If urlRecord is failure, then throw a "SyntaxError" DOMException.
+        let url_record = validate_event_source_url_then_require_subscription(
+            global.encoding_parse_a_url(&url.str()),
+            || global.require_external_subscription(),
+        )?;
         // Step 1 Let ev be a new EventSource object.
         let event_source = EventSource::new(
             cx,

@@ -138,7 +138,13 @@ use crate::dom::customevent::CustomEvent;
 use crate::dom::document::accessibility_data::AccessibilityData;
 use crate::dom::document::focus::{DocumentFocusHandler, FocusableArea};
 use crate::dom::document::iframe_collection::IFrameCollection;
-use crate::dom::document::image_animation::ImageAnimationManager;
+use crate::dom::document::image_animation::{
+    ImageAnimationManager, ImageAnimationObservationContext,
+};
+pub(crate) use crate::dom::document::image_animation::{
+    ImageAnimationPendingCounts, ImageAnimationPendingObservation, RetainedImageAnimationClass,
+    RetainedImageAnimationObservation,
+};
 use crate::dom::document::tree_ordered_index_map::TreeOrderedIndexMap;
 use crate::dom::document::websocket::WebSocket;
 use crate::dom::document_embedder_controls::DocumentEmbedderControls;
@@ -174,9 +180,7 @@ use crate::dom::html::htmlimageelement::HTMLImageElement;
 use crate::dom::html::htmlscriptelement::{HTMLScriptElement, ScriptResult};
 use crate::dom::html::htmltitleelement::HTMLTitleElement;
 use crate::dom::htmldetailselement::DetailsNameGroups;
-use crate::dom::intersectionobserver::{
-    IntersectionObserver, IntersectionObserverRenderingTime,
-};
+use crate::dom::intersectionobserver::{IntersectionObserver, IntersectionObserverRenderingTime};
 use crate::dom::iterators::ShadowIncluding;
 use crate::dom::keyboardevent::KeyboardEvent;
 use crate::dom::largestcontentfulpaint::LargestContentfulPaint;
@@ -414,9 +418,55 @@ pub(crate) struct DocumentCanvasPendingObservation {
     pub(crate) dirty_canvas_count: usize,
     /// Whether paint still owes completion for asynchronous canvas image uploads.
     pub(crate) waiting_on_canvas_image_updates: bool,
-    /// A complete retained live-canvas inventory is not currently owned by Document.
-    /// `None` must not be interpreted as zero live canvases.
+    /// Live `HTMLCanvasElement` owners retained in this document's Window realm.
+    pub(crate) live_html_canvas_count: usize,
+    /// Live, non-detached `OffscreenCanvas` owners retained in this document's Window realm.
+    pub(crate) live_window_offscreen_canvas_count: usize,
+    /// The exact sum of the two Window-owned inventories above.
+    /// `None` means the sum overflowed and must not be interpreted as zero live canvases.
     pub(crate) live_canvas_count: Option<usize>,
+    /// Retained canvases which can execute outside this document's event loop.
+    ///
+    /// Every non-detached Window-owned `OffscreenCanvas` is an execution surface. Worker and
+    /// worklet ownership is gated separately after a successful transfer leaves this inventory.
+    pub(crate) offscreen_execution_count: usize,
+}
+
+/// One live, non-Closed WebSocket retained by this document.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PendingWebSocketObservation {
+    pub(crate) stable_id: u64,
+}
+
+/// One exact live-inventory registration for a Window-owned `OffscreenCanvas`.
+///
+/// `OffscreenCanvas` is not weak-referenceable. Keeping only this shared counter avoids retaining
+/// the DOM object while still decrementing exactly when it is collected or becomes detached by a
+/// successful transfer.
+pub(crate) struct WindowOffscreenCanvasRegistration {
+    live_count: Rc<Cell<usize>>,
+}
+
+impl WindowOffscreenCanvasRegistration {
+    fn new(live_count: Rc<Cell<usize>>) -> Self {
+        let next = live_count
+            .get()
+            .checked_add(1)
+            .expect("live Window OffscreenCanvas count overflowed");
+        live_count.set(next);
+        Self { live_count }
+    }
+}
+
+impl Drop for WindowOffscreenCanvasRegistration {
+    fn drop(&mut self) {
+        let previous = self.live_count.get();
+        self.live_count.set(
+            previous
+                .checked_sub(1)
+                .expect("live Window OffscreenCanvas registration underflowed"),
+        );
+    }
 }
 
 /// Passive non-animated image facts available directly from a document.
@@ -442,6 +492,8 @@ pub(crate) struct DocumentRenderingPendingObservation {
     pub(crate) needs_rendering_update: bool,
     pub(crate) css_animations: CssAnimationPendingObservation,
     pub(crate) canvas: DocumentCanvasPendingObservation,
+    /// The exact readiness bit consumed by the next rendering opportunity for animated images.
+    pub(crate) animated_image_update_ready: bool,
     /// FontContext's exact outstanding web-font load count.
     pub(crate) web_fonts_still_loading: usize,
     pub(crate) nonanimated_images: DocumentImagePendingObservation,
@@ -661,6 +713,12 @@ pub(crate) struct Document {
     /// A set of dirty HTML canvas elements that need their WebRender images updated the
     /// next time the rendering is updated.
     dirty_canvases: DomRefCell<Vec<Dom<HTMLCanvasElement>>>,
+    /// Weak live-object inventory for every `HTMLCanvasElement` created in this document.
+    html_canvases: DOMTracker<HTMLCanvasElement>,
+    /// Exact live count for non-detached `OffscreenCanvas` objects owned by this Window.
+    #[no_trace = "Rc<Cell<usize>> contains no JS-managed objects"]
+    #[ignore_malloc_size_of = "Rc counter has no independently meaningful DOM allocation size"]
+    live_window_offscreen_canvases: Rc<Cell<usize>>,
     /// Whether or not animated images need to have their contents updated.
     has_pending_animated_image_update: Cell<bool>,
     /// <https://w3c.github.io/slection-api/#dfn-selection>
@@ -897,6 +955,17 @@ impl Document {
 
     pub(crate) fn track_websocket(&self, websocket: &WebSocket) {
         self.websockets.track(websocket);
+    }
+
+    /// Capture canonical live WebSocket identities without closing, cancelling, or dispatching.
+    pub(crate) fn pending_websocket_observation(&self) -> Vec<PendingWebSocketObservation> {
+        let mut stable_ids = Vec::new();
+        self.websockets.for_each(|websocket: DomRoot<WebSocket>| {
+            if let Some(stable_id) = websocket.pending_stable_id_if_non_closed() {
+                stable_ids.push(stable_id);
+            }
+        });
+        canonical_pending_websocket_observations(stable_ids)
     }
 
     fn close_outstanding_websockets(&self) -> bool {
@@ -2054,17 +2123,16 @@ impl Document {
                 .into(),
         );
         let event_loop_sender = network_listener.task_source.sender.clone();
-        let callback = match event_loop_sender
-            .fence_fetch_until_eof(network_listener.into_callback())
-        {
-            Ok(callback) => callback,
-            Err(error) => {
-                // Admission is sticky in Controlled mode. Do not add a blocking load or start an
-                // untracked request after the fence has become terminal.
-                error!("Refusing to start an unfenced document load: {error}");
-                return;
-            },
-        };
+        let callback =
+            match event_loop_sender.fence_fetch_until_eof(network_listener.into_callback()) {
+                Ok(callback) => callback,
+                Err(error) => {
+                    // Admission is sticky in Controlled mode. Do not add a blocking load or start an
+                    // untracked request after the fence has become terminal.
+                    error!("Refusing to start an unfenced document load: {error}");
+                    return;
+                },
+            };
         self.loader_mut()
             .fetch_async_with_callback(load, request, callback);
     }
@@ -2082,15 +2150,14 @@ impl Document {
                 .into(),
         );
         let event_loop_sender = network_listener.task_source.sender.clone();
-        let callback = match event_loop_sender
-            .fence_fetch_until_eof(network_listener.into_callback())
-        {
-            Ok(callback) => callback,
-            Err(error) => {
-                error!("Refusing to start an unfenced background document load: {error}");
-                return;
-            },
-        };
+        let callback =
+            match event_loop_sender.fence_fetch_until_eof(network_listener.into_callback()) {
+                Ok(callback) => callback,
+                Err(error) => {
+                    error!("Refusing to start an unfenced background document load: {error}");
+                    return;
+                },
+            };
         self.loader_mut().fetch_async_background(request, callback);
     }
 
@@ -3287,6 +3354,26 @@ impl Document {
         dirty_canvases.push(canvas.clone());
     }
 
+    /// Register one newly reflected `HTMLCanvasElement` without extending its lifetime.
+    pub(crate) fn register_html_canvas_element(&self, canvas: &HTMLCanvasElement) {
+        self.html_canvases.track(canvas);
+    }
+
+    /// Register one non-detached `OffscreenCanvas` owned by this document's Window.
+    pub(crate) fn register_window_offscreen_canvas(&self) -> WindowOffscreenCanvasRegistration {
+        WindowOffscreenCanvasRegistration::new(Rc::clone(&self.live_window_offscreen_canvases))
+    }
+
+    fn live_html_canvas_count(&self) -> usize {
+        let mut count = 0usize;
+        self.html_canvases.for_each(|_| {
+            count = count
+                .checked_add(1)
+                .expect("live HTMLCanvasElement count overflowed");
+        });
+        count
+    }
+
     /// Whether or not this [`Document`] needs a rendering update, due to changed
     /// contents or pending events. This is used to decide whether or not to schedule
     /// a call to the "update the rendering" algorithm.
@@ -3343,10 +3430,18 @@ impl Document {
         let needs_rendering_update = self.needs_rendering_update(no_gc);
         let animation_frames = self.animation_frame_pending_observation();
         let css_animations = self.animations.pending_observation();
+        let live_html_canvas_count = self.live_html_canvas_count();
+        let live_window_offscreen_canvas_count = self.live_window_offscreen_canvases.get();
         let canvas = DocumentCanvasPendingObservation {
             dirty_canvas_count: self.dirty_canvases.borrow().len(),
             waiting_on_canvas_image_updates,
-            live_canvas_count: None,
+            live_html_canvas_count,
+            live_window_offscreen_canvas_count,
+            live_canvas_count: checked_live_canvas_count(
+                live_html_canvas_count,
+                live_window_offscreen_canvas_count,
+            ),
+            offscreen_execution_count: live_window_offscreen_canvas_count,
         };
 
         DocumentRenderingPendingObservation {
@@ -3360,6 +3455,7 @@ impl Document {
             needs_rendering_update,
             css_animations,
             canvas,
+            animated_image_update_ready: self.has_pending_animated_image_update.get(),
             web_fonts_still_loading: self.window().font_context().web_fonts_still_loading(),
             nonanimated_images: DocumentImagePendingObservation {
                 pending_callback_ids: None,
@@ -4141,6 +4237,8 @@ impl Document {
             shadow_roots_styles_changed: Cell::new(false),
             media_controls: DomRefCell::new(HashMap::new()),
             dirty_canvases: DomRefCell::new(Default::default()),
+            html_canvases: DOMTracker::new(),
+            live_window_offscreen_canvases: Rc::new(Cell::new(0)),
             has_pending_animated_image_update: Cell::new(false),
             selection: MutNullableDom::new(None),
             timeline: Dom::from_ref(timeline),
@@ -5042,6 +5140,21 @@ impl Document {
         self.image_animation_manager.borrow()
     }
 
+    /// Capture retained animated-image state using owner-authoritative document activity.
+    ///
+    /// This is passive: it does not sample or advance either the image timeline or scheduler.
+    pub(crate) fn pending_image_animation_observation(
+        &self,
+        timeline_controlled: bool,
+    ) -> ImageAnimationPendingObservation {
+        self.image_animation_manager.borrow().pending_observation(
+            ImageAnimationObservationContext {
+                timeline_controlled,
+                document_fully_active: self.is_fully_active(),
+            },
+        )
+    }
+
     pub(crate) fn set_has_pending_animated_image_update(&self) {
         self.has_pending_animated_image_update.set(true);
     }
@@ -5386,6 +5499,53 @@ fn rendering_eligibility_observation(
     }
 }
 
+fn checked_live_canvas_count(
+    live_html_canvas_count: usize,
+    live_window_offscreen_canvas_count: usize,
+) -> Option<usize> {
+    live_html_canvas_count.checked_add(live_window_offscreen_canvas_count)
+}
+
+fn canonical_pending_websocket_observations(
+    stable_ids: impl IntoIterator<Item = u64>,
+) -> Vec<PendingWebSocketObservation> {
+    let mut observations = stable_ids
+        .into_iter()
+        .map(|stable_id| {
+            assert_ne!(
+                stable_id, 0,
+                "WebSocket pending-observation IDs must be nonzero"
+            );
+            PendingWebSocketObservation { stable_id }
+        })
+        .collect::<Vec<_>>();
+    observations.sort_unstable_by_key(|observation| observation.stable_id);
+    assert!(
+        observations
+            .windows(2)
+            .all(|pair| pair[0].stable_id < pair[1].stable_id),
+        "WebSocket pending-observation IDs must be unique"
+    );
+    observations
+}
+
+#[cfg(test)]
+mod pending_websocket_observation_tests {
+    use super::{PendingWebSocketObservation, canonical_pending_websocket_observations};
+
+    #[test]
+    fn websocket_rows_are_canonical_and_identity_preserving() {
+        assert_eq!(
+            canonical_pending_websocket_observations([9, 2, 5]),
+            vec![
+                PendingWebSocketObservation { stable_id: 2 },
+                PendingWebSocketObservation { stable_id: 5 },
+                PendingWebSocketObservation { stable_id: 9 },
+            ]
+        );
+    }
+}
+
 fn run_animation_frame_callback_snapshot<T, Timestamp: Copy>(
     callbacks: &DomRefCell<VecDeque<(u32, Option<T>)>>,
     timestamp: Timestamp,
@@ -5436,12 +5596,8 @@ mod animation_frame_callback_tests {
 
     #[test]
     fn passive_callback_observation_separates_runnable_slots_and_tombstones() {
-        let callbacks = VecDeque::from([
-            (1, Some("first")),
-            (2, None),
-            (3, Some("third")),
-            (4, None),
-        ]);
+        let callbacks =
+            VecDeque::from([(1, Some("first")), (2, None), (3, Some("third")), (4, None)]);
 
         assert_eq!(
             observe_animation_frame_slots(&callbacks),
@@ -5507,6 +5663,28 @@ mod animation_frame_callback_tests {
                 rendering_opportunity_eligible: false,
             }
         );
+    }
+
+    #[test]
+    fn window_offscreen_canvas_registration_tracks_exact_live_scope() {
+        let live_count = Rc::new(Cell::new(0));
+        let first = WindowOffscreenCanvasRegistration::new(Rc::clone(&live_count));
+        assert_eq!(live_count.get(), 1);
+
+        {
+            let _second = WindowOffscreenCanvasRegistration::new(Rc::clone(&live_count));
+            assert_eq!(live_count.get(), 2);
+        }
+        assert_eq!(live_count.get(), 1);
+
+        drop(first);
+        assert_eq!(live_count.get(), 0);
+    }
+
+    #[test]
+    fn live_canvas_total_fails_closed_on_overflow() {
+        assert_eq!(checked_live_canvas_count(4, 3), Some(7));
+        assert_eq!(checked_live_canvas_count(usize::MAX, 1), None);
     }
 
     #[test]

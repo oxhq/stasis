@@ -35,8 +35,8 @@ use servo_base::id::{
 };
 use servo_constellation_traits::{
     BlobImpl, DomException, DomMatrix, DomPoint, DomQuad, DomRect, MessagePortImpl,
-    Serializable as SerializableInterface, SerializableCryptoKey, SerializableFile,
-    SerializableFileList, SerializableImageBitmap, SerializableImageData,
+    ScriptToConstellationMessage, Serializable as SerializableInterface, SerializableCryptoKey,
+    SerializableFile, SerializableFileList, SerializableImageBitmap, SerializableImageData,
     SerializableQuotaExceededError, StructuredSerializedData, TransferableOffscreenCanvas,
     Transferrable as TransferrableInterface, TransformStreamData,
 };
@@ -57,7 +57,9 @@ use crate::dom::filelist::FileList;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::imagebitmap::ImageBitmap;
 use crate::dom::imagedata::ImageData;
-use crate::dom::messageport::MessagePort;
+use crate::dom::messageport::{
+    MessagePort, rejected_transfer_cleanup_message, send_rejected_transfer_cleanup_messages,
+};
 use crate::dom::offscreencanvas::OffscreenCanvas;
 use crate::dom::stream::readablestream::ReadableStream;
 use crate::dom::stream::writablestream::WritableStream;
@@ -407,8 +409,12 @@ fn receive_object<T: Transferable>(
         );
     };
 
-    let Ok(received) = T::transfer_receive(cx, owner, id, serialized) else {
-        return Err(());
+    let received = match T::transfer_receive(cx, owner, id, serialized) {
+        Ok(received) => received,
+        Err(error) => {
+            record_structured_clone_error(&mut sc_reader.error, error);
+            return Err(());
+        },
     };
     return_object.set(received.reflector().rootable().get());
     sc_reader.roots.push(Heap::boxed(return_object.get()));
@@ -614,10 +620,13 @@ unsafe extern "C" fn report_error_callback(
 
     if let Ok(msg) = msg_result {
         let error = unsafe { &mut *(closure as *mut Option<Error>) };
+        record_structured_clone_error(error, Error::DataClone(Some(msg)));
+    }
+}
 
-        if error.is_none() {
-            *error = Some(Error::DataClone(Some(msg)));
-        }
+fn record_structured_clone_error(slot: &mut Option<Error>, error: Error) {
+    if slot.is_none() {
+        *slot = Some(error);
     }
 }
 
@@ -691,6 +700,62 @@ pub(crate) struct StructuredDataReader<'a> {
     pub(crate) image_data: Option<FxHashMap<ImageDataId, SerializableImageData>>,
     // A map of serialized crypto keys.
     pub(crate) crypto_keys: Option<FxHashMap<CryptoKeyId, SerializableCryptoKey>>,
+}
+
+fn has_unreceived_port_transfers(reader: &StructuredDataReader<'_>) -> bool {
+    reader
+        .port_impls
+        .as_ref()
+        .is_some_and(|ports| !ports.is_empty()) ||
+        reader
+            .transform_streams_port_impls
+            .as_ref()
+            .is_some_and(|transforms| !transforms.is_empty())
+}
+
+fn unreceived_port_cleanup_messages(
+    port_impls: Option<&FxHashMap<MessagePortId, MessagePortImpl>>,
+    transform_streams: Option<&FxHashMap<MessagePortId, TransformStreamData>>,
+) -> Vec<ScriptToConstellationMessage> {
+    let mut ports = Vec::new();
+    if let Some(port_impls) = port_impls {
+        ports.extend(port_impls.iter().map(|(id, port_impl)| (*id, port_impl)));
+    }
+    if let Some(transform_streams) = transform_streams {
+        for data in transform_streams.values() {
+            ports.push((data.readable.0, &data.readable.1));
+            ports.push((data.writable.0, &data.writable.1));
+        }
+    }
+    ports.sort_unstable_by_key(|(id, _)| *id);
+    ports
+        .into_iter()
+        .map(|(id, port_impl)| rejected_transfer_cleanup_message(id, port_impl))
+        .collect()
+}
+
+fn cleanup_unreceived_port_transfers(global: &GlobalScope, reader: &StructuredDataReader<'_>) {
+    send_rejected_transfer_cleanup_messages(
+        global,
+        unreceived_port_cleanup_messages(
+            reader.port_impls.as_ref(),
+            reader.transform_streams_port_impls.as_ref(),
+        ),
+    );
+}
+
+fn require_structured_clone_transfer_admission(
+    global: &GlobalScope,
+    reader: &StructuredDataReader<'_>,
+) -> Fallible<()> {
+    if !has_unreceived_port_transfers(reader) {
+        return Ok(());
+    }
+    if let Err(error) = global.require_external_subscription() {
+        cleanup_unreceived_port_transfers(global, reader);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// A data holder for transferred and serialized objects.
@@ -839,6 +904,9 @@ pub(crate) fn read(
         image_data: data.image_data.take(),
         crypto_keys: data.crypto_keys.take(),
     };
+    // Admission is checked once for the complete transfer bundle before SpiderMonkey can remove or
+    // adopt any record. Controlled-mode rejection therefore cleans every in-flight port atomically.
+    require_structured_clone_transfer_admission(global, &sc_reader)?;
     let sc_reader_ptr = &mut sc_reader as *mut _;
     unsafe {
         let scbuf = JSAutoStructuredCloneBufferWrapper::new(
@@ -867,6 +935,10 @@ pub(crate) fn read(
             sc_reader_ptr as *mut raw::c_void,
         );
         if !result {
+            // A malformed clone or a later callback failure can leave unread transfer records even
+            // after bundle admission. Dispose only those still present in the reader maps; records
+            // already adopted or rejected by a callback have been removed.
+            cleanup_unreceived_port_transfers(global, &sc_reader);
             let error = if JS_IsExceptionPending(cx) {
                 Error::JSFailed
             } else {
@@ -886,5 +958,87 @@ pub(crate) fn read(
         // Any transfer-received port-impls should have been taken out.
         assert!(sc_reader.port_impls.is_none());
         Ok(message_ports)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use servo_base::id::{MessagePortIndex, PipelineNamespaceId};
+
+    use super::*;
+
+    fn message_port_id(index: u32) -> MessagePortId {
+        MessagePortId {
+            namespace_id: PipelineNamespaceId(7),
+            index: Index::<MessagePortIndex>::new(index).unwrap(),
+        }
+    }
+
+    fn entangled_port(id: MessagePortId, peer: MessagePortId) -> MessagePortImpl {
+        let mut port_impl = MessagePortImpl::new(id);
+        port_impl.entangle(peer);
+        port_impl
+    }
+
+    fn assert_cleanup_message(
+        message: ScriptToConstellationMessage,
+        expected_port: MessagePortId,
+        expected_peer: MessagePortId,
+    ) {
+        match message {
+            ScriptToConstellationMessage::DisentanglePorts(port, Some(peer)) => {
+                assert_eq!(port, expected_port);
+                assert_eq!(peer, expected_peer);
+            },
+            _ => panic!("expected exact rejected-transfer cleanup message"),
+        }
+    }
+
+    #[test]
+    fn transfer_receive_error_precedes_generic_clone_error() {
+        const MESSAGE: &str = "external subscription is not controlled";
+        let mut error = None;
+        record_structured_clone_error(&mut error, Error::NotSupported(Some(MESSAGE.to_string())));
+        record_structured_clone_error(
+            &mut error,
+            Error::DataClone(Some("transfer callback failed".to_string())),
+        );
+
+        match error {
+            Some(Error::NotSupported(Some(message))) => assert_eq!(message, MESSAGE),
+            other => panic!("expected the original NotSupported error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unread_transfer_cleanup_covers_ordinary_and_both_transform_ports() {
+        let ordinary = message_port_id(1);
+        let ordinary_peer = message_port_id(2);
+        let readable = message_port_id(3);
+        let readable_peer = message_port_id(4);
+        let writable = message_port_id(5);
+        let writable_peer = message_port_id(6);
+
+        let mut port_impls = FxHashMap::default();
+        port_impls.insert(ordinary, entangled_port(ordinary, ordinary_peer));
+
+        let mut transform_streams = FxHashMap::default();
+        transform_streams.insert(
+            // The map key is a storage key, not an additional owned port.
+            message_port_id(9),
+            TransformStreamData {
+                readable: (readable, entangled_port(readable, readable_peer)),
+                writable: (writable, entangled_port(writable, writable_peer)),
+            },
+        );
+
+        let messages =
+            unreceived_port_cleanup_messages(Some(&port_impls), Some(&transform_streams));
+        let [ordinary_cleanup, readable_cleanup, writable_cleanup]: [_; 3] =
+            messages.try_into().expect("exactly three owned ports");
+
+        assert_cleanup_message(ordinary_cleanup, ordinary, ordinary_peer);
+        assert_cleanup_message(readable_cleanup, readable, readable_peer);
+        assert_cleanup_message(writable_cleanup, writable, writable_peer);
     }
 }

@@ -264,10 +264,7 @@ impl LayoutBlocker {
         !matches!(self, Self::FiredLoadEventOrParsingTimerExpired)
     }
 
-    fn start_parsing(
-        controlled: bool,
-        host_now: impl FnOnce() -> Instant,
-    ) -> LayoutBlocker {
+    fn start_parsing(controlled: bool, host_now: impl FnOnce() -> Instant) -> LayoutBlocker {
         if controlled {
             return Self::ParsingWithoutProgressiveTimeout;
         }
@@ -275,10 +272,7 @@ impl LayoutBlocker {
         Self::Parsing(host_now())
     }
 
-    fn progressive_timeout_expired(
-        self,
-        host_now: impl FnOnce() -> Instant,
-    ) -> bool {
+    fn progressive_timeout_expired(self, host_now: impl FnOnce() -> Instant) -> bool {
         matches!(
             self,
             Self::Parsing(instant) if instant + INITIAL_REFLOW_DELAY < host_now()
@@ -719,6 +713,13 @@ impl Window {
 
     pub(crate) fn as_global_scope(&self) -> &GlobalScope {
         self.upcast::<GlobalScope>()
+    }
+
+    /// Observe an already-created Navigator/MediaSession chain without instantiating either.
+    pub(crate) fn pending_media_session_action_handler_present(&self) -> bool {
+        self.navigator
+            .get()
+            .is_some_and(|navigator| navigator.pending_media_session_action_handler_present())
     }
 
     pub(crate) fn layout(&self) -> Ref<'_, Box<dyn Layout>> {
@@ -1192,6 +1193,7 @@ impl Window {
                 global: target_global,
                 task_source,
             }),
+            document_clock: global.document_clock(),
         }
     }
 
@@ -1409,6 +1411,9 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
         if self.cannot_show_simple_dialogs() {
             return;
         }
+        if self.as_global_scope().require_embedder_control().is_err() {
+            return;
+        }
 
         // Step 2 is handled in the other variant of this method.
         //
@@ -1468,6 +1473,9 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
         if self.cannot_show_simple_dialogs() {
             return false;
         }
+        if self.as_global_scope().require_embedder_control().is_err() {
+            return false;
+        }
 
         // Step 2: Set message to the result of normalizing newlines given message.
         message.normalize_newlines();
@@ -1515,6 +1523,9 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     fn Prompt(&self, mut message: DOMString, default: DOMString) -> Option<DOMString> {
         // Step 1: If we cannot show simple dialogs for this, then return null.
         if self.cannot_show_simple_dialogs() {
+            return None;
+        }
+        if self.as_global_scope().require_embedder_control().is_err() {
             return None;
         }
 
@@ -1754,6 +1765,8 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-sessionstorage>
     fn GetSessionStorage(&self, cx: &mut JSContext) -> Fallible<DomRoot<Storage>> {
+        self.as_global_scope().require_resource_thread_io()?;
+
         // Step 1. If this's associated Document's session storage holder is non-null,
         // then return this's associated Document's session storage holder.
         if let Some(storage) = self.session_storage.get() {
@@ -1781,6 +1794,8 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-localstorage>
     fn GetLocalStorage(&self, cx: &mut JSContext) -> Fallible<DomRoot<Storage>> {
+        self.as_global_scope().require_resource_thread_io()?;
+
         // Step 1. If this's associated Document's local storage holder is non-null,
         // then return this's associated Document's local storage holder.
         if let Some(storage) = self.local_storage.get() {

@@ -339,7 +339,7 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
         let global = self.global();
         let p = Promise::new_in_realm(cx);
         let id = self.get_blob_url_id();
-        global.read_file_async(
+        if let Err(error) = global.read_file_async(
             id,
             p.clone(),
             Box::new(|cx, promise, bytes| match bytes {
@@ -352,7 +352,9 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
                     promise.reject_error(cx, e);
                 },
             }),
-        );
+        ) {
+            p.reject_error(cx, error);
+        }
         p
     }
 

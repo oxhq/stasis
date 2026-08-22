@@ -79,6 +79,8 @@ impl OfflineAudioContext {
         length: u32,
         sample_rate: f32,
     ) -> Fallible<DomRoot<OfflineAudioContext>> {
+        window.as_global_scope().require_native_media()?;
+
         if channel_count > MAX_CHANNEL_COUNT ||
             channel_count == 0 ||
             length == 0 ||

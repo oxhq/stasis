@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Stasis controlled persistent interval</title>
+  </head>
+  <body>
+    <button id="start" type="button">start</button>
+    <output id="heartbeat-count">0</output>
+    <output id="deferred-count">0</output>
+
+    <script>
+      document.querySelector("#start").addEventListener(
+        "click",
+        () => {
+          let heartbeatCount = 0;
+          window.__stasisHeartbeat = setInterval(() => {
+            heartbeatCount += 1;
+            document.querySelector("#heartbeat-count").textContent = String(
+              heartbeatCount,
+            );
+          }, 5_000);
+
+          setTimeout(() => {
+            document.querySelector("#deferred-count").textContent = "1";
+          }, 10_000);
+        },
+        { once: true },
+      );
+    </script>
+  </body>
+</html>

@@ -1,6 +1,12 @@
-# Settlement contract 0.1
+# Settlement design contract 0.1 (future surface)
 
-## Target release claim
+> **Status:** Design history and future direction. This is not the shipped
+> contract for `v0.1.0-alpha.0`. The alpha's implemented public surface is the
+> exact method and mode list in `protocol-v1.md`; in particular, it does not
+> advertise fill, query/extract, screenshots, journals, or named support
+> profiles.
+
+## Historical target claim
 
 For one fully active top-level document on one ScriptThread, under a declared
 support profile, Stasis drives supported owned work without wall-clock polling
@@ -16,15 +22,16 @@ The PR-7 core proof profile includes:
 - one finite rendering opportunity and rAF callback;
 - DOM inspection while controlled page turns remain paused.
 
-The release-0.1 envelope then adds the `test` profile's layout-backed click,
-hit testing, and basic screenshot. Those features consume the same settlement
-model but are not prerequisites for proving the controlled event-loop kernel.
+The proposed contract-0.1 envelope then adds the `test` profile's layout-backed
+click, hit testing, and basic screenshot. Those features consume the same
+settlement model but are not prerequisites for proving the controlled
+event-loop kernel.
 
 Workers, every child browsing context (including same-loop iframes), auxiliary
 WebViews, WebSockets/SSE, media, and uncontrolled time surfaces are typed
-unsupported work in 0.1.
+unsupported work under this proposed contract.
 
-## Controlled-clock release gate
+## Proposed controlled-clock gate
 
 Stasis must not advertise `clock: controlled` until one document clock governs:
 
@@ -95,9 +102,9 @@ Every settlement result contains distinct exact virtual time and measured wall
 time, the effective policy, processed task/microtask/rendering/mutation counts,
 the final raw pending snapshot, and structured persistent or unsupported work.
 
-## Network rule for the first proof
+## Network rule for the design proof
 
-The deterministic release gate uses intercepted or local fixture network only.
+The proposed deterministic gate uses intercepted or local fixture network only.
 Live network is observable but does not receive a determinism claim. A later
 live-network policy must explicitly choose whether virtual timers freeze while
 I/O is pending or race against it; silently freezing can prevent an application
@@ -117,10 +124,10 @@ inside one turn. Distinct execution limits must terminate all three cases with
 typed outcomes.
 
 Synchronous JavaScript that never returns cannot yet be interrupted by these
-turn-level limits. The 0.1 safety boundary is an outer process supervisor until
-a SpiderMonkey interrupt/watchdog is implemented.
+turn-level limits. The contract-0.1 design uses an outer process supervisor
+until a SpiderMonkey interrupt/watchdog is implemented.
 
-## Profiles and reproducibility
+## Proposed profiles and reproducibility
 
 `crawl` enables DOM, JavaScript, storage, network fixtures, semantic actions,
 and layout only on demand. `test` adds continuous layout where required, hit

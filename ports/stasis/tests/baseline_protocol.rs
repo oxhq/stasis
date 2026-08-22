@@ -38,8 +38,31 @@ fn embedded_baseline_survives_a_bad_close_and_reports_the_final_url() {
     );
     let initialized = receive(&responses);
     assert_eq!(initialized["id"], "init-1");
-    assert_eq!(initialized["result"]["capabilities"]["settlement"], false);
+    assert_eq!(initialized["result"]["capabilities"]["settlement"], true);
     assert_eq!(initialized["result"]["capabilities"]["profiles"], json!([]));
+    assert_eq!(
+        initialized["result"]["capabilities"]["clockModes"],
+        json!(["real", "controlled"])
+    );
+    let methods = initialized["result"]["capabilities"]["methods"]
+        .as_array()
+        .expect("capabilities.methods must be an array");
+    for required in [
+        "protocol.initialize",
+        "session.open",
+        "runtime.pending",
+        "runtime.settle",
+        "runtime.advance_to_next",
+        "protocol.cancel",
+        "session.close",
+    ] {
+        assert!(
+            methods
+                .iter()
+                .any(|method| method.as_str() == Some(required)),
+            "initialize did not advertise {required}: {methods:?}"
+        );
+    }
 
     send(
         &mut input,

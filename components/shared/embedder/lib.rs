@@ -9,6 +9,8 @@
 //! is probably a better fit for the `servo_constellation_traits` crate.
 
 #[doc(hidden)]
+pub mod document_automation;
+#[doc(hidden)]
 pub mod document_control;
 #[doc(hidden)]
 pub mod document_pending;
@@ -45,6 +47,8 @@ use servo_url::ServoUrl;
 use strum::{EnumMessage, IntoStaticStr};
 use style::queries::values::PrefersColorScheme;
 use style_traits::CSSPixel;
+#[doc(hidden)]
+pub use timers::{DocumentClockConfiguration, DocumentClockError, DocumentTimeSurface};
 use url::Url;
 use uuid::Uuid;
 use webrender_api::ExternalScrollId;
@@ -53,12 +57,12 @@ use webrender_api::units::{
     DeviceVector2D, LayoutPoint, LayoutRect, LayoutSize, LayoutVector2D,
 };
 
+#[doc(hidden)]
+pub use crate::document_automation::*;
 pub use crate::embedder_controls::*;
 pub use crate::input_events::*;
 use crate::user_contents::UserContentManagerId;
 pub use crate::webdriver::*;
-#[doc(hidden)]
-pub use timers::{DocumentClockConfiguration, DocumentClockError, DocumentTimeSurface};
 
 /// Validate a document-clock configuration at the embedder boundary, before it can be sent to a
 /// script thread.
@@ -78,10 +82,11 @@ pub fn validate_document_clock_configuration(
 
 #[cfg(test)]
 mod document_clock_configuration_tests {
+    use timers::DocumentUnixTime;
+
     use super::{
         DocumentClockConfiguration, DocumentClockError, validate_document_clock_configuration,
     };
-    use timers::DocumentUnixTime;
 
     #[test]
     fn embedder_boundary_rejects_an_overflowing_controlled_clock() {

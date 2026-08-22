@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Stasis controlled external I/O</title>
+  </head>
+  <body>
+    <button id="start" type="button">start</button>
+    <output id="status">fetching</output>
+
+    <script>
+      document.querySelector("#start").addEventListener(
+        "click",
+        () => {
+          fetch("/stall")
+            .then((response) => response.json())
+            .then((payload) => {
+              document.querySelector("#status").textContent = payload.status;
+            })
+            .catch(() => {
+              document.querySelector("#status").textContent = "failed";
+            });
+        },
+        { once: true },
+      );
+    </script>
+  </body>
+</html>

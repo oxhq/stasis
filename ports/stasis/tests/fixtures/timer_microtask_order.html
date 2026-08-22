@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Stasis controlled timer and microtask order</title>
+  </head>
+  <body>
+    <button id="start" type="button">Start</button>
+    <output id="order">idle</output>
+
+    <script>
+      document.querySelector("#start").addEventListener("click", () => {
+        const order = [];
+
+        setTimeout(() => {
+          order.push("timer-1");
+          Promise.resolve().then(() => order.push("microtask"));
+        }, 1_000);
+
+        setTimeout(() => {
+          order.push("timer-2");
+          document.querySelector("#order").textContent = order.join(",");
+        }, 1_000);
+      });
+    </script>
+  </body>
+</html>

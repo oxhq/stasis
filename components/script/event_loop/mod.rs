@@ -4,6 +4,9 @@
 
 pub(crate) mod document_collection;
 pub(crate) mod document_loader;
+pub(crate) mod pending_network;
+pub(crate) mod pending_snapshot;
+pub(crate) mod pending_state;
 mod script_mutation_observers;
 #[expect(unsafe_code)]
 pub(crate) mod script_thread;

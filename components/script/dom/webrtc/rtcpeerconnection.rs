@@ -510,6 +510,7 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
         proto: Option<HandleObject>,
         config: &RTCConfiguration,
     ) -> Fallible<DomRoot<RTCPeerConnection>> {
+        window.as_global_scope().require_external_subscription()?;
         Ok(RTCPeerConnection::new(cx, window, proto, config))
     }
 

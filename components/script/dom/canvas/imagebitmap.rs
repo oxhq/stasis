@@ -697,7 +697,7 @@ impl Transferable for ImageBitmap {
         owner: &GlobalScope,
         _: ImageBitmapId,
         transferred: SerializableImageBitmap,
-    ) -> Result<DomRoot<Self>, ()> {
+    ) -> Fallible<DomRoot<Self>> {
         // Step 1. Set value's bitmap data to serialized.[[BitmapData]].
         Ok(ImageBitmap::new(
             cx,

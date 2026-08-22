@@ -75,7 +75,8 @@ use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
 use storage_traits::StorageThreads;
 use strum::VariantArray;
 use timers::{
-    DocumentClock, DocumentClockError, TimerControlError, TimerEventRequest, TimerId,
+    DocumentClock, DocumentClockError, DocumentTimeSurface, TimerControlError, TimerEventRequest,
+    TimerId,
 };
 use uuid::Uuid;
 #[cfg(feature = "webgpu")]
@@ -146,6 +147,9 @@ use crate::dom::webgpu::identityhub::IdentityHub;
 use crate::dom::window::Window;
 use crate::dom::workerglobalscope::WorkerGlobalScope;
 use crate::dom::workletglobalscope::WorkletGlobalScope;
+use crate::event_loop::pending_state::{
+    PendingPersistentSourceIdentity, PendingPersistentSourceStableId,
+};
 use crate::event_loop::script_thread::{ScriptThread, with_script_thread};
 use crate::fetch::fetch::{DeferredFetchRecordId, FetchGroup, QueuedDeferredFetchRecord};
 use crate::fetch::network_listener::{FetchResponseListener, NetworkListener};
@@ -162,8 +166,8 @@ use crate::script_runtime::ThreadSafeJSContext;
 use crate::tasks::task_manager::TaskManager;
 use crate::tasks::task_source::SendableTaskSource;
 use crate::timers::{
-    DomTimerMetadata, IsInterval, OneshotTimerCallback, OneshotTimerHandle, OneshotTimers,
-    TimerCallback, TimerEventId, TimerSource,
+    DomTimerMetadata, DomTimerPendingObservation, IsInterval, OneshotTimerCallback,
+    OneshotTimerHandle, OneshotTimers, TimerCallback, TimerEventId, TimerSource,
 };
 use crate::unminify::unminified_path;
 
@@ -184,6 +188,118 @@ pub(crate) struct AutoCloseWorker {
     #[ignore_malloc_size_of = "mozjs"]
     #[no_trace]
     context: ThreadSafeJSContext,
+}
+
+#[derive(JSTraceable, MallocSizeOf)]
+struct PendingEventSourceRegistration {
+    stable_id: u64,
+    event_source: WeakRef<EventSource>,
+}
+
+/// Failure to produce a complete canonical passive persistent-source inventory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingPersistentSourceObservationError {
+    EventSourceIdentityExhausted,
+    DuplicateIdentity(PendingPersistentSourceIdentity),
+}
+
+fn canonical_pending_persistent_sources(
+    mut sources: Vec<PendingPersistentSourceIdentity>,
+) -> Result<Vec<PendingPersistentSourceIdentity>, PendingPersistentSourceObservationError> {
+    sources.sort_unstable();
+    if let Some(duplicate) = sources
+        .windows(2)
+        .find(|pair| pair[0] == pair[1])
+        .map(|pair| pair[0])
+    {
+        return Err(PendingPersistentSourceObservationError::DuplicateIdentity(
+            duplicate,
+        ));
+    }
+    Ok(sources)
+}
+
+fn time_surface_permit(clock: &DocumentClock, surface: DocumentTimeSurface) -> Fallible<()> {
+    clock
+        .require_surface(surface)
+        .map_err(|error| Error::NotSupported(Some(error.to_string())))
+}
+
+fn resource_thread_io_permit(clock: &DocumentClock) -> Fallible<()> {
+    time_surface_permit(clock, DocumentTimeSurface::ResourceThreadIo)
+}
+
+#[cfg(test)]
+mod pending_persistent_source_tests {
+    use servo_base::id::TEST_PIPELINE_ID;
+    use timers::{DocumentClockConfiguration, DocumentUnixTime};
+
+    use super::*;
+
+    #[test]
+    fn canonical_inventory_sorts_and_rejects_duplicate_native_identity() {
+        let first = PendingPersistentSourceIdentity {
+            pipeline_id: TEST_PIPELINE_ID,
+            stable_id: PendingPersistentSourceStableId::WebSocket(1),
+        };
+        let second = PendingPersistentSourceIdentity {
+            pipeline_id: TEST_PIPELINE_ID,
+            stable_id: PendingPersistentSourceStableId::EventSource(2),
+        };
+        assert_eq!(
+            canonical_pending_persistent_sources(vec![second, first]).unwrap(),
+            vec![first, second]
+        );
+        assert_eq!(
+            canonical_pending_persistent_sources(vec![first, first]),
+            Err(PendingPersistentSourceObservationError::DuplicateIdentity(
+                first
+            ))
+        );
+    }
+
+    #[test]
+    fn resource_thread_io_gate_rejects_controlled_before_native_dispatch() {
+        let controlled = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        });
+        assert!(matches!(
+            resource_thread_io_permit(&controlled),
+            Err(Error::NotSupported(Some(_)))
+        ));
+        assert_eq!(
+            controlled.unsupported_surface(),
+            Some(DocumentTimeSurface::ResourceThreadIo)
+        );
+
+        let realtime = DocumentClock::default();
+        assert!(resource_thread_io_permit(&realtime).is_ok());
+        assert_eq!(realtime.unsupported_surface(), None);
+    }
+
+    #[test]
+    fn unsupported_async_surface_gates_are_exact_and_realtime_is_unchanged() {
+        for surface in [
+            DocumentTimeSurface::ExternalSubscription,
+            DocumentTimeSurface::NativeMedia,
+            DocumentTimeSurface::EmbedderControl,
+        ] {
+            let controlled = DocumentClock::new(DocumentClockConfiguration::Controlled {
+                initial_time_ns: 0,
+                unix_time_origin_ns: DocumentUnixTime::default(),
+            });
+            assert!(matches!(
+                time_surface_permit(&controlled, surface),
+                Err(Error::NotSupported(Some(_)))
+            ));
+            assert_eq!(controlled.unsupported_surface(), Some(surface));
+
+            let realtime = DocumentClock::default();
+            assert!(time_surface_permit(&realtime, surface).is_ok());
+            assert_eq!(realtime.unsupported_surface(), None);
+        }
+    }
 }
 
 impl Drop for AutoCloseWorker {
@@ -309,6 +425,11 @@ pub(crate) struct GlobalScope {
 
     /// Vector storing references of all eventsources.
     event_source_tracker: DOMTracker<EventSource>,
+
+    /// Stable passive-observation identities paired with the same weak EventSource owners.
+    pending_event_source_registrations: DomRefCell<Vec<PendingEventSourceRegistration>>,
+    pending_event_source_last_id: Cell<u64>,
+    pending_event_source_identity_exhausted: Cell<bool>,
 
     /// Dependent AbortSignals that must be kept alive per
     /// <https://dom.spec.whatwg.org/#abort-signal-garbage-collection?
@@ -813,6 +934,9 @@ impl GlobalScope {
             permission_state_invocation_results: Default::default(),
             list_auto_close_worker: Default::default(),
             event_source_tracker: DOMTracker::new(),
+            pending_event_source_registrations: Default::default(),
+            pending_event_source_last_id: Cell::new(0),
+            pending_event_source_identity_exhausted: Cell::new(false),
             abort_signal_dependents: Default::default(),
             uncaught_rejections: Default::default(),
             consumed_rejections: Default::default(),
@@ -1912,6 +2036,10 @@ impl GlobalScope {
     }
 
     fn decrement_file_ref(&self, id: Uuid) {
+        if self.require_resource_thread_io().is_err() {
+            return;
+        }
+
         let origin = self.origin().immutable().clone();
 
         let (tx, rx) = profile_generic_channel::channel(self.time_profiler_chan().clone()).unwrap();
@@ -2059,6 +2187,10 @@ impl GlobalScope {
     }
 
     pub(crate) fn get_blob_url_id(&self, blob_id: &BlobId) -> Uuid {
+        if self.require_resource_thread_io().is_err() {
+            return Uuid::nil();
+        }
+
         let mut blob_state = self.blob_state.borrow_mut();
         let parent = {
             let blob_info = blob_state
@@ -2210,7 +2342,7 @@ impl GlobalScope {
     }
 
     fn read_file(&self, id: Uuid) -> Result<Vec<u8>, ()> {
-        let recv = self.send_msg(id);
+        let recv = self.send_msg(id).map_err(|_| ())?;
         GlobalScope::read_msg(recv)
     }
 
@@ -2234,7 +2366,7 @@ impl GlobalScope {
             UnderlyingSourceType::Blob(size),
         )?;
 
-        let recv = self.send_msg(file_id);
+        let recv = self.send_msg(file_id)?;
 
         let trusted_stream = Trusted::new(&*stream);
         let mut file_listener = FileListener {
@@ -2259,8 +2391,8 @@ impl GlobalScope {
         id: Uuid,
         promise: Rc<Promise>,
         callback: FileListenerCallback,
-    ) {
-        let recv = self.send_msg(id);
+    ) -> Fallible<()> {
+        let recv = self.send_msg(id)?;
 
         let trusted_promise = TrustedPromise::new(promise);
         let mut file_listener = FileListener {
@@ -2277,15 +2409,20 @@ impl GlobalScope {
                 file_listener.handle(msg.expect("Deserialization of file listener msg failed."));
             }),
         );
+        Ok(())
     }
 
-    fn send_msg(&self, id: Uuid) -> profile_ipc::IpcReceiver<FileManagerResult<ReadFileProgress>> {
+    fn send_msg(
+        &self,
+        id: Uuid,
+    ) -> Fallible<profile_ipc::IpcReceiver<FileManagerResult<ReadFileProgress>>> {
+        self.require_resource_thread_io()?;
         let resource_threads = self.resource_threads();
         let (chan, recv) = profile_ipc::channel(self.time_profiler_chan().clone()).unwrap();
         let origin = self.origin().immutable().clone();
         let msg = FileManagerThreadMsg::ReadFile(chan, id, origin);
         let _ = resource_threads.send(CoreResourceMsg::ToFileManager(msg));
-        recv
+        Ok(recv)
     }
 
     fn read_msg(
@@ -2345,8 +2482,119 @@ impl GlobalScope {
         }
     }
 
+    /// Return the complete passive inventory of retained externally-triggered sources owned by
+    /// this global. The observation roots/prunes weak owners but never instantiates a DOM object.
+    pub(crate) fn pending_persistent_sources(
+        &self,
+    ) -> Result<Vec<PendingPersistentSourceIdentity>, PendingPersistentSourceObservationError> {
+        if self.pending_event_source_identity_exhausted.get() {
+            return Err(PendingPersistentSourceObservationError::EventSourceIdentityExhausted);
+        }
+        let pipeline_id = self.pipeline_id();
+        let mut sources = Vec::new();
+
+        if let Some(window) = self.downcast::<Window>() {
+            sources.extend(
+                window
+                    .Document()
+                    .pending_websocket_observation()
+                    .into_iter()
+                    .map(|websocket| PendingPersistentSourceIdentity {
+                        pipeline_id,
+                        stable_id: PendingPersistentSourceStableId::WebSocket(websocket.stable_id),
+                    }),
+            );
+            if window.pending_media_session_action_handler_present() {
+                sources.push(PendingPersistentSourceIdentity {
+                    pipeline_id,
+                    stable_id: PendingPersistentSourceStableId::MediaSessionActionHandler,
+                });
+            }
+            if self
+                .upcast::<EventTarget>()
+                .has_listeners_for(&atom!("storage"))
+            {
+                sources.push(PendingPersistentSourceIdentity {
+                    pipeline_id,
+                    stable_id: PendingPersistentSourceStableId::StorageEventListener,
+                });
+            }
+        }
+
+        {
+            let mut registrations = self.pending_event_source_registrations.borrow_mut();
+            registrations.retain(|registration| registration.event_source.is_alive());
+            for registration in registrations.iter() {
+                let event_source = registration
+                    .event_source
+                    .root()
+                    .expect("dead EventSource registrations were pruned above");
+                if event_source.ReadyState() != 2 {
+                    sources.push(PendingPersistentSourceIdentity {
+                        pipeline_id,
+                        stable_id: PendingPersistentSourceStableId::EventSource(
+                            registration.stable_id,
+                        ),
+                    });
+                }
+            }
+        }
+
+        if let BroadcastChannelState::Managed(_, channels) = &*self.broadcast_channel_state.borrow()
+        {
+            for channel in channels.values().flatten() {
+                if !channel.closed() {
+                    sources.push(PendingPersistentSourceIdentity {
+                        pipeline_id,
+                        stable_id: PendingPersistentSourceStableId::BroadcastChannel(
+                            channel.id().as_u128(),
+                        ),
+                    });
+                }
+            }
+        }
+
+        if let MessagePortState::Managed(_, message_ports) = &*self.message_port_state.borrow() {
+            for (id, port) in message_ports.iter() {
+                if !port.explicitly_closed &&
+                    port.port_impl
+                        .as_ref()
+                        .is_some_and(|port_impl| port_impl.entangled_port_id().is_some())
+                {
+                    sources.push(PendingPersistentSourceIdentity {
+                        pipeline_id,
+                        stable_id: PendingPersistentSourceStableId::MessagePort(*id),
+                    });
+                }
+            }
+        }
+
+        if !self.list_auto_close_worker.borrow().is_empty() {
+            sources.push(PendingPersistentSourceIdentity {
+                pipeline_id,
+                stable_id: PendingPersistentSourceStableId::Worker,
+            });
+        }
+
+        canonical_pending_persistent_sources(sources)
+    }
+
     pub(crate) fn track_event_source(&self, event_source: &EventSource) {
         self.event_source_tracker.track(event_source);
+        if self.pending_event_source_identity_exhausted.get() {
+            return;
+        }
+        let Some(stable_id) = self.pending_event_source_last_id.get().checked_add(1) else {
+            self.pending_event_source_identity_exhausted.set(true);
+            return;
+        };
+        self.pending_event_source_last_id.set(stable_id);
+        self.pending_event_source_registrations
+            .borrow_mut()
+            .push(PendingEventSourceRegistration {
+                stable_id,
+                event_source: WeakRef::new(event_source),
+            });
     }
 
     pub(crate) fn close_event_sources(&self) -> bool {
@@ -2632,13 +2880,11 @@ impl GlobalScope {
         request: TimerEventRequest,
     ) -> Result<TimerId, TimerControlError> {
         match self.downcast::<WorkerGlobalScope>() {
-            Some(worker_global) => worker_global
-                .timer_scheduler()
-                .try_schedule_timer(request),
-            _ => with_script_thread(|script_thread| {
-                Some(script_thread.try_schedule_timer(request))
-            })
-            .unwrap_or(Err(TimerControlError::Clock(DocumentClockError::Overflow))),
+            Some(worker_global) => worker_global.timer_scheduler().try_schedule_timer(request),
+            _ => {
+                with_script_thread(|script_thread| Some(script_thread.try_schedule_timer(request)))
+                    .unwrap_or(Err(TimerControlError::Clock(DocumentClockError::Overflow)))
+            },
         }
     }
 
@@ -2658,6 +2904,30 @@ impl GlobalScope {
         }
     }
 
+    /// Reject resource-thread operations whose native callback or blocking lifecycle has not yet
+    /// been brought under controlled pending authority.
+    pub(crate) fn require_resource_thread_io(&self) -> Fallible<()> {
+        resource_thread_io_permit(&self.document_clock())
+    }
+
+    /// Reject externally-driven subscriptions whose callback lifecycle is not yet controlled.
+    pub(crate) fn require_external_subscription(&self) -> Fallible<()> {
+        time_surface_permit(
+            &self.document_clock(),
+            DocumentTimeSurface::ExternalSubscription,
+        )
+    }
+
+    /// Reject native-media backends whose callback lifecycle is not yet controlled.
+    pub(crate) fn require_native_media(&self) -> Fallible<()> {
+        time_surface_permit(&self.document_clock(), DocumentTimeSurface::NativeMedia)
+    }
+
+    /// Reject embedder-owned controls whose response lifecycle is not yet controlled.
+    pub(crate) fn require_embedder_control(&self) -> Fallible<()> {
+        time_surface_permit(&self.document_clock(), DocumentTimeSurface::EmbedderControl)
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#nested-browsing-context>
     pub(crate) fn is_nested_browsing_context(&self) -> bool {
         self.downcast::<Window>()
@@ -2669,7 +2939,8 @@ impl GlobalScope {
     /// the limit is higher than what is allowed. This ensures that whenever
     /// we want to initiate a keep alive request and the thread doesn't communicate,
     /// we block additional keep alive requests.
-    pub(crate) fn total_size_of_in_flight_keep_alive_records(&self) -> u64 {
+    pub(crate) fn total_size_of_in_flight_keep_alive_records(&self) -> Fallible<u64> {
+        self.require_resource_thread_io()?;
         let (sender, receiver) = generic_channel::channel().unwrap();
         if self
             .core_resource_thread()
@@ -2679,9 +2950,9 @@ impl GlobalScope {
             ))
             .is_err()
         {
-            return u64::MAX;
+            return Ok(u64::MAX);
         }
-        receiver.recv().unwrap_or(u64::MAX)
+        Ok(receiver.recv().unwrap_or(u64::MAX))
     }
 
     /// Part of <https://fetch.spec.whatwg.org/#populate-request-from-client>
@@ -3051,6 +3322,14 @@ impl GlobalScope {
         &self,
     ) -> Result<Vec<DomTimerMetadata>, DocumentClockError> {
         self.with_timers(OneshotTimers::pending_timer_metadata)
+    }
+
+    /// Return all pending logical DOM timers together with their exact selected ordering head and
+    /// the single outer scheduler timer still bound to that head, if it has not already activated.
+    pub(crate) fn pending_timer_observation(
+        &self,
+    ) -> Result<DomTimerPendingObservation, DocumentClockError> {
+        self.with_timers(OneshotTimers::pending_timer_observation)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#timer-initialisation-steps>

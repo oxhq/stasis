@@ -175,6 +175,13 @@ impl Navigator {
         reflect_dom_object_with_cx(Box::new(Navigator::new_inherited()), window, cx)
     }
 
+    /// Observe an already-created MediaSession without instantiating one during capture.
+    pub(crate) fn pending_media_session_action_handler_present(&self) -> bool {
+        self.mediasession
+            .get()
+            .is_some_and(|session| session.pending_action_handler_present())
+    }
+
     #[cfg(feature = "webxr")]
     pub(crate) fn xr(&self) -> Option<DomRoot<XRSystem>> {
         self.xr.get()
@@ -561,8 +568,8 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
             // set the return value to false and terminate these steps.
             if let Some(total_bytes) = extracted_body.total_bytes {
                 let in_flight_keep_alive_bytes =
-                    global.total_size_of_in_flight_keep_alive_records();
-                if total_bytes as u64 + in_flight_keep_alive_bytes > 64 * 1024 {
+                    global.total_size_of_in_flight_keep_alive_records()?;
+                if (total_bytes as u64).saturating_add(in_flight_keep_alive_bytes) > 64 * 1024 {
                     return Ok(false);
                 }
             }

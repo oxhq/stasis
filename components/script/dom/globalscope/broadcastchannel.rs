@@ -12,7 +12,7 @@ use servo_constellation_traits::BroadcastChannelMsg;
 use uuid::Uuid;
 
 use crate::dom::bindings::codegen::Bindings::BroadcastChannelBinding::BroadcastChannelMethods;
-use crate::dom::bindings::error::{Error, ErrorResult};
+use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
@@ -74,8 +74,9 @@ impl BroadcastChannelMethods<crate::DomTypeHolder> for BroadcastChannel {
         global: &GlobalScope,
         proto: Option<HandleObject>,
         name: DOMString,
-    ) -> DomRoot<BroadcastChannel> {
-        BroadcastChannel::new(cx, global, proto, name)
+    ) -> Fallible<DomRoot<BroadcastChannel>> {
+        global.require_external_subscription()?;
+        Ok(BroadcastChannel::new(cx, global, proto, name))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-messageport-postmessage>

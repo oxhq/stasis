@@ -6,6 +6,7 @@ use std::borrow::ToOwned;
 use std::cell::Cell;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dom_struct::dom_struct;
 use ipc_channel::router::ROUTER;
@@ -61,6 +62,77 @@ enum WebSocketRequestState {
     Closed = 3,
 }
 
+static NEXT_PENDING_WEBSOCKET_STABLE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_pending_websocket_stable_id() -> u64 {
+    NEXT_PENDING_WEBSOCKET_STABLE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("process-lifetime WebSocket pending-observation IDs exhausted")
+}
+
+fn validate_websocket_constructor_then_require_subscription(
+    base_url: &ServoUrl,
+    url: &str,
+    protocols: Vec<String>,
+    require_subscription: impl FnOnce() -> ErrorResult,
+) -> Fallible<(ServoUrl, Vec<String>)> {
+    // Step 2. Let urlRecord be the result of applying the URL parser to url with baseURL.
+    // Step 3. If urlRecord is failure, then throw a "SyntaxError" DOMException.
+    let mut url_record =
+        ServoUrl::parse_with_base(Some(base_url), url).or(Err(Error::Syntax(None)))?;
+
+    // Step 4. If urlRecord’s scheme is "http", then set urlRecord’s scheme to "ws".
+    // Step 5. Otherwise, if urlRecord’s scheme is "https", set urlRecord’s scheme to "wss".
+    // Step 6. If urlRecord’s scheme is not "ws" or "wss", then throw a "SyntaxError" DOMException.
+    match url_record.scheme() {
+        "http" => {
+            url_record
+                .as_mut_url()
+                .set_scheme("ws")
+                .expect("Can't set scheme from http to ws");
+        },
+        "https" => {
+            url_record
+                .as_mut_url()
+                .set_scheme("wss")
+                .expect("Can't set scheme from https to wss");
+        },
+        "ws" | "wss" => {},
+        _ => return Err(Error::Syntax(None)),
+    }
+
+    // Step 7. If urlRecord’s fragment is non-null, then throw a "SyntaxError" DOMException.
+    if url_record.fragment().is_some() {
+        return Err(Error::Syntax(None));
+    }
+
+    // Step 9. If any of the values in protocols occur more than once or otherwise fail to match
+    // the requirements for elements that comprise the value of `Sec-WebSocket-Protocol` fields as
+    // defined by The WebSocket protocol, then throw a "SyntaxError" DOMException.
+    for (i, protocol) in protocols.iter().enumerate() {
+        // https://tools.ietf.org/html/rfc6455#section-4.1
+        // Handshake requirements, step 10
+        if protocols[i + 1..]
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(protocol))
+        {
+            return Err(Error::Syntax(None));
+        }
+
+        // https://tools.ietf.org/html/rfc6455#section-4.1
+        if !is_token(protocol.as_bytes()) {
+            return Err(Error::Syntax(None));
+        }
+    }
+
+    // Validation errors take precedence over controlled-clock admission. Once validation succeeds,
+    // refuse the asynchronous subscription before allocating channels or dispatching the request.
+    require_subscription()?;
+    Ok((url_record, protocols))
+}
+
 // Close codes defined in https://tools.ietf.org/html/rfc6455#section-7.4.1
 // Names are from https://github.com/mozilla/gecko-dev/blob/master/netwerk/protocol/websocket/nsIWebSocketChannel.idl
 #[expect(dead_code)]
@@ -105,6 +177,8 @@ fn fail_the_websocket_connection(address: Trusted<WebSocket>, task_source: &Send
 #[dom_struct]
 pub(crate) struct WebSocket {
     eventtarget: EventTarget,
+    /// Nonzero process-lifetime identity used by passive pending-work observations.
+    pending_stable_id: u64,
     #[no_trace]
     url: ServoUrl,
     ready_state: Cell<WebSocketRequestState>,
@@ -120,6 +194,7 @@ impl WebSocket {
     fn new_inherited(url: ServoUrl, callback: LazyCallback<WebSocketDomAction>) -> WebSocket {
         WebSocket {
             eventtarget: EventTarget::new_inherited(),
+            pending_stable_id: next_pending_websocket_stable_id(),
             url,
             ready_state: Cell::new(WebSocketRequestState::Connecting),
             buffered_amount: Cell::new(0),
@@ -187,12 +262,89 @@ impl WebSocket {
         self.url.origin()
     }
 
+    /// Return this WebSocket's stable pending-work identity while it remains non-Closed.
+    pub(crate) fn pending_stable_id_if_non_closed(&self) -> Option<u64> {
+        (self.ready_state.get() != WebSocketRequestState::Closed).then_some(self.pending_stable_id)
+    }
+
     /// <https://websockets.spec.whatwg.org/#make-disappear>
     /// Returns true if any action was taken.
     pub(crate) fn make_disappear(&self) -> bool {
         let result = self.ready_state.get() != WebSocketRequestState::Closed;
         let _ = self.Close(Some(1001), None);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use servo_url::ServoUrl;
+
+    use super::{
+        next_pending_websocket_stable_id, validate_websocket_constructor_then_require_subscription,
+    };
+    use crate::dom::bindings::error::Error;
+
+    #[test]
+    fn websocket_pending_ids_are_nonzero_and_monotonic() {
+        let first = next_pending_websocket_stable_id();
+        let second = next_pending_websocket_stable_id();
+
+        assert_ne!(first, 0);
+        assert_eq!(first.checked_add(1), Some(second));
+    }
+
+    #[test]
+    fn invalid_websocket_url_does_not_run_subscription_guard() {
+        let guard_ran = Cell::new(false);
+        let result = validate_websocket_constructor_then_require_subscription(
+            &ServoUrl::parse("https://example.test/").unwrap(),
+            "ftp://example.test/",
+            Vec::new(),
+            || {
+                guard_ran.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(Error::Syntax(_))));
+        assert!(!guard_ran.get());
+    }
+
+    #[test]
+    fn invalid_websocket_protocol_does_not_run_subscription_guard() {
+        let guard_ran = Cell::new(false);
+        let result = validate_websocket_constructor_then_require_subscription(
+            &ServoUrl::parse("https://example.test/").unwrap(),
+            "wss://example.test/socket",
+            vec!["invalid protocol".to_owned()],
+            || {
+                guard_ran.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(Error::Syntax(_))));
+        assert!(!guard_ran.get());
+    }
+
+    #[test]
+    fn valid_websocket_input_runs_subscription_guard() {
+        let guard_ran = Cell::new(false);
+        let result = validate_websocket_constructor_then_require_subscription(
+            &ServoUrl::parse("https://example.test/").unwrap(),
+            "wss://example.test/socket",
+            vec!["chat".to_owned()],
+            || {
+                guard_ran.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(guard_ran.get());
     }
 }
 
@@ -207,36 +359,6 @@ impl WebSocketMethods<crate::DomTypeHolder> for WebSocket {
     ) -> Fallible<DomRoot<WebSocket>> {
         // Step 1. Let baseURL be this's relevant settings object's API base URL.
         let base_url = global.api_base_url();
-        // Step 2. Let urlRecord be the result of applying the URL parser to url with baseURL.
-        // Step 3. If urlRecord is failure, then throw a "SyntaxError" DOMException.
-        let mut url_record =
-            ServoUrl::parse_with_base(Some(&base_url), &url.str()).or(Err(Error::Syntax(None)))?;
-
-        // Step 4. If urlRecord’s scheme is "http", then set urlRecord’s scheme to "ws".
-        // Step 5. Otherwise, if urlRecord’s scheme is "https", set urlRecord’s scheme to "wss".
-        // Step 6. If urlRecord’s scheme is not "ws" or "wss", then throw a "SyntaxError" DOMException.
-        match url_record.scheme() {
-            "http" => {
-                url_record
-                    .as_mut_url()
-                    .set_scheme("ws")
-                    .expect("Can't set scheme from http to ws");
-            },
-            "https" => {
-                url_record
-                    .as_mut_url()
-                    .set_scheme("wss")
-                    .expect("Can't set scheme from https to wss");
-            },
-            "ws" | "wss" => {},
-            _ => return Err(Error::Syntax(None)),
-        }
-
-        // Step 7. If urlRecord’s fragment is non-null, then throw a "SyntaxError" DOMException.
-        if url_record.fragment().is_some() {
-            return Err(Error::Syntax(None));
-        }
-
         // Step 8. If protocols is a string, set protocols to a sequence consisting of just that string.
         let protocols = protocols.map_or(vec![], |p| match p {
             StringOrStringSequence::String(string) => vec![string.into()],
@@ -244,26 +366,12 @@ impl WebSocketMethods<crate::DomTypeHolder> for WebSocket {
                 seq.into_iter().map(String::from).collect()
             },
         });
-
-        // Step 9. If any of the values in protocols occur more than once or otherwise fail to match the requirements
-        // for elements that comprise the value of `Sec-WebSocket-Protocol` fields as defined by The WebSocket protocol,
-        // then throw a "SyntaxError" DOMException.
-        for (i, protocol) in protocols.iter().enumerate() {
-            // https://tools.ietf.org/html/rfc6455#section-4.1
-            // Handshake requirements, step 10
-
-            if protocols[i + 1..]
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(protocol))
-            {
-                return Err(Error::Syntax(None));
-            }
-
-            // https://tools.ietf.org/html/rfc6455#section-4.1
-            if !is_token(protocol.as_bytes()) {
-                return Err(Error::Syntax(None));
-            }
-        }
+        let (url_record, protocols) = validate_websocket_constructor_then_require_subscription(
+            &base_url,
+            &url.str(),
+            protocols,
+            || global.require_external_subscription(),
+        )?;
 
         // Create the interface for communication with the resource thread
         let (dom_action_sender, resource_action_receiver) = lazy_callback();

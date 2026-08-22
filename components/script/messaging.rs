@@ -7,8 +7,9 @@ use core::fmt;
 use std::cell::RefCell;
 use std::option::Option;
 use std::result::Result;
+use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Select, SelectedOperation, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Select, SelectedOperation, Sender};
 use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg};
 use embedder_traits::{EmbedderControlId, EmbedderControlResponse, ScriptToEmbedderChan};
 use net_traits::image_cache::ImageCacheResponseMessage;
@@ -16,7 +17,7 @@ use net_traits::{BoxedFetchCallback, FetchResponseMsg};
 use profile_traits::mem::{self as profile_mem, OpaqueSender, ReportsChan};
 use profile_traits::time::{self as profile_time};
 use rustc_hash::FxHashSet;
-use script_traits::{Painter, ScriptThreadMessage};
+use script_traits::{Painter, ScriptThreadControlMessage, ScriptThreadMessage};
 use servo_base::generic_channel::{GenericCallback, GenericSender, RoutedReceiver};
 use servo_base::id::{PipelineId, WebViewId};
 #[cfg(feature = "bluetooth")]
@@ -57,6 +58,19 @@ pub(crate) enum MixedMessage {
     #[cfg(feature = "webgpu")]
     FromWebGPUServer(WebGPUMsg),
     TimerFired,
+}
+
+#[derive(Debug)]
+pub(crate) enum ControlledMessage {
+    Control(ScriptThreadControlMessage),
+    Ordinary(MixedMessage),
+}
+
+/// Result of one bounded wait on the priority document-control lane.
+pub(crate) enum DocumentControlWaitResult {
+    Message(ScriptThreadControlMessage),
+    TimedOut,
+    Closed,
 }
 
 impl MixedMessage {
@@ -476,10 +490,9 @@ impl QueuedTaskConversion for MainThreadScriptMsg {
                 pipeline_id,
                 _task_source,
             )) => *pipeline_id,
-            MainThreadScriptMsg::Common(CommonScriptMsg::ReportCspViolations(
-                pipeline_id,
-                _,
-            )) => Some(*pipeline_id),
+            MainThreadScriptMsg::Common(CommonScriptMsg::ReportCspViolations(pipeline_id, _)) => {
+                Some(*pipeline_id)
+            },
             MainThreadScriptMsg::NavigationResponse { pipeline_id, .. } => Some(*pipeline_id),
             MainThreadScriptMsg::WorkletLoaded(pipeline_id) => Some(*pipeline_id),
             MainThreadScriptMsg::RegisterPaintWorklet { pipeline_id, .. } => Some(*pipeline_id),
@@ -1175,8 +1188,7 @@ mod producer_fence_tests {
         let (raw_sender, receiver) = crossbeam_channel::unbounded();
         let producer_fence = DocumentProducerFence::default();
         let event_loop_sender = main_thread_sender(raw_sender.clone(), &producer_fence);
-        let task_queue =
-            TaskQueue::new_with_producer_tracking(receiver, raw_sender.clone(), true);
+        let task_queue = TaskQueue::new_with_producer_tracking(receiver, raw_sender.clone(), true);
 
         for _ in 0..6 {
             event_loop_sender
@@ -1255,11 +1267,7 @@ mod producer_fence_tests {
     fn discarding_a_pipeline_purges_direct_navigation_messages() {
         let _script_thread_state = ScriptThreadStateGuard::enter();
         let (raw_sender, receiver) = crossbeam_channel::unbounded();
-        let task_queue = TaskQueue::new_with_producer_tracking(
-            receiver,
-            raw_sender.clone(),
-            true,
-        );
+        let task_queue = TaskQueue::new_with_producer_tracking(receiver, raw_sender.clone(), true);
         let producer_fence = DocumentProducerFence::default();
         let fully_active = FxHashSet::default();
 
@@ -1411,6 +1419,10 @@ pub(crate) struct ScriptThreadSenders {
 
 #[derive(JSTraceable)]
 pub(crate) struct ScriptThreadReceivers {
+    /// Priority document-control lane. Commands on this receiver are never page events.
+    #[no_trace]
+    pub(crate) document_control_receiver: RoutedReceiver<ScriptThreadControlMessage>,
+
     /// A [`Receiver`] that receives messages from the constellation.
     #[no_trace]
     pub(crate) constellation_receiver: RoutedReceiver<ScriptThreadMessage>,
@@ -1502,26 +1514,26 @@ impl ScriptThreadReceivers {
     }
 
     /// Block for one controlled input without draining a ready task-port suffix.
-    #[expect(
-        dead_code,
-        reason = "used by the upcoming ScriptThread controlled owner loop"
-    )]
     pub(crate) fn recv_controlled(
         &self,
         task_queue: &TaskQueue<MainThreadScriptMsg>,
         timer_scheduler: &TimerScheduler,
         fully_active: &FxHashSet<PipelineId>,
-    ) -> MixedMessage {
+    ) -> ControlledMessage {
         // A blocking wait begins a fresh event-loop intake iteration. Reset before the
         // nonblocking precheck so newly eligible retained throttles cannot be stranded while the
         // raw receiver sleeps.
         let task_recv = task_queue.select();
+        if let Some(message) = self.try_recv_document_control() {
+            return ControlledMessage::Control(message);
+        }
         if let Some(message) = self.try_recv_controlled(task_queue, fully_active) {
-            return message;
+            return ControlledMessage::Ordinary(message);
         }
 
         let mut select = Select::new();
 
+        let document_control_index = select.recv(&self.document_control_receiver);
         let task_index = select.recv(task_recv);
         let constellation_index = select.recv(&self.constellation_receiver);
         let devtools_index = select.recv(&self.devtools_server_receiver);
@@ -1534,34 +1546,43 @@ impl ScriptThreadReceivers {
 
         let message_from_operation = |operation: SelectedOperation| {
             let index = operation.index();
-            if index == task_index {
-                let msg = operation.recv(task_recv).unwrap();
-                MixedMessage::FromScript(
-                    task_queue.take_controlled_task_and_recv(msg, fully_active),
+            if index == document_control_index {
+                ControlledMessage::Control(
+                    operation
+                        .recv(&self.document_control_receiver)
+                        .unwrap()
+                        .unwrap(),
                 )
+            } else if index == task_index {
+                let msg = operation.recv(task_recv).unwrap();
+                ControlledMessage::Ordinary(MixedMessage::FromScript(
+                    task_queue.take_controlled_task_and_recv(msg, fully_active),
+                ))
             } else if index == constellation_index {
-                MixedMessage::FromConstellation(
+                ControlledMessage::Ordinary(MixedMessage::FromConstellation(
                     operation
                         .recv(&self.constellation_receiver)
                         .unwrap()
                         .unwrap(),
-                )
+                ))
             } else if index == devtools_index {
-                MixedMessage::FromDevtools(
+                ControlledMessage::Ordinary(MixedMessage::FromDevtools(
                     operation
                         .recv(&self.devtools_server_receiver)
                         .unwrap()
                         .unwrap(),
-                )
+                ))
             } else if index == image_cache_index {
-                MixedMessage::FromImageCache(operation.recv(&self.image_cache_receiver).unwrap())
+                ControlledMessage::Ordinary(MixedMessage::FromImageCache(
+                    operation.recv(&self.image_cache_receiver).unwrap(),
+                ))
             } else {
                 #[cfg(feature = "webgpu")]
                 {
                     debug_assert_eq!(index, webgpu_index);
-                    MixedMessage::FromWebGPUServer(
+                    ControlledMessage::Ordinary(MixedMessage::FromWebGPUServer(
                         operation.recv(&*webgpu_receiver).unwrap().unwrap(),
-                    )
+                    ))
                 }
                 #[cfg(not(feature = "webgpu"))]
                 unreachable!("select returned an unknown index {index}")
@@ -1572,10 +1593,50 @@ impl ScriptThreadReceivers {
             select
                 .select_deadline(deadline)
                 .map(message_from_operation)
-                .unwrap_or(MixedMessage::TimerFired)
+                .unwrap_or(ControlledMessage::Ordinary(MixedMessage::TimerFired))
         } else {
             message_from_operation(select.select())
         }
+    }
+
+    /// Wait for at most `timeout` on the priority document-control lane.
+    ///
+    /// This is used while an already-executed initial navigation-header turn waits for the
+    /// Constellation to return the exact pending-to-active target authority. The bounded wait lets
+    /// ScriptThread observe forced shutdown and priority lifecycle input without running ordinary
+    /// page work during that handoff.
+    pub(crate) fn recv_document_control_timeout(
+        &self,
+        timeout: Duration,
+    ) -> DocumentControlWaitResult {
+        match self.document_control_receiver.recv_timeout(timeout) {
+            Ok(Ok(message)) => DocumentControlWaitResult::Message(message),
+            Ok(Err(error)) => {
+                log::warn!(
+                    "ScriptThreadReceivers IPC error on document_control_receiver: {:?}",
+                    error
+                );
+                DocumentControlWaitResult::Closed
+            },
+            Err(RecvTimeoutError::Timeout) => DocumentControlWaitResult::TimedOut,
+            Err(RecvTimeoutError::Disconnected) => {
+                log::warn!("ScriptThreadReceivers disconnected document_control_receiver");
+                DocumentControlWaitResult::Closed
+            },
+        }
+    }
+
+    /// Receive one priority command or cancellation without touching ordinary page input.
+    pub(crate) fn try_recv_document_control(&self) -> Option<ScriptThreadControlMessage> {
+        let message = self.document_control_receiver.try_recv().ok()?;
+        message
+            .inspect_err(|error| {
+                log::warn!(
+                    "ScriptThreadReceivers IPC error on document_control_receiver: {:?}",
+                    error
+                );
+            })
+            .ok()
     }
 
     /// Try to receive a from any of the receivers of this [`ScriptThreadReceivers`] or the given
