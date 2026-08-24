@@ -1,4 +1,9 @@
-/* This file is generated for an exact SDK release. Do not edit by hand. */
+/*
+ * Fail-closed source-tree placeholder: these are the immutable historical
+ * v0.1.0-alpha.0 bytes, not a v0.2.0 distribution manifest. The gated release
+ * workflow must replace this module with the exact generated v0.2.0 manifest
+ * before packing; local prepack intentionally rejects this placeholder.
+ */
 import type { RuntimeDistributionManifest } from "./runtime-manifest.js";
 
 // The first alpha archive predates the stable ten-member archive contract.

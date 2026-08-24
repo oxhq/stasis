@@ -14,15 +14,16 @@ use std::fmt;
 use bitflags::bitflags;
 use crossbeam_channel::RecvTimeoutError;
 use devtools_traits::ScriptToDevtoolsControlMsg;
-use embedder_traits::user_contents::{UserContentManagerId, UserContents};
 use embedder_traits::document_control::{
     DocumentControlCancellationId, DocumentControlCommand, DocumentControlRequestId,
 };
 use embedder_traits::document_pending::{PendingRuntimeTerminals, PendingTargetObservation};
+use embedder_traits::user_contents::{UserContentManagerId, UserContents};
 use embedder_traits::{
-    DocumentClockConfiguration, EmbedderControlId, EmbedderControlResponse, FocusSequenceNumber,
-    InputEventAndId, JavaScriptEvaluationId, MediaSessionActionType, MouseButton,
-    PaintHitTestResult, ScriptToEmbedderChan, Theme, ViewportDetails, WebDriverScriptCommand,
+    DocumentClockConfiguration, DocumentControlProfile, EmbedderControlId, EmbedderControlResponse,
+    FocusSequenceNumber, InputEventAndId, JavaScriptEvaluationId, MediaSessionActionType,
+    MouseButton, PaintHitTestResult, ScriptToEmbedderChan, Theme, ViewportDetails,
+    WebDriverScriptCommand,
 };
 use euclid::{Scale, Size2D};
 use fonts_traits::{SystemFontServiceProxySender, WebFontLoadEvent};
@@ -488,6 +489,8 @@ pub struct InitialScriptState {
     pub id: ScriptEventLoopId,
     /// The immutable document clock shared by every pipeline on this event loop.
     pub document_clock: DocumentClockConfiguration,
+    /// The immutable top-level document authority shared by every pipeline on this event loop.
+    pub document_control_profile: DocumentControlProfile,
     /// The sender to use to install the `Pipeline` namespace into this process (if necessary).
     pub namespace_request_sender: GenericSender<PipelineNamespaceRequest>,
     /// A channel with which messages can be sent to us (the script thread).

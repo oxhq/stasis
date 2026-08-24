@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+  <body>
+    <button id="history-back" type="button">Back</button>
+    <p id="history-traversal-status">untouched</p>
+    <script>
+      document.querySelector("#history-back").addEventListener("click", () => {
+        try {
+          history.back();
+          document.querySelector("#history-traversal-status").textContent = "unexpected-success";
+        } catch (error) {
+          document.querySelector("#history-traversal-status").textContent = error.name;
+        }
+      });
+    </script>
+  </body>
+</html>

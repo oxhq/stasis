@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Synchronous same-document history</title>
+<main>
+  <button id="sync-history-action" type="button">Change history synchronously</button>
+  <output id="sync-history-status">sync-history-source-ready</output>
+</main>
+<script>
+  let activations = 0;
+  document.querySelector("#sync-history-action").addEventListener("click", () => {
+    activations += 1;
+    history.pushState({ step: 1 }, "", "/sync-history-one");
+    history.pushState({ step: 2 }, "", "/sync-history-two");
+    document.querySelector("#sync-history-status").textContent =
+      `${location.pathname}|history-changes=2|activations=${activations}`;
+  });
+</script>

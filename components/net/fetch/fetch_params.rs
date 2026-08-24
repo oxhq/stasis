@@ -5,9 +5,11 @@
 use std::sync::{Arc, Mutex};
 
 use content_security_policy as csp;
+use net_traits::ControlledCookiePolicyError;
 use net_traits::request::{PreloadEntry, PreloadId, PreloadKey, Request, RequestClient};
 use net_traits::response::Response;
 use rustc_hash::FxHashMap;
+use servo_url::ServoUrl;
 use tokio::sync::oneshot::Receiver as TokioReceiver;
 
 /// <https://fetch.spec.whatwg.org/#fetch-params-preloaded-response-candidate>
@@ -42,6 +44,12 @@ pub struct FetchParams {
     pub request: Request,
     /// <https://fetch.spec.whatwg.org/#fetch-params-preloaded-response-candidate>
     pub preload_response_candidate: PreloadResponseCandidate,
+    /// Schemeful site authority supplied only by an installed controlled-session interceptor.
+    pub controlled_cookie_site: Option<ServoUrl>,
+    /// Whether the current response was supplied by the immutable fixture table.
+    pub controlled_fixture_response: bool,
+    /// First secret-safe policy rejection retained until the terminal callback reaches Servo.
+    pub controlled_cookie_failure: Arc<Mutex<Option<ControlledCookiePolicyError>>>,
 }
 
 impl FetchParams {
@@ -49,6 +57,9 @@ impl FetchParams {
         FetchParams {
             request,
             preload_response_candidate: PreloadResponseCandidate::None,
+            controlled_cookie_site: None,
+            controlled_fixture_response: false,
+            controlled_cookie_failure: Arc::new(Mutex::new(None)),
         }
     }
 }

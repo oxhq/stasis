@@ -14,6 +14,8 @@ pub mod document_automation;
 pub mod document_control;
 #[doc(hidden)]
 pub mod document_pending;
+#[doc(hidden)]
+pub mod document_session;
 pub mod embedder_controls;
 pub mod input_events;
 pub mod resources;
@@ -59,10 +61,53 @@ use webrender_api::units::{
 
 #[doc(hidden)]
 pub use crate::document_automation::*;
+#[doc(hidden)]
+pub use crate::document_session::*;
 pub use crate::embedder_controls::*;
 pub use crate::input_events::*;
 use crate::user_contents::UserContentManagerId;
 pub use crate::webdriver::*;
+
+/// The checked control authority selected for a WebView before its initial navigation.
+///
+/// This policy is deliberately separate from [`DocumentClockConfiguration`]: the clock owns
+/// document-observable time, while this value decides whether that clock may remain authoritative
+/// across replacement top-level documents. Ordinary WebViews and controlled-webapp-v1 retain the
+/// single-document default.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum DocumentControlProfile {
+    /// A controlled event loop may own exactly one top-level document.
+    #[default]
+    SingleDocument,
+    /// A controlled event loop may remain authoritative across top-level navigation in one
+    /// WebView. This does not enable auxiliary WebViews, iframes, or worker event loops.
+    TopLevelSession,
+}
+
+/// A checked failure while selecting a [`DocumentControlProfile`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DocumentControlProfileError {
+    /// Session authority requires a controlled document clock.
+    RequiresControlledClock,
+    /// An auxiliary WebView attempted to override its opener's inherited profile.
+    InheritedProfileMismatch,
+}
+
+/// Validate the control profile independently at the embedder boundary.
+#[doc(hidden)]
+pub const fn validate_document_control_profile(
+    profile: DocumentControlProfile,
+    clock: DocumentClockConfiguration,
+) -> Result<(), DocumentControlProfileError> {
+    match (profile, clock) {
+        (DocumentControlProfile::TopLevelSession, DocumentClockConfiguration::Realtime) => {
+            Err(DocumentControlProfileError::RequiresControlledClock)
+        },
+        _ => Ok(()),
+    }
+}
 
 /// Validate a document-clock configuration at the embedder boundary, before it can be sent to a
 /// script thread.
@@ -85,7 +130,9 @@ mod document_clock_configuration_tests {
     use timers::DocumentUnixTime;
 
     use super::{
-        DocumentClockConfiguration, DocumentClockError, validate_document_clock_configuration,
+        DocumentClockConfiguration, DocumentClockError, DocumentControlProfile,
+        DocumentControlProfileError, validate_document_clock_configuration,
+        validate_document_control_profile,
     };
 
     #[test]
@@ -105,6 +152,42 @@ mod document_clock_configuration_tests {
     fn embedder_boundary_preserves_the_realtime_default() {
         assert_eq!(
             validate_document_clock_configuration(DocumentClockConfiguration::Realtime),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn top_level_session_requires_a_controlled_clock() {
+        assert_eq!(
+            validate_document_control_profile(
+                DocumentControlProfile::TopLevelSession,
+                DocumentClockConfiguration::Realtime,
+            ),
+            Err(DocumentControlProfileError::RequiresControlledClock),
+        );
+    }
+
+    #[test]
+    fn single_document_remains_the_realtime_and_controlled_default_policy() {
+        assert_eq!(
+            DocumentControlProfile::default(),
+            DocumentControlProfile::SingleDocument
+        );
+        assert_eq!(
+            validate_document_control_profile(
+                DocumentControlProfile::SingleDocument,
+                DocumentClockConfiguration::Realtime,
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            validate_document_control_profile(
+                DocumentControlProfile::SingleDocument,
+                DocumentClockConfiguration::Controlled {
+                    initial_time_ns: 0,
+                    unix_time_origin_ns: DocumentUnixTime::from_nanos(0),
+                },
+            ),
             Ok(()),
         );
     }
@@ -745,10 +828,83 @@ pub struct WebResourceRequest {
     pub referrer_url: Option<Url>,
     pub is_for_main_frame: bool,
     pub is_redirect: bool,
+    /// Checked request-hop identity used only by an installed controlled-network session.
+    pub controlled_load_id: WebResourceLoadId,
+    /// Exact request body length. `None` means an unbounded/streaming body.
+    pub controlled_body_bytes: Option<u64>,
+    /// Allow-listed resource class; ambiguous empty-destination requests remain unclassified.
+    pub controlled_resource_kind: WebResourceKind,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub enum WebResourceKind {
+    Navigation,
+    Fetch,
+    XmlHttpRequest,
+    Image,
+    Font,
+    Stylesheet,
+    Script,
+    UnclassifiedProducerIo,
+    Other,
+}
+
+/// Opaque same-process identity for one HTTP(S) hop. The random request identity never enters
+/// public evidence; only the checked redirect index is used to derive the immediate parent hop.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct WebResourceLoadId {
+    request_identity: [u8; 16],
+    redirect_index: u32,
+}
+
+impl WebResourceLoadId {
+    #[doc(hidden)]
+    pub const fn new(request_identity: [u8; 16], redirect_index: u32) -> Self {
+        Self {
+            request_identity,
+            redirect_index,
+        }
+    }
+
+    pub const fn redirect_parent(self) -> Option<Self> {
+        match self.redirect_index.checked_sub(1) {
+            Some(redirect_index) => Some(Self {
+                request_identity: self.request_identity,
+                redirect_index,
+            }),
+            None => None,
+        }
+    }
+}
+
+/// Redacted terminal metadata returned by Net to an installed controlled-network session.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum WebResourceLoadTerminal {
+    Completed {
+        status: u16,
+        response_bytes: u64,
+    },
+    Failed,
+    /// A controlled-session cookie boundary rejected metadata before jar mutation.
+    ControlledCookiePolicyRejected(WebResourceCookiePolicyFailure),
+}
+
+/// Secret-safe controlled cookie-policy reason. This crosses only the same-build Net/Servo seam.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum WebResourceCookiePolicyFailure {
+    SameSiteContextUnsupported,
+    PersistentCookieUnsupported,
+    PartitionedCookieUnsupported,
+    InvalidCookie,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 pub enum WebResourceResponseMsg {
+    /// Mark this hop as owned by a controlled top-level session. Net validates this schemeful
+    /// site context before either request Cookie emission or response Set-Cookie mutation.
+    ControlledSession { top_level_url: Url },
     /// Start an interception of this web resource load. It's expected that the client subsequently
     /// send either a `CancelLoad` or `FinishLoad` message after optionally sending chunks of body
     /// data via `SendBodyData`.
@@ -1262,6 +1418,9 @@ pub struct NewWebViewDetails {
     /// The document clock selected before this WebView's initial navigation starts.
     #[doc(hidden)]
     pub document_clock: DocumentClockConfiguration,
+    /// The checked control profile selected before this WebView's initial navigation.
+    #[doc(hidden)]
+    pub document_control_profile: DocumentControlProfile,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

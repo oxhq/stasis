@@ -109,21 +109,24 @@ use embedder_traits::document_control::{
     DocumentControlAutomationKind, DocumentControlCancellationId, DocumentControlCommand,
     DocumentControlError, DocumentControlOutcome, DocumentControlRequestId,
     is_exact_initial_pipeline_activation_transition,
+    is_exact_replacement_pipeline_activation_before_exit_transition,
+    is_exact_replacement_pipeline_activation_transition,
 };
 use embedder_traits::document_pending::{
     PendingActiveTopLevelPipeline, PendingGenerationTerminal, PendingGenerationTerminalObservation,
     PendingNavigationRevision, PendingPipelineMembershipRevision, PendingRuntimeTerminals,
     PendingTargetObservation, PendingTargetTimeTerminalObservation,
 };
+use embedder_traits::document_session::{SessionNavigationAuthority, SessionNavigationError};
 use embedder_traits::resources::{self, Resource};
 use embedder_traits::user_contents::{UserContentManagerId, UserContents};
 use embedder_traits::{
-    AnimationState, DocumentClockConfiguration, EmbedderControlId, EmbedderControlResponse,
-    EmbedderProxy, FocusSequenceNumber, GenericEmbedderProxy, InputEvent, InputEventAndId,
-    InputEventOutcome, JSValue, JavaScriptEvaluationError, JavaScriptEvaluationId, KeyboardEvent,
-    MediaSessionActionType, MediaSessionEvent, MediaSessionPlaybackState, MouseButtonAction,
-    MouseButtonEvent, NewWebViewDetails, PaintHitTestResult, Theme, ViewportDetails,
-    WakeLockDelegate, WakeLockType, WebDriverCommandMsg, WebDriverLoadStatus,
+    AnimationState, DocumentClockConfiguration, DocumentControlProfile, EmbedderControlId,
+    EmbedderControlResponse, EmbedderProxy, FocusSequenceNumber, GenericEmbedderProxy, InputEvent,
+    InputEventAndId, InputEventOutcome, JSValue, JavaScriptEvaluationError, JavaScriptEvaluationId,
+    KeyboardEvent, MediaSessionActionType, MediaSessionEvent, MediaSessionPlaybackState,
+    MouseButtonAction, MouseButtonEvent, NewWebViewDetails, PaintHitTestResult, Theme,
+    ViewportDetails, WakeLockDelegate, WakeLockType, WebDriverCommandMsg, WebDriverLoadStatus,
     WebDriverScriptCommand,
 };
 use euclid::Size2D;
@@ -201,7 +204,9 @@ use crate::browsingcontext::{
     AllBrowsingContextsIterator, BrowsingContext, FullyActiveBrowsingContextsIterator,
     NewBrowsingContextInfo,
 };
-use crate::constellation_webview::{ConstellationWebView, OngoingHistoryTraversalRequest};
+use crate::constellation_webview::{
+    ApplicationSessionNavigationFailure, ConstellationWebView, OngoingHistoryTraversalRequest,
+};
 use crate::event_loop::EventLoop;
 use crate::pipeline::Pipeline;
 use crate::process_manager::ProcessManager;
@@ -223,6 +228,76 @@ struct PendingDocumentControl {
     cancellation_id: DocumentControlCancellationId,
     command: DocumentControlCommand,
     owner_response: GenericCallback<DocumentControlOutcome>,
+    deferred_replacement_activation: Option<DeferredReplacementActivation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeferredReplacementActivation {
+    source_pipeline_id: PipelineId,
+    pipeline_id: PipelineId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredReplacementExit {
+    Source,
+    Replacement,
+}
+
+impl DeferredReplacementActivation {
+    fn classify_exit(self, pipeline_id: PipelineId) -> Option<DeferredReplacementExit> {
+        if pipeline_id == self.source_pipeline_id {
+            Some(DeferredReplacementExit::Source)
+        } else if pipeline_id == self.pipeline_id {
+            Some(DeferredReplacementExit::Replacement)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod deferred_replacement_activation_tests {
+    use servo_base::id::{PipelineNamespaceId, TEST_PIPELINE_INDEX};
+
+    use super::{DeferredReplacementActivation, DeferredReplacementExit, PipelineId};
+
+    fn pipeline_id(namespace: u32) -> PipelineId {
+        PipelineId {
+            namespace_id: PipelineNamespaceId(namespace),
+            index: TEST_PIPELINE_INDEX,
+        }
+    }
+
+    #[test]
+    fn classifies_only_the_correlated_source_and_replacement_exits() {
+        let activation = DeferredReplacementActivation {
+            source_pipeline_id: pipeline_id(1),
+            pipeline_id: pipeline_id(2),
+        };
+
+        assert_eq!(
+            activation.classify_exit(pipeline_id(1)),
+            Some(DeferredReplacementExit::Source)
+        );
+        assert_eq!(
+            activation.classify_exit(pipeline_id(2)),
+            Some(DeferredReplacementExit::Replacement)
+        );
+        assert_eq!(activation.classify_exit(pipeline_id(3)), None);
+    }
+}
+
+enum CorrelatedPipelineActivationAdmission {
+    Initial {
+        before: PendingTargetObservation,
+        before_terminals: PendingRuntimeTerminals,
+    },
+    Replacement {
+        before: PendingTargetObservation,
+        before_terminals: PendingRuntimeTerminals,
+        source_pipeline_id: PipelineId,
+        pipeline_id: PipelineId,
+    },
 }
 
 struct CapturedDocumentControlTarget {
@@ -240,10 +315,10 @@ impl PendingDocumentControl {
         cancellation_id: DocumentControlCancellationId,
         target: &PendingTargetObservation,
     ) -> bool {
-        self.webview_id == source_webview_id &&
-            self.route_pipeline_id == source_pipeline_id &&
-            self.cancellation_id == cancellation_id &&
-            self.target == *target
+        self.webview_id == source_webview_id
+            && self.route_pipeline_id == source_pipeline_id
+            && self.cancellation_id == cancellation_id
+            && self.target == *target
     }
 
     fn send(self, outcome: DocumentControlOutcome) {
@@ -259,6 +334,11 @@ impl PendingDocumentControl {
                 }
             },
             DocumentControlCommand::BootstrapInitialPipeline { .. } => {
+                DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate {
+                    target: Box::new(self.target.clone()),
+                }
+            },
+            DocumentControlCommand::BootstrapReplacementPipeline { .. } => {
                 DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate {
                     target: Box::new(self.target.clone()),
                 }
@@ -290,10 +370,26 @@ fn is_exact_initial_pipeline_bootstrap_target(
     target: &PendingTargetObservation,
     pipeline_id: PipelineId,
 ) -> bool {
-    target.active_top_level.is_none() &&
-        target.pipelines() == [pipeline_id] &&
-        target.fully_active_pipelines().is_empty() &&
-        target.pending_top_level_pipelines() == [pipeline_id]
+    target.active_top_level.is_none()
+        && target.pipelines() == [pipeline_id]
+        && target.fully_active_pipelines().is_empty()
+        && target.pending_top_level_pipelines() == [pipeline_id]
+}
+
+fn is_exact_replacement_pipeline_bootstrap_target(
+    target: &PendingTargetObservation,
+    source_pipeline_id: PipelineId,
+    pipeline_id: PipelineId,
+) -> bool {
+    source_pipeline_id != pipeline_id
+        && target
+            .active_top_level
+            .is_some_and(|active| active.pipeline_id == source_pipeline_id)
+        && target.pipelines().len() == 2
+        && target.contains_pipeline(source_pipeline_id)
+        && target.contains_pipeline(pipeline_id)
+        && target.fully_active_pipelines() == [source_pipeline_id]
+        && target.pending_top_level_pipelines() == [pipeline_id]
 }
 
 type PendingApprovalNavigations = FxHashMap<PipelineId, PendingApprovalNavigation>;
@@ -1023,8 +1119,8 @@ where
         let Some(bc_group_id) = maybe_bc_group_id else {
             return warn!("Trying to add an event-loop to an unknown browsing context group");
         };
-        if let Some(bc_group) = self.browsing_context_group_set.get_mut(&bc_group_id) &&
-            bc_group
+        if let Some(bc_group) = self.browsing_context_group_set.get_mut(&bc_group_id)
+            && bc_group
                 .event_loops
                 .insert(host.clone(), Rc::downgrade(event_loop))
                 .is_some_and(|old_event_loop| old_event_loop.strong_count() != 0)
@@ -1098,10 +1194,16 @@ where
         } else {
             DocumentTimeSurface::CrossEventLoopNavigation
         };
-        let document_clock = self
+        let (document_clock, document_control_profile, controlled_event_loop_id) = self
             .webviews
             .get(&webview_id)
-            .map(ConstellationWebView::document_clock)
+            .map(|webview| {
+                (
+                    webview.document_clock(),
+                    webview.document_control_profile(),
+                    webview.controlled_event_loop_id(),
+                )
+            })
             .unwrap_or_default();
         if parent_pipeline_id.is_some() && document_clock != DocumentClockConfiguration::Realtime {
             if let Some(webview) = self.webviews.get_mut(&webview_id) {
@@ -1120,6 +1222,44 @@ where
             registered_domain_name(&load_data.url)
         };
 
+        // A controlled session is one WebView and one Script event loop across replacement
+        // top-level documents. Resolve that bound loop before normal registered-domain lookup so
+        // a cross-origin navigation cannot silently select or spawn a second authority.
+        if opener.is_none()
+            && parent_pipeline_id.is_none()
+            && document_clock != DocumentClockConfiguration::Realtime
+            && document_control_profile == DocumentControlProfile::TopLevelSession
+            && let Some(bound_event_loop_id) = controlled_event_loop_id
+            && let Some(event_loop) = self
+                .event_loops
+                .iter()
+                .filter_map(Weak::upgrade)
+                .find(|event_loop| event_loop.id() == bound_event_loop_id)
+        {
+            if event_loop.document_clock() != document_clock
+                || event_loop.document_control_profile() != document_control_profile
+            {
+                if let Some(webview) = self.webviews.get_mut(&webview_id) {
+                    webview.fail_document_time(DocumentTimeSurface::CrossEventLoopNavigation);
+                }
+                return Err(EventLoopCreationError::UnsupportedDocumentTime(
+                    DocumentTimeSurface::CrossEventLoopNavigation,
+                ));
+            }
+            if let Some(registered_domain_name) = registered_domain_name.clone() {
+                self.set_event_loop(&event_loop, registered_domain_name, webview_id, opener);
+            }
+            if let Some(webview) = self.webviews.get_mut(&webview_id) {
+                webview
+                    .bind_controlled_event_loop(
+                        event_loop.id(),
+                        DocumentTimeSurface::CrossEventLoopNavigation,
+                    )
+                    .map_err(EventLoopCreationError::UnsupportedDocumentTime)?;
+            }
+            return Ok(event_loop);
+        }
+
         if let Some(event_loop) = self.get_event_loop_for_new_pipeline(
             load_data,
             webview_id,
@@ -1127,7 +1267,9 @@ where
             parent_pipeline_id,
             &registered_domain_name,
         ) {
-            if event_loop.document_clock() != document_clock {
+            if event_loop.document_clock() != document_clock
+                || event_loop.document_control_profile() != document_control_profile
+            {
                 if let Some(webview) = self.webviews.get_mut(&webview_id) {
                     webview.fail_document_time(unsupported_event_loop_surface);
                 }
@@ -1143,8 +1285,9 @@ where
             return Ok(event_loop);
         }
 
-        if document_clock != DocumentClockConfiguration::Realtime &&
-            self.webviews
+        if document_clock != DocumentClockConfiguration::Realtime
+            && self
+                .webviews
                 .get(&webview_id)
                 .is_some_and(|webview| webview.controlled_event_loop_id().is_some())
         {
@@ -1156,7 +1299,8 @@ where
             ));
         }
 
-        let event_loop = EventLoop::spawn(self, is_private, document_clock)?;
+        let event_loop =
+            EventLoop::spawn(self, is_private, document_clock, document_control_profile)?;
         if let Some(webview) = self.webviews.get_mut(&webview_id) {
             webview
                 .bind_controlled_event_loop(event_loop.id(), unsupported_event_loop_surface)
@@ -1382,8 +1526,8 @@ where
             .insert(browsing_context_id, browsing_context);
 
         // If this context is a nested container, attach it to parent pipeline.
-        if let Some(parent_pipeline_id) = parent_pipeline_id &&
-            let Some(parent) = self.pipelines.get_mut(&parent_pipeline_id)
+        if let Some(parent_pipeline_id) = parent_pipeline_id
+            && let Some(parent) = self.pipelines.get_mut(&parent_pipeline_id)
         {
             parent.add_child(browsing_context_id);
         }
@@ -1522,6 +1666,41 @@ where
                     NavigationHistoryBehavior::Push,
                     TargetSnapshotParams::default(),
                 );
+            },
+            EmbedderToConstellationMessage::ObserveSessionNavigation {
+                webview_id,
+                response,
+            } => {
+                let application_failure = self
+                    .webviews
+                    .get_mut(&webview_id)
+                    .and_then(ConstellationWebView::take_application_navigation_failure);
+                let result = match application_failure {
+                    Some(ApplicationSessionNavigationFailure::Terminal(terminal)) => {
+                        Err(SessionNavigationError::Terminal(terminal))
+                    },
+                    Some(ApplicationSessionNavigationFailure::UnsupportedScheme { scheme }) => {
+                        Err(SessionNavigationError::UnsupportedScheme { scheme })
+                    },
+                    Some(ApplicationSessionNavigationFailure::NavigationStartFailed) => self
+                        .capture_session_navigation_authority(webview_id)
+                        .and_then(|authority| match authority.terminal() {
+                            Some(terminal) => Err(SessionNavigationError::Terminal(terminal)),
+                            None => Err(SessionNavigationError::NavigationStartFailed {
+                                observed: Box::new(authority),
+                            }),
+                        }),
+                    None => self.capture_session_navigation_authority(webview_id),
+                };
+                let _ = response.send(result);
+            },
+            EmbedderToConstellationMessage::NavigateControlledSession {
+                webview_id,
+                expected,
+                url,
+                response,
+            } => {
+                self.handle_navigate_controlled_session(webview_id, *expected, url, response);
             },
             // Create a new top level browsing context. Will use response_chan to return
             // the browsing context id.
@@ -1748,8 +1927,8 @@ where
         &self,
         message: BackgroundHangMonitorControlMsg,
     ) {
-        if let Some(background_monitor_control_sender) = &self.background_monitor_control_sender &&
-            let Err(error) = background_monitor_control_sender.send(message.clone())
+        if let Some(background_monitor_control_sender) = &self.background_monitor_control_sender
+            && let Err(error) = background_monitor_control_sender.send(message.clone())
         {
             error!("Could not send message ({message:?}) to BHM: {error}");
         }
@@ -1905,8 +2084,8 @@ where
             .pipelines
             .get(&route_pipeline_id)
             .ok_or(DocumentControlError::EventLoopUnavailable)?;
-        if route_pipeline.webview_id != webview_id ||
-            route_pipeline.event_loop.id() != event_loop_id
+        if route_pipeline.webview_id != webview_id
+            || route_pipeline.event_loop.id() != event_loop_id
         {
             return Err(DocumentControlError::EventLoopUnavailable);
         }
@@ -1917,6 +2096,143 @@ where
             route_pipeline_id,
             event_loop: route_pipeline.event_loop.clone(),
         })
+    }
+
+    fn capture_session_navigation_authority(
+        &self,
+        webview_id: WebViewId,
+    ) -> Result<SessionNavigationAuthority, SessionNavigationError> {
+        let webview =
+            self.webviews
+                .get(&webview_id)
+                .ok_or(SessionNavigationError::TargetUnavailable(
+                    DocumentControlError::WebViewUnavailable,
+                ))?;
+        if webview.document_control_profile() != DocumentControlProfile::TopLevelSession {
+            return Err(SessionNavigationError::NotTopLevelSession);
+        }
+        let captured = self
+            .capture_document_control_target(webview_id)
+            .map_err(SessionNavigationError::TargetUnavailable)?;
+        let route_url = captured
+            .target
+            .pending_top_level_pipelines()
+            .first()
+            .and_then(|pipeline_id| self.pipelines.get(pipeline_id))
+            .or_else(|| {
+                captured
+                    .target
+                    .active_top_level
+                    .and_then(|active| self.pipelines.get(&active.pipeline_id))
+            })
+            .ok_or(SessionNavigationError::TargetUnavailable(
+                DocumentControlError::EventLoopUnavailable,
+            ))?
+            .url
+            .clone();
+        let (document_epoch, navigation_id, history_revision, replacements, terminal) =
+            webview.session_navigation_authority();
+        Ok(SessionNavigationAuthority::new_internal(
+            Box::new(captured.target),
+            document_epoch,
+            navigation_id,
+            history_revision,
+            replacements,
+            route_url,
+            terminal,
+        ))
+    }
+
+    fn handle_navigate_controlled_session(
+        &mut self,
+        webview_id: WebViewId,
+        expected: SessionNavigationAuthority,
+        url: ServoUrl,
+        response: GenericCallback<Result<SessionNavigationAuthority, SessionNavigationError>>,
+    ) {
+        let observed = match self.capture_session_navigation_authority(webview_id) {
+            Ok(observed) => observed,
+            Err(error) => {
+                let _ = response.send(Err(error));
+                return;
+            },
+        };
+        if observed != expected {
+            let _ = response.send(Err(SessionNavigationError::TargetChanged {
+                expected: Box::new(expected),
+                observed: Box::new(observed),
+            }));
+            return;
+        }
+        if let Some(terminal) = observed.terminal() {
+            let _ = response.send(Err(SessionNavigationError::Terminal(terminal)));
+            return;
+        }
+        if !matches!(url.scheme(), "http" | "https") {
+            let _ = response.send(Err(SessionNavigationError::UnsupportedScheme {
+                scheme: url.scheme().to_owned(),
+            }));
+            return;
+        }
+        let browsing_context_id = BrowsingContextId::from(webview_id);
+        let source_id = match self.browsing_contexts.get(&browsing_context_id) {
+            Some(context) => context.pipeline_id,
+            None => {
+                let _ = response.send(Err(SessionNavigationError::TargetUnavailable(
+                    DocumentControlError::WebViewUnavailable,
+                )));
+                return;
+            },
+        };
+        if !observed.target().pending_top_level_pipelines().is_empty() {
+            let _ = response.send(Err(SessionNavigationError::NavigationInProgress));
+            return;
+        }
+        if self.get_activity(source_id) == DocumentActivity::Inactive {
+            let _ = response.send(Err(SessionNavigationError::SourceInactive));
+            return;
+        }
+        let admission = self
+            .webviews
+            .get_mut(&webview_id)
+            .ok_or(SessionNavigationError::TargetUnavailable(
+                DocumentControlError::WebViewUnavailable,
+            ))
+            .and_then(|webview| {
+                webview
+                    .admit_session_document_replacement()
+                    .map_err(SessionNavigationError::Terminal)
+            });
+        if let Err(error) = admission {
+            let _ = response.send(Err(error));
+            return;
+        }
+        let load_data = LoadData::new_for_new_unrelated_webview(url);
+        if self
+            .load_url_with_session_admission(
+                webview_id,
+                source_id,
+                load_data,
+                NavigationHistoryBehavior::Push,
+                TargetSnapshotParams::default(),
+                true,
+            )
+            .is_none()
+        {
+            let result = self
+                .capture_session_navigation_authority(webview_id)
+                .and_then(|authority| match authority.terminal() {
+                    Some(terminal) => Err(SessionNavigationError::Terminal(terminal)),
+                    None => Err(SessionNavigationError::NavigationStartFailed {
+                        observed: Box::new(authority),
+                    }),
+                });
+            let _ = response.send(result);
+            return;
+        }
+        // This acknowledgement attests admission and the newly pending target. Activation and
+        // controlled readiness remain separate engine observations; no completion is fabricated.
+        let _ = response.send(self.capture_session_navigation_authority(webview_id));
     }
 
     fn next_document_control_request_id(
@@ -1954,6 +2270,7 @@ where
             cancellation_id,
             command: command.clone(),
             owner_response,
+            deferred_replacement_activation: None,
         };
         self.pending_document_controls.insert(request_id, pending);
         let send_result =
@@ -1966,8 +2283,8 @@ where
                     target_terminals: captured.target_terminals,
                     command,
                 });
-        if send_result.is_err() &&
-            let Some(pending) = self.pending_document_controls.remove(&request_id)
+        if send_result.is_err()
+            && let Some(pending) = self.pending_document_controls.remove(&request_id)
         {
             pending.send(DocumentControlOutcome::Rejected(
                 DocumentControlError::ChannelClosed,
@@ -2005,11 +2322,29 @@ where
                 return;
             },
         };
-        if let DocumentControlCommand::BootstrapInitialPipeline { pipeline_id } = &command &&
-            !is_exact_initial_pipeline_bootstrap_target(&captured.target, *pipeline_id)
+        if let DocumentControlCommand::BootstrapInitialPipeline { pipeline_id } = &command
+            && !is_exact_initial_pipeline_bootstrap_target(&captured.target, *pipeline_id)
         {
             let _ = response.send(DocumentControlOutcome::Rejected(
                 DocumentControlError::InitialPipelineBootstrapUnavailable {
+                    pipeline_id: *pipeline_id,
+                },
+            ));
+            return;
+        }
+        if let DocumentControlCommand::BootstrapReplacementPipeline {
+            source_pipeline_id,
+            pipeline_id,
+        } = &command
+            && !is_exact_replacement_pipeline_bootstrap_target(
+                &captured.target,
+                *source_pipeline_id,
+                *pipeline_id,
+            )
+        {
+            let _ = response.send(DocumentControlOutcome::Rejected(
+                DocumentControlError::ReplacementPipelineBootstrapUnavailable {
+                    source_pipeline_id: *source_pipeline_id,
                     pipeline_id: *pipeline_id,
                 },
             ));
@@ -2115,7 +2450,7 @@ where
         }
     }
 
-    fn reject_initial_pipeline_activation_correlation(
+    fn reject_pipeline_activation_correlation(
         &mut self,
         webview_id: WebViewId,
         source_pipeline_id: PipelineId,
@@ -2127,9 +2462,7 @@ where
             .pending_document_controls
             .get(&request_id)
             .is_some_and(|pending| {
-                pending.webview_id == webview_id &&
-                    pending.route_pipeline_id == source_pipeline_id &&
-                    pending.cancellation_id == cancellation_id
+                pending.webview_id == webview_id && pending.cancellation_id == cancellation_id
             })
         {
             self.fail_document_control_request(request_id, DocumentControlError::ChannelClosed);
@@ -2151,71 +2484,29 @@ where
         }
     }
 
-    fn handle_initial_pipeline_activation(
+    fn reroute_correlated_document_control(
         &mut self,
+        request_id: DocumentControlRequestId,
+        cancellation_id: DocumentControlCancellationId,
         webview_id: WebViewId,
-        source_pipeline_id: PipelineId,
-        correlation: Option<InitialPipelineActivationCorrelation>,
+        expected_route_pipeline_id: PipelineId,
+        before: &PendingTargetObservation,
+        captured: CapturedDocumentControlTarget,
     ) {
-        let admission = correlation.and_then(|correlation| {
-            let pending = self
-                .pending_document_controls
-                .get(&correlation.request_id())?;
-            (pending.cancellation_id == correlation.cancellation_id() &&
-                pending.webview_id == webview_id &&
-                pending.route_pipeline_id == source_pipeline_id &&
-                matches!(&pending.command, DocumentControlCommand::DriveOneTurn) &&
-                is_exact_initial_pipeline_bootstrap_target(&pending.target, source_pipeline_id))
-            .then(|| (pending.target.clone(), pending.target_terminals.clone()))
-        });
-
-        self.handle_activate_document_msg(webview_id, source_pipeline_id);
-
-        let Some(correlation) = correlation else {
-            return;
-        };
-        let request_id = correlation.request_id();
-        let cancellation_id = correlation.cancellation_id();
-        let Some((before, before_terminals)) = admission else {
-            self.reject_initial_pipeline_activation_correlation(
-                webview_id,
-                source_pipeline_id,
-                correlation,
-            );
-            return;
-        };
-        let captured = match self.capture_document_control_target(webview_id) {
-            Ok(captured)
-                if captured.route_pipeline_id == source_pipeline_id &&
-                    captured.target_terminals == before_terminals &&
-                    is_exact_initial_pipeline_activation_transition(
-                        &before,
-                        &captured.target,
-                        source_pipeline_id,
-                    ) =>
-            {
-                captured
-            },
-            _ => {
-                self.fail_document_control_request(request_id, DocumentControlError::ChannelClosed);
-                return;
-            },
-        };
         let still_matches =
             self.pending_document_controls
                 .get(&request_id)
                 .is_some_and(|pending| {
-                    pending.cancellation_id == cancellation_id &&
-                        pending.webview_id == webview_id &&
-                        pending.route_pipeline_id == source_pipeline_id &&
-                        pending.target == before &&
-                        matches!(&pending.command, DocumentControlCommand::DriveOneTurn)
+                    pending.cancellation_id == cancellation_id
+                        && pending.webview_id == webview_id
+                        && pending.route_pipeline_id == expected_route_pipeline_id
+                        && pending.target == *before
+                        && matches!(&pending.command, DocumentControlCommand::DriveOneTurn)
                 });
         if !still_matches {
-            self.reject_initial_pipeline_activation_correlation(
+            self.fail_document_controls_for_webview(
                 webview_id,
-                source_pipeline_id,
-                correlation,
+                DocumentControlError::ChannelClosed,
             );
             return;
         }
@@ -2233,6 +2524,7 @@ where
             pending.event_loop = Rc::downgrade(&event_loop);
             pending.target = target.clone();
             pending.target_terminals = target_terminals.clone();
+            pending.deferred_replacement_activation = None;
             pending.command.clone()
         };
         let send_result = event_loop.send_document_control(ScriptThreadControlMessage::Command {
@@ -2245,6 +2537,222 @@ where
         if send_result.is_err() {
             self.fail_document_control_request(request_id, DocumentControlError::ChannelClosed);
         }
+    }
+
+    fn handle_correlated_pipeline_activation(
+        &mut self,
+        webview_id: WebViewId,
+        source_pipeline_id: PipelineId,
+        correlation: Option<InitialPipelineActivationCorrelation>,
+    ) {
+        let admission = correlation.and_then(|correlation| {
+            let pending = self
+                .pending_document_controls
+                .get(&correlation.request_id())?;
+            if pending.cancellation_id != correlation.cancellation_id()
+                || pending.webview_id != webview_id
+                || !matches!(&pending.command, DocumentControlCommand::DriveOneTurn)
+                || pending.deferred_replacement_activation.is_some()
+            {
+                return None;
+            }
+            if pending.route_pipeline_id == source_pipeline_id
+                && is_exact_initial_pipeline_bootstrap_target(&pending.target, source_pipeline_id)
+            {
+                return Some(CorrelatedPipelineActivationAdmission::Initial {
+                    before: pending.target.clone(),
+                    before_terminals: pending.target_terminals.clone(),
+                });
+            }
+            let replacement_source = pending.target.active_top_level?.pipeline_id;
+            (pending.route_pipeline_id == replacement_source
+                && is_exact_replacement_pipeline_bootstrap_target(
+                    &pending.target,
+                    replacement_source,
+                    source_pipeline_id,
+                ))
+            .then(|| CorrelatedPipelineActivationAdmission::Replacement {
+                before: pending.target.clone(),
+                before_terminals: pending.target_terminals.clone(),
+                source_pipeline_id: replacement_source,
+                pipeline_id: source_pipeline_id,
+            })
+        });
+
+        self.handle_activate_document_msg(webview_id, source_pipeline_id);
+
+        let Some(correlation) = correlation else {
+            return;
+        };
+        let request_id = correlation.request_id();
+        let cancellation_id = correlation.cancellation_id();
+        let Some(admission) = admission else {
+            self.reject_pipeline_activation_correlation(
+                webview_id,
+                source_pipeline_id,
+                correlation,
+            );
+            return;
+        };
+        match admission {
+            CorrelatedPipelineActivationAdmission::Initial {
+                before,
+                before_terminals,
+            } => {
+                let captured = match self.capture_document_control_target(webview_id) {
+                    Ok(captured)
+                        if captured.route_pipeline_id == source_pipeline_id
+                            && captured.target_terminals == before_terminals
+                            && is_exact_initial_pipeline_activation_transition(
+                                &before,
+                                &captured.target,
+                                source_pipeline_id,
+                            ) =>
+                    {
+                        captured
+                    },
+                    _ => {
+                        self.fail_document_control_request(
+                            request_id,
+                            DocumentControlError::ChannelClosed,
+                        );
+                        return;
+                    },
+                };
+                self.reroute_correlated_document_control(
+                    request_id,
+                    cancellation_id,
+                    webview_id,
+                    source_pipeline_id,
+                    &before,
+                    captured,
+                );
+            },
+            CorrelatedPipelineActivationAdmission::Replacement {
+                before,
+                before_terminals,
+                source_pipeline_id,
+                pipeline_id,
+            } => {
+                let _captured = match self.capture_document_control_target(webview_id) {
+                    Ok(captured)
+                        if captured.route_pipeline_id == pipeline_id
+                            && captured.target_terminals == before_terminals
+                            && is_exact_replacement_pipeline_activation_before_exit_transition(
+                                &before,
+                                &captured.target,
+                                source_pipeline_id,
+                                pipeline_id,
+                            ) =>
+                    {
+                        captured
+                    },
+                    _ => {
+                        self.fail_document_control_request(
+                            request_id,
+                            DocumentControlError::ChannelClosed,
+                        );
+                        return;
+                    },
+                };
+                let still_matches =
+                    self.pending_document_controls
+                        .get(&request_id)
+                        .is_some_and(|pending| {
+                            pending.cancellation_id == cancellation_id
+                                && pending.webview_id == webview_id
+                                && pending.route_pipeline_id == source_pipeline_id
+                                && pending.target == before
+                                && pending.target_terminals == before_terminals
+                                && pending.deferred_replacement_activation.is_none()
+                                && matches!(&pending.command, DocumentControlCommand::DriveOneTurn)
+                        });
+                if !still_matches {
+                    self.reject_pipeline_activation_correlation(
+                        webview_id,
+                        pipeline_id,
+                        correlation,
+                    );
+                    return;
+                }
+                // The activation is owner-attested, but the inactive source still belongs to the
+                // captured event-loop target until Script acknowledges its queued ExitPipeline.
+                // Keep the original Drive pending and reroute it only from that exact exit ack.
+                let pending = self
+                    .pending_document_controls
+                    .get_mut(&request_id)
+                    .expect("the replacement activation was revalidated above");
+                pending.deferred_replacement_activation = Some(DeferredReplacementActivation {
+                    source_pipeline_id,
+                    pipeline_id,
+                });
+            },
+        }
+    }
+
+    fn resume_deferred_replacement_activation(&mut self, exited_pipeline_id: PipelineId) {
+        let deferred = self
+            .pending_document_controls
+            .iter()
+            .find_map(|(request_id, pending)| {
+                let activation = pending.deferred_replacement_activation?;
+                activation.classify_exit(exited_pipeline_id).map(|exit| {
+                    (
+                        *request_id,
+                        pending.cancellation_id,
+                        pending.webview_id,
+                        pending.target.clone(),
+                        pending.target_terminals.clone(),
+                        activation,
+                        exit,
+                    )
+                })
+            });
+        let Some((
+            request_id,
+            cancellation_id,
+            webview_id,
+            before,
+            before_terminals,
+            activation,
+            exit,
+        )) = deferred
+        else {
+            return;
+        };
+        if exit == DeferredReplacementExit::Replacement {
+            // A replacement which dies before the inactive source acknowledges its exit can no
+            // longer become the sole active target. Retire the correlated command immediately;
+            // a later duplicate/source exit must not reroute or resurrect it.
+            self.fail_document_control_request(request_id, DocumentControlError::ChannelClosed);
+            return;
+        }
+        let captured = match self.capture_document_control_target(webview_id) {
+            Ok(captured)
+                if captured.route_pipeline_id == activation.pipeline_id
+                    && captured.target_terminals == before_terminals
+                    && is_exact_replacement_pipeline_activation_transition(
+                        &before,
+                        &captured.target,
+                        activation.source_pipeline_id,
+                        activation.pipeline_id,
+                    ) =>
+            {
+                captured
+            },
+            _ => {
+                self.fail_document_control_request(request_id, DocumentControlError::ChannelClosed);
+                return;
+            },
+        };
+        self.reroute_correlated_document_control(
+            request_id,
+            cancellation_id,
+            webview_id,
+            activation.source_pipeline_id,
+            &before,
+            captured,
+        );
     }
 
     fn handle_document_control_response(
@@ -2297,6 +2805,17 @@ where
             (DocumentControlCommand::BootstrapInitialPipeline { .. }, _) => {
                 pending.send_unresolved(DocumentControlError::ChannelClosed)
             },
+            (
+                DocumentControlCommand::BootstrapReplacementPipeline { .. },
+                DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate { target },
+            ) if target.as_ref() == &pending.target => pending.send(outcome),
+            (
+                DocumentControlCommand::BootstrapReplacementPipeline { .. },
+                DocumentControlOutcome::Completed(observation),
+            ) if observation.pending().target == pending.target => pending.send(outcome),
+            (DocumentControlCommand::BootstrapReplacementPipeline { .. }, _) => {
+                pending.send_unresolved(DocumentControlError::ChannelClosed)
+            },
             (DocumentControlCommand::AdvanceTo(token), DocumentControlOutcome::Completed(_))
                 if token.target() == &pending.target =>
             {
@@ -2325,8 +2844,8 @@ where
                 }
                 match self.capture_document_control_target(pending.webview_id) {
                     Ok(captured)
-                        if captured.target == pending.target &&
-                            captured.target_terminals == pending.target_terminals =>
+                        if captured.target == pending.target
+                            && captured.target_terminals == pending.target_terminals =>
                     {
                         pending.send(outcome)
                     },
@@ -2356,8 +2875,8 @@ where
                 }
                 match self.capture_document_control_target(pending.webview_id) {
                     Ok(captured)
-                        if captured.target == pending.target &&
-                            captured.target_terminals == pending.target_terminals =>
+                        if captured.target == pending.target
+                            && captured.target_terminals == pending.target_terminals =>
                     {
                         pending.send(outcome)
                     },
@@ -2382,8 +2901,8 @@ where
                 }
                 match self.capture_document_control_target(pending.webview_id) {
                     Ok(captured)
-                        if captured.target == pending.target &&
-                            captured.target_terminals == pending.target_terminals =>
+                        if captured.target == pending.target
+                            && captured.target_terminals == pending.target_terminals =>
                     {
                         pending.send(outcome)
                     },
@@ -2566,6 +3085,50 @@ where
             ScriptToConstellationMessage::AbortLoadUrl => {
                 self.handle_abort_load_url_msg(webview_id, source_pipeline_id);
             },
+            ScriptToConstellationMessage::ControlledSessionRedirectLimitExceeded { observed } => {
+                let is_pending_top_level = self
+                    .webviews
+                    .get(&webview_id)
+                    .is_some_and(|webview| webview.pipeline_is_pending(source_pipeline_id))
+                    && self
+                        .pipelines
+                        .get(&source_pipeline_id)
+                        .and_then(|pipeline| {
+                            self.browsing_contexts.get(&pipeline.browsing_context_id)
+                        })
+                        .is_some_and(|context| context.parent_pipeline_id.is_none());
+                if is_pending_top_level {
+                    if let Some(webview) = self.webviews.get_mut(&webview_id) {
+                        webview.fail_session_redirect_limit(observed);
+                    }
+                }
+            },
+            ScriptToConstellationMessage::ControlledSessionHistoryLimitExceeded => {
+                let active_top_level = self
+                    .webviews
+                    .get(&webview_id)
+                    .and_then(|webview| webview.active_top_level_pipeline())
+                    .is_some_and(|(pipeline_id, _)| pipeline_id == source_pipeline_id);
+                if active_top_level {
+                    if let Some(webview) = self.webviews.get_mut(&webview_id) {
+                        let _ = webview.admit_application_session_history_change();
+                    }
+                }
+            },
+            ScriptToConstellationMessage::ControlledSessionUnsupportedNavigationScheme {
+                scheme,
+            } => {
+                let active_top_level = self
+                    .webviews
+                    .get(&webview_id)
+                    .and_then(|webview| webview.active_top_level_pipeline())
+                    .is_some_and(|(pipeline_id, _)| pipeline_id == source_pipeline_id);
+                if active_top_level {
+                    if let Some(webview) = self.webviews.get_mut(&webview_id) {
+                        let _ = webview.reject_application_session_navigation_scheme(&scheme);
+                    }
+                }
+            },
             // A page loaded has completed all parsing, script, and reflow messages have been sent.
             ScriptToConstellationMessage::LoadComplete => {
                 self.handle_load_complete_msg(webview_id, source_pipeline_id)
@@ -2591,7 +3154,7 @@ where
             },
             // Notification that the new document is ready to become active
             ScriptToConstellationMessage::ActivateDocument(correlation) => {
-                self.handle_initial_pipeline_activation(
+                self.handle_correlated_pipeline_activation(
                     webview_id,
                     source_pipeline_id,
                     correlation,
@@ -2756,9 +3319,9 @@ where
                 // The last media session claiming to be in playing state is set to
                 // the active media session.
                 // Events coming from inactive media sessions are discarded.
-                if self.active_media_session.is_some() &&
-                    let MediaSessionEvent::PlaybackStateChange(ref state) = event &&
-                    !matches!(
+                if self.active_media_session.is_some()
+                    && let MediaSessionEvent::PlaybackStateChange(ref state) = event
+                    && !matches!(
                         state,
                         MediaSessionPlaybackState::Playing | MediaSessionPlaybackState::Paused
                     )
@@ -2801,8 +3364,8 @@ where
                 self.handle_finish_javascript_evaluation(evaluation_id, result)
             },
             ScriptToConstellationMessage::ForwardKeyboardScroll(pipeline_id, scroll) => {
-                if let Some(pipeline) = self.pipelines.get(&pipeline_id) &&
-                    let Err(error) =
+                if let Some(pipeline) = self.pipelines.get(&pipeline_id)
+                    && let Err(error) =
                         pipeline
                             .event_loop
                             .send(ScriptThreadMessage::ForwardKeyboardScroll(
@@ -2824,8 +3387,8 @@ where
             ScriptToConstellationMessage::AcquireWakeLock(type_) => match type_ {
                 WakeLockType::Screen => {
                     self.screen_wake_lock_count += 1;
-                    if self.screen_wake_lock_count == 1 &&
-                        let Err(e) = self.wake_lock_provider.acquire(type_)
+                    if self.screen_wake_lock_count == 1
+                        && let Err(e) = self.wake_lock_provider.acquire(type_)
                     {
                         warn!("Failed to acquire screen wake lock: {e}");
                     }
@@ -2834,8 +3397,8 @@ where
             ScriptToConstellationMessage::ReleaseWakeLock(type_) => match type_ {
                 WakeLockType::Screen => {
                     self.screen_wake_lock_count = self.screen_wake_lock_count.saturating_sub(1);
-                    if self.screen_wake_lock_count == 0 &&
-                        let Err(e) = self.wake_lock_provider.release(type_)
+                    if self.screen_wake_lock_count == 0
+                        && let Err(e) = self.wake_lock_provider.release(type_)
                     {
                         warn!("Failed to release screen wake lock: {e}");
                     }
@@ -3109,8 +3672,8 @@ where
                         entangled_with: entry.entangled_with,
                     }
                 },
-                TransferState::CompletionFailed(buffer) |
-                TransferState::CompletionRequested(_, buffer) => {
+                TransferState::CompletionFailed(buffer)
+                | TransferState::CompletionRequested(_, buffer) => {
                     // If the completion had already failed,
                     // this is a request coming from a global to complete a new transfer,
                     // but we're still awaiting the return of the buffer
@@ -3275,8 +3838,8 @@ where
         if let Some(info) = self.message_ports.get_mut(&port2) {
             info.entangled_with = None;
             match &mut info.state {
-                TransferState::Managed(router_id) |
-                TransferState::CompletionInProgress(router_id) => {
+                TransferState::Managed(router_id)
+                | TransferState::CompletionInProgress(router_id) => {
                     // We try to disentangle the other port now,
                     // and if it has been transfered out by the time the message is received,
                     // it will be ignored,
@@ -3408,8 +3971,8 @@ where
             // and, if type is "session", whose relevant settings object's associated Document's
             // node navigable's traversable navigable is thisDocument's node navigable's
             // traversable navigable."
-            if storage == WebStorageType::Session &&
-                pipeline.webview_id != source_pipeline.webview_id
+            if storage == WebStorageType::Session
+                && pipeline.webview_id != source_pipeline.webview_id
             {
                 continue;
             }
@@ -3533,8 +4096,8 @@ where
 
         // In single process mode, join on the background hang monitor worker thread.
         drop(self.background_monitor_register.take());
-        if let Some(join_handle) = self.background_monitor_register_join_handle.take() &&
-            join_handle.join().is_err()
+        if let Some(join_handle) = self.background_monitor_register_join_handle.take()
+            && join_handle.join().is_err()
         {
             error!("Failed to join on the bhm background thread.");
         }
@@ -3753,6 +4316,7 @@ where
         if let Some(webview) = self.webviews.get_mut(&pipeline.webview_id) {
             webview.note_pipeline_membership_change();
         }
+        self.resume_deferred_replacement_activation(pipeline_id);
 
         // Clean up any registered interests for this pipeline.
         self.pipeline_interests.retain(|_, set| {
@@ -4073,6 +4637,7 @@ where
             viewport_details,
             user_content_manager_id,
             document_clock,
+            document_control_profile,
         }: NewWebViewDetails,
     ) {
         let pipeline_id = PipelineId::new();
@@ -4088,6 +4653,7 @@ where
             browsing_context_id,
             user_content_manager_id,
             document_clock,
+            document_control_profile,
         );
         self.webviews.insert(webview_id, new_webview);
 
@@ -4513,6 +5079,7 @@ where
             viewport_details,
             user_content_manager_id,
             document_clock,
+            document_control_profile,
         } = match webview_id_receiver.recv() {
             Ok(Some(new_webview_details)) => new_webview_details,
             Ok(None) | Err(_) => {
@@ -4532,7 +5099,9 @@ where
                     );
                 },
             };
-        if script_sender.document_clock() != document_clock {
+        if script_sender.document_clock() != document_clock
+            || script_sender.document_control_profile() != document_control_profile
+        {
             if let Some(opener_webview) = self.webviews.get_mut(&opener_webview_id) {
                 opener_webview.fail_document_time(DocumentTimeSurface::AuxiliaryWebView);
             }
@@ -4558,6 +5127,7 @@ where
             new_browsing_context_id,
             user_content_manager_id,
             document_clock,
+            document_control_profile,
         );
         if let Err(surface) = new_webview
             .bind_controlled_event_loop(script_sender.id(), DocumentTimeSurface::AuxiliaryWebView)
@@ -4646,8 +5216,8 @@ where
                 self.handle_change_document_animation_frame_provider_state(pipeline_id, false);
             },
             AnimationState::AnimationsPresent | AnimationState::NoAnimationsPresent => {
-                if let Some(pipeline) = self.pipelines.get_mut(&pipeline_id) &&
-                    pipeline.animation_state != animation_state
+                if let Some(pipeline) = self.pipelines.get_mut(&pipeline_id)
+                    && pipeline.animation_state != animation_state
                 {
                     pipeline.animation_state = animation_state;
                     self.paint_proxy
@@ -4977,8 +5547,8 @@ where
                         pending.target_snapshot_params,
                     );
                 } else {
-                    if let Some((sender, id)) = &self.webdriver_load_status_sender &&
-                        pipeline_id == *id
+                    if let Some((sender, id)) = &self.webdriver_load_status_sender
+                        && pipeline_id == *id
                     {
                         let _ = sender.send(WebDriverLoadStatus::NavigationStop);
                     }
@@ -5016,6 +5586,25 @@ where
         load_data: LoadData,
         history_handling: NavigationHistoryBehavior,
         target_snapshot_params: TargetSnapshotParams,
+    ) -> Option<PipelineId> {
+        self.load_url_with_session_admission(
+            webview_id,
+            source_id,
+            load_data,
+            history_handling,
+            target_snapshot_params,
+            false,
+        )
+    }
+
+    fn load_url_with_session_admission(
+        &mut self,
+        webview_id: WebViewId,
+        source_id: PipelineId,
+        load_data: LoadData,
+        history_handling: NavigationHistoryBehavior,
+        target_snapshot_params: TargetSnapshotParams,
+        session_already_admitted: bool,
     ) -> Option<PipelineId> {
         debug!(
             "{}: Loading ({}replacing): {}",
@@ -5089,8 +5678,8 @@ where
                 };
                 if let Err(e) = result {
                     self.handle_send_error(parent_pipeline_id, e);
-                } else if let Some((sender, id)) = &self.webdriver_load_status_sender &&
-                    source_id == *id
+                } else if let Some((sender, id)) = &self.webdriver_load_status_sender
+                    && source_id == *id
                 {
                     let _ = sender.send(WebDriverLoadStatus::NavigationStop);
                 }
@@ -5099,8 +5688,8 @@ where
             },
             None => {
                 // Make sure no pending page would be overridden.
-                if let Some(webview) = self.webviews.get(&webview_id) &&
-                    webview.pending_changes().iter().any(|pending_change| {
+                if let Some(webview) = self.webviews.get(&webview_id)
+                    && webview.pending_changes().iter().any(|pending_change| {
                         pending_change.browsing_context_id == browsing_context_id
                     })
                 {
@@ -5114,6 +5703,26 @@ where
                     // a timer) or a race between multiple navigations (such as an
                     // onclick handler on an anchor element).
                     return None;
+                }
+
+                let mut application_session_admitted = false;
+                if !session_already_admitted {
+                    let should_admit = self.webviews.get(&webview_id).is_some_and(|webview| {
+                        webview.document_control_profile()
+                            == DocumentControlProfile::TopLevelSession
+                            && webview.active_top_level_pipeline().is_some()
+                    });
+                    if should_admit {
+                        application_session_admitted =
+                            self.webviews.get_mut(&webview_id).is_some_and(|webview| {
+                                webview.admit_application_session_document_replacement(
+                                    load_data.url.scheme(),
+                                )
+                            });
+                        if !application_session_admitted {
+                            return None;
+                        }
+                    }
                 }
 
                 // Being here means either there are no pending changes, or none of the pending
@@ -5141,6 +5750,11 @@ where
                     target_snapshot_params,
                     None,
                 ) {
+                    if application_session_admitted {
+                        if let Some(webview) = self.webviews.get_mut(&webview_id) {
+                            webview.note_application_session_navigation_start_failed();
+                        }
+                    }
                     return None;
                 }
 
@@ -5219,11 +5833,8 @@ where
         new_url: ServoUrl,
         history_handling: NavigationHistoryBehavior,
     ) {
-        let (webview_id, old_url) = match self.pipelines.get_mut(&pipeline_id) {
-            Some(pipeline) => {
-                let old_url = replace(&mut pipeline.url, new_url.clone());
-                (pipeline.webview_id, old_url)
-            },
+        let webview_id = match self.pipelines.get(&pipeline_id) {
+            Some(pipeline) => pipeline.webview_id,
             None => {
                 return warn!("{}: Navigated to fragment after closure", pipeline_id);
             },
@@ -5231,6 +5842,15 @@ where
 
         let Some(webview) = self.webviews.get_mut(&webview_id) else {
             return warn!("Ignoring navigation in non-existent WebView ({webview_id:?}).");
+        };
+        if webview.document_control_profile() == DocumentControlProfile::TopLevelSession
+            && !webview.admit_application_session_history_change()
+        {
+            return;
+        }
+        let old_url = match self.pipelines.get_mut(&pipeline_id) {
+            Some(pipeline) => replace(&mut pipeline.url, new_url.clone()),
+            None => return,
         };
 
         match history_handling {
@@ -5260,6 +5880,16 @@ where
         traversal_request: SessionHistoryTraversalRequest,
     ) {
         let webview_id = traversal_request.webview_id;
+        if self
+            .webviews
+            .get_mut(&webview_id)
+            .is_some_and(|webview| webview.reject_session_history_traversal())
+        {
+            self.notify_embedder_of_completed_session_history_traversal_request(&traversal_request);
+            return warn!(
+                "Ignoring unsupported history traversal in controlled top-level session ({webview_id:?})."
+            );
+        }
         let Some(webview) = self.webviews.get_mut(&webview_id) else {
             self.notify_embedder_of_completed_session_history_traversal_request(&traversal_request);
             return warn!("Ignoring history traversal in non-existent WebView ({webview_id:?}).");
@@ -5411,8 +6041,8 @@ where
         let pipelines_awaiting_activation: FxHashSet<_> = browsing_context_changes
             .drain()
             .filter_map(|(browsing_context_id, mut pipeline_reloader)| {
-                if let NeedsToReload::Yes(pipeline_id, ref mut load_data) = pipeline_reloader &&
-                    let Some(url) = url_to_load.get(&pipeline_id)
+                if let NeedsToReload::Yes(pipeline_id, ref mut load_data) = pipeline_reloader
+                    && let Some(url) = url_to_load.get(&pipeline_id)
                 {
                     load_data.url = url.clone();
                 }
@@ -5690,14 +6320,8 @@ where
         history_state_id: HistoryStateId,
         url: ServoUrl,
     ) {
-        let (webview_id, old_state_id, old_url) = match self.pipelines.get_mut(&pipeline_id) {
-            Some(pipeline) => {
-                let old_history_state_id = pipeline.history_state_id;
-                let old_url = replace(&mut pipeline.url, url.clone());
-                pipeline.history_state_id = Some(history_state_id);
-                pipeline.history_states.insert(history_state_id);
-                (pipeline.webview_id, old_history_state_id, old_url)
-            },
+        let webview_id = match self.pipelines.get(&pipeline_id) {
+            Some(pipeline) => pipeline.webview_id,
             None => {
                 return warn!(
                     "{}: Push history state {} for closed pipeline",
@@ -5705,9 +6329,23 @@ where
                 );
             },
         };
-
         let Some(webview) = self.webviews.get_mut(&webview_id) else {
             return warn!("Ignoring history change in non-existent WebView ({webview_id:?}).");
+        };
+        if webview.document_control_profile() == DocumentControlProfile::TopLevelSession
+            && !webview.admit_application_session_history_change()
+        {
+            return;
+        }
+        let (old_state_id, old_url) = match self.pipelines.get_mut(&pipeline_id) {
+            Some(pipeline) => {
+                let old_history_state_id = pipeline.history_state_id;
+                let old_url = replace(&mut pipeline.url, url.clone());
+                pipeline.history_state_id = Some(history_state_id);
+                pipeline.history_states.insert(history_state_id);
+                (old_history_state_id, old_url)
+            },
+            None => return,
         };
 
         let diff = SessionHistoryDiff::Pipeline {
@@ -5728,12 +6366,8 @@ where
         history_state_id: HistoryStateId,
         url: ServoUrl,
     ) {
-        let webview_id = match self.pipelines.get_mut(&pipeline_id) {
-            Some(pipeline) => {
-                pipeline.history_state_id = Some(history_state_id);
-                pipeline.url = url.clone();
-                pipeline.webview_id
-            },
+        let webview_id = match self.pipelines.get(&pipeline_id) {
+            Some(pipeline) => pipeline.webview_id,
             None => {
                 return warn!(
                     "{}: Replace history state {} for closed pipeline",
@@ -5745,6 +6379,16 @@ where
         let Some(webview) = self.webviews.get_mut(&webview_id) else {
             return warn!("Ignoring history change in non-existent WebView ({webview_id:?}).");
         };
+        if webview.document_control_profile() == DocumentControlProfile::TopLevelSession
+            && !webview.admit_application_session_history_change()
+        {
+            return;
+        }
+        let Some(pipeline) = self.pipelines.get_mut(&pipeline_id) else {
+            return;
+        };
+        pipeline.history_state_id = Some(history_state_id);
+        pipeline.url = url.clone();
 
         webview
             .session_history
@@ -6008,8 +6652,8 @@ where
         for &pipeline in new_focus_chain_pipelines.iter().rev() {
             // Don't send a message to the browsing context that initiated this
             // focus operation. It already knows that it has gotten focus.
-            if Some(pipeline.id) != initiator_pipeline_id &&
-                let Err(error) = pipeline.event_loop.send(
+            if Some(pipeline.id) != initiator_pipeline_id
+                && let Err(error) = pipeline.event_loop.send(
                     ScriptThreadMessage::FocusDocumentAsPartOfFocusingSteps(
                         pipeline.id,
                         pipeline.focus_sequence,
@@ -6022,15 +6666,16 @@ where
             child_browsing_context_id = Some(pipeline.browsing_context_id);
         }
 
-        if let Some(pipeline) = first_common_pipeline_in_chain &&
-            Some(pipeline.id) != initiator_pipeline_id &&
-            let Err(error) = pipeline.event_loop.send(
-                ScriptThreadMessage::FocusDocumentAsPartOfFocusingSteps(
-                    pipeline.id,
-                    pipeline.focus_sequence,
-                    child_browsing_context_id,
-                ),
-            )
+        if let Some(pipeline) = first_common_pipeline_in_chain
+            && Some(pipeline.id) != initiator_pipeline_id
+            && let Err(error) =
+                pipeline
+                    .event_loop
+                    .send(ScriptThreadMessage::FocusDocumentAsPartOfFocusingSteps(
+                        pipeline.id,
+                        pipeline.focus_sequence,
+                        child_browsing_context_id,
+                    ))
         {
             send_errors.push((pipeline.id, error));
         }
@@ -6150,18 +6795,18 @@ where
                     "ScriptCommand after closure",
                 );
             },
-            WebDriverCommandMsg::CloseWebView(..) |
-            WebDriverCommandMsg::NewWindow(..) |
-            WebDriverCommandMsg::FocusWebView(..) |
-            WebDriverCommandMsg::IsWebViewOpen(..) |
-            WebDriverCommandMsg::GetWindowRect(..) |
-            WebDriverCommandMsg::GetViewportSize(..) |
-            WebDriverCommandMsg::SetWindowRect(..) |
-            WebDriverCommandMsg::MaximizeWebView(..) |
-            WebDriverCommandMsg::LoadUrl(..) |
-            WebDriverCommandMsg::Refresh(..) |
-            WebDriverCommandMsg::InputEvent(..) |
-            WebDriverCommandMsg::TakeScreenshot(..) => {
+            WebDriverCommandMsg::CloseWebView(..)
+            | WebDriverCommandMsg::NewWindow(..)
+            | WebDriverCommandMsg::FocusWebView(..)
+            | WebDriverCommandMsg::IsWebViewOpen(..)
+            | WebDriverCommandMsg::GetWindowRect(..)
+            | WebDriverCommandMsg::GetViewportSize(..)
+            | WebDriverCommandMsg::SetWindowRect(..)
+            | WebDriverCommandMsg::MaximizeWebView(..)
+            | WebDriverCommandMsg::LoadUrl(..)
+            | WebDriverCommandMsg::Refresh(..)
+            | WebDriverCommandMsg::InputEvent(..)
+            | WebDriverCommandMsg::TakeScreenshot(..) => {
                 unreachable!("This command should be send directly to the embedder.");
             },
             _ => {
@@ -6313,8 +6958,8 @@ where
         // If the currently focused browsing context is a child of the browsing
         // context in which the page is being loaded, then update the focused
         // browsing context to be the one where the page is being loaded.
-        if self.focused_browsing_context_is_descendant_of(&change) &&
-            let Some(webview) = self.webviews.get_mut(&change.webview_id)
+        if self.focused_browsing_context_is_descendant_of(&change)
+            && let Some(webview) = self.webviews.get_mut(&change.webview_id)
         {
             webview.focused_browsing_context_id = change.browsing_context_id;
         }
@@ -6337,6 +6982,21 @@ where
         if let Some(old_pipeline_id) = old_pipeline_id {
             self.unload_document(old_pipeline_id);
         }
+
+        let controlled_dead_source = old_pipeline_id.and_then(|old_pipeline_id| {
+            self.webviews
+                .get(&change.webview_id)
+                .is_some_and(|webview| {
+                    webview.document_control_profile() == DocumentControlProfile::TopLevelSession
+                        && change.browsing_context_id == BrowsingContextId::from(change.webview_id)
+                        && change.replace.is_none()
+                })
+                .then(|| {
+                    self.refresh_load_data(old_pipeline_id)
+                        .map(|load_data| (old_pipeline_id, load_data))
+                })
+                .flatten()
+        });
 
         let Some(webview) = self.webviews.get_mut(&change.webview_id) else {
             return warn!("Ignoring history change in non-existent WebView ({webview_id:?}).");
@@ -6377,10 +7037,24 @@ where
                         NeedsToReload::Yes(..) => (None, None),
                     }
                 } else {
+                    let old_reloader = if let Some((old_pipeline_id, load_data)) =
+                        controlled_dead_source.clone()
+                    {
+                        let dead = NeedsToReload::Yes(old_pipeline_id, load_data);
+                        // A controlled session never retains an inactive live Document. Replace
+                        // every same-document history reference before recording this transition,
+                        // so unsupported traversal can never resurrect the old pipeline.
+                        webview
+                            .session_history
+                            .replace_reloader(NeedsToReload::No(old_pipeline_id), dead.clone());
+                        dead
+                    } else {
+                        NeedsToReload::No(old_pipeline_id)
+                    };
                     let diff = SessionHistoryDiff::BrowsingContext {
                         browsing_context_id: change.browsing_context_id,
                         new_reloader: NeedsToReload::No(change.new_pipeline_id),
-                        old_reloader: NeedsToReload::No(old_pipeline_id),
+                        old_reloader,
                     };
 
                     let mut pipelines_to_close = vec![];
@@ -6407,6 +7081,12 @@ where
                             },
                             _ => {},
                         }
+                    }
+
+                    if controlled_dead_source.is_some() {
+                        pipelines_to_close.push(old_pipeline_id);
+                        pipelines_to_close.sort_unstable();
+                        pipelines_to_close.dedup();
                     }
 
                     (Some(pipelines_to_close), Some(states_to_close))
@@ -6493,8 +7173,9 @@ where
             .get(&change.webview_id)
             .map(|webview| webview.focused_browsing_context_id);
         focused_browsing_context_id.is_some_and(|focused_browsing_context_id| {
-            focused_browsing_context_id == change.browsing_context_id ||
-                self.fully_active_descendant_browsing_contexts_iter(change.browsing_context_id)
+            focused_browsing_context_id == change.browsing_context_id
+                || self
+                    .fully_active_descendant_browsing_contexts_iter(change.browsing_context_id)
                     .any(|nested_ctx| nested_ctx.id == focused_browsing_context_id)
         })
     }
@@ -6593,8 +7274,8 @@ where
                 },
             },
         };
-        if let Some(parent_pipeline_id) = parent_pipeline_id &&
-            let Some(parent_pipeline) = self.pipelines.get(&parent_pipeline_id)
+        if let Some(parent_pipeline_id) = parent_pipeline_id
+            && let Some(parent_pipeline) = self.pipelines.get(&parent_pipeline_id)
         {
             let msg = ScriptThreadMessage::UpdatePipelineId(
                 parent_pipeline_id,
@@ -6754,10 +7435,10 @@ where
     fn get_activity(&self, pipeline_id: PipelineId) -> DocumentActivity {
         let mut ancestor_id = pipeline_id;
         loop {
-            if let Some(ancestor) = self.pipelines.get(&ancestor_id) &&
-                let Some(browsing_context) =
-                    self.browsing_contexts.get(&ancestor.browsing_context_id) &&
-                browsing_context.pipeline_id == ancestor_id
+            if let Some(ancestor) = self.pipelines.get(&ancestor_id)
+                && let Some(browsing_context) =
+                    self.browsing_contexts.get(&ancestor.browsing_context_id)
+                && browsing_context.pipeline_id == ancestor_id
             {
                 if let Some(parent_pipeline_id) = browsing_context.parent_pipeline_id {
                     ancestor_id = parent_pipeline_id;
@@ -7128,15 +7809,15 @@ where
         // In order to get repeatability, we sort the pipeline ids.
         let mut pipeline_ids: Vec<&PipelineId> = self.pipelines.keys().collect();
         pipeline_ids.sort_unstable();
-        if let Some((ref mut rng, probability)) = self.random_pipeline_closure &&
-            let Some(pipeline_id) = pipeline_ids.choose(rng) &&
-            let Some(pipeline) = self.pipelines.get(pipeline_id)
+        if let Some((ref mut rng, probability)) = self.random_pipeline_closure
+            && let Some(pipeline_id) = pipeline_ids.choose(rng)
+            && let Some(pipeline) = self.pipelines.get(pipeline_id)
         {
             if self
                 .webviews
                 .values()
-                .any(|webview| webview.pipeline_is_pending(pipeline.id)) &&
-                probability <= rng.random::<f32>()
+                .any(|webview| webview.pipeline_is_pending(pipeline.id))
+                && probability <= rng.random::<f32>()
             {
                 // We tend not to close pending pipelines, as that almost always
                 // results in pipelines being closed early in their lifecycle,

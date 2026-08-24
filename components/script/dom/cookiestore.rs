@@ -9,12 +9,14 @@ use std::rc::Rc;
 
 use cookie::{Cookie, SameSite};
 use dom_struct::dom_struct;
+use embedder_traits::DocumentControlProfile;
 use hyper_serde::Serde;
 use itertools::Itertools;
 use js::context::JSContext;
 use js::jsval::NullValue;
 use net_traits::CookieSource::NonHTTP;
-use net_traits::{CookieAsyncResponse, CookieData, CoreResourceMsg};
+use net_traits::{ControlledCookiePolicyError, CookieAsyncResponse, CookieData, CoreResourceMsg};
+use profile_traits::generic_channel as profile_generic_channel;
 use script_bindings::cell::DomRefCell;
 use script_bindings::codegen::GenericBindings::CookieStoreBinding::CookieSameSite;
 use script_bindings::reflector::reflect_dom_object_with_cx;
@@ -36,6 +38,7 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 use crate::dom::window::Window;
+use crate::event_loop::script_thread::ScriptThread;
 use crate::tasks::task_source::SendableTaskSource;
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -78,6 +81,23 @@ struct CookieListener {
     // TODO:(whatwg/cookiestore#239) The spec is missing details for what task source to use
     task_source: SendableTaskSource,
     context: Trusted<CookieStore>,
+}
+
+fn controlled_cookie_policy_dom_error(error: ControlledCookiePolicyError) -> Error {
+    match error {
+        ControlledCookiePolicyError::SameSiteContextUnsupported => {
+            Error::NotSupported(Some("unsupported_cookie_same_site_context".to_owned()))
+        },
+        ControlledCookiePolicyError::PersistentCookieUnsupported => {
+            Error::NotSupported(Some("unsupported_persistent_cookie".to_owned()))
+        },
+        ControlledCookiePolicyError::PartitionedCookieUnsupported => {
+            Error::NotSupported(Some("unsupported_partitioned_cookie".to_owned()))
+        },
+        ControlledCookiePolicyError::InvalidCookie => {
+            Error::Type(c"invalid_controlled_cookie".to_owned())
+        },
+    }
 }
 
 impl CookieListener {
@@ -145,6 +165,9 @@ impl CookieStore {
         // Registering this callback gives the resource thread a future ingress into the Window.
         // Until that lifetime is represented in controlled pending state, reject the surface
         // before creating or publishing the callback.
+        if self.uses_controlled_session_cookie_boundary() {
+            return;
+        }
         if self.global().require_resource_thread_io().is_err() {
             return;
         }
@@ -180,11 +203,78 @@ impl CookieStore {
         }
     }
 
+    fn uses_controlled_session_cookie_boundary(&self) -> bool {
+        DomRoot::downcast::<Window>(self.global()).is_some()
+            && ScriptThread::current_document_control_profile()
+                == DocumentControlProfile::TopLevelSession
+    }
+
+    fn set_controlled_session_cookie(
+        &self,
+        cx: &mut JSContext,
+        promise: &Promise,
+        request_url: ServoUrl,
+        cookie: Cookie<'static>,
+    ) {
+        let global = self.global();
+        let Some(window) = DomRoot::downcast::<Window>(self.global()) else {
+            promise.reject_error(
+                cx,
+                Error::NotSupported(Some("unsupported_cookie_same_site_context".to_owned())),
+            );
+            return;
+        };
+        if !window.is_top_level() {
+            promise.reject_error(
+                cx,
+                Error::NotSupported(Some("unsupported_cookie_same_site_context".to_owned())),
+            );
+            return;
+        }
+
+        let (consumer, response) =
+            profile_generic_channel::channel(global.time_profiler_chan().clone()).unwrap();
+        if global
+            .resource_threads()
+            .send(CoreResourceMsg::SetControlledCookieForUrl(
+                request_url,
+                window.get_url(),
+                cookie.to_string(),
+                consumer,
+            ))
+            .is_err()
+        {
+            promise.reject_error(
+                cx,
+                Error::InvalidState(Some("controlled_cookie_resource_unavailable".to_owned())),
+            );
+            return;
+        }
+
+        match response.recv() {
+            Ok(Ok(())) => promise.resolve_native(cx, &()),
+            Ok(Err(error)) => promise.reject_error(cx, controlled_cookie_policy_dom_error(error)),
+            Err(_) => promise.reject_error(
+                cx,
+                Error::InvalidState(Some("controlled_cookie_resource_unavailable".to_owned())),
+            ),
+        }
+    }
+
     fn reject_if_resource_thread_io_is_unsupported(
         &self,
         cx: &mut JSContext,
         promise: &Promise,
     ) -> bool {
+        if self.uses_controlled_session_cookie_boundary() {
+            promise.reject_error(
+                cx,
+                Error::NotSupported(Some(
+                    "controlled_cookie_store_read_delete_unsupported".to_owned(),
+                )),
+            );
+            return true;
+        }
         match self.global().require_resource_thread_io() {
             Ok(()) => false,
             Err(error) => {
@@ -294,8 +384,8 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
             // 6.2. If this’s relevant global object is a Window object and parsed does not equal url with exclude fragments set to true,
             // then return a promise rejected with a TypeError.
-            if let Some(_window) = DomRoot::downcast::<Window>(self.global()) &&
-                parsed_url
+            if let Some(_window) = DomRoot::downcast::<Window>(self.global())
+                && parsed_url
                     .as_ref()
                     .is_ok_and(|parsed| !parsed.is_equal_excluding_fragments(&creation_url))
             {
@@ -417,8 +507,8 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
             // If this’s relevant global object is a Window object and parsed does not equal url with exclude fragments set to true,
             // then return a promise rejected with a TypeError.
-            if let Some(_window) = DomRoot::downcast::<Window>(self.global()) &&
-                parsed_url
+            if let Some(_window) = DomRoot::downcast::<Window>(self.global())
+                && parsed_url
                     .as_ref()
                     .is_ok_and(|parsed| !parsed.is_equal_excluding_fragments(&creation_url))
             {
@@ -473,7 +563,8 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 9. Let p be a new promise.
         let p = Promise::new(cx, &global);
-        if self.reject_if_resource_thread_io_is_unsupported(cx, &p) {
+        let controlled_session = self.uses_controlled_session_cookie_boundary();
+        if !controlled_session && self.reject_if_resource_thread_io_is_unsupported(cx, &p) {
             return p;
         }
 
@@ -496,9 +587,21 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
         let creation_url = global.creation_url();
         let Some(cookie) = CookieStore::set_a_cookie(&creation_url, &properties) else {
             // If r is failure, then reject p with a TypeError and abort these steps.
-            p.reject_error(cx, Error::Type(c"Invalid cookie".to_owned()));
+            p.reject_error(
+                cx,
+                Error::Type(if controlled_session {
+                    c"invalid_controlled_cookie".to_owned()
+                } else {
+                    c"Invalid cookie".to_owned()
+                }),
+            );
             return p;
         };
+
+        if controlled_session {
+            self.set_controlled_session_cookie(cx, &p, creation_url.clone(), cookie.into_owned());
+            return p;
+        }
 
         // 6. Run the following steps in parallel:
         let res = self
@@ -532,7 +635,8 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 5. Let p be a new promise.
         let p = Promise::new(cx, &global);
-        if self.reject_if_resource_thread_io_is_unsupported(cx, &p) {
+        let controlled_session = self.uses_controlled_session_cookie_boundary();
+        if !controlled_session && self.reject_if_resource_thread_io_is_unsupported(cx, &p) {
             return p;
         }
 
@@ -548,9 +652,21 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
         // 6.1. Let r be the result of running set a cookie with url, options["name"], options["value"],
         // options["expires"], options["domain"], options["path"], options["sameSite"], and options["partitioned"].
         let Some(cookie) = CookieStore::set_a_cookie(&creation_url, options) else {
-            p.reject_error(cx, Error::Type(c"Invalid cookie".to_owned()));
+            p.reject_error(
+                cx,
+                Error::Type(if controlled_session {
+                    c"invalid_controlled_cookie".to_owned()
+                } else {
+                    c"Invalid cookie".to_owned()
+                }),
+            );
             return p;
         };
+
+        if controlled_session {
+            self.set_controlled_session_cookie(cx, &p, creation_url.clone(), cookie.into_owned());
+            return p;
+        }
 
         // 6. Run the following steps in parallel:
         let res = self
@@ -671,8 +787,8 @@ impl CookieStore {
         let value = CookieStore::normalize(&properties.value);
 
         // 3. If name or value contain U+003B (;), any C0 control character except U+0009 TAB, or U+007F DELETE, then return failure.
-        if CookieStore::contains_control_characters(&name) ||
-            CookieStore::contains_control_characters(&value)
+        if CookieStore::contains_control_characters(&name)
+            || CookieStore::contains_control_characters(&value)
         {
             return None;
         }
@@ -755,10 +871,9 @@ impl CookieStore {
         if let Some(expiry) = properties.expires {
             // TODO: update cookiestore to take new maxAge parameter
             // 13.2 Append (`Expires`, expires (date serialized)) to attributes.
-            cookie.inner_mut().set_expires(
-                OffsetDateTime::from_unix_timestamp((*expiry / 1000.0) as i64)
-                    .expect("cookie expiry out of range"),
-            );
+            cookie
+                .inner_mut()
+                .set_expires(OffsetDateTime::from_unix_timestamp((*expiry / 1000.0) as i64).ok()?);
         }
 
         // 15. If path is the empty string, then set path to the serialized cookie default path of url.

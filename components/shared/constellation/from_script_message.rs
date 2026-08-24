@@ -58,11 +58,12 @@ use crate::{
 pub type ScriptToConstellationSender =
     GenericSender<(WebViewId, PipelineId, ScriptToConstellationMessage)>;
 
-/// Exact priority-command identity for the initial response-headers activation handoff.
+/// Exact priority-command identity for a controlled top-level response-headers activation
+/// handoff.
 ///
 /// This correlation is deliberately constructible only for the ordinary `DriveOneTurn` phase.
-/// `BootstrapInitialPipeline` has already completed after admitting `SpawnPipeline` and must never
-/// authorize the later pending-to-active transition.
+/// The initial or replacement bootstrap has already completed after admitting `SpawnPipeline`
+/// and must never authorize the later pending-to-active transition.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InitialPipelineActivationCorrelation {
     request_id: DocumentControlRequestId,
@@ -874,6 +875,19 @@ pub enum ScriptToConstellationMessage {
         target: Box<PendingTargetObservation>,
         /// Sole typed command result.
         outcome: DocumentControlOutcome,
+    },
+    /// A controlled top-level replacement exceeded the fixed HTTP redirect ceiling.
+    #[doc(hidden)]
+    ControlledSessionRedirectLimitExceeded {
+        observed: u64,
+    },
+    /// A controlled same-document change was rejected before script-visible mutation.
+    #[doc(hidden)]
+    ControlledSessionHistoryLimitExceeded,
+    /// A controlled top-level application navigation was rejected before scheme-specific work.
+    #[doc(hidden)]
+    ControlledSessionUnsupportedNavigationScheme {
+        scheme: String,
     },
 }
 

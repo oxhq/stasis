@@ -11,16 +11,35 @@ use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use embedder_traits::document_automation::{DocumentAutomationError, DocumentAutomationResult};
+use embedder_traits::document_session::{
+    SameDocumentSessionTransition, SessionNavigationCounter, SessionNavigationTerminal,
+    classify_same_document_session_transition,
+};
+use net_traits::controlled_network::{ControlledNetworkFailure, ControlledNetworkSnapshot};
+use net_traits::network_evidence::{
+    EvidenceLedgerError, EvidenceSequence, NetworkEvidencePage, NetworkFailureReason,
+    NetworkRequestsPage,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use servo::document_control::{
     DocumentControlAction, DocumentControlAutomationKind, DocumentControlCommand,
     DocumentControlError, DocumentControlOutcome, DocumentControlReceiveOutcome,
 };
+use stasis_shell::session_state::{
+    SessionCookiesResultV1, SessionCookiesSetParamsV1, SessionStateError,
+    SessionStateExportResultV1, SessionStateMutationResultV1, SessionStateToken, SessionStateV1,
+    SessionStorageResultV1, SessionStorageSetParamsV1, WireU64,
+};
 use stasis_shell::{settle, wire};
 use url::Url;
 
-use crate::engine::{ControlOutcomeDisposition, EngineClockMode, EngineControlPoll, EngineSession};
+use crate::engine::{
+    ControlOutcomeDisposition, DocumentControlProfile, EngineClockMode, EngineControlPoll,
+    EngineNavigationPoll, EngineSession, EngineSessionOpenOptions, NavigationOperationCompletion,
+    NavigationOperationKind, SessionNavigationAuthority, SessionNavigationError,
+    SessionNavigationId,
+};
 use crate::protocol::{
     DEFAULT_ORDINARY_LANE_CAPACITY, OrdinaryRequestRemoval, ProtocolError, ProtocolWriter,
     ReaderInbox, ReaderMessage, Request, reader_channel, spawn_reader,
@@ -30,9 +49,38 @@ use crate::wake::{ShellWaker, WakeGeneration, WakeWaitError};
 const SOURCE_IDENTITIES: &str = include_str!("../../../STASIS_UPSTREAM.toml");
 const SESSION_ID: &str = "s-1";
 const CONTROLLED_WEBAPP_V1_PROFILE: &str = "controlled-webapp-v1";
+const CONTROLLED_WEB_SESSION_V1_PROFILE: &str = "controlled-web-session-v1";
 const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROLLED_OPEN_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const OWNER_LOOP_SAFETY_TIMEOUT: Duration = Duration::from_secs(86_400);
+const DEFAULT_SESSION_AUDIT_PAGE_ITEMS: usize = 256;
+const HARD_SESSION_AUDIT_PAGE_ITEMS: usize = 1024;
+
+fn earliest_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
+    [left, right].into_iter().flatten().min()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionProfile {
+    ControlledWebappV1,
+    ControlledWebSessionV1,
+}
+
+impl SessionProfile {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::ControlledWebappV1 => CONTROLLED_WEBAPP_V1_PROFILE,
+            Self::ControlledWebSessionV1 => CONTROLLED_WEB_SESSION_V1_PROFILE,
+        }
+    }
+
+    const fn document_control_profile(self) -> DocumentControlProfile {
+        match self {
+            Self::ControlledWebappV1 => DocumentControlProfile::SingleDocument,
+            Self::ControlledWebSessionV1 => DocumentControlProfile::TopLevelSession,
+        }
+    }
+}
 
 fn main() {
     // Claim the protocol pipe before starting any helper or Servo-owned threads. Descriptor 1 is
@@ -61,6 +109,8 @@ fn main() {
         writer: ProtocolWriter::new(stdout),
         active: None,
         projection: wire::WireProjectionContext::new(),
+        profile: None,
+        last_navigation_authority: None,
     };
 
     if let Err(error) = shell.run() {
@@ -79,17 +129,20 @@ struct Shell<W, E = EngineSession> {
     writer: ProtocolWriter<W>,
     active: Option<ActiveRequest>,
     projection: wire::WireProjectionContext,
+    profile: Option<SessionProfile>,
+    last_navigation_authority: Option<SessionNavigationAuthority>,
 }
 
 trait EnginePort: Sized {
     fn open_session(
         url: Url,
         waker: ShellWaker,
-        clock_mode: EngineClockMode,
+        options: EngineSessionOpenOptions,
     ) -> Result<Self, ProtocolError>;
     fn pump(&mut self);
     fn url(&self) -> Option<Url>;
     fn clock_mode(&self) -> EngineClockMode;
+    fn document_control_profile(&self) -> DocumentControlProfile;
     fn evaluate(&self, expression: &str) -> Result<Value, ProtocolError>;
     fn submit_document_control(
         &mut self,
@@ -98,6 +151,114 @@ trait EnginePort: Sized {
     ) -> Result<(), ProtocolError>;
     fn poll_control_operation(&mut self) -> EnginePortPoll;
     fn cancel_control_operation(&mut self) -> Option<EnginePortCompletion>;
+    fn submit_session_navigation_observation(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), ProtocolError>;
+    fn submit_session_navigation(
+        &mut self,
+        expected: SessionNavigationAuthority,
+        url: Url,
+        timeout: Duration,
+    ) -> Result<(), ProtocolError>;
+    fn poll_session_navigation(&mut self) -> EnginePortNavigationPoll;
+    fn cancel_session_navigation(&mut self) -> Option<NavigationOperationCompletion>;
+    fn session_state_token(&self) -> Result<SessionStateToken, ProtocolError> {
+        Err(ProtocolError::operation(
+            "session_state_backend_unavailable",
+            "session-state backend is unavailable",
+            "none",
+        ))
+    }
+    fn session_cookies_get(&self) -> Result<SessionCookiesResultV1, ProtocolError> {
+        Err(ProtocolError::operation(
+            "session_state_backend_unavailable",
+            "session-state backend is unavailable",
+            "none",
+        ))
+    }
+    fn session_storage_get(&self) -> Result<SessionStorageResultV1, ProtocolError> {
+        Err(ProtocolError::operation(
+            "session_state_backend_unavailable",
+            "session-state backend is unavailable",
+            "none",
+        ))
+    }
+    fn session_state_export(&self) -> Result<SessionStateExportResultV1, ProtocolError> {
+        Err(ProtocolError::operation(
+            "session_state_backend_unavailable",
+            "session-state backend is unavailable",
+            "none",
+        ))
+    }
+    fn session_cookies_set(
+        &self,
+        params: SessionCookiesSetParamsV1,
+    ) -> Result<SessionStateMutationResultV1, ProtocolError> {
+        Err(ProtocolError::operation(
+            "session_state_backend_unavailable",
+            "session-state backend is unavailable",
+            "none",
+        ))
+    }
+    fn session_storage_set(
+        &self,
+        params: SessionStorageSetParamsV1,
+    ) -> Result<SessionStateMutationResultV1, ProtocolError> {
+        Err(ProtocolError::operation(
+            "session_state_backend_unavailable",
+            "session-state backend is unavailable",
+            "none",
+        ))
+    }
+    fn controlled_network_snapshot(&self) -> Option<ControlledNetworkSnapshot> {
+        None
+    }
+    fn set_controlled_network_virtual_time_ns(
+        &self,
+        virtual_time_ns: u128,
+    ) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+    fn network_requests_page(
+        &self,
+        after: Option<EvidenceSequence>,
+        limit: usize,
+    ) -> Result<NetworkRequestsPage, ProtocolError> {
+        Err(ProtocolError::operation(
+            "controlled_network_unavailable",
+            "controlled-network ledger is unavailable",
+            "none",
+        ))
+    }
+    fn network_evidence_page(
+        &self,
+        after: Option<EvidenceSequence>,
+        limit: usize,
+    ) -> Result<NetworkEvidencePage, ProtocolError> {
+        Err(ProtocolError::operation(
+            "controlled_network_unavailable",
+            "controlled-network ledger is unavailable",
+            "none",
+        ))
+    }
+    fn record_navigation_started(&self, _authority: &SessionNavigationAuthority) {}
+    fn record_navigation_started_id(&self, _navigation_id: SessionNavigationId) {}
+    fn record_navigation_committed(&self, _authority: &SessionNavigationAuthority) {}
+    fn record_navigation_failed(
+        &self,
+        authority: &SessionNavigationAuthority,
+        reason: NetworkFailureReason,
+    ) {
+    }
+    fn record_navigation_failed_id(
+        &self,
+        _navigation_id: SessionNavigationId,
+        _reason: NetworkFailureReason,
+    ) {
+    }
+    fn record_same_document_history_changed(&self, _authority: &SessionNavigationAuthority) {}
+    fn record_settlement_terminal(&self, _authority: &SessionNavigationAuthority) {}
     fn close(&mut self);
 }
 
@@ -112,15 +273,21 @@ enum EnginePortPoll {
     Complete(EnginePortCompletion),
 }
 
+enum EnginePortNavigationPoll {
+    Idle,
+    Pending { deadline: Instant },
+    Complete(NavigationOperationCompletion),
+}
+
 impl EnginePort for EngineSession {
     fn open_session(
         url: Url,
         waker: ShellWaker,
-        clock_mode: EngineClockMode,
+        options: EngineSessionOpenOptions,
     ) -> Result<Self, ProtocolError> {
-        match clock_mode {
+        match options.clock_mode {
             EngineClockMode::Real => Self::open(url, waker),
-            EngineClockMode::Controlled { .. } => Self::start(url, waker, clock_mode),
+            EngineClockMode::Controlled { .. } => Self::start_with_options(url, waker, options),
         }
         .map_err(|error| error.to_protocol_error())
     }
@@ -135,6 +302,10 @@ impl EnginePort for EngineSession {
 
     fn clock_mode(&self) -> EngineClockMode {
         Self::clock_mode(self)
+    }
+
+    fn document_control_profile(&self) -> DocumentControlProfile {
+        Self::document_control_profile(self)
     }
 
     fn evaluate(&self, expression: &str) -> Result<Value, ProtocolError> {
@@ -170,6 +341,139 @@ impl EnginePort for EngineSession {
         })
     }
 
+    fn submit_session_navigation_observation(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), ProtocolError> {
+        Self::submit_session_navigation_observation(self, timeout)
+            .map_err(|error| error.to_protocol_error())
+    }
+
+    fn submit_session_navigation(
+        &mut self,
+        expected: SessionNavigationAuthority,
+        url: Url,
+        timeout: Duration,
+    ) -> Result<(), ProtocolError> {
+        Self::submit_session_navigation(self, expected, url, timeout)
+            .map_err(|error| error.to_protocol_error())
+    }
+
+    fn poll_session_navigation(&mut self) -> EnginePortNavigationPoll {
+        match Self::poll_session_navigation(self) {
+            EngineNavigationPoll::Idle => EnginePortNavigationPoll::Idle,
+            EngineNavigationPoll::Pending { deadline } => {
+                EnginePortNavigationPoll::Pending { deadline }
+            },
+            EngineNavigationPoll::Complete(completion) => {
+                EnginePortNavigationPoll::Complete(completion)
+            },
+        }
+    }
+
+    fn cancel_session_navigation(&mut self) -> Option<NavigationOperationCompletion> {
+        Self::cancel_session_navigation(self)
+    }
+
+    fn session_state_token(&self) -> Result<SessionStateToken, ProtocolError> {
+        Self::session_state_token(self).map_err(session_state_protocol_error)
+    }
+
+    fn session_cookies_get(&self) -> Result<SessionCookiesResultV1, ProtocolError> {
+        Self::session_cookies_get(self).map_err(session_state_protocol_error)
+    }
+
+    fn session_storage_get(&self) -> Result<SessionStorageResultV1, ProtocolError> {
+        Self::session_storage_get(self).map_err(session_state_protocol_error)
+    }
+
+    fn session_state_export(&self) -> Result<SessionStateExportResultV1, ProtocolError> {
+        Self::session_state_export(self).map_err(session_state_protocol_error)
+    }
+
+    fn session_cookies_set(
+        &self,
+        params: SessionCookiesSetParamsV1,
+    ) -> Result<SessionStateMutationResultV1, ProtocolError> {
+        Self::session_cookies_set(self, params).map_err(session_state_protocol_error)
+    }
+
+    fn session_storage_set(
+        &self,
+        params: SessionStorageSetParamsV1,
+    ) -> Result<SessionStateMutationResultV1, ProtocolError> {
+        Self::session_storage_set(self, params).map_err(session_state_protocol_error)
+    }
+
+    fn controlled_network_snapshot(&self) -> Option<ControlledNetworkSnapshot> {
+        Self::controlled_network_snapshot(self)
+    }
+
+    fn set_controlled_network_virtual_time_ns(
+        &self,
+        virtual_time_ns: u128,
+    ) -> Result<(), ProtocolError> {
+        Self::set_controlled_network_virtual_time_ns(self, virtual_time_ns).map_err(|error| {
+            fatal_operation(
+                "internal_runtime_failure",
+                format!("controlled-network virtual time regressed: {error:?}"),
+                "indeterminate",
+            )
+        })
+    }
+
+    fn network_requests_page(
+        &self,
+        after: Option<EvidenceSequence>,
+        limit: usize,
+    ) -> Result<NetworkRequestsPage, ProtocolError> {
+        Self::network_requests_page(self, after, limit).map_err(network_evidence_protocol_error)
+    }
+
+    fn network_evidence_page(
+        &self,
+        after: Option<EvidenceSequence>,
+        limit: usize,
+    ) -> Result<NetworkEvidencePage, ProtocolError> {
+        Self::network_evidence_page(self, after, limit).map_err(network_evidence_protocol_error)
+    }
+
+    fn record_navigation_started(&self, authority: &SessionNavigationAuthority) {
+        Self::record_navigation_started(self, authority);
+    }
+
+    fn record_navigation_started_id(&self, navigation_id: SessionNavigationId) {
+        Self::record_navigation_started_id(self, navigation_id);
+    }
+
+    fn record_navigation_committed(&self, authority: &SessionNavigationAuthority) {
+        Self::record_navigation_committed(self, authority);
+    }
+
+    fn record_navigation_failed(
+        &self,
+        authority: &SessionNavigationAuthority,
+        reason: NetworkFailureReason,
+    ) {
+        Self::record_navigation_failed(self, authority, reason);
+    }
+
+    fn record_navigation_failed_id(
+        &self,
+        navigation_id: SessionNavigationId,
+        reason: NetworkFailureReason,
+    ) {
+        Self::record_navigation_failed_id(self, navigation_id, reason);
+    }
+
+    fn record_same_document_history_changed(&self, authority: &SessionNavigationAuthority) {
+        Self::record_same_document_history_changed(self, authority);
+    }
+
+    fn record_settlement_terminal(&self, authority: &SessionNavigationAuthority) {
+        Self::record_settlement_terminal(self, authority);
+    }
+
     fn close(&mut self) {
         Self::close(self);
     }
@@ -177,11 +481,31 @@ impl EnginePort for EngineSession {
 
 struct ActiveRequest {
     request: Request,
+    profile: Option<SessionProfile>,
     operation: ActiveOperation,
     started_at: Instant,
     in_flight: Option<DocumentControlCommand>,
+    /// Servo generation immediately before the in-flight control command is submitted. Later Servo
+    /// pumps may consume producer notifications before the typed response is pollable, so
+    /// settlement waits must retain this older edge instead of the global cursor.
+    control_turn_observed: Option<WakeGeneration>,
     needs_initial_pump: bool,
     state_effect: RequestStateEffect,
+}
+
+impl ActiveRequest {
+    fn settle_host_wait(
+        &mut self,
+        fallback: WakeGeneration,
+        started_at: Instant,
+        deadline: Option<Instant>,
+    ) -> SettleHostWait {
+        SettleHostWait {
+            observed: self.control_turn_observed.take().unwrap_or(fallback),
+            started_at,
+            deadline,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,14 +529,29 @@ enum ActiveOperation {
     AdvanceToNext(AdvanceToNextState),
     Settle(SettleState),
     Automation(AutomationState),
+    Audit(AuditState),
+    Navigate(NavigateState),
+    SessionProjection(SessionProjectionState),
+}
+
+struct AuditState {
+    value: Option<Value>,
 }
 
 struct ControlledOpenState {
     requested_url: Url,
     current_url: Url,
+    profile: SessionProfile,
     deadline: Instant,
-    waiting: Option<ControlledOpenWait>,
+    readiness_waiting: Option<ControlledOpenWait>,
     bootstrap_attempted: bool,
+    settlement: Option<ControlledOpenSettlement>,
+}
+
+struct ControlledOpenSettlement {
+    coordinator: settle::SettleCoordinator,
+    cumulative_external_io_wall_time: Duration,
+    waiting: Option<SettleHostWait>,
 }
 
 struct ControlledOpenWait {
@@ -221,22 +560,199 @@ struct ControlledOpenWait {
 }
 
 enum AdvanceToNextState {
-    Observing,
-    Advancing { from_virtual_time_ns: u128 },
+    Observing {
+        expected_state_token: Option<wire::DocumentStateToken>,
+        navigation: Option<SessionNavigationAuthority>,
+    },
+    Advancing {
+        from_virtual_time_ns: u128,
+    },
 }
 
 struct SettleState {
+    profile: SessionProfile,
+    authorizing_state_token: Option<wire::DocumentStateToken>,
+    authorizing_navigation: Option<SessionNavigationAuthority>,
+    replacement: Option<SettleReplacementPhase>,
+    /// A coordinator command is held until a passive no-pump session observation binds the exact
+    /// current document authority which may be replaced by a later mutating turn.
+    authority_bound_command: Option<DocumentControlCommand>,
+    latest_pending_target: Option<Box<servo::document_pending::PendingTargetObservation>>,
+    response: SettleResponse,
     coordinator: settle::SettleCoordinator,
     effective_policy: wire::ResolvedSettlePolicy,
     cumulative_external_io_wall_time: Duration,
     waiting: Option<SettleHostWait>,
 }
 
+#[derive(Clone)]
+enum SettleResponse {
+    Runtime,
+    /// A read-only `runtime.pending` projection which must be recomputed if document authority
+    /// changes while its final N1/document/N2 bracket is in flight.
+    Pending,
+    Automation {
+        kind: wire::PublicAutomationKind,
+        result: DocumentAutomationResult,
+    },
+    ControlledOpen {
+        requested_url: Url,
+        current_url: Url,
+        profile: SessionProfile,
+        deadline: Instant,
+        bootstrap_attempted: bool,
+    },
+    Navigate {
+        requested_url: Url,
+        source: SessionNavigationAuthority,
+        admitted: SessionNavigationAuthority,
+    },
+}
+
+enum SettleReplacementPhase {
+    /// A typed in-process Drive result was bound to the token-authorizing document. No recovery
+    /// is permitted until a passive, no-pump session observation proves one exact replacement
+    /// admission.
+    AwaitingAdmission {
+        source: SessionNavigationAuthority,
+        drive_outcome: DocumentControlReceiveOutcome,
+    },
+    /// The exact owner-attested pending pipeline is being admitted. Retaining both authorities and
+    /// the command keeps a second or mismatched handoff from being mistaken for this one.
+    Bootstrapping {
+        source: SessionNavigationAuthority,
+        admitted: SessionNavigationAuthority,
+        command: DocumentControlCommand,
+    },
+    /// Bootstrap was consumed by the settlement coordinator. Subsequent controlled observations
+    /// are bracketed with passive Constellation authority until the admitted pipeline becomes the
+    /// sole controlled-ready document.
+    Activating {
+        source: SessionNavigationAuthority,
+        admitted: SessionNavigationAuthority,
+    },
+    /// One post-bootstrap document-control completion is held exactly once while Constellation
+    /// independently reports either the same admitted shape or its successful activation.
+    AwaitingActivation {
+        source: SessionNavigationAuthority,
+        admitted: SessionNavigationAuthority,
+        command: DocumentControlCommand,
+        control_outcome: DocumentControlReceiveOutcome,
+        controlled_network_active: bool,
+    },
+}
+
 struct AutomationState {
+    profile: SessionProfile,
     kind: wire::PublicAutomationKind,
     /// Present while the shell is obtaining fresh private target authority. The resolved public
     /// data is consumed exactly once when the Observe response is bound into an engine request.
-    unresolved: Option<wire::ResolvedAutomationParams>,
+    unresolved: Option<UnresolvedAutomationParams>,
+    authorizing_navigation: Option<SessionNavigationAuthority>,
+    /// A mutating v2 result already consumed from Script exactly once. Before exposing it, the
+    /// shell passively brackets session authority so native activation/submission navigation can
+    /// either be proven absent or carried through controlled-ready settlement.
+    completed: Option<CompletedAutomation>,
+}
+
+struct CompletedAutomation {
+    result: DocumentAutomationResult,
+    pending: Box<servo::document_pending::RawPendingSnapshot>,
+    synchronous_navigation_emitted: bool,
+}
+
+enum UnresolvedAutomationParams {
+    Legacy(wire::ResolvedAutomationParams),
+    Session(wire::ResolvedSessionAutomationParams),
+}
+
+struct NavigateState {
+    requested_url: Url,
+    phase: NavigatePhase,
+    coordinator: settle::SettleCoordinator,
+    cumulative_external_io_wall_time: Duration,
+    waiting: Option<SettleHostWait>,
+}
+
+enum NavigatePhase {
+    AwaitingAuthority {
+        expected_state_token: wire::DocumentStateToken,
+    },
+    Authorizing {
+        expected_state_token: wire::DocumentStateToken,
+        navigation: SessionNavigationAuthority,
+    },
+    AwaitingAdmission {
+        source: SessionNavigationAuthority,
+    },
+    Settling {
+        source: SessionNavigationAuthority,
+        admitted: SessionNavigationAuthority,
+    },
+}
+
+struct SessionProjectionState {
+    pending: Box<servo::document_pending::RawPendingSnapshot>,
+    kind: SessionProjectionKind,
+    phase: SessionProjectionPhase,
+}
+
+enum SessionProjectionPhase {
+    AwaitingInitialNavigation,
+    AwaitingPendingObservation {
+        navigation: SessionNavigationAuthority,
+    },
+    /// The document Observe raced an exact pending replacement after N1. Re-observe the owner
+    /// authority and admit only the two pipeline identities carried by the typed rejection.
+    AwaitingReplacementAdmission {
+        source: SessionNavigationAuthority,
+        source_pipeline_id: servo_base::id::PipelineId,
+        pipeline_id: servo_base::id::PipelineId,
+    },
+    AwaitingStableNavigation {
+        navigation: SessionNavigationAuthority,
+    },
+}
+
+enum SessionProjectionKind {
+    /// A mutating automation result is retained in its native action shape until a fresh pending
+    /// observation is bracketed by two passive owner authorities. This prevents a pre-action
+    /// pending snapshot from leaking its generation into the public result.
+    Automation {
+        settle_resume: SettleProjectionResume,
+        replacement_rearm: bool,
+    },
+    Value {
+        value: Value,
+        snapshot_token: bool,
+        settle_resume: Option<SettleProjectionResume>,
+    },
+    Navigate {
+        requested_url: Url,
+        source: SessionNavigationAuthority,
+        admitted: SessionNavigationAuthority,
+        cumulative_external_io_wall_time: Duration,
+        settle_resume: Option<SettleProjectionResume>,
+    },
+    ControlledOpen {
+        requested_url: Url,
+        current_url: Url,
+        profile: SessionProfile,
+        deadline: Instant,
+        bootstrap_attempted: bool,
+        cumulative_external_io_wall_time: Duration,
+        session_state_token: Option<SessionStateToken>,
+        settle_resume: Option<SettleProjectionResume>,
+    },
+}
+
+#[derive(Clone)]
+struct SettleProjectionResume {
+    profile: SessionProfile,
+    effective_policy: wire::ResolvedSettlePolicy,
+    cumulative_external_io_wall_time: Duration,
+    authorizing_navigation: Option<SessionNavigationAuthority>,
+    response: SettleResponse,
 }
 
 struct SettleHostWait {
@@ -247,6 +763,14 @@ struct SettleHostWait {
 
 enum ActiveTransition {
     Submit(DocumentControlCommand),
+    SubmitSessionNavigationObservation {
+        allow_servo_pump: bool,
+    },
+    SubmitSessionNavigation {
+        expected: SessionNavigationAuthority,
+        url: Url,
+    },
+    ProjectSession(SessionProjectionState),
     WaitForControlledOpen,
     Wait(settle::SettleWait),
     Complete(Value),
@@ -290,14 +814,53 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             // host-waiting state cannot consume the wake which makes that observation stale.
             let (control_progress, mut control_deadline) = self.poll_active_control()?;
             progressed |= control_progress;
+            let (navigation_progress, navigation_deadline) = self.poll_active_navigation()?;
+            progressed |= navigation_progress;
+            control_deadline = earliest_deadline(control_deadline, navigation_deadline);
 
             let before_pump = self.checked_wake_snapshot()?;
             let force_initial_pump = self
                 .active
                 .as_ref()
                 .is_some_and(|active| active.needs_initial_pump);
-            if self.engine.is_some() &&
-                (force_initial_pump || before_pump.servo_changed_since(self.servo_cursor))
+            if self.engine.is_some()
+                && !self.active.as_ref().is_some_and(|active| {
+                    matches!(
+                        &active.operation,
+                        ActiveOperation::SessionProjection(SessionProjectionState {
+                            phase: SessionProjectionPhase::AwaitingStableNavigation { .. }
+                                | SessionProjectionPhase::AwaitingReplacementAdmission { .. },
+                            ..
+                        }) | ActiveOperation::SessionProjection(SessionProjectionState {
+                            phase: SessionProjectionPhase::AwaitingInitialNavigation,
+                            kind: SessionProjectionKind::Value {
+                                settle_resume: Some(SettleProjectionResume {
+                                    response: SettleResponse::Automation { .. },
+                                    ..
+                                }),
+                                ..
+                            },
+                            ..
+                        }) | ActiveOperation::SessionProjection(SessionProjectionState {
+                            phase: SessionProjectionPhase::AwaitingInitialNavigation,
+                            kind: SessionProjectionKind::Automation { .. },
+                            ..
+                        }) | ActiveOperation::Settle(SettleState {
+                            replacement: Some(
+                                SettleReplacementPhase::AwaitingAdmission { .. }
+                                    | SettleReplacementPhase::AwaitingActivation { .. }
+                            ),
+                            ..
+                        }) | ActiveOperation::Settle(SettleState {
+                            authority_bound_command: Some(_),
+                            ..
+                        }) | ActiveOperation::Automation(AutomationState {
+                            completed: Some(_),
+                            ..
+                        })
+                    )
+                })
+                && (force_initial_pump || before_pump.servo_changed_since(self.servo_cursor))
             {
                 self.engine
                     .as_mut()
@@ -312,14 +875,17 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
 
                 let (post_pump_progress, post_pump_deadline) = self.poll_active_control()?;
                 progressed |= post_pump_progress;
-                control_deadline = post_pump_deadline.or(control_deadline);
+                control_deadline = earliest_deadline(control_deadline, post_pump_deadline);
+                let (post_nav_progress, post_nav_deadline) = self.poll_active_navigation()?;
+                progressed |= post_nav_progress;
+                control_deadline = earliest_deadline(control_deadline, post_nav_deadline);
             }
 
             let after_pump = self.checked_wake_snapshot()?;
             if self.service_active_host_wait(after_pump, Instant::now())? {
                 progressed = true;
                 let (_, deadline) = self.poll_active_control()?;
-                control_deadline = deadline.or(control_deadline);
+                control_deadline = earliest_deadline(control_deadline, deadline);
             }
 
             if input_closed && inbox_empty && self.active.is_none() {
@@ -380,8 +946,8 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         // Reject a self-targeting cancellation before duplicate-active-id enforcement. A cancel
         // frame cannot make its own id ambiguous with the target it names, even when that id also
         // happens to be active.
-        if request.method == "protocol.cancel" &&
-            parse_params::<CancelParams>(&request)
+        if request.method == "protocol.cancel"
+            && parse_params::<CancelParams>(&request)
                 .is_ok_and(|params| params.request_id == request.id)
         {
             self.write_method_result(
@@ -438,9 +1004,35 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         }
         if matches!(
             method.as_str(),
-            "action.activate" | "action.fill" | "dom.query" | "dom.text" | "dom.extract"
+            "action.activate"
+                | "action.fill"
+                | "action.focus"
+                | "action.check"
+                | "action.uncheck"
+                | "action.select"
+                | "action.submit"
+                | "dom.query"
+                | "dom.text"
+                | "dom.extract"
         ) {
             return self.begin_automation_request(request).map(|()| false);
+        }
+        if method == "session.navigate" {
+            return self.begin_session_navigate(request).map(|()| false);
+        }
+        if matches!(
+            method.as_str(),
+            "session.cookies.get"
+                | "session.cookies.set"
+                | "session.storage.get"
+                | "session.storage.set"
+                | "session.state.export"
+                | "session.state.import"
+        ) {
+            return self.handle_session_state_request(request);
+        }
+        if matches!(method.as_str(), "session.requests" | "session.evidence") {
+            return self.begin_session_audit(request).map(|()| false);
         }
         if method == "session.open" {
             return self.begin_open(request).map(|()| false);
@@ -464,6 +1056,9 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             return self.write_method_result(&request, Err(error));
         }
 
+        let profile = self
+            .profile
+            .expect("a controlled session has a validated support profile");
         let started_at = Instant::now();
         let method = request.method.clone();
         let (operation, first_progress) = match method.as_str() {
@@ -478,42 +1073,94 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 )
             },
             "runtime.advance_to_next" => {
-                let params = parse_params::<wire::RuntimeAdvanceToNextParams>(&request);
-                if let Err(error) = params {
-                    return self.write_method_result(&request, Err(error));
-                }
+                let expected_state_token = match profile {
+                    SessionProfile::ControlledWebappV1 => {
+                        if let Err(error) =
+                            parse_params::<wire::RuntimeAdvanceToNextParams>(&request)
+                        {
+                            return self.write_method_result(&request, Err(error));
+                        }
+                        None
+                    },
+                    SessionProfile::ControlledWebSessionV1 => {
+                        match parse_params::<wire::SessionRuntimeAdvanceToNextParams>(&request) {
+                            Ok(params) => Some(params.expected_state_token),
+                            Err(error) => return self.write_method_result(&request, Err(error)),
+                        }
+                    },
+                };
                 (
-                    ActiveOperation::AdvanceToNext(AdvanceToNextState::Observing),
-                    ActiveTransition::Submit(DocumentControlCommand::Observe),
+                    ActiveOperation::AdvanceToNext(AdvanceToNextState::Observing {
+                        expected_state_token,
+                        navigation: None,
+                    }),
+                    if profile == SessionProfile::ControlledWebSessionV1 {
+                        ActiveTransition::SubmitSessionNavigationObservation {
+                            allow_servo_pump: true,
+                        }
+                    } else {
+                        ActiveTransition::Submit(DocumentControlCommand::Observe)
+                    },
                 )
             },
             "runtime.settle" => {
-                let params = match parse_params::<wire::RuntimeSettleParams>(&request) {
-                    Ok(params) => params,
-                    Err(error) => return self.write_method_result(&request, Err(error)),
+                let resolved = match profile {
+                    SessionProfile::ControlledWebappV1 => {
+                        parse_params::<wire::RuntimeSettleParams>(&request).and_then(|params| {
+                            params
+                                .resolve(settle::SettlePolicy::default())
+                                .map(|policy| (None, policy))
+                                .map_err(|error| {
+                                    ProtocolError::invalid_request(format!(
+                                        "invalid settlement policy: {error:?}"
+                                    ))
+                                })
+                        })
+                    },
+                    SessionProfile::ControlledWebSessionV1 => parse_params::<
+                        wire::SessionRuntimeSettleParams,
+                    >(&request)
+                    .and_then(|params| {
+                        params
+                            .resolve(settle::SettlePolicy::default())
+                            .map(|(token, policy)| (Some(token), policy))
+                            .map_err(|error| {
+                                ProtocolError::invalid_request(format!(
+                                    "invalid settlement policy: {error:?}"
+                                ))
+                            })
+                    }),
                 };
-                let effective_policy = match params.resolve(settle::SettlePolicy::default()) {
-                    Ok(policy) => policy,
+                let (authorizing_state_token, effective_policy) = match resolved {
+                    Ok(resolved) => resolved,
                     Err(error) => {
-                        return self.write_method_result(
-                            &request,
-                            Err(ProtocolError::invalid_request(format!(
-                                "invalid settlement policy: {error:?}"
-                            ))),
-                        );
+                        return self.write_method_result(&request, Err(error));
                     },
                 };
                 let mut coordinator = settle::SettleCoordinator::new(effective_policy.engine);
-                let progress = match coordinator.start() {
-                    Ok(progress) => transition_from_settle_progress(progress),
-                    Err(error) => ActiveTransition::Fail(settle_failure(
-                        error,
-                        RequestStateEffect::None,
-                        None,
-                    )),
+                let progress = if authorizing_state_token.is_some() {
+                    ActiveTransition::SubmitSessionNavigationObservation {
+                        allow_servo_pump: true,
+                    }
+                } else {
+                    match coordinator.start() {
+                        Ok(progress) => transition_from_settle_progress(progress),
+                        Err(error) => ActiveTransition::Fail(settle_failure(
+                            error,
+                            RequestStateEffect::None,
+                            None,
+                        )),
+                    }
                 };
                 (
                     ActiveOperation::Settle(SettleState {
+                        profile,
+                        authorizing_state_token,
+                        authorizing_navigation: None,
+                        replacement: None,
+                        authority_bound_command: None,
+                        latest_pending_target: None,
+                        response: SettleResponse::Runtime,
                         coordinator,
                         effective_policy,
                         cumulative_external_io_wall_time: Duration::ZERO,
@@ -527,9 +1174,11 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
 
         let active = ActiveRequest {
             request,
+            profile: Some(profile),
             operation,
             started_at,
             in_flight: None,
+            control_turn_observed: None,
             needs_initial_pump: false,
             state_effect: RequestStateEffect::None,
         };
@@ -541,59 +1190,277 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             return self.write_method_result(&request, Err(error));
         }
 
-        let resolved = match request.method.as_str() {
-            "action.activate" => {
-                parse_params::<wire::ActionActivateParams>(&request).and_then(|params| {
-                    params.resolve().map_err(|error| {
-                        ProtocolError::invalid_request(format!(
-                            "invalid action.activate parameters: {error:?}"
-                        ))
-                    })
-                })
+        let profile = self
+            .profile
+            .expect("a controlled session has a validated support profile");
+        let invalid =
+            |_| ProtocolError::invalid_request(format!("invalid {} parameters", request.method));
+        let resolved: Result<UnresolvedAutomationParams, ProtocolError> = match profile {
+            SessionProfile::ControlledWebappV1 => match request.method.as_str() {
+                "action.activate" => parse_params::<wire::ActionActivateParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Legacy),
+                "action.fill" => parse_params::<wire::ActionFillParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Legacy),
+                "dom.query" => parse_params::<wire::DomQueryParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Legacy),
+                "dom.text" => parse_params::<wire::DomTextParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Legacy),
+                "dom.extract" => parse_params::<wire::DomExtractParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Legacy),
+                _ => Err(ProtocolError::operation(
+                    "unsupported_profile_method",
+                    format!(
+                        "{} is not supported by {CONTROLLED_WEBAPP_V1_PROFILE}",
+                        request.method
+                    ),
+                    "none",
+                )),
             },
-            "action.fill" => parse_params::<wire::ActionFillParams>(&request).and_then(|params| {
-                params.resolve().map_err(|error| {
-                    ProtocolError::invalid_request(format!(
-                        "invalid action.fill parameters: {error:?}"
-                    ))
-                })
-            }),
-            "dom.query" => parse_params::<wire::DomQueryParams>(&request).and_then(|params| {
-                params.resolve().map_err(|error| {
-                    ProtocolError::invalid_request(format!(
-                        "invalid dom.query parameters: {error:?}"
-                    ))
-                })
-            }),
-            "dom.text" => parse_params::<wire::DomTextParams>(&request).and_then(|params| {
-                params.resolve().map_err(|error| {
-                    ProtocolError::invalid_request(format!(
-                        "invalid dom.text parameters: {error:?}"
-                    ))
-                })
-            }),
-            "dom.extract" => parse_params::<wire::DomExtractParams>(&request).and_then(|params| {
-                params.resolve().map_err(|error| {
-                    ProtocolError::invalid_request(format!(
-                        "invalid dom.extract parameters: {error:?}"
-                    ))
-                })
-            }),
-            _ => unreachable!("automation method was filtered by the dispatcher"),
+            SessionProfile::ControlledWebSessionV1 => match request.method.as_str() {
+                "action.activate" => parse_params::<wire::SessionActionActivateParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Session),
+                "action.fill" => parse_params::<wire::SessionActionFillParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Session),
+                "action.focus" => parse_params::<wire::SessionActionFocusParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Session),
+                "action.check" => parse_params::<wire::SessionActionCheckParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Session),
+                "action.uncheck" => parse_params::<wire::SessionActionUncheckParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Session),
+                "action.select" => parse_params::<wire::SessionActionSelectParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Session),
+                "action.submit" => parse_params::<wire::SessionActionSubmitParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Session),
+                "dom.query" => parse_params::<wire::SessionDomQueryParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Session),
+                "dom.text" => parse_params::<wire::SessionDomTextParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Session),
+                "dom.extract" => parse_params::<wire::SessionDomExtractParams>(&request)
+                    .and_then(|params| params.resolve().map_err(invalid))
+                    .map(UnresolvedAutomationParams::Session),
+                _ => unreachable!("automation method was filtered by the dispatcher"),
+            },
         };
         let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(error) => return self.write_method_result(&request, Err(error)),
         };
-        let kind = resolved.kind();
+        let kind = match &resolved {
+            UnresolvedAutomationParams::Legacy(resolved) => resolved.kind(),
+            UnresolvedAutomationParams::Session(resolved) => resolved.kind(),
+        };
         let active = ActiveRequest {
             request,
+            profile: Some(profile),
             operation: ActiveOperation::Automation(AutomationState {
+                profile,
                 kind,
                 unresolved: Some(resolved),
+                authorizing_navigation: None,
+                completed: None,
             }),
             started_at: Instant::now(),
             in_flight: None,
+            control_turn_observed: None,
+            needs_initial_pump: false,
+            state_effect: RequestStateEffect::None,
+        };
+        self.apply_active_transition(
+            active,
+            if profile == SessionProfile::ControlledWebSessionV1 {
+                ActiveTransition::SubmitSessionNavigationObservation {
+                    allow_servo_pump: true,
+                }
+            } else {
+                ActiveTransition::Submit(DocumentControlCommand::Observe)
+            },
+        )
+    }
+
+    fn begin_session_navigate(&mut self, request: Request) -> Result<(), String> {
+        if let Err(error) = self.require_controlled_session(&request) {
+            return self.write_method_result(&request, Err(error));
+        }
+        if self.profile != Some(SessionProfile::ControlledWebSessionV1) {
+            return self.write_method_result(
+                &request,
+                Err(ProtocolError::operation(
+                    "unsupported_profile_method",
+                    format!("session.navigate requires {CONTROLLED_WEB_SESSION_V1_PROFILE}"),
+                    "none",
+                )),
+            );
+        }
+        let params = match parse_params::<wire::SessionNavigateParams>(&request) {
+            Ok(params) => params,
+            Err(error) => return self.write_method_result(&request, Err(error)),
+        };
+        let requested_url = match Url::parse(&params.url) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") => url,
+            Ok(_) => {
+                return self.write_method_result(
+                    &request,
+                    Err(ProtocolError::operation(
+                        "unsupported_navigation_scheme",
+                        "session navigation supports only HTTP(S) URLs",
+                        "none",
+                    )),
+                );
+            },
+            Err(error) => {
+                return self.write_method_result(
+                    &request,
+                    Err(ProtocolError::invalid_request(format!(
+                        "invalid navigation URL: {error}"
+                    ))),
+                );
+            },
+        };
+        let effective_policy = wire::RuntimeSettleParams::default()
+            .resolve(settle::SettlePolicy::default())
+            .expect("the product default settlement policy is valid");
+        let active = ActiveRequest {
+            request,
+            profile: Some(SessionProfile::ControlledWebSessionV1),
+            operation: ActiveOperation::Navigate(NavigateState {
+                requested_url,
+                phase: NavigatePhase::AwaitingAuthority {
+                    expected_state_token: params.expected_state_token,
+                },
+                coordinator: settle::SettleCoordinator::new(effective_policy.engine),
+                cumulative_external_io_wall_time: Duration::ZERO,
+                waiting: None,
+            }),
+            started_at: Instant::now(),
+            in_flight: None,
+            control_turn_observed: None,
+            needs_initial_pump: false,
+            state_effect: RequestStateEffect::None,
+        };
+        self.apply_active_transition(
+            active,
+            ActiveTransition::SubmitSessionNavigationObservation {
+                allow_servo_pump: true,
+            },
+        )
+    }
+
+    fn handle_session_state_request(&mut self, request: Request) -> Result<bool, String> {
+        if let Err(error) = self.require_controlled_web_session(&request) {
+            self.write_method_result(&request, Err(error))?;
+            return Ok(false);
+        }
+        let engine = self
+            .engine
+            .as_ref()
+            .expect("a validated controlled session has an engine");
+        let result = match request.method.as_str() {
+            "session.cookies.get" => parse_params::<EmptyParams>(&request)
+                .and_then(|_| engine.session_cookies_get())
+                .and_then(serialize_immediate_result),
+            "session.cookies.set" => parse_sensitive_params::<SessionCookiesSetParamsV1>(
+                &request,
+                "invalid session cookie parameters",
+            )
+            .and_then(|params| engine.session_cookies_set(params))
+            .and_then(serialize_immediate_result),
+            "session.storage.get" => parse_params::<EmptyParams>(&request)
+                .and_then(|_| engine.session_storage_get())
+                .and_then(serialize_immediate_result),
+            "session.storage.set" => parse_sensitive_params::<SessionStorageSetParamsV1>(
+                &request,
+                "invalid session storage parameters",
+            )
+            .and_then(|params| engine.session_storage_set(params))
+            .and_then(serialize_immediate_result),
+            "session.state.export" => parse_params::<EmptyParams>(&request)
+                .and_then(|_| engine.session_state_export())
+                .and_then(serialize_immediate_result),
+            "session.state.import" => Err(ProtocolError::operation(
+                "session_state_import_phase_closed",
+                "session.state.import is available only before session publication; use session.open state",
+                "none",
+            )),
+            _ => unreachable!("session-state method was filtered by the dispatcher"),
+        };
+        let result = result
+            .map_err(|error| harden_session_state_mutation_error(request.method.as_str(), error));
+        let fatal = result.as_ref().err().is_some_and(|error| error.fatal);
+        self.write_method_result(&request, result)?;
+        if fatal {
+            self.abortive_close();
+            self.state = ShellState::Closed;
+            return Err(
+                "session-state authority failed terminally; session was fail-stopped".into(),
+            );
+        }
+        Ok(false)
+    }
+
+    fn begin_session_audit(&mut self, request: Request) -> Result<(), String> {
+        if let Err(error) = self.require_controlled_web_session(&request) {
+            return self.write_method_result(&request, Err(error));
+        }
+        let params = match parse_params::<SessionAuditParams>(&request) {
+            Ok(params) => params,
+            Err(error) => return self.write_method_result(&request, Err(error)),
+        };
+        let after = params
+            .after_seq
+            .map(|sequence| EvidenceSequence::new(sequence.get()));
+        let limit = params.limit.unwrap_or(DEFAULT_SESSION_AUDIT_PAGE_ITEMS);
+        if limit == 0 || limit > HARD_SESSION_AUDIT_PAGE_ITEMS {
+            return self.write_method_result(
+                &request,
+                Err(with_error_details(
+                    ProtocolError::invalid_request(
+                        "session audit limit is outside the public bound",
+                    ),
+                    json!({
+                        "observed": limit.to_string(),
+                        "limit": HARD_SESSION_AUDIT_PAGE_ITEMS,
+                    }),
+                )),
+            );
+        }
+        let engine = self
+            .engine
+            .as_ref()
+            .expect("a validated controlled session has an engine");
+        let value = match request.method.as_str() {
+            "session.requests" => engine
+                .network_requests_page(after, limit)
+                .and_then(serialize_immediate_result),
+            "session.evidence" => engine
+                .network_evidence_page(after, limit)
+                .and_then(serialize_immediate_result),
+            _ => unreachable!("session audit method was filtered by the dispatcher"),
+        };
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => return self.write_method_result(&request, Err(error)),
+        };
+        let active = ActiveRequest {
+            request,
+            profile: Some(SessionProfile::ControlledWebSessionV1),
+            operation: ActiveOperation::Audit(AuditState { value: Some(value) }),
+            started_at: Instant::now(),
+            in_flight: None,
+            control_turn_observed: None,
             needs_initial_pump: false,
             state_effect: RequestStateEffect::None,
         };
@@ -601,6 +1468,21 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             active,
             ActiveTransition::Submit(DocumentControlCommand::Observe),
         )
+    }
+
+    fn require_controlled_web_session(&self, request: &Request) -> Result<(), ProtocolError> {
+        self.require_controlled_session(request)?;
+        if self.profile != Some(SessionProfile::ControlledWebSessionV1) {
+            return Err(ProtocolError::operation(
+                "unsupported_profile_method",
+                format!(
+                    "{} requires {CONTROLLED_WEB_SESSION_V1_PROFILE}",
+                    request.method
+                ),
+                "none",
+            ));
+        }
+        Ok(())
     }
 
     fn poll_active_control(&mut self) -> Result<(bool, Option<Instant>), String> {
@@ -639,10 +1521,53 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     .take()
                     .expect("active request tracked its in-flight command");
                 active.needs_initial_pump = false;
-                if let ActiveOperation::ControlledOpen(state) = &mut active.operation &&
-                    let Some(url) = self.engine.as_ref().and_then(|engine| engine.url())
+                if let ActiveOperation::ControlledOpen(state) = &mut active.operation
+                    && let Some(url) = self.engine.as_ref().and_then(|engine| engine.url())
                 {
                     state.current_url = url;
+                }
+                if let ActiveOperation::Settle(state) = &mut active.operation
+                    && let Some(target) = receive_outcome_pending_target(&completion.outcome)
+                {
+                    state.latest_pending_target = Some(Box::new(target.clone()));
+                }
+                let replacement_source = if completion.disposition
+                    == ControlOutcomeDisposition::Indeterminate
+                    && command == DocumentControlCommand::DriveOneTurn
+                    && let DocumentControlReceiveOutcome::CommandOutcome(
+                        DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate { target },
+                    ) = &completion.outcome
+                    && let ActiveOperation::Settle(SettleState {
+                        profile: SessionProfile::ControlledWebSessionV1,
+                        authorizing_state_token: None,
+                        authorizing_navigation: Some(source),
+                        replacement: None,
+                        ..
+                    }) = &active.operation
+                    && source.target() == target.as_ref()
+                {
+                    Some(source.clone())
+                } else {
+                    None
+                };
+                if let Some(source) = replacement_source {
+                    let ActiveOperation::Settle(state) = &mut active.operation else {
+                        unreachable!("the replacement source was taken only from settlement")
+                    };
+                    state.replacement = Some(SettleReplacementPhase::AwaitingAdmission {
+                        source,
+                        drive_outcome: completion.outcome,
+                    });
+                    // The source turn crossed its linearization point. It will be counted exactly
+                    // once only after the passive session authority proves the navigation shape.
+                    active.state_effect = RequestStateEffect::Partial;
+                    self.apply_active_transition(
+                        active,
+                        ActiveTransition::SubmitSessionNavigationObservation {
+                            allow_servo_pump: false,
+                        },
+                    )?;
+                    return Ok((true, None));
                 }
                 if completion.disposition == ControlOutcomeDisposition::Indeterminate {
                     self.apply_active_transition(
@@ -658,15 +1583,350 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     )?;
                     return Ok((true, None));
                 }
-                if completion.disposition == ControlOutcomeDisposition::Completed &&
-                    command_is_mutating(&command)
+                if active.profile == Some(SessionProfile::ControlledWebSessionV1)
+                    && matches!(
+                        &completion.outcome,
+                        DocumentControlReceiveOutcome::ObserveTransportFailure(_)
+                            | DocumentControlReceiveOutcome::AutomationTransportFailure(_)
+                            | DocumentControlReceiveOutcome::DriveOneTurnOutcomeIndeterminate(_)
+                    )
+                {
+                    self.apply_active_transition(
+                        active,
+                        ActiveTransition::Fail(ActiveFailure {
+                            error: fatal_operation(
+                                "session_command_transport_failure",
+                                "an active controlled-session command lost its typed response",
+                                "indeterminate",
+                            ),
+                            fail_stop: true,
+                        }),
+                    )?;
+                    return Ok((true, None));
+                }
+                if active.profile == Some(SessionProfile::ControlledWebSessionV1)
+                    && let DocumentControlCommand::AdvanceTo(token) = &command
+                {
+                    let requested_virtual_time_ns = token.deadline().deadline.as_nanos();
+                    if completion.disposition != ControlOutcomeDisposition::Completed
+                        || receive_outcome_virtual_time_ns(&completion.outcome)
+                            != Some(requested_virtual_time_ns)
+                    {
+                        self.apply_active_transition(
+                            active,
+                            ActiveTransition::Fail(ActiveFailure {
+                                error: fatal_operation(
+                                    "controlled_network_time_authority_diverged",
+                                    "the document did not attest the virtual time staged for its network evidence",
+                                    "indeterminate",
+                                ),
+                                fail_stop: true,
+                            }),
+                        )?;
+                        return Ok((true, None));
+                    }
+                }
+                if completion.disposition == ControlOutcomeDisposition::Completed
+                    && command_is_mutating(&command)
                 {
                     active.state_effect = RequestStateEffect::Partial;
+                }
+                if let Some(virtual_time_ns) = receive_outcome_virtual_time_ns(&completion.outcome)
+                    && let Err(mut error) = self
+                        .engine
+                        .as_ref()
+                        .expect("a completed control operation has an engine")
+                        .set_controlled_network_virtual_time_ns(virtual_time_ns)
+                {
+                    error.fatal = true;
+                    self.apply_active_transition(
+                        active,
+                        ActiveTransition::Fail(ActiveFailure {
+                            error,
+                            fail_stop: true,
+                        }),
+                    )?;
+                    return Ok((true, None));
                 }
                 let transition = transition_from_control_completion(
                     &mut active,
                     command,
                     completion.outcome,
+                    &mut self.projection,
+                    self.engine
+                        .as_ref()
+                        .and_then(EnginePort::controlled_network_snapshot)
+                        .map_or(0, |snapshot| snapshot.active_operations),
+                );
+                self.apply_active_transition(active, transition)?;
+                Ok((true, None))
+            },
+        }
+    }
+
+    fn poll_active_navigation(&mut self) -> Result<(bool, Option<Instant>), String> {
+        let Some(active) = self.active.as_ref() else {
+            return Ok((false, None));
+        };
+        if !active_expects_navigation_response(&active.operation) {
+            return Ok((false, None));
+        }
+        let poll = self
+            .engine
+            .as_mut()
+            .expect("an active controlled-session request has an engine")
+            .poll_session_navigation();
+        match poll {
+            EnginePortNavigationPoll::Pending { deadline } => Ok((false, Some(deadline))),
+            EnginePortNavigationPoll::Idle => {
+                let active = self.active.take().expect("active request was observed");
+                self.apply_active_transition(
+                    active,
+                    ActiveTransition::Fail(ActiveFailure {
+                        error: fatal_operation(
+                            "internal_runtime_failure",
+                            "engine lost an in-flight session-navigation receiver",
+                            "indeterminate",
+                        ),
+                        fail_stop: true,
+                    }),
+                )?;
+                Ok((true, None))
+            },
+            EnginePortNavigationPoll::Complete(completion) => {
+                let mut active = self.active.take().expect("active request was observed");
+                active.needs_initial_pump = false;
+                if let Ok(navigation) = completion.outcome() {
+                    let navigation = navigation.clone();
+                    let engine = self
+                        .engine
+                        .as_ref()
+                        .expect("an active controlled-session request has an engine");
+                    if let Some(terminal) = navigation.terminal() {
+                        let (navigation_id, reason) =
+                            terminal_navigation_evidence(terminal, navigation.navigation_id());
+                        if matches!(
+                            &active.operation,
+                            ActiveOperation::Navigate(NavigateState {
+                                phase: NavigatePhase::AwaitingAdmission { .. },
+                                ..
+                            })
+                        ) && completion.kind() == NavigationOperationKind::Navigate
+                        {
+                            engine.record_navigation_started_id(navigation_id);
+                        }
+                        engine.record_navigation_failed_id(navigation_id, reason);
+                    } else {
+                        match &mut active.operation {
+                            ActiveOperation::Navigate(NavigateState {
+                                phase: NavigatePhase::AwaitingAdmission { .. },
+                                ..
+                            }) if completion.kind() == NavigationOperationKind::Navigate => {
+                                engine.record_navigation_started(&navigation);
+                            },
+                            ActiveOperation::Settle(SettleState {
+                                replacement:
+                                    Some(SettleReplacementPhase::AwaitingActivation {
+                                        source,
+                                        admitted,
+                                        ..
+                                    }),
+                                ..
+                            }) if completion.kind() == NavigationOperationKind::Observe
+                                && explicit_navigation_reached_controlled_ready(
+                                    source,
+                                    admitted,
+                                    &navigation,
+                                ) =>
+                            {
+                                if self
+                                    .last_navigation_authority
+                                    .as_ref()
+                                    .is_none_or(|previous| {
+                                        previous.navigation_id() != navigation.navigation_id()
+                                    })
+                                {
+                                    engine.record_navigation_started(&navigation);
+                                    engine.record_navigation_committed(&navigation);
+                                }
+                                if self
+                                    .last_navigation_authority
+                                    .as_ref()
+                                    .is_some_and(|previous| {
+                                        previous.history_revision() != navigation.history_revision()
+                                    })
+                                {
+                                    engine.record_same_document_history_changed(&navigation);
+                                }
+                                self.last_navigation_authority = Some(navigation.clone());
+                            },
+                            ActiveOperation::SessionProjection(state)
+                                if completion.kind() == NavigationOperationKind::Observe =>
+                            {
+                                let stable = matches!(
+                                    &state.phase,
+                                    SessionProjectionPhase::AwaitingStableNavigation {
+                                        navigation: before,
+                                    } if before == &navigation
+                                );
+                                if !stable {
+                                    // N1 establishes the authority to be bracketed around the final
+                                    // document Observe. Only the matching no-pump N2 is terminal.
+                                    let transition = transition_from_navigation_completion(
+                                        &mut active,
+                                        completion,
+                                        &mut self.projection,
+                                    );
+                                    self.apply_active_transition(active, transition)?;
+                                    return Ok((true, None));
+                                }
+                                match &mut state.kind {
+                                    SessionProjectionKind::ControlledOpen {
+                                        session_state_token,
+                                        settle_resume,
+                                        ..
+                                    } => {
+                                        let controlled_ready = if settle_resume.is_some() {
+                                            session_navigation_reached_controlled_ready(&navigation)
+                                        } else {
+                                            initial_navigation_reached_controlled_ready(&navigation)
+                                        };
+                                        if !controlled_ready {
+                                            let transition = navigation_activation_failure(
+                                                active.state_effect,
+                                                true,
+                                            );
+                                            self.apply_active_transition(active, transition)?;
+                                            return Ok((true, None));
+                                        }
+                                        match engine.session_state_token() {
+                                            Ok(token) => *session_state_token = Some(token),
+                                            Err(mut error) => {
+                                                error.fatal = true;
+                                                self.apply_active_transition(
+                                                    active,
+                                                    ActiveTransition::Fail(ActiveFailure {
+                                                        error,
+                                                        fail_stop: true,
+                                                    }),
+                                                )?;
+                                                return Ok((true, None));
+                                            },
+                                        }
+                                        if self.last_navigation_authority.as_ref().is_none_or(
+                                            |previous| {
+                                                previous.navigation_id()
+                                                    != navigation.navigation_id()
+                                            },
+                                        ) {
+                                            engine.record_navigation_started(&navigation);
+                                            engine.record_navigation_committed(&navigation);
+                                        }
+                                        engine.record_settlement_terminal(&navigation);
+                                    },
+                                    SessionProjectionKind::Navigate {
+                                        source,
+                                        admitted,
+                                        settle_resume,
+                                        ..
+                                    } => {
+                                        let controlled_ready = if settle_resume.is_some() {
+                                            explicit_navigation_chain_reached_controlled_ready(
+                                                source,
+                                                &navigation,
+                                            )
+                                        } else {
+                                            explicit_navigation_reached_controlled_ready(
+                                                source,
+                                                admitted,
+                                                &navigation,
+                                            )
+                                        };
+                                        if !controlled_ready {
+                                            let transition = navigation_activation_failure(
+                                                active.state_effect,
+                                                true,
+                                            );
+                                            self.apply_active_transition(active, transition)?;
+                                            return Ok((true, None));
+                                        }
+                                        if settle_resume.is_none()
+                                            || self.last_navigation_authority.as_ref().is_none_or(
+                                                |previous| {
+                                                    previous.navigation_id()
+                                                        != navigation.navigation_id()
+                                                },
+                                            )
+                                        {
+                                            engine.record_navigation_committed(&navigation);
+                                        }
+                                        if admitted.history_revision()
+                                            != navigation.history_revision()
+                                        {
+                                            engine
+                                                .record_same_document_history_changed(&navigation);
+                                        }
+                                        engine.record_settlement_terminal(&navigation);
+                                    },
+                                    SessionProjectionKind::Automation { .. }
+                                    | SessionProjectionKind::Value { .. } => {
+                                        if let Some(previous) =
+                                            self.last_navigation_authority.as_ref()
+                                        {
+                                            if previous.navigation_id()
+                                                != navigation.navigation_id()
+                                            {
+                                                engine.record_navigation_started(&navigation);
+                                                engine.record_navigation_committed(&navigation);
+                                            }
+                                            if previous.history_revision()
+                                                != navigation.history_revision()
+                                            {
+                                                engine.record_same_document_history_changed(
+                                                    &navigation,
+                                                );
+                                            }
+                                        }
+                                        if active.request.method == "runtime.settle" {
+                                            engine.record_settlement_terminal(&navigation);
+                                        }
+                                    },
+                                }
+                                self.last_navigation_authority = Some(navigation);
+                            },
+                            _ => {},
+                        }
+                    }
+                } else {
+                    let engine = self
+                        .engine
+                        .as_ref()
+                        .expect("navigation failure has an engine");
+                    match completion.outcome() {
+                        Err(SessionNavigationError::NavigationStartFailed { observed }) => {
+                            engine.record_navigation_started(observed);
+                            engine.record_navigation_failed(
+                                observed,
+                                NetworkFailureReason::NetworkError,
+                            );
+                        },
+                        Err(SessionNavigationError::Terminal(terminal)) => {
+                            let fallback = self
+                                .last_navigation_authority
+                                .as_ref()
+                                .map_or(SessionNavigationId::new(0), |authority| {
+                                    authority.navigation_id()
+                                });
+                            let (navigation_id, reason) =
+                                terminal_navigation_evidence(*terminal, fallback);
+                            engine.record_navigation_failed_id(navigation_id, reason);
+                        },
+                        _ => {},
+                    }
+                }
+                let transition = transition_from_navigation_completion(
+                    &mut active,
+                    completion,
                     &mut self.projection,
                 );
                 self.apply_active_transition(active, transition)?;
@@ -683,10 +1943,9 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         let Some(active) = self.active.as_ref() else {
             return Ok(false);
         };
-        if let ActiveOperation::ControlledOpen(state) = &active.operation {
-            let Some(wait) = state.waiting.as_ref() else {
-                return Ok(false);
-            };
+        if let ActiveOperation::ControlledOpen(state) = &active.operation
+            && let Some(wait) = state.readiness_waiting.as_ref()
+        {
             let deadline_expired = now >= state.deadline;
             let retry_ready = now >= wait.retry_at;
             let servo_woke = current.servo_changed_since(wait.observed);
@@ -701,15 +1960,24 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             let ActiveOperation::ControlledOpen(state) = &mut active.operation else {
                 unreachable!("controlled open wait changed operation kind")
             };
-            state.waiting = None;
+            state.readiness_waiting = None;
             let transition = if deadline_expired {
+                let v2 = state.profile == SessionProfile::ControlledWebSessionV1;
                 ActiveTransition::Fail(ActiveFailure {
-                    error: ProtocolError::operation(
-                        "controlled_open_timeout",
-                        "the controlled document did not become ready before the wall deadline",
-                        "none",
-                    ),
-                    fail_stop: false,
+                    error: if v2 {
+                        fatal_operation(
+                            "controlled_open_timeout",
+                            "the controlled session did not become ready before the wall deadline",
+                            "indeterminate",
+                        )
+                    } else {
+                        ProtocolError::operation(
+                            "controlled_open_timeout",
+                            "the controlled document did not become ready before the wall deadline",
+                            "none",
+                        )
+                    },
+                    fail_stop: v2,
                 })
             } else {
                 ActiveTransition::Submit(DocumentControlCommand::Observe)
@@ -717,10 +1985,20 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             self.apply_active_transition(active, transition)?;
             return Ok(true);
         }
-        let ActiveOperation::Settle(settle) = &active.operation else {
-            return Ok(false);
+        let wait = match &active.operation {
+            ActiveOperation::ControlledOpen(state) => state
+                .settlement
+                .as_ref()
+                .and_then(|settlement| settlement.waiting.as_ref()),
+            ActiveOperation::Settle(state) => state.waiting.as_ref(),
+            ActiveOperation::Navigate(state)
+                if matches!(state.phase, NavigatePhase::Settling { .. }) =>
+            {
+                state.waiting.as_ref()
+            },
+            _ => None,
         };
-        let Some(wait) = settle.waiting.as_ref() else {
+        let Some(wait) = wait else {
             return Ok(false);
         };
         let expired = wait.deadline.is_some_and(|deadline| now >= deadline);
@@ -732,14 +2010,34 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         let mut active = self.active.take().expect("settle wait was observed");
         let state_effect = active.state_effect;
         let started_at = active.started_at;
-        let (wait, previous_cumulative) = {
-            let ActiveOperation::Settle(state) = &mut active.operation else {
-                unreachable!("settle wait changed operation kind")
-            };
-            (
+        let controlled_network_active = self
+            .engine
+            .as_ref()
+            .and_then(EnginePort::controlled_network_snapshot)
+            .is_some_and(|snapshot| snapshot.active_operations != 0);
+        let (wait, previous_cumulative) = match &mut active.operation {
+            ActiveOperation::ControlledOpen(state) => {
+                let settlement = state
+                    .settlement
+                    .as_mut()
+                    .expect("controlled-open settlement wait has coordinator state");
+                (
+                    settlement
+                        .waiting
+                        .take()
+                        .expect("controlled-open settle wait was observed"),
+                    settlement.cumulative_external_io_wall_time,
+                )
+            },
+            ActiveOperation::Settle(state) => (
                 state.waiting.take().expect("settle wait was observed"),
                 state.cumulative_external_io_wall_time,
-            )
+            ),
+            ActiveOperation::Navigate(state) => (
+                state.waiting.take().expect("navigate wait was observed"),
+                state.cumulative_external_io_wall_time,
+            ),
+            _ => unreachable!("settlement wait changed operation kind"),
         };
         let elapsed = now.saturating_duration_since(wait.started_at);
         let Some(cumulative) = previous_cumulative.checked_add(elapsed) else {
@@ -757,24 +2055,76 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 )
                 .map(|()| true);
         };
-        let ActiveOperation::Settle(state) = &mut active.operation else {
-            unreachable!("settle wait changed operation kind")
-        };
-        state.cumulative_external_io_wall_time = cumulative;
-        let progress = if expired {
-            state.coordinator.external_io_wait_expired(cumulative)
-        } else {
-            state.coordinator.resume_after_wake(cumulative)
-        };
-        let transition = match progress {
-            Ok(progress) => transition_from_settle_progress_for_active(
-                state,
-                started_at,
-                progress,
-                state_effect,
-                &mut self.projection,
-            ),
-            Err(error) => ActiveTransition::Fail(settle_failure(error, state_effect, None)),
+        let transition = match &mut active.operation {
+            ActiveOperation::ControlledOpen(state) => {
+                let settlement = state
+                    .settlement
+                    .as_mut()
+                    .expect("controlled-open settlement is active");
+                settlement.cumulative_external_io_wall_time = cumulative;
+                settlement
+                    .coordinator
+                    .set_additional_foreground_external_io_active(controlled_network_active);
+                let progress = if expired {
+                    settlement.coordinator.external_io_wait_expired(cumulative)
+                } else {
+                    settlement.coordinator.resume_after_wake(cumulative)
+                };
+                match progress {
+                    Ok(progress) => transition_from_controlled_open_settle_progress(
+                        state,
+                        progress,
+                        state_effect,
+                    ),
+                    Err(error) => ActiveTransition::Fail(settle_failure(error, state_effect, None)),
+                }
+            },
+            ActiveOperation::Settle(state) => {
+                state.cumulative_external_io_wall_time = cumulative;
+                state
+                    .coordinator
+                    .set_additional_foreground_external_io_active(
+                        controlled_network_active || state.replacement.is_some(),
+                    );
+                let progress = if expired {
+                    state.coordinator.external_io_wait_expired(cumulative)
+                } else {
+                    state.coordinator.resume_after_wake(cumulative)
+                };
+                match progress {
+                    Ok(progress) => transition_from_settle_progress_for_active(
+                        state,
+                        started_at,
+                        progress,
+                        state_effect,
+                        &mut self.projection,
+                    ),
+                    Err(error) => ActiveTransition::Fail(settle_failure_for_response(
+                        error,
+                        state_effect,
+                        None,
+                        &state.response,
+                    )),
+                }
+            },
+            ActiveOperation::Navigate(state) => {
+                state.cumulative_external_io_wall_time = cumulative;
+                state
+                    .coordinator
+                    .set_additional_foreground_external_io_active(controlled_network_active);
+                let progress = if expired {
+                    state.coordinator.external_io_wait_expired(cumulative)
+                } else {
+                    state.coordinator.resume_after_wake(cumulative)
+                };
+                match progress {
+                    Ok(progress) => {
+                        transition_from_navigate_settle_progress(state, progress, state_effect)
+                    },
+                    Err(error) => ActiveTransition::Fail(settle_failure(error, state_effect, None)),
+                }
+            },
+            _ => unreachable!("settlement wait changed operation kind"),
         };
         self.apply_active_transition(active, transition)?;
         Ok(true)
@@ -785,22 +2135,66 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         mut active: ActiveRequest,
         transition: ActiveTransition,
     ) -> Result<(), String> {
+        if !matches!(&transition, ActiveTransition::Fail(_))
+            && !matches!(&active.operation, ActiveOperation::Audit(_))
+            && let Some(snapshot) = self
+                .engine
+                .as_ref()
+                .and_then(EnginePort::controlled_network_snapshot)
+            && let Some(mut failure) = controlled_network_failure(snapshot, active.state_effect)
+        {
+            if matches!(&active.operation, ActiveOperation::ControlledOpen(_)) {
+                failure.error.fatal = true;
+                failure.fail_stop = true;
+            }
+            return self.apply_active_transition(active, ActiveTransition::Fail(failure));
+        }
         match transition {
             ActiveTransition::Submit(command) => {
                 let controlled_open =
                     matches!(&active.operation, ActiveOperation::ControlledOpen(_));
+                if active.profile == Some(SessionProfile::ControlledWebSessionV1)
+                    && let DocumentControlCommand::AdvanceTo(token) = &command
+                {
+                    let requested_virtual_time_ns = token.deadline().deadline.as_nanos();
+                    if let Err(mut error) = self
+                        .engine
+                        .as_ref()
+                        .expect("a v2 advance has an engine")
+                        .set_controlled_network_virtual_time_ns(requested_virtual_time_ns)
+                    {
+                        error.fatal = true;
+                        error.state_effect = active.state_effect.as_protocol_str();
+                        return self.apply_active_transition(
+                            active,
+                            ActiveTransition::Fail(ActiveFailure {
+                                error,
+                                fail_stop: true,
+                            }),
+                        );
+                    }
+                }
                 let timeout = if let ActiveOperation::ControlledOpen(state) = &active.operation {
+                    let v2 = state.profile == SessionProfile::ControlledWebSessionV1;
                     let Some(remaining) = state.deadline.checked_duration_since(Instant::now())
                     else {
                         return self.apply_active_transition(
                             active,
                             ActiveTransition::Fail(ActiveFailure {
-                                error: ProtocolError::operation(
-                                    "controlled_open_timeout",
-                                    "the controlled document did not become ready before the wall deadline",
-                                    "none",
-                                ),
-                                fail_stop: false,
+                                error: if v2 {
+                                    fatal_operation(
+                                        "controlled_open_timeout",
+                                        "the controlled session did not become ready before the wall deadline",
+                                        "indeterminate",
+                                    )
+                                } else {
+                                    ProtocolError::operation(
+                                        "controlled_open_timeout",
+                                        "the controlled document did not become ready before the wall deadline",
+                                        "none",
+                                    )
+                                },
+                                fail_stop: v2,
                             }),
                         );
                     };
@@ -808,6 +2202,7 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 } else {
                     CONTROL_COMMAND_TIMEOUT
                 };
+                let control_turn_observed = self.checked_wake_snapshot()?;
                 let submission = self
                     .engine
                     .as_mut()
@@ -816,8 +2211,17 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 match submission {
                     Ok(()) => {
                         active.in_flight = Some(command);
+                        active.control_turn_observed = Some(control_turn_observed);
                         active.needs_initial_pump = true;
                         if let ActiveOperation::Settle(state) = &mut active.operation {
+                            state.waiting = None;
+                        }
+                        if let ActiveOperation::ControlledOpen(state) = &mut active.operation
+                            && let Some(settlement) = state.settlement.as_mut()
+                        {
+                            settlement.waiting = None;
+                        }
+                        if let ActiveOperation::Navigate(state) = &mut active.operation {
                             state.waiting = None;
                         }
                         self.active = Some(active);
@@ -825,13 +2229,86 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     },
                     Err(mut error) => {
                         error.state_effect = active.state_effect.as_protocol_str();
+                        let v2 = active.profile == Some(SessionProfile::ControlledWebSessionV1);
+                        if v2 {
+                            error.fatal = true;
+                        }
                         if controlled_open {
                             self.close_engine();
-                            self.state = ShellState::Initialized;
+                            self.state = if v2 {
+                                ShellState::Closed
+                            } else {
+                                ShellState::Initialized
+                            };
                         }
+                        self.write_method_result(&active.request, Err(error))?;
+                        if v2 {
+                            self.abortive_close();
+                            self.state = ShellState::Closed;
+                            return Err(
+                                "controlled-session command submission failed terminally".into()
+                            );
+                        }
+                        Ok(())
+                    },
+                }
+            },
+            ActiveTransition::SubmitSessionNavigationObservation { allow_servo_pump } => {
+                let submission = self
+                    .engine
+                    .as_mut()
+                    .expect("controlled-session request has an engine")
+                    .submit_session_navigation_observation(CONTROL_COMMAND_TIMEOUT);
+                match submission {
+                    Ok(()) => {
+                        active.needs_initial_pump = allow_servo_pump;
+                        self.active = Some(active);
+                        Ok(())
+                    },
+                    Err(mut error) => {
+                        error.state_effect = active.state_effect.as_protocol_str();
+                        let v2 = active.profile == Some(SessionProfile::ControlledWebSessionV1);
+                        if v2 {
+                            error.fatal = true;
+                        }
+                        self.write_method_result(&active.request, Err(error))?;
+                        if v2 {
+                            self.abortive_close();
+                            self.state = ShellState::Closed;
+                            return Err(
+                                "session-navigation observation submission failed terminally"
+                                    .into(),
+                            );
+                        }
+                        Ok(())
+                    },
+                }
+            },
+            ActiveTransition::SubmitSessionNavigation { expected, url } => {
+                let submission = self
+                    .engine
+                    .as_mut()
+                    .expect("controlled-session request has an engine")
+                    .submit_session_navigation(expected, url, CONTROL_COMMAND_TIMEOUT);
+                match submission {
+                    Ok(()) => {
+                        active.needs_initial_pump = true;
+                        self.active = Some(active);
+                        Ok(())
+                    },
+                    Err(mut error) => {
+                        error.state_effect = active.state_effect.as_protocol_str();
                         self.write_method_result(&active.request, Err(error))
                     },
                 }
+            },
+            ActiveTransition::ProjectSession(state) => {
+                let allow_servo_pump = !session_projection_suppresses_initial_pump(&state.kind);
+                active.operation = ActiveOperation::SessionProjection(state);
+                self.apply_active_transition(
+                    active,
+                    ActiveTransition::SubmitSessionNavigationObservation { allow_servo_pump },
+                )
             },
             ActiveTransition::WaitForControlledOpen => {
                 let now = Instant::now();
@@ -848,7 +2325,7 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                         }),
                     );
                 };
-                state.waiting = Some(ControlledOpenWait {
+                state.readiness_waiting = Some(ControlledOpenWait {
                     observed: self.servo_cursor,
                     retry_at: now
                         .checked_add(CONTROLLED_OPEN_RETRY_INTERVAL)
@@ -900,24 +2377,44 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                         Some(deadline)
                     },
                 };
-                let ActiveOperation::Settle(state) = &mut active.operation else {
-                    return self.apply_active_transition(
-                        active,
-                        ActiveTransition::Fail(ActiveFailure {
-                            error: fatal_operation(
-                                "internal_runtime_failure",
-                                "non-settlement request entered a settlement wait",
-                                "none",
-                            ),
-                            fail_stop: true,
-                        }),
-                    );
-                };
-                state.waiting = Some(SettleHostWait {
-                    observed: self.servo_cursor,
-                    started_at: now,
-                    deadline,
-                });
+                let host_wait = active.settle_host_wait(self.servo_cursor, now, deadline);
+                match &mut active.operation {
+                    ActiveOperation::ControlledOpen(state) => {
+                        let Some(settlement) = state.settlement.as_mut() else {
+                            return self.apply_active_transition(
+                                active,
+                                ActiveTransition::Fail(ActiveFailure {
+                                    error: fatal_operation(
+                                        "internal_runtime_failure",
+                                        "controlled open entered settlement wait before settlement started",
+                                        "none",
+                                    ),
+                                    fail_stop: true,
+                                }),
+                            );
+                        };
+                        settlement.waiting = Some(host_wait)
+                    },
+                    ActiveOperation::Settle(state) => state.waiting = Some(host_wait),
+                    ActiveOperation::Navigate(state)
+                        if matches!(state.phase, NavigatePhase::Settling { .. }) =>
+                    {
+                        state.waiting = Some(host_wait)
+                    },
+                    _ => {
+                        return self.apply_active_transition(
+                            active,
+                            ActiveTransition::Fail(ActiveFailure {
+                                error: fatal_operation(
+                                    "internal_runtime_failure",
+                                    "non-settlement request entered a settlement wait",
+                                    "none",
+                                ),
+                                fail_stop: true,
+                            }),
+                        );
+                    },
+                }
                 self.active = Some(active);
                 Ok(())
             },
@@ -1031,9 +2528,27 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             .engine
             .as_mut()
             .and_then(|engine| engine.cancel_control_operation());
-        if command_is_mutating ||
-            completion.as_ref().is_some_and(|completion| {
+        let navigation_completion = self
+            .engine
+            .as_mut()
+            .and_then(|engine| engine.cancel_session_navigation());
+        if active.profile == Some(SessionProfile::ControlledWebSessionV1) {
+            return ActiveFailure {
+                error: fatal_operation(
+                    "outcome_indeterminate",
+                    "cancellation abandoned an active controlled-session command sequence",
+                    "indeterminate",
+                ),
+                fail_stop: true,
+            };
+        }
+        if command_is_mutating
+            || completion.as_ref().is_some_and(|completion| {
                 completion.disposition == ControlOutcomeDisposition::Indeterminate
+            })
+            || navigation_completion.as_ref().is_some_and(|completion| {
+                completion.kind() == NavigationOperationKind::Navigate
+                    && !completion.response_received()
             })
         {
             return ActiveFailure {
@@ -1110,16 +2625,28 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             .as_ref()
             .and_then(|active| match &active.operation {
                 ActiveOperation::ControlledOpen(state) => {
-                    Some(state.waiting.as_ref().map_or(state.deadline, |wait| {
-                        Instant::min(wait.retry_at, state.deadline)
-                    }))
+                    state.readiness_waiting.as_ref().map_or_else(
+                        || {
+                            state
+                                .settlement
+                                .as_ref()
+                                .and_then(|settlement| settlement.waiting.as_ref())
+                                .and_then(|wait| wait.deadline)
+                        },
+                        |wait| Some(Instant::min(wait.retry_at, state.deadline)),
+                    )
                 },
                 ActiveOperation::Settle(state) => {
                     state.waiting.as_ref().and_then(|wait| wait.deadline)
                 },
-                ActiveOperation::Pending |
-                ActiveOperation::AdvanceToNext(_) |
-                ActiveOperation::Automation(_) => None,
+                ActiveOperation::Navigate(state) => {
+                    state.waiting.as_ref().and_then(|wait| wait.deadline)
+                },
+                ActiveOperation::Pending
+                | ActiveOperation::AdvanceToNext(_)
+                | ActiveOperation::Automation(_)
+                | ActiveOperation::Audit(_)
+                | ActiveOperation::SessionProjection(_) => None,
             });
         [control_deadline, host_wait]
             .into_iter()
@@ -1143,8 +2670,8 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             ));
         }
         let params: InitializeParams = parse_params(request)?;
-        if let Some(client) = params.client &&
-            (client.name.is_empty() || client.version.is_empty())
+        if let Some(client) = params.client
+            && (client.name.is_empty() || client.version.is_empty())
         {
             return Err(ProtocolError::invalid_request(
                 "client name and version must not be empty",
@@ -1166,16 +2693,30 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     "runtime.pending",
                     "runtime.settle",
                     "runtime.advance_to_next",
+                    "session.navigate",
                     "action.activate",
                     "action.fill",
+                    "action.focus",
+                    "action.check",
+                    "action.uncheck",
+                    "action.select",
+                    "action.submit",
                     "dom.query",
                     "dom.text",
                     "dom.extract",
+                    "session.cookies.get",
+                    "session.cookies.set",
+                    "session.storage.get",
+                    "session.storage.set",
+                    "session.state.export",
+                    "session.state.import",
+                    "session.requests",
+                    "session.evidence",
                     "protocol.cancel",
                     "session.close"
                 ],
                 "clockModes": ["real", "controlled"],
-                "profiles": [CONTROLLED_WEBAPP_V1_PROFILE],
+                "profiles": [CONTROLLED_WEBAPP_V1_PROFILE, CONTROLLED_WEB_SESSION_V1_PROFILE],
                 "settlement": true,
                 "settlementLimits": [
                     "maxVirtualTimeNs",
@@ -1205,10 +2746,11 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 )),
             );
         }
-        let params: OpenParams = match parse_params(&request) {
-            Ok(params) => params,
-            Err(error) => return self.write_method_result(&request, Err(error)),
-        };
+        let params: OpenParams =
+            match parse_sensitive_params(&request, "invalid session.open parameters") {
+                Ok(params) => params,
+                Err(error) => return self.write_method_result(&request, Err(error)),
+            };
         let url = match Url::parse(&params.url) {
             Ok(url) => url,
             Err(error) => {
@@ -1220,17 +2762,66 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 );
             },
         };
-        let (clock_mode, boundary) = match params.clock_mode() {
-            Ok(mode) => mode,
+        let configuration = match params.configuration() {
+            Ok(configuration) => configuration,
             Err(error) => return self.write_method_result(&request, Err(error)),
         };
-        let mut engine = match E::open_session(url.clone(), self.waker.clone(), clock_mode) {
+        if configuration.profile == Some(SessionProfile::ControlledWebSessionV1)
+            && !matches!(url.scheme(), "http" | "https")
+        {
+            return self.write_method_result(
+                &request,
+                Err(ProtocolError::operation(
+                    "unsupported_navigation_scheme",
+                    "initial session navigation supports only HTTP(S) URLs",
+                    "none",
+                )),
+            );
+        }
+        let document_control_profile = configuration.profile.map_or(
+            DocumentControlProfile::SingleDocument,
+            SessionProfile::document_control_profile,
+        );
+        let mut engine = match E::open_session(
+            url.clone(),
+            self.waker.clone(),
+            EngineSessionOpenOptions {
+                clock_mode: configuration.clock_mode,
+                document_control_profile,
+                state: configuration.state,
+                network: configuration.network,
+            },
+        ) {
             Ok(engine) => engine,
-            Err(error) => return self.write_method_result(&request, Err(error)),
+            Err(error) => {
+                let fatal = error.fatal;
+                self.write_method_result(&request, Err(error))?;
+                if fatal {
+                    self.state = ShellState::Closed;
+                    return Err(
+                        "session construction failed at a terminal unpublished boundary".into(),
+                    );
+                }
+                return Ok(());
+            },
         };
         let final_url = engine.url().unwrap_or_else(|| url.clone());
 
-        if clock_mode.is_controlled() {
+        if configuration.clock_mode.is_controlled() {
+            let profile = configuration
+                .profile
+                .expect("a controlled open has a validated support profile");
+            if engine.document_control_profile() != profile.document_control_profile() {
+                engine.close();
+                return self.write_method_result(
+                    &request,
+                    Err(fatal_operation(
+                        "internal_runtime_failure",
+                        "engine opened with a different document-control profile",
+                        "none",
+                    )),
+                );
+            }
             let started_at = Instant::now();
             let Some(deadline) = started_at.checked_add(CONTROL_COMMAND_TIMEOUT) else {
                 engine.close();
@@ -1243,6 +2834,7 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     )),
                 );
             };
+            let control_turn_observed = self.checked_wake_snapshot()?;
             if let Err(mut error) = engine.submit_document_control(
                 DocumentControlCommand::Observe,
                 deadline.saturating_duration_since(Instant::now()),
@@ -1252,19 +2844,25 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 return self.write_method_result(&request, Err(error));
             }
             self.projection = wire::WireProjectionContext::new();
+            self.last_navigation_authority = None;
             self.engine.replace(engine);
+            self.profile = Some(profile);
             self.state = ShellState::Open;
             self.active = Some(ActiveRequest {
                 request,
+                profile: Some(profile),
                 operation: ActiveOperation::ControlledOpen(ControlledOpenState {
                     requested_url: url,
                     current_url: final_url,
+                    profile,
                     deadline,
-                    waiting: None,
+                    readiness_waiting: None,
                     bootstrap_attempted: false,
+                    settlement: None,
                 }),
                 started_at,
                 in_flight: Some(DocumentControlCommand::Observe),
+                control_turn_observed: Some(control_turn_observed),
                 needs_initial_pump: true,
                 state_effect: RequestStateEffect::None,
             });
@@ -1272,6 +2870,7 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         }
 
         self.engine.replace(engine);
+        self.profile = None;
         self.state = ShellState::Open;
         self.write_method_result(
             &request,
@@ -1279,7 +2878,7 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 "sessionId": SESSION_ID,
                 "requestedUrl": url,
                 "url": final_url,
-                "boundary": boundary,
+                "boundary": configuration.boundary,
                 "clockMode": "real",
                 "profile": null,
             })),
@@ -1368,10 +2967,32 @@ fn transition_from_control_completion(
     command: DocumentControlCommand,
     outcome: DocumentControlReceiveOutcome,
     projection: &mut wire::WireProjectionContext,
+    controlled_network_active_operations: usize,
 ) -> ActiveTransition {
     let state_effect = active.state_effect;
+    let active_profile = active.profile;
     match &mut active.operation {
         ActiveOperation::ControlledOpen(state) => {
+            if let Some(settlement) = state.settlement.as_mut() {
+                settlement
+                    .coordinator
+                    .set_additional_foreground_external_io_active(
+                        controlled_network_active_operations != 0,
+                    );
+                let progress = settlement
+                    .coordinator
+                    .consume_receive_outcome(outcome, settlement.cumulative_external_io_wall_time);
+                return match progress {
+                    Ok(progress) => transition_from_controlled_open_settle_progress(
+                        state,
+                        progress,
+                        state_effect,
+                    ),
+                    Err(error) => {
+                        ActiveTransition::Fail(settle_failure(error, state_effect, Some(&command)))
+                    },
+                };
+            }
             let observation = match command {
                 DocumentControlCommand::Observe => {
                     if matches!(
@@ -1453,25 +3074,74 @@ fn transition_from_control_completion(
                     });
                 },
             };
-            let _ = observation;
-            ActiveTransition::Complete(json!({
-                "sessionId": SESSION_ID,
-                "requestedUrl": state.requested_url,
-                "url": state.current_url,
-                "boundary": "controlled_ready",
-                "clockMode": "controlled",
-                "profile": CONTROLLED_WEBAPP_V1_PROFILE,
-            }))
+            if state.profile == SessionProfile::ControlledWebSessionV1 {
+                let response = SettleResponse::ControlledOpen {
+                    requested_url: state.requested_url.clone(),
+                    current_url: state.current_url.clone(),
+                    profile: state.profile,
+                    deadline: state.deadline,
+                    bootstrap_attempted: state.bootstrap_attempted,
+                };
+                let effective_policy = default_resolved_settle_policy();
+                let mut coordinator = settle::SettleCoordinator::new(effective_policy.engine);
+                let command = match coordinator.start() {
+                    Ok(settle::SettleProgress::Command(command)) => command,
+                    Ok(_) => {
+                        return ActiveTransition::Fail(ActiveFailure {
+                            error: fatal_operation(
+                                "internal_runtime_failure",
+                                "controlled open settlement did not request its initial observation",
+                                state_effect.as_protocol_str(),
+                            ),
+                            fail_stop: true,
+                        });
+                    },
+                    Err(error) => {
+                        return ActiveTransition::Fail(harden_continuation_failure(
+                            settle_failure(error, state_effect, None),
+                            state_effect,
+                        ));
+                    },
+                };
+                active.operation = ActiveOperation::Settle(SettleState {
+                    profile: SessionProfile::ControlledWebSessionV1,
+                    authorizing_state_token: None,
+                    authorizing_navigation: None,
+                    replacement: None,
+                    authority_bound_command: Some(command),
+                    latest_pending_target: Some(Box::new(observation.pending().target.clone())),
+                    response,
+                    coordinator,
+                    effective_policy,
+                    cumulative_external_io_wall_time: Duration::ZERO,
+                    waiting: None,
+                });
+                ActiveTransition::SubmitSessionNavigationObservation {
+                    allow_servo_pump: false,
+                }
+            } else {
+                ActiveTransition::Complete(json!({
+                    "sessionId": SESSION_ID,
+                    "requestedUrl": state.requested_url,
+                    "url": state.current_url,
+                    "boundary": "controlled_ready",
+                    "clockMode": "controlled",
+                    "profile": state.profile.id(),
+                }))
+            }
         },
         ActiveOperation::Pending => {
             let observation = match completed_observation(outcome, &command, state_effect) {
                 Ok(observation) => observation,
                 Err(failure) => return ActiveTransition::Fail(failure),
             };
-            serialize_result(
-                wire::RuntimePendingResult::project(observation.pending(), projection),
-                state_effect,
-            )
+            let result = wire::RuntimePendingResult::project(observation.pending(), projection);
+            match active_profile {
+                Some(SessionProfile::ControlledWebSessionV1) => {
+                    project_session_pending(result, observation.pending(), state_effect)
+                },
+                _ => serialize_result(result, state_effect),
+            }
         },
         ActiveOperation::AdvanceToNext(state) => {
             let observation = match completed_observation(outcome, &command, state_effect) {
@@ -1479,17 +3149,53 @@ fn transition_from_control_completion(
                 Err(failure) => return ActiveTransition::Fail(failure),
             };
             match state {
-                AdvanceToNextState::Observing => {
-                    if observation.pending().scheduler.next_deadline.is_none() {
-                        return serialize_result(
-                            wire::RuntimeAdvanceToNextResult::project(
-                                wire::RuntimeAdvanceToNextFacts::NoFiniteDeadline {
-                                    final_snapshot: observation.pending(),
-                                },
-                                projection,
+                AdvanceToNextState::Observing {
+                    expected_state_token,
+                    navigation,
+                } => {
+                    if let Some(expected_state_token) = expected_state_token.as_ref() {
+                        let Some(navigation) = navigation.as_ref() else {
+                            return missing_navigation_authority("runtime.advance_to_next");
+                        };
+                        match projection.authorizes_document_state(
+                            observation.pending(),
+                            navigation,
+                            expected_state_token,
+                        ) {
+                            Ok(true) => {},
+                            Ok(false) => return stale_state_token(),
+                            Err(error) => return document_authority_authorization_failure(error),
+                        }
+                    }
+                    if controlled_network_blocks_virtual_advance(
+                        active_profile,
+                        controlled_network_active_operations,
+                    ) {
+                        return ActiveTransition::Fail(ActiveFailure {
+                            error: ProtocolError::operation(
+                                "advance_not_available",
+                                "virtual time is frozen while controlled network operations are active",
+                                "none",
                             ),
-                            state_effect,
+                            fail_stop: false,
+                        });
+                    }
+                    if observation.pending().scheduler.next_deadline.is_none() {
+                        let result = wire::RuntimeAdvanceToNextResult::project(
+                            wire::RuntimeAdvanceToNextFacts::NoFiniteDeadline {
+                                final_snapshot: observation.pending(),
+                            },
+                            projection,
                         );
+                        return match active_profile {
+                            Some(SessionProfile::ControlledWebSessionV1) => project_session_value(
+                                result,
+                                observation.pending(),
+                                true,
+                                state_effect,
+                            ),
+                            _ => serialize_result(result, state_effect),
+                        };
                     }
                     let Some(token) = observation.advance_token().cloned() else {
                         return ActiveTransition::Fail(ActiveFailure {
@@ -1509,16 +3215,21 @@ fn transition_from_control_completion(
                 },
                 AdvanceToNextState::Advancing {
                     from_virtual_time_ns,
-                } => serialize_result(
-                    wire::RuntimeAdvanceToNextResult::project(
+                } => {
+                    let result = wire::RuntimeAdvanceToNextResult::project(
                         wire::RuntimeAdvanceToNextFacts::Advanced {
                             from_virtual_time_ns: *from_virtual_time_ns,
                             final_snapshot: observation.pending(),
                         },
                         projection,
-                    ),
-                    state_effect,
-                ),
+                    );
+                    match active_profile {
+                        Some(SessionProfile::ControlledWebSessionV1) => {
+                            project_session_value(result, observation.pending(), true, state_effect)
+                        },
+                        _ => serialize_result(result, state_effect),
+                    }
+                },
             }
         },
         ActiveOperation::Automation(state) => {
@@ -1537,15 +3248,31 @@ fn transition_from_control_completion(
                     Ok(observation) => observation,
                     Err(failure) => return ActiveTransition::Fail(failure),
                 };
-                let request = match resolved.bind_to_target(observation.pending().target.clone()) {
+                let request = match resolved {
+                    UnresolvedAutomationParams::Legacy(resolved) => resolved
+                        .bind_to_target(observation.pending().target.clone())
+                        .map_err(wire::SessionAutomationBindError::InvalidRequest),
+                    UnresolvedAutomationParams::Session(resolved) => {
+                        let Some(navigation) = state.authorizing_navigation.as_ref() else {
+                            return missing_navigation_authority("session automation");
+                        };
+                        resolved.authorize_and_bind(observation.pending(), navigation, projection)
+                    },
+                };
+                let request = match request {
                     Ok(request) => request,
-                    Err(error) => {
+                    Err(wire::SessionAutomationBindError::StaleStateToken) => {
+                        return stale_state_token();
+                    },
+                    Err(wire::SessionAutomationBindError::Authority(error)) => {
+                        return document_authority_authorization_failure(error);
+                    },
+                    Err(wire::SessionAutomationBindError::InvalidRequest(error)) => {
+                        let _ = error;
                         return ActiveTransition::Fail(ActiveFailure {
                             error: fatal_operation(
                                 "internal_runtime_failure",
-                                format!(
-                                    "failed to bind validated automation data to fresh target authority: {error:?}"
-                                ),
+                                "validated automation data could not be bound to fresh target authority",
                                 state_effect.as_protocol_str(),
                             ),
                             fail_stop: true,
@@ -1554,11 +3281,35 @@ fn transition_from_control_completion(
                 };
                 ActiveTransition::Submit(DocumentControlCommand::Automate(Box::new(request)))
             } else {
-                let (result, observation) =
+                let (result, observation, synchronous_navigation_emitted) =
                     match completed_automation(outcome, &command, state_effect) {
                         Ok(completion) => completion,
                         Err(failure) => return ActiveTransition::Fail(failure),
                     };
+                if state.profile == SessionProfile::ControlledWebSessionV1
+                    && public_automation_is_mutating(state.kind)
+                {
+                    if state.completed.is_some() {
+                        return ActiveTransition::Fail(ActiveFailure {
+                            error: fatal_operation(
+                                "internal_runtime_failure",
+                                "a completed automation result was consumed more than once",
+                                state_effect.as_protocol_str(),
+                            ),
+                            fail_stop: true,
+                        });
+                    }
+                    state.completed = Some(CompletedAutomation {
+                        result,
+                        pending: Box::new(observation.pending().clone()),
+                        synchronous_navigation_emitted,
+                    });
+                    return ActiveTransition::SubmitSessionNavigationObservation {
+                        // The action completion and this passive bracket are one ordered owner
+                        // sequence. Do not pump unrelated Servo work between them.
+                        allow_servo_pump: false,
+                    };
+                }
                 let result = match wire::PublicAutomationResult::project(
                     state.kind,
                     result,
@@ -1576,10 +3327,153 @@ fn transition_from_control_completion(
                         });
                     },
                 };
-                serialize_result(result, state_effect)
+                match state.profile {
+                    SessionProfile::ControlledWebappV1 => serialize_result(result, state_effect),
+                    SessionProfile::ControlledWebSessionV1 => {
+                        project_session_value(result, observation.pending(), false, state_effect)
+                    },
+                }
             }
         },
+        ActiveOperation::Audit(state) => {
+            let observation = match completed_observation(outcome, &command, state_effect) {
+                Ok(observation) => observation,
+                Err(failure) => return ActiveTransition::Fail(failure),
+            };
+            let Some(value) = state.value.take() else {
+                return ActiveTransition::Fail(ActiveFailure {
+                    error: fatal_operation(
+                        "internal_runtime_failure",
+                        "session audit value was consumed more than once",
+                        state_effect.as_protocol_str(),
+                    ),
+                    fail_stop: true,
+                });
+            };
+            project_session_value(value, observation.pending(), false, state_effect)
+        },
         ActiveOperation::Settle(state) => {
+            if state.authority_bound_command.is_some() && command == DocumentControlCommand::Observe
+            {
+                let observation = match completed_observation(outcome, &command, state_effect) {
+                    Ok(observation) => observation,
+                    Err(failure) => {
+                        return ActiveTransition::Fail(harden_continuation_failure(
+                            failure,
+                            state_effect,
+                        ));
+                    },
+                };
+                state.latest_pending_target = Some(Box::new(observation.pending().target.clone()));
+                return ActiveTransition::SubmitSessionNavigationObservation {
+                    allow_servo_pump: false,
+                };
+            }
+            if matches!(
+                state.replacement,
+                Some(SettleReplacementPhase::Bootstrapping { .. })
+            ) {
+                let Some(SettleReplacementPhase::Bootstrapping {
+                    source,
+                    admitted,
+                    command: expected,
+                }) = state.replacement.take()
+                else {
+                    unreachable!("the settlement bootstrap phase was matched above")
+                };
+                if command != expected {
+                    return ActiveTransition::Fail(ActiveFailure {
+                        error: fatal_operation(
+                            "internal_runtime_failure",
+                            "settlement replacement bootstrap completed under a different command",
+                            state_effect.as_protocol_str(),
+                        ),
+                        fail_stop: true,
+                    });
+                }
+                state
+                    .coordinator
+                    .set_additional_foreground_external_io_active(
+                        controlled_network_active_operations != 0,
+                    );
+                state.replacement = Some(SettleReplacementPhase::AwaitingActivation {
+                    source,
+                    admitted,
+                    command,
+                    control_outcome: outcome,
+                    controlled_network_active: controlled_network_active_operations != 0,
+                });
+                return ActiveTransition::SubmitSessionNavigationObservation {
+                    allow_servo_pump: false,
+                };
+            }
+            if matches!(
+                state.replacement,
+                Some(SettleReplacementPhase::Activating { .. })
+            ) {
+                let Some(SettleReplacementPhase::Activating { source, admitted }) =
+                    state.replacement.take()
+                else {
+                    unreachable!("the settlement activation phase was matched above")
+                };
+                state
+                    .coordinator
+                    .set_additional_foreground_external_io_active(
+                        controlled_network_active_operations != 0,
+                    );
+                state.replacement = Some(SettleReplacementPhase::AwaitingActivation {
+                    source,
+                    admitted,
+                    command,
+                    control_outcome: outcome,
+                    controlled_network_active: controlled_network_active_operations != 0,
+                });
+                return ActiveTransition::SubmitSessionNavigationObservation {
+                    allow_servo_pump: false,
+                };
+            }
+            if let Some(expected_state_token) = state.authorizing_state_token.take() {
+                if command != DocumentControlCommand::Observe {
+                    return ActiveTransition::Fail(ActiveFailure {
+                        error: fatal_operation(
+                            "internal_runtime_failure",
+                            "settlement token authorization did not use a fresh observation",
+                            "none",
+                        ),
+                        fail_stop: true,
+                    });
+                }
+                let observation = match completed_observation(outcome, &command, state_effect) {
+                    Ok(observation) => observation,
+                    Err(failure) => return ActiveTransition::Fail(failure),
+                };
+                let Some(navigation) = state.authorizing_navigation.as_ref() else {
+                    return missing_navigation_authority("runtime.settle");
+                };
+                match projection.authorizes_document_state(
+                    observation.pending(),
+                    navigation,
+                    &expected_state_token,
+                ) {
+                    Ok(true) => {},
+                    Ok(false) => return stale_state_token(),
+                    Err(error) => return document_authority_authorization_failure(error),
+                }
+                return match state.coordinator.start() {
+                    Ok(progress) => transition_from_settle_progress(progress),
+                    Err(error) => ActiveTransition::Fail(settle_failure_for_response(
+                        error,
+                        state_effect,
+                        None,
+                        &state.response,
+                    )),
+                };
+            }
+            state
+                .coordinator
+                .set_additional_foreground_external_io_active(
+                    controlled_network_active_operations != 0,
+                );
             let progress = state
                 .coordinator
                 .consume_receive_outcome(outcome, state.cumulative_external_io_wall_time);
@@ -1591,12 +3485,1321 @@ fn transition_from_control_completion(
                     state_effect,
                     projection,
                 ),
+                Err(error) => ActiveTransition::Fail(settle_failure_for_response(
+                    error,
+                    state_effect,
+                    Some(&command),
+                    &state.response,
+                )),
+            }
+        },
+        ActiveOperation::Navigate(state) => {
+            if !matches!(
+                state.phase,
+                NavigatePhase::Authorizing { .. } | NavigatePhase::Settling { .. }
+            ) {
+                return ActiveTransition::Fail(ActiveFailure {
+                    error: fatal_operation(
+                        "internal_runtime_failure",
+                        "session.navigate received a document-control result in the wrong phase",
+                        state_effect.as_protocol_str(),
+                    ),
+                    fail_stop: true,
+                });
+            }
+            if let NavigatePhase::Authorizing {
+                expected_state_token,
+                navigation,
+            } = &state.phase
+            {
+                let observation = match completed_observation(outcome, &command, state_effect) {
+                    Ok(observation) => observation,
+                    Err(failure) => return ActiveTransition::Fail(failure),
+                };
+                match projection.authorizes_document_state(
+                    observation.pending(),
+                    navigation,
+                    expected_state_token,
+                ) {
+                    Ok(true) => {},
+                    Ok(false) => return stale_state_token(),
+                    Err(error) => return document_authority_authorization_failure(error),
+                }
+                let expected = navigation.clone();
+                let url = state.requested_url.clone();
+                state.phase = NavigatePhase::AwaitingAdmission {
+                    source: expected.clone(),
+                };
+                return ActiveTransition::SubmitSessionNavigation { expected, url };
+            }
+            state
+                .coordinator
+                .set_additional_foreground_external_io_active(
+                    controlled_network_active_operations != 0,
+                );
+            let progress = state
+                .coordinator
+                .consume_receive_outcome(outcome, state.cumulative_external_io_wall_time);
+            match progress {
+                Ok(progress) => {
+                    transition_from_navigate_settle_progress(state, progress, state_effect)
+                },
                 Err(error) => {
                     ActiveTransition::Fail(settle_failure(error, state_effect, Some(&command)))
                 },
             }
         },
+        ActiveOperation::SessionProjection(state) => {
+            let SessionProjectionPhase::AwaitingPendingObservation { navigation } = &state.phase
+            else {
+                return ActiveTransition::Fail(ActiveFailure {
+                    error: fatal_operation(
+                        "internal_runtime_failure",
+                        "session projection received a document-control result in the wrong phase",
+                        state_effect.as_protocol_str(),
+                    ),
+                    fail_stop: true,
+                });
+            };
+            let navigation = navigation.clone();
+            if command == DocumentControlCommand::Observe
+                && session_projection_allows_replacement_rearm(&state.kind)
+                && session_projection_settle_resume(&state.kind).is_some()
+                && let DocumentControlReceiveOutcome::CommandOutcome(
+                    DocumentControlOutcome::Rejected(
+                        DocumentControlError::ReplacementPipelineBootstrapRequired {
+                            source_pipeline_id,
+                            pipeline_id,
+                        },
+                    ),
+                ) = &outcome
+            {
+                let source_shape_is_exact = state.pending.target == *navigation.target()
+                    && navigation
+                        .target()
+                        .active_top_level
+                        .is_some_and(|active| active.pipeline_id == *source_pipeline_id)
+                    && navigation.target().pipelines() == [*source_pipeline_id]
+                    && navigation.target().fully_active_pipelines() == [*source_pipeline_id]
+                    && navigation.target().pending_top_level_pipelines().is_empty()
+                    && source_pipeline_id != pipeline_id;
+                if !source_shape_is_exact {
+                    return navigation_activation_failure(state_effect, true);
+                }
+                if let Some(resume) = session_projection_settle_resume_mut(&mut state.kind) {
+                    resume.authorizing_navigation = Some(navigation.clone());
+                }
+                state.phase = SessionProjectionPhase::AwaitingReplacementAdmission {
+                    source: navigation,
+                    source_pipeline_id: *source_pipeline_id,
+                    pipeline_id: *pipeline_id,
+                };
+                return ActiveTransition::SubmitSessionNavigationObservation {
+                    allow_servo_pump: false,
+                };
+            }
+            let observation = match completed_observation(outcome, &command, state_effect) {
+                Ok(observation) => observation,
+                Err(failure) => {
+                    let failure = if session_projection_settle_resume(&state.kind).is_some() {
+                        harden_continuation_failure(failure, state_effect)
+                    } else {
+                        failure
+                    };
+                    return ActiveTransition::Fail(failure);
+                },
+            };
+            let pending = Box::new(observation.pending().clone());
+            let raw_automation_projection =
+                matches!(&state.kind, SessionProjectionKind::Automation { .. });
+            let exact_action_refresh = raw_automation_projection
+                && session_projection_settle_resume(&state.kind)
+                    .and_then(|resume| resume.authorizing_navigation.as_ref())
+                    .is_some_and(|source| {
+                        classify_same_document_session_transition(source, &navigation).is_some()
+                    })
+                && navigation.target() == &pending.target;
+            if pending.as_ref() != state.pending.as_ref() && !exact_action_refresh {
+                let restart = restart_session_projection_after_drift(&state.kind, state_effect);
+                return match restart {
+                    Ok((operation, transition)) => {
+                        active.operation = operation;
+                        transition
+                    },
+                    Err(failure) => ActiveTransition::Fail(failure),
+                };
+            }
+            if navigation.target() != &pending.target {
+                let restart = restart_session_projection_after_drift(&state.kind, state_effect);
+                return match restart {
+                    Ok((operation, transition)) => {
+                        active.operation = operation;
+                        transition
+                    },
+                    Err(failure) => ActiveTransition::Fail(failure),
+                };
+            }
+            if let Some(resume) = session_projection_settle_resume_mut(&mut state.kind) {
+                resume.authorizing_navigation = Some(navigation.clone());
+            }
+            state.pending = pending;
+            state.phase = SessionProjectionPhase::AwaitingStableNavigation { navigation };
+            ActiveTransition::SubmitSessionNavigationObservation {
+                allow_servo_pump: false,
+            }
+        },
     }
+}
+
+fn controlled_network_blocks_virtual_advance(
+    profile: Option<SessionProfile>,
+    active_operations: usize,
+) -> bool {
+    profile == Some(SessionProfile::ControlledWebSessionV1) && active_operations != 0
+}
+
+fn public_automation_is_mutating(kind: wire::PublicAutomationKind) -> bool {
+    matches!(
+        kind,
+        wire::PublicAutomationKind::Activate
+            | wire::PublicAutomationKind::Fill
+            | wire::PublicAutomationKind::Focus
+            | wire::PublicAutomationKind::Check
+            | wire::PublicAutomationKind::Uncheck
+            | wire::PublicAutomationKind::Select
+            | wire::PublicAutomationKind::Submit
+    )
+}
+
+fn default_resolved_settle_policy() -> wire::ResolvedSettlePolicy {
+    wire::RuntimeSettleParams::default()
+        .resolve(settle::SettlePolicy::default())
+        .expect("the product default settlement policy is valid")
+}
+
+fn active_expects_navigation_response(operation: &ActiveOperation) -> bool {
+    match operation {
+        ActiveOperation::AdvanceToNext(AdvanceToNextState::Observing {
+            expected_state_token: Some(_),
+            navigation: None,
+        }) => true,
+        ActiveOperation::Settle(SettleState {
+            authorizing_state_token: Some(_),
+            authorizing_navigation: None,
+            ..
+        }) => true,
+        ActiveOperation::Settle(SettleState {
+            replacement:
+                Some(
+                    SettleReplacementPhase::AwaitingAdmission { .. }
+                    | SettleReplacementPhase::AwaitingActivation { .. },
+                ),
+            ..
+        }) => true,
+        ActiveOperation::Settle(SettleState {
+            authority_bound_command: Some(_),
+            ..
+        }) => true,
+        ActiveOperation::Automation(AutomationState {
+            profile: SessionProfile::ControlledWebSessionV1,
+            unresolved: Some(_),
+            authorizing_navigation: None,
+            ..
+        }) => true,
+        ActiveOperation::Automation(AutomationState {
+            profile: SessionProfile::ControlledWebSessionV1,
+            completed: Some(_),
+            ..
+        }) => true,
+        ActiveOperation::Navigate(NavigateState {
+            phase: NavigatePhase::AwaitingAuthority { .. } | NavigatePhase::AwaitingAdmission { .. },
+            ..
+        }) => true,
+        ActiveOperation::SessionProjection(SessionProjectionState {
+            phase:
+                SessionProjectionPhase::AwaitingInitialNavigation
+                | SessionProjectionPhase::AwaitingReplacementAdmission { .. }
+                | SessionProjectionPhase::AwaitingStableNavigation { .. },
+            ..
+        }) => true,
+        _ => false,
+    }
+}
+
+fn transition_from_navigation_completion(
+    active: &mut ActiveRequest,
+    completion: NavigationOperationCompletion,
+    projection: &mut wire::WireProjectionContext,
+) -> ActiveTransition {
+    let kind = completion.kind();
+    if !completion.response_received() {
+        return ActiveTransition::Fail(ActiveFailure {
+            error: if kind == NavigationOperationKind::Navigate {
+                fatal_operation(
+                    "outcome_indeterminate",
+                    "a written navigation lost its admission response",
+                    "indeterminate",
+                )
+            } else {
+                fatal_operation(
+                    "navigation_transport_failure",
+                    "the engine lost a passive session-navigation observation",
+                    active.state_effect.as_protocol_str(),
+                )
+            },
+            fail_stop: true,
+        });
+    }
+    let navigation = match completion.into_outcome() {
+        Ok(navigation) => navigation,
+        Err(error) => return session_navigation_failure(error, kind, active.state_effect),
+    };
+    if let Some(terminal) = navigation.terminal() {
+        return session_navigation_terminal_failure(terminal, active.state_effect);
+    }
+
+    match &mut active.operation {
+        ActiveOperation::AdvanceToNext(AdvanceToNextState::Observing {
+            expected_state_token: Some(_),
+            navigation: slot @ None,
+        }) if kind == NavigationOperationKind::Observe => {
+            *slot = Some(navigation);
+            ActiveTransition::Submit(DocumentControlCommand::Observe)
+        },
+        ActiveOperation::Settle(state)
+            if kind == NavigationOperationKind::Observe
+                && state.authority_bound_command.is_some() =>
+        {
+            let Some(expected_target) = state.latest_pending_target.as_ref() else {
+                return ActiveTransition::Fail(ActiveFailure {
+                    error: fatal_operation(
+                        "internal_runtime_failure",
+                        "a held settlement Drive lost its pending target",
+                        active.state_effect.as_protocol_str(),
+                    ),
+                    fail_stop: true,
+                });
+            };
+            let initial_open_bind = state.authorizing_navigation.is_none()
+                && matches!(state.response, SettleResponse::ControlledOpen { .. });
+            if initial_open_bind {
+                if navigation.terminal().is_some()
+                    || !matches!(navigation.url().scheme(), "http" | "https")
+                    || navigation.target().webview_id != expected_target.webview_id
+                    || navigation.target().event_loop_id != expected_target.event_loop_id
+                {
+                    return navigation_activation_failure(active.state_effect, true);
+                }
+                // Initial bootstrap only proves the root lifecycle event. Navigation-response
+                // headers can advance its pending membership before the first owner observation;
+                // bind the coordinator's initial Observe to that fresh owner target.
+                state.latest_pending_target = Some(Box::new(navigation.target().clone()));
+            } else if navigation.target() != expected_target.as_ref() {
+                let queued_replacement_admission = state
+                    .authorizing_navigation
+                    .as_ref()
+                    .filter(|source| {
+                        state.replacement.is_none() && source.target() == expected_target.as_ref()
+                    })
+                    .and_then(|source| {
+                        exact_replacement_admission(source, &navigation)
+                            .map(|admission| (source.clone(), admission))
+                    });
+                if let Some((source, admission)) = queued_replacement_admission {
+                    if state.authority_bound_command.as_ref()
+                        != Some(&DocumentControlCommand::DriveOneTurn)
+                    {
+                        return ActiveTransition::Fail(ActiveFailure {
+                            error: fatal_operation(
+                                "internal_runtime_failure",
+                                "replacement admission did not interrupt one unsubmitted settlement Drive",
+                                active.state_effect.as_protocol_str(),
+                            ),
+                            fail_stop: true,
+                        });
+                    }
+                    let bootstrap = DocumentControlCommand::BootstrapReplacementPipeline {
+                        source_pipeline_id: admission.source_pipeline_id,
+                        pipeline_id: admission.pipeline_id,
+                    };
+                    let progress = state
+                        .coordinator
+                        .replace_unsubmitted_drive_with_replacement_bootstrap(
+                            source.target(),
+                            bootstrap.clone(),
+                        );
+                    return match progress {
+                        Ok(settle::SettleProgress::Command(command)) if command == bootstrap => {
+                            // The coordinator selected the source Drive, but the shell had not
+                            // submitted it. Replace that in-flight intent atomically with the
+                            // independently owner-attested lifecycle bootstrap; never run or
+                            // replay the stale source turn.
+                            state.authority_bound_command = None;
+                            state.replacement = Some(SettleReplacementPhase::Bootstrapping {
+                                source,
+                                admitted: navigation,
+                                command: command.clone(),
+                            });
+                            active.state_effect = RequestStateEffect::Partial;
+                            ActiveTransition::Submit(command)
+                        },
+                        Ok(_) => ActiveTransition::Fail(ActiveFailure {
+                            error: fatal_operation(
+                                "internal_runtime_failure",
+                                "replacement rearm did not issue its exact bootstrap command",
+                                active.state_effect.as_protocol_str(),
+                            ),
+                            fail_stop: true,
+                        }),
+                        Err(error) => ActiveTransition::Fail(settle_failure_for_response(
+                            error,
+                            active.state_effect,
+                            Some(&DocumentControlCommand::DriveOneTurn),
+                            &state.response,
+                        )),
+                    };
+                }
+                let exact_replacement_progress = match state.replacement.as_ref() {
+                    Some(SettleReplacementPhase::Activating { source, admitted }) => {
+                        held_drive_replacement_target_progressed(
+                            source,
+                            admitted,
+                            expected_target,
+                            &navigation,
+                        )
+                    },
+                    _ => false,
+                };
+                if !exact_replacement_progress {
+                    return navigation_activation_failure(active.state_effect, true);
+                }
+                // The held Drive was bound to a pending snapshot immediately before the same
+                // admitted replacement advanced. Refresh document authority and bracket it once
+                // more; the coordinator command remains retained and is never replayed.
+                state.latest_pending_target = Some(Box::new(navigation.target().clone()));
+                return ActiveTransition::Submit(DocumentControlCommand::Observe);
+            }
+            let mut replacement_became_ready = false;
+            if let Some(SettleReplacementPhase::Activating { source, admitted }) =
+                state.replacement.as_ref()
+            {
+                match classify_replacement_activation_observation(source, admitted, &navigation) {
+                    ReplacementActivationObservation::ControlledReady => {
+                        state.replacement = None;
+                        replacement_became_ready = true;
+                    },
+                    ReplacementActivationObservation::Pending
+                    | ReplacementActivationObservation::ActivatedAwaitingSourceExit => {},
+                    ReplacementActivationObservation::Invalid => {
+                        return navigation_activation_failure(active.state_effect, true);
+                    },
+                }
+            }
+            if !replacement_became_ready
+                && state.replacement.is_none()
+                && state.authorizing_navigation.as_ref().is_some_and(|source| {
+                    session_navigation_reached_controlled_ready(source)
+                        && classify_same_document_session_transition(source, &navigation).is_none()
+                })
+            {
+                return navigation_activation_failure(active.state_effect, true);
+            }
+            let Some(command) = state.authority_bound_command.take() else {
+                unreachable!("the pending Drive phase was matched above")
+            };
+            state.authorizing_navigation = Some(navigation);
+            ActiveTransition::Submit(command)
+        },
+        ActiveOperation::Settle(state)
+            if kind == NavigationOperationKind::Observe
+                && matches!(
+                    state.replacement.as_ref(),
+                    Some(SettleReplacementPhase::AwaitingAdmission { .. })
+                ) =>
+        {
+            let Some(SettleReplacementPhase::AwaitingAdmission {
+                source,
+                drive_outcome,
+            }) = state.replacement.take()
+            else {
+                unreachable!("the replacement admission phase was matched above")
+            };
+            let Some(admission) = exact_replacement_admission(&source, &navigation) else {
+                return navigation_activation_failure(active.state_effect, true);
+            };
+            let bootstrap = DocumentControlCommand::BootstrapReplacementPipeline {
+                source_pipeline_id: admission.source_pipeline_id,
+                pipeline_id: admission.pipeline_id,
+            };
+            let progress = state
+                .coordinator
+                .consume_drive_one_turn_replacement_boundary(
+                    drive_outcome,
+                    state.cumulative_external_io_wall_time,
+                    bootstrap.clone(),
+                );
+            match progress {
+                Ok(settle::SettleProgress::Command(command)) if command == bootstrap => {
+                    state.replacement = Some(SettleReplacementPhase::Bootstrapping {
+                        source,
+                        admitted: navigation,
+                        command: command.clone(),
+                    });
+                    ActiveTransition::Submit(command)
+                },
+                Ok(_) => ActiveTransition::Fail(ActiveFailure {
+                    error: fatal_operation(
+                        "internal_runtime_failure",
+                        "replacement boundary did not issue its exact bootstrap command",
+                        active.state_effect.as_protocol_str(),
+                    ),
+                    fail_stop: true,
+                }),
+                Err(error) => ActiveTransition::Fail(settle_failure_for_response(
+                    error,
+                    active.state_effect,
+                    None,
+                    &state.response,
+                )),
+            }
+        },
+        ActiveOperation::Settle(state)
+            if kind == NavigationOperationKind::Observe
+                && matches!(
+                    state.replacement.as_ref(),
+                    Some(SettleReplacementPhase::AwaitingActivation { .. })
+                ) =>
+        {
+            let Some(SettleReplacementPhase::AwaitingActivation {
+                source,
+                admitted,
+                command,
+                control_outcome,
+                controlled_network_active,
+            }) = state.replacement.take()
+            else {
+                unreachable!("the replacement activation phase was matched above")
+            };
+            let observation =
+                classify_replacement_activation_observation(&source, &admitted, &navigation);
+            match observation {
+                ReplacementActivationObservation::ControlledReady => {
+                    let document_target_matches = receive_outcome_pending_target(&control_outcome)
+                        .is_some_and(|target| target == navigation.target());
+                    if document_target_matches {
+                        state.latest_pending_target = Some(Box::new(navigation.target().clone()));
+                        state.authorizing_navigation = Some(navigation);
+                        state
+                            .coordinator
+                            .set_additional_foreground_external_io_active(
+                                controlled_network_active,
+                            );
+                        // `None` is the armed state: a later Drive boundary must bind to the newly
+                        // activated document authority and may cross another independently verified
+                        // replacement.
+                        state.replacement = None;
+                    } else {
+                        // Constellation is ready but the held document outcome still describes an
+                        // earlier admitted/retained membership. Keep the exact replacement phase
+                        // until the coordinator's next command and passive bracket agree on ready.
+                        state
+                            .coordinator
+                            .set_additional_foreground_external_io_active(true);
+                        state.replacement =
+                            Some(SettleReplacementPhase::Activating { source, admitted });
+                    }
+                },
+                ReplacementActivationObservation::Pending
+                | ReplacementActivationObservation::ActivatedAwaitingSourceExit => {
+                    // An incomplete replacement is settlement foreground work. Consume the exact
+                    // held outcome through the existing coordinator so all subsequent drives,
+                    // waits, wall-I/O expiry, and control-turn limits remain on one ledger.
+                    state
+                        .coordinator
+                        .set_additional_foreground_external_io_active(true);
+                    state.replacement =
+                        Some(SettleReplacementPhase::Activating { source, admitted });
+                },
+                ReplacementActivationObservation::Invalid => {
+                    return navigation_activation_failure(active.state_effect, true);
+                },
+            }
+            match state
+                .coordinator
+                .consume_receive_outcome(control_outcome, state.cumulative_external_io_wall_time)
+            {
+                Ok(progress) => transition_from_settle_progress_for_active(
+                    state,
+                    active.started_at,
+                    progress,
+                    active.state_effect,
+                    projection,
+                ),
+                Err(error) => ActiveTransition::Fail(settle_failure_for_response(
+                    error,
+                    active.state_effect,
+                    Some(&command),
+                    &state.response,
+                )),
+            }
+        },
+        ActiveOperation::Settle(SettleState {
+            authorizing_state_token: Some(_),
+            authorizing_navigation: slot @ None,
+            ..
+        }) if kind == NavigationOperationKind::Observe => {
+            *slot = Some(navigation);
+            ActiveTransition::Submit(DocumentControlCommand::Observe)
+        },
+        ActiveOperation::Automation(AutomationState {
+            profile: SessionProfile::ControlledWebSessionV1,
+            unresolved: Some(_),
+            authorizing_navigation: slot @ None,
+            ..
+        }) if kind == NavigationOperationKind::Observe => {
+            *slot = Some(navigation);
+            ActiveTransition::Submit(DocumentControlCommand::Observe)
+        },
+        ActiveOperation::Automation(state)
+            if state.profile == SessionProfile::ControlledWebSessionV1
+                && state.completed.is_some()
+                && kind == NavigationOperationKind::Observe =>
+        {
+            let Some(source) = state.authorizing_navigation.clone() else {
+                return missing_navigation_authority("completed session automation");
+            };
+            let Some(completed) = state.completed.take() else {
+                unreachable!("the completed automation phase was matched above")
+            };
+            let action_kind = state.kind;
+            if completed.pending.target != *source.target() {
+                return navigation_activation_failure(active.state_effect, true);
+            }
+            let synchronous_navigation_emitted = completed.synchronous_navigation_emitted;
+            let response = SettleResponse::Automation {
+                kind: action_kind,
+                result: completed.result,
+            };
+            if synchronous_navigation_emitted
+                && let Some(admission) = exact_replacement_admission(&source, &navigation)
+            {
+                let bootstrap = DocumentControlCommand::BootstrapReplacementPipeline {
+                    source_pipeline_id: admission.source_pipeline_id,
+                    pipeline_id: admission.pipeline_id,
+                };
+                let effective_policy = default_resolved_settle_policy();
+                let mut coordinator = settle::SettleCoordinator::new(effective_policy.engine);
+                let progress = coordinator.start_with_replacement_bootstrap(bootstrap.clone());
+                let command = match progress {
+                    Ok(settle::SettleProgress::Command(command)) if command == bootstrap => command,
+                    Ok(_) => {
+                        return ActiveTransition::Fail(ActiveFailure {
+                            error: fatal_operation(
+                                "internal_runtime_failure",
+                                "automation replacement did not issue its exact bootstrap command",
+                                active.state_effect.as_protocol_str(),
+                            ),
+                            fail_stop: true,
+                        });
+                    },
+                    Err(error) => {
+                        return ActiveTransition::Fail(harden_continuation_failure(
+                            settle_failure(error, active.state_effect, None),
+                            active.state_effect,
+                        ));
+                    },
+                };
+                active.operation = ActiveOperation::Settle(SettleState {
+                    profile: SessionProfile::ControlledWebSessionV1,
+                    authorizing_state_token: None,
+                    authorizing_navigation: Some(source.clone()),
+                    replacement: Some(SettleReplacementPhase::Bootstrapping {
+                        source,
+                        admitted: navigation,
+                        command: command.clone(),
+                    }),
+                    authority_bound_command: None,
+                    latest_pending_target: Some(Box::new(completed.pending.target.clone())),
+                    response,
+                    coordinator,
+                    effective_policy,
+                    cumulative_external_io_wall_time: Duration::ZERO,
+                    waiting: None,
+                });
+                ActiveTransition::Submit(command)
+            } else if classify_same_document_session_transition(&source, &navigation).is_some_and(
+                |transition| {
+                    synchronous_navigation_emitted
+                        || transition == SameDocumentSessionTransition::Unchanged
+                },
+            ) {
+                active.operation = ActiveOperation::SessionProjection(SessionProjectionState {
+                    // This pending snapshot proves the action completed on `source`, but is not
+                    // projected. The following document Observe supplies the fresh generation
+                    // bracketed by N1 and N2.
+                    pending: completed.pending,
+                    kind: SessionProjectionKind::Automation {
+                        settle_resume: SettleProjectionResume {
+                            profile: SessionProfile::ControlledWebSessionV1,
+                            effective_policy: default_resolved_settle_policy(),
+                            cumulative_external_io_wall_time: Duration::ZERO,
+                            authorizing_navigation: Some(navigation.clone()),
+                            response,
+                        },
+                        replacement_rearm: synchronous_navigation_emitted,
+                    },
+                    phase: SessionProjectionPhase::AwaitingPendingObservation { navigation },
+                });
+                ActiveTransition::Submit(DocumentControlCommand::Observe)
+            } else {
+                navigation_activation_failure(active.state_effect, true)
+            }
+        },
+        ActiveOperation::Navigate(state) => match &mut state.phase {
+            NavigatePhase::AwaitingAuthority {
+                expected_state_token,
+            } if kind == NavigationOperationKind::Observe => {
+                state.phase = NavigatePhase::Authorizing {
+                    expected_state_token: expected_state_token.clone(),
+                    navigation,
+                };
+                ActiveTransition::Submit(DocumentControlCommand::Observe)
+            },
+            NavigatePhase::AwaitingAdmission { source }
+                if kind == NavigationOperationKind::Navigate =>
+            {
+                active.state_effect = RequestStateEffect::Partial;
+                let Some(admission) = exact_replacement_admission(source, &navigation) else {
+                    return navigation_activation_failure(active.state_effect, true);
+                };
+                let requested_url = state.requested_url.clone();
+                let source = source.clone();
+                let admitted = navigation;
+                let bootstrap = DocumentControlCommand::BootstrapReplacementPipeline {
+                    source_pipeline_id: admission.source_pipeline_id,
+                    pipeline_id: admission.pipeline_id,
+                };
+                let effective_policy = default_resolved_settle_policy();
+                let mut coordinator = settle::SettleCoordinator::new(effective_policy.engine);
+                let command = match coordinator.start_with_replacement_bootstrap(bootstrap.clone())
+                {
+                    Ok(settle::SettleProgress::Command(command)) if command == bootstrap => command,
+                    Ok(_) => {
+                        return ActiveTransition::Fail(ActiveFailure {
+                            error: fatal_operation(
+                                "internal_runtime_failure",
+                                "explicit navigation did not issue its exact bootstrap command",
+                                active.state_effect.as_protocol_str(),
+                            ),
+                            fail_stop: true,
+                        });
+                    },
+                    Err(error) => {
+                        return ActiveTransition::Fail(harden_continuation_failure(
+                            settle_failure(error, active.state_effect, None),
+                            active.state_effect,
+                        ));
+                    },
+                };
+                active.operation = ActiveOperation::Settle(SettleState {
+                    profile: SessionProfile::ControlledWebSessionV1,
+                    authorizing_state_token: None,
+                    authorizing_navigation: Some(source.clone()),
+                    replacement: Some(SettleReplacementPhase::Bootstrapping {
+                        source: source.clone(),
+                        admitted: admitted.clone(),
+                        command: command.clone(),
+                    }),
+                    authority_bound_command: None,
+                    latest_pending_target: Some(Box::new(admitted.target().clone())),
+                    response: SettleResponse::Navigate {
+                        requested_url,
+                        source,
+                        admitted,
+                    },
+                    coordinator,
+                    effective_policy,
+                    cumulative_external_io_wall_time: Duration::ZERO,
+                    waiting: None,
+                });
+                ActiveTransition::Submit(command)
+            },
+            _ => unexpected_navigation_completion(active.state_effect),
+        },
+        ActiveOperation::SessionProjection(state) if kind == NavigationOperationKind::Observe => {
+            let resume = session_projection_settle_resume(&state.kind).cloned();
+            let replacement_source = match &state.phase {
+                SessionProjectionPhase::AwaitingInitialNavigation => resume
+                    .as_ref()
+                    .and_then(|resume| resume.authorizing_navigation.clone()),
+                SessionProjectionPhase::AwaitingStableNavigation { navigation } => {
+                    Some(navigation.clone())
+                },
+                SessionProjectionPhase::AwaitingPendingObservation { .. }
+                | SessionProjectionPhase::AwaitingReplacementAdmission { .. } => None,
+            };
+            if let SessionProjectionPhase::AwaitingReplacementAdmission {
+                source,
+                source_pipeline_id,
+                pipeline_id,
+            } = &state.phase
+            {
+                let Some(admission) = exact_replacement_admission(source, &navigation) else {
+                    return navigation_activation_failure(active.state_effect, true);
+                };
+                if admission.source_pipeline_id != *source_pipeline_id
+                    || admission.pipeline_id != *pipeline_id
+                {
+                    return navigation_activation_failure(active.state_effect, true);
+                }
+                let Some(resume) = resume.as_ref() else {
+                    return projection_shape_failure(
+                        "replacement admission lost its projection continuation",
+                        active.state_effect,
+                    );
+                };
+                let restart = resume_session_projection_at_replacement(
+                    resume,
+                    source.clone(),
+                    navigation,
+                    Box::new(state.pending.target.clone()),
+                    active.state_effect,
+                );
+                return match restart {
+                    Ok((operation, transition)) => {
+                        active.operation = operation;
+                        transition
+                    },
+                    Err(failure) => ActiveTransition::Fail(failure),
+                };
+            }
+            if let (Some(resume), Some(source)) = (resume.as_ref(), replacement_source)
+                && session_projection_allows_replacement_rearm(&state.kind)
+                && exact_replacement_admission(&source, &navigation).is_some()
+            {
+                let restart = resume_session_projection_at_replacement(
+                    resume,
+                    source,
+                    navigation,
+                    Box::new(state.pending.target.clone()),
+                    active.state_effect,
+                );
+                return match restart {
+                    Ok((operation, transition)) => {
+                        active.operation = operation;
+                        transition
+                    },
+                    Err(failure) => ActiveTransition::Fail(failure),
+                };
+            }
+            match &state.phase {
+                SessionProjectionPhase::AwaitingInitialNavigation => {
+                    state.phase = SessionProjectionPhase::AwaitingPendingObservation { navigation };
+                    return ActiveTransition::Submit(DocumentControlCommand::Observe);
+                },
+                SessionProjectionPhase::AwaitingPendingObservation { .. } => {
+                    return unexpected_navigation_completion(active.state_effect);
+                },
+                SessionProjectionPhase::AwaitingReplacementAdmission { .. } => {
+                    unreachable!("replacement admission was handled before projection bracketing")
+                },
+                SessionProjectionPhase::AwaitingStableNavigation { navigation: before }
+                    if before != &navigation =>
+                {
+                    if session_projection_allows_replacement_rearm(&state.kind)
+                        && classify_same_document_session_transition(before, &navigation).is_some()
+                    {
+                        if let Some(resume) = session_projection_settle_resume_mut(&mut state.kind)
+                        {
+                            resume.authorizing_navigation = Some(navigation.clone());
+                        }
+                        // A bounded group of same-document messages can land between N1 and N2.
+                        // Refresh the pending observation and bracket again without driving any
+                        // ordinary page work or converting an ordinary action into settlement.
+                        state.phase =
+                            SessionProjectionPhase::AwaitingPendingObservation { navigation };
+                        return ActiveTransition::Submit(DocumentControlCommand::Observe);
+                    }
+                    let restart =
+                        restart_session_projection_after_drift(&state.kind, active.state_effect);
+                    return match restart {
+                        Ok((operation, transition)) => {
+                            active.operation = operation;
+                            transition
+                        },
+                        Err(failure) => ActiveTransition::Fail(failure),
+                    };
+                },
+                SessionProjectionPhase::AwaitingStableNavigation { .. } => {},
+            }
+            let token = match projection.document_state_token(&state.pending, &navigation) {
+                Ok(token) => token,
+                Err(error) => return mismatched_navigation_authority(error, active.state_effect),
+            };
+            match &mut state.kind {
+                SessionProjectionKind::Automation { settle_resume, .. } => {
+                    let SettleResponse::Automation { kind, result } = &settle_resume.response
+                    else {
+                        return projection_shape_failure(
+                            "an automation projection lost its original action-shaped result",
+                            active.state_effect,
+                        );
+                    };
+                    let public = match wire::PublicAutomationResult::project(
+                        *kind,
+                        result.clone(),
+                        state.pending.as_ref(),
+                    ) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            return ActiveTransition::Fail(ActiveFailure {
+                                error: fatal_operation(
+                                    "internal_runtime_failure",
+                                    format!("failed to project automation result: {error:?}"),
+                                    active.state_effect.as_protocol_str(),
+                                ),
+                                fail_stop: true,
+                            });
+                        },
+                    };
+                    let mut value = match serde_json::to_value(public) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return ActiveTransition::Fail(ActiveFailure {
+                                error: fatal_operation(
+                                    "internal_runtime_failure",
+                                    format!("failed to serialize automation result: {error}"),
+                                    active.state_effect.as_protocol_str(),
+                                ),
+                                fail_stop: true,
+                            });
+                        },
+                    };
+                    let Some(object) = value.as_object_mut() else {
+                        return projection_shape_failure(
+                            "automation result is not an object",
+                            active.state_effect,
+                        );
+                    };
+                    object.insert(
+                        "stateToken".into(),
+                        serde_json::to_value(&token).expect("opaque token serializes"),
+                    );
+                    ActiveTransition::Complete(value)
+                },
+                SessionProjectionKind::Value {
+                    value,
+                    snapshot_token,
+                    ..
+                } => {
+                    let Some(object) = value.as_object_mut() else {
+                        return projection_shape_failure(
+                            "session result is not an object",
+                            active.state_effect,
+                        );
+                    };
+                    object.insert(
+                        "stateToken".into(),
+                        serde_json::to_value(&token).expect("opaque token serializes"),
+                    );
+                    if *snapshot_token {
+                        let Some(snapshot) =
+                            object.get_mut("snapshot").and_then(Value::as_object_mut)
+                        else {
+                            return projection_shape_failure(
+                                "session result snapshot is not an object",
+                                active.state_effect,
+                            );
+                        };
+                        snapshot.insert(
+                            "stateToken".into(),
+                            serde_json::to_value(&token).expect("opaque token serializes"),
+                        );
+                    }
+                    ActiveTransition::Complete(std::mem::take(value))
+                },
+                SessionProjectionKind::Navigate {
+                    requested_url,
+                    source,
+                    admitted,
+                    cumulative_external_io_wall_time: _,
+                    settle_resume,
+                } => {
+                    let controlled_ready = if settle_resume.is_some() {
+                        explicit_navigation_chain_reached_controlled_ready(source, &navigation)
+                    } else {
+                        explicit_navigation_reached_controlled_ready(source, admitted, &navigation)
+                    };
+                    if !controlled_ready {
+                        return navigation_activation_failure(active.state_effect, true);
+                    }
+                    match wire::SessionNavigateResult::project(
+                        requested_url.to_string(),
+                        &state.pending,
+                        &navigation,
+                        projection,
+                    ) {
+                        Ok(result) => serialize_result(result, active.state_effect),
+                        Err(error) => mismatched_navigation_authority(error, active.state_effect),
+                    }
+                },
+                SessionProjectionKind::ControlledOpen {
+                    requested_url,
+                    current_url,
+                    profile: _,
+                    deadline: _,
+                    bootstrap_attempted: _,
+                    cumulative_external_io_wall_time: _,
+                    session_state_token,
+                    settle_resume,
+                } => {
+                    let _ = current_url;
+                    let controlled_ready = if settle_resume.is_some() {
+                        session_navigation_reached_controlled_ready(&navigation)
+                    } else {
+                        initial_navigation_reached_controlled_ready(&navigation)
+                    };
+                    if !controlled_ready {
+                        return navigation_activation_failure(active.state_effect, true);
+                    }
+                    let Some(session_state_token) = session_state_token.take() else {
+                        return projection_shape_failure(
+                            "controlled open did not refresh session-state authority",
+                            active.state_effect,
+                        );
+                    };
+                    ActiveTransition::Complete(json!({
+                        "sessionId": SESSION_ID,
+                        "requestedUrl": requested_url,
+                        "url": navigation.url().to_string(),
+                        "boundary": "controlled_ready",
+                        "clockMode": "controlled",
+                        "profile": CONTROLLED_WEB_SESSION_V1_PROFILE,
+                        "stateToken": token,
+                        "sessionStateToken": session_state_token,
+                    }))
+                },
+            }
+        },
+        _ => unexpected_navigation_completion(active.state_effect),
+    }
+}
+
+fn terminal_navigation_evidence(
+    terminal: SessionNavigationTerminal,
+    fallback: SessionNavigationId,
+) -> (SessionNavigationId, NetworkFailureReason) {
+    match terminal {
+        SessionNavigationTerminal::DocumentTransitionLimitExceeded {
+            next_navigation_id, ..
+        } => (
+            next_navigation_id,
+            NetworkFailureReason::DocumentTransitionLimitExceeded,
+        ),
+        SessionNavigationTerminal::HistoryLimitExceeded { navigation_id, .. } => {
+            (navigation_id, NetworkFailureReason::HistoryLimitExceeded)
+        },
+        SessionNavigationTerminal::RedirectLimitExceeded { navigation_id, .. } => {
+            (navigation_id, NetworkFailureReason::RedirectLimitExceeded)
+        },
+        SessionNavigationTerminal::CounterOverflow { .. } => {
+            (fallback, NetworkFailureReason::NavigationError)
+        },
+    }
+}
+
+fn session_navigation_failure(
+    error: SessionNavigationError,
+    kind: NavigationOperationKind,
+    state_effect: RequestStateEffect,
+) -> ActiveTransition {
+    match error {
+        SessionNavigationError::TargetChanged { .. }
+            if state_effect == RequestStateEffect::Partial =>
+        {
+            navigation_activation_failure(state_effect, true)
+        },
+        SessionNavigationError::TargetChanged { .. } => stale_state_token(),
+        SessionNavigationError::NavigationInProgress => continuation_navigation_rejection(
+            "navigation_in_progress",
+            "another top-level navigation is already pending",
+            state_effect,
+        ),
+        SessionNavigationError::SourceInactive => continuation_navigation_rejection(
+            "navigation_source_inactive",
+            "the current top-level source is no longer active",
+            state_effect,
+        ),
+        SessionNavigationError::NavigationStartFailed { observed } => {
+            ActiveTransition::Fail(ActiveFailure {
+                error: with_error_details(
+                    fatal_operation(
+                        "navigation_start_failed",
+                        "navigation identity was reserved but the fetch pipeline did not start",
+                        "partial",
+                    ),
+                    json!({
+                        "navigationId": observed.navigation_id().get().to_string(),
+                    }),
+                ),
+                fail_stop: true,
+            })
+        },
+        SessionNavigationError::UnsupportedScheme { scheme } => {
+            let fail_stop = state_effect == RequestStateEffect::Partial;
+            let mut error = ProtocolError::operation(
+                "unsupported_navigation_scheme",
+                "session navigation supports only HTTP(S) URLs",
+                state_effect.as_protocol_str(),
+            );
+            let _ = scheme;
+            error.fatal = fail_stop;
+            ActiveTransition::Fail(ActiveFailure { error, fail_stop })
+        },
+        SessionNavigationError::Terminal(terminal) => {
+            session_navigation_terminal_failure(terminal, state_effect)
+        },
+        SessionNavigationError::ChannelClosed => ActiveTransition::Fail(ActiveFailure {
+            error: fatal_operation(
+                "navigation_transport_failure",
+                "the engine session-navigation channel closed",
+                if kind == NavigationOperationKind::Navigate {
+                    "indeterminate"
+                } else {
+                    state_effect.as_protocol_str()
+                },
+            ),
+            fail_stop: true,
+        }),
+        SessionNavigationError::NotTopLevelSession
+        | SessionNavigationError::TargetUnavailable(_) => ActiveTransition::Fail(ActiveFailure {
+            error: fatal_operation(
+                "session_navigation_authority_unavailable",
+                format!("engine could not capture controlled-session authority: {error:?}"),
+                state_effect.as_protocol_str(),
+            ),
+            fail_stop: true,
+        }),
+    }
+}
+
+fn continuation_navigation_rejection(
+    code: &'static str,
+    message: &'static str,
+    state_effect: RequestStateEffect,
+) -> ActiveTransition {
+    let fail_stop = state_effect == RequestStateEffect::Partial;
+    let mut error = ProtocolError::operation(code, message, state_effect.as_protocol_str());
+    error.fatal = fail_stop;
+    ActiveTransition::Fail(ActiveFailure { error, fail_stop })
+}
+
+fn session_navigation_terminal_failure(
+    terminal: SessionNavigationTerminal,
+    state_effect: RequestStateEffect,
+) -> ActiveTransition {
+    let completed_other_work = state_effect == RequestStateEffect::Partial;
+    let (error, fail_stop) = match terminal {
+        SessionNavigationTerminal::DocumentTransitionLimitExceeded {
+            limit,
+            observed,
+            next_navigation_id,
+        } => (
+            with_error_details(
+                ProtocolError::operation(
+                    "document_transition_limit_exceeded",
+                    "document transition limit was exceeded",
+                    state_effect.as_protocol_str(),
+                ),
+                json!({
+                    "limit": limit.to_string(),
+                    "observed": observed.to_string(),
+                    "nextNavigationId": next_navigation_id.get().to_string(),
+                }),
+            ),
+            completed_other_work,
+        ),
+        SessionNavigationTerminal::HistoryLimitExceeded {
+            limit,
+            observed,
+            navigation_id,
+            history_revision,
+        } => (
+            with_error_details(
+                ProtocolError::operation(
+                    "history_limit_exceeded",
+                    "same-document history limit was exceeded",
+                    state_effect.as_protocol_str(),
+                ),
+                json!({
+                    "limit": limit.to_string(),
+                    "observed": observed.to_string(),
+                    "navigationId": navigation_id.get().to_string(),
+                    "historyRevision": history_revision.get().to_string(),
+                }),
+            ),
+            completed_other_work,
+        ),
+        SessionNavigationTerminal::RedirectLimitExceeded {
+            limit,
+            observed,
+            navigation_id,
+        } => (
+            with_error_details(
+                fatal_operation(
+                    "redirect_limit_exceeded",
+                    "redirect limit was exceeded after network work began",
+                    "partial",
+                ),
+                json!({
+                    "limit": limit.to_string(),
+                    "observed": observed.to_string(),
+                    "navigationId": navigation_id.get().to_string(),
+                }),
+            ),
+            true,
+        ),
+        SessionNavigationTerminal::CounterOverflow { counter } => (
+            fatal_operation(
+                "runtime_error",
+                format!(
+                    "controlled-session {} counter overflowed",
+                    match counter {
+                        SessionNavigationCounter::DocumentEpoch => "document epoch",
+                        SessionNavigationCounter::NavigationId => "navigation id",
+                        SessionNavigationCounter::HistoryRevision => "history revision",
+                        SessionNavigationCounter::SuccessfulDocumentReplacements => {
+                            "successful document replacement"
+                        },
+                    }
+                ),
+                state_effect.as_protocol_str(),
+            ),
+            true,
+        ),
+    };
+    let mut error = error;
+    error.fatal |= fail_stop;
+    ActiveTransition::Fail(ActiveFailure { error, fail_stop })
+}
+
+fn unexpected_navigation_completion(state_effect: RequestStateEffect) -> ActiveTransition {
+    ActiveTransition::Fail(ActiveFailure {
+        error: fatal_operation(
+            "internal_runtime_failure",
+            "session-navigation completion did not match the active request phase",
+            state_effect.as_protocol_str(),
+        ),
+        fail_stop: true,
+    })
+}
+
+fn projection_shape_failure(
+    message: &'static str,
+    state_effect: RequestStateEffect,
+) -> ActiveTransition {
+    ActiveTransition::Fail(ActiveFailure {
+        error: fatal_operation(
+            "internal_runtime_failure",
+            message,
+            state_effect.as_protocol_str(),
+        ),
+        fail_stop: true,
+    })
+}
+
+fn stale_state_token() -> ActiveTransition {
+    ActiveTransition::Fail(ActiveFailure {
+        error: ProtocolError::operation(
+            "stale_state_token",
+            "expectedStateToken does not authorize the current document state",
+            "none",
+        ),
+        fail_stop: false,
+    })
+}
+
+fn missing_navigation_authority(operation: &'static str) -> ActiveTransition {
+    ActiveTransition::Fail(ActiveFailure {
+        error: fatal_operation(
+            "internal_runtime_failure",
+            format!("{operation} did not retain checked session-navigation authority"),
+            "none",
+        ),
+        fail_stop: true,
+    })
+}
+
+fn mismatched_navigation_authority(
+    error: wire::DocumentStateAuthorityError,
+    state_effect: RequestStateEffect,
+) -> ActiveTransition {
+    match error {
+        wire::DocumentStateAuthorityError::NavigationTargetDoesNotMatchPending => {
+            ActiveTransition::Fail(ActiveFailure {
+                error: if state_effect == RequestStateEffect::Partial {
+                    fatal_operation(
+                        "document_authority_changed",
+                        "document authority changed after request work was admitted",
+                        "partial",
+                    )
+                } else {
+                    ProtocolError::operation(
+                        "document_authority_changed",
+                        "document authority changed while projecting the result",
+                        "none",
+                    )
+                },
+                fail_stop: state_effect == RequestStateEffect::Partial,
+            })
+        },
+        wire::DocumentStateAuthorityError::TokenSpaceExhausted => {
+            document_authority_token_space_exhausted(state_effect)
+        },
+        wire::DocumentStateAuthorityError::TokenEntropyUnavailable => {
+            document_authority_token_entropy_unavailable(state_effect)
+        },
+    }
+}
+
+fn document_authority_authorization_failure(
+    error: wire::DocumentStateAuthorityError,
+) -> ActiveTransition {
+    match error {
+        wire::DocumentStateAuthorityError::NavigationTargetDoesNotMatchPending => {
+            stale_state_token()
+        },
+        wire::DocumentStateAuthorityError::TokenSpaceExhausted => {
+            document_authority_token_space_exhausted(RequestStateEffect::None)
+        },
+        wire::DocumentStateAuthorityError::TokenEntropyUnavailable => {
+            document_authority_token_entropy_unavailable(RequestStateEffect::None)
+        },
+    }
+}
+
+fn document_authority_token_entropy_unavailable(
+    state_effect: RequestStateEffect,
+) -> ActiveTransition {
+    ActiveTransition::Fail(ActiveFailure {
+        error: fatal_operation(
+            "runtime_error",
+            "document-state token entropy is unavailable",
+            state_effect.as_protocol_str(),
+        ),
+        fail_stop: true,
+    })
+}
+
+fn document_authority_token_space_exhausted(state_effect: RequestStateEffect) -> ActiveTransition {
+    ActiveTransition::Fail(ActiveFailure {
+        error: fatal_operation(
+            "runtime_error",
+            "document-state token allocator exhausted",
+            state_effect.as_protocol_str(),
+        ),
+        fail_stop: true,
+    })
 }
 
 fn completed_observation(
@@ -1643,9 +4846,9 @@ fn completed_observation(
                     ),
                     fail_stop: false,
                 }),
-                DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate { .. } |
-                DocumentControlOutcome::AdvanceOutcomeIndeterminate { .. } |
-                DocumentControlOutcome::AutomationOutcomeIndeterminate { .. } => {
+                DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate { .. }
+                | DocumentControlOutcome::AdvanceOutcomeIndeterminate { .. }
+                | DocumentControlOutcome::AutomationOutcomeIndeterminate { .. } => {
                     Err(ActiveFailure {
                         error: fatal_operation(
                             "outcome_indeterminate",
@@ -1696,6 +4899,7 @@ fn completed_automation(
     (
         DocumentAutomationResult,
         Box<servo::document_control::DocumentControlObservation>,
+        bool,
     ),
     ActiveFailure,
 > {
@@ -1735,7 +4939,8 @@ fn completed_automation(
                 DocumentControlOutcome::AutomationCompleted {
                     result,
                     observation,
-                } => Ok((result, observation)),
+                    synchronous_navigation_emitted,
+                } => Ok((result, observation, synchronous_navigation_emitted)),
                 DocumentControlOutcome::Rejected(error) => Err(ActiveFailure {
                     error: automation_rejection(error, state_effect),
                     fail_stop: false,
@@ -1750,16 +4955,18 @@ fn completed_automation(
                         fail_stop: true,
                     })
                 },
-                DocumentControlOutcome::Completed(_) |
-                DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate { .. } |
-                DocumentControlOutcome::AdvanceOutcomeIndeterminate { .. } => Err(ActiveFailure {
-                    error: fatal_operation(
-                        "internal_runtime_failure",
-                        "a non-automation outcome was delivered for an automation command",
-                        state_effect.as_protocol_str(),
-                    ),
-                    fail_stop: true,
-                }),
+                DocumentControlOutcome::Completed(_)
+                | DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate { .. }
+                | DocumentControlOutcome::AdvanceOutcomeIndeterminate { .. } => {
+                    Err(ActiveFailure {
+                        error: fatal_operation(
+                            "internal_runtime_failure",
+                            "a non-automation outcome was delivered for an automation command",
+                            state_effect.as_protocol_str(),
+                        ),
+                        fail_stop: true,
+                    })
+                },
             }
         },
         DocumentControlReceiveOutcome::AutomationTransportFailure(error) => Err(ActiveFailure {
@@ -1803,7 +5010,7 @@ fn automation_rejection(
     };
     ProtocolError::operation(
         code,
-        format!("document automation was rejected: {error:?}"),
+        "document automation request was rejected",
         state_effect.as_protocol_str(),
     )
 }
@@ -1833,6 +5040,17 @@ fn automation_error_code(error: &DocumentAutomationError) -> &'static str {
             "unsupported_activation_element"
         },
         DocumentAutomationError::DisabledActivationElement { .. } => "disabled_activation_element",
+        DocumentAutomationError::UnsupportedCheckElement { .. } => "unsupported_check_element",
+        DocumentAutomationError::ImmutableCheckElement { .. } => "immutable_check_element",
+        DocumentAutomationError::UnsupportedUncheckElement { .. } => "unsupported_uncheck_element",
+        DocumentAutomationError::ImmutableUncheckElement { .. } => "immutable_uncheck_element",
+        DocumentAutomationError::UnsupportedSelectElement { .. } => "unsupported_select_element",
+        DocumentAutomationError::ImmutableSelectElement { .. } => "immutable_select_element",
+        DocumentAutomationError::InvalidSelectMultiplicity { .. } => "invalid_select_multiplicity",
+        DocumentAutomationError::SelectValueNotFound { .. } => "select_value_not_found",
+        DocumentAutomationError::SelectValueDisabled { .. } => "select_value_disabled",
+        DocumentAutomationError::UnsupportedFocusElement { .. } => "unsupported_focus_element",
+        DocumentAutomationError::UnsupportedSubmitElement { .. } => "unsupported_submit_element",
         DocumentAutomationError::UnsupportedLazyAttributeSerialization { .. } => {
             "unsupported_dom_serialization"
         },
@@ -1856,25 +5074,896 @@ fn transition_from_settle_progress(progress: settle::SettleProgress) -> ActiveTr
     }
 }
 
+fn transition_from_controlled_open_settle_progress(
+    state: &ControlledOpenState,
+    progress: settle::SettleProgress,
+    state_effect: RequestStateEffect,
+) -> ActiveTransition {
+    match progress {
+        settle::SettleProgress::Command(command) => ActiveTransition::Submit(command),
+        settle::SettleProgress::Wait(wait) => ActiveTransition::Wait(wait),
+        settle::SettleProgress::Complete(completion) => {
+            match controlled_ready_pending(completion, state_effect, true) {
+                Ok(pending) => ActiveTransition::ProjectSession(SessionProjectionState {
+                    pending,
+                    kind: SessionProjectionKind::ControlledOpen {
+                        requested_url: state.requested_url.clone(),
+                        current_url: state.current_url.clone(),
+                        profile: state.profile,
+                        deadline: state.deadline,
+                        bootstrap_attempted: state.bootstrap_attempted,
+                        cumulative_external_io_wall_time: state
+                            .settlement
+                            .as_ref()
+                            .map_or(Duration::ZERO, |settlement| {
+                                settlement.cumulative_external_io_wall_time
+                            }),
+                        session_state_token: None,
+                        settle_resume: None,
+                    },
+                    phase: SessionProjectionPhase::AwaitingInitialNavigation,
+                }),
+                Err(failure) => ActiveTransition::Fail(failure),
+            }
+        },
+    }
+}
+
 fn transition_from_settle_progress_for_active(
-    state: &SettleState,
+    state: &mut SettleState,
     started_at: Instant,
     progress: settle::SettleProgress,
     state_effect: RequestStateEffect,
     projection: &mut wire::WireProjectionContext,
 ) -> ActiveTransition {
     match progress {
+        settle::SettleProgress::Complete(completion) if state.replacement.is_some() => {
+            match controlled_ready_pending(completion, state_effect, true) {
+                Err(failure) => ActiveTransition::Fail(failure),
+                Ok(_) => ActiveTransition::Fail(ActiveFailure {
+                    error: fatal_operation(
+                        "internal_runtime_failure",
+                        "settlement reached quiescence before replacement authority was controlled-ready",
+                        state_effect.as_protocol_str(),
+                    ),
+                    fail_stop: true,
+                }),
+            }
+        },
+        settle::SettleProgress::Command(command)
+            if state.profile == SessionProfile::ControlledWebSessionV1
+                && command == DocumentControlCommand::DriveOneTurn =>
+        {
+            if state.authority_bound_command.replace(command).is_some()
+                || state.latest_pending_target.is_none()
+            {
+                return ActiveTransition::Fail(ActiveFailure {
+                    error: fatal_operation(
+                        "internal_runtime_failure",
+                        "settlement could not bind one pending Drive to fresh document authority",
+                        state_effect.as_protocol_str(),
+                    ),
+                    fail_stop: true,
+                });
+            }
+            ActiveTransition::SubmitSessionNavigationObservation {
+                allow_servo_pump: false,
+            }
+        },
         settle::SettleProgress::Command(command) => ActiveTransition::Submit(command),
         settle::SettleProgress::Wait(wait) => ActiveTransition::Wait(wait),
-        settle::SettleProgress::Complete(completion) => serialize_result(
-            wire::RuntimeSettleResult::project(
-                completion,
-                Instant::now().saturating_duration_since(started_at),
-                state.effective_policy,
-                projection,
-            ),
-            state_effect,
+        settle::SettleProgress::Complete(completion) => match &state.response {
+            SettleResponse::Runtime => {
+                let pending = (state.profile == SessionProfile::ControlledWebSessionV1)
+                    .then(|| completion.pending().clone());
+                let result = wire::RuntimeSettleResult::project(
+                    completion,
+                    Instant::now().saturating_duration_since(started_at),
+                    state.effective_policy,
+                    projection,
+                );
+                match pending {
+                    Some(pending) => project_session_value_with_resume(
+                        result,
+                        &pending,
+                        true,
+                        state_effect,
+                        Some(SettleProjectionResume {
+                            profile: state.profile,
+                            effective_policy: state.effective_policy,
+                            cumulative_external_io_wall_time: state
+                                .cumulative_external_io_wall_time,
+                            authorizing_navigation: state.authorizing_navigation.clone(),
+                            response: state.response.clone(),
+                        }),
+                    ),
+                    None => serialize_result(result, state_effect),
+                }
+            },
+            SettleResponse::Pending => {
+                let pending = match controlled_ready_pending(completion, state_effect, true) {
+                    Ok(pending) => pending,
+                    Err(failure) => return ActiveTransition::Fail(failure),
+                };
+                let result = wire::RuntimePendingResult::project(&pending, projection);
+                project_session_value_with_resume(
+                    result,
+                    &pending,
+                    false,
+                    state_effect,
+                    Some(SettleProjectionResume {
+                        profile: state.profile,
+                        effective_policy: state.effective_policy,
+                        cumulative_external_io_wall_time: state.cumulative_external_io_wall_time,
+                        authorizing_navigation: state.authorizing_navigation.clone(),
+                        response: SettleResponse::Pending,
+                    }),
+                )
+            },
+            SettleResponse::Automation { kind, result } => {
+                let pending = match controlled_ready_pending(completion, state_effect, true) {
+                    Ok(pending) => pending,
+                    Err(failure) => return ActiveTransition::Fail(failure),
+                };
+                let response = SettleResponse::Automation {
+                    kind: *kind,
+                    result: result.clone(),
+                };
+                ActiveTransition::ProjectSession(SessionProjectionState {
+                    pending,
+                    kind: SessionProjectionKind::Automation {
+                        settle_resume: SettleProjectionResume {
+                            profile: state.profile,
+                            effective_policy: state.effective_policy,
+                            cumulative_external_io_wall_time: state
+                                .cumulative_external_io_wall_time,
+                            authorizing_navigation: state.authorizing_navigation.clone(),
+                            response,
+                        },
+                        replacement_rearm: true,
+                    },
+                    phase: SessionProjectionPhase::AwaitingInitialNavigation,
+                })
+            },
+            SettleResponse::ControlledOpen {
+                requested_url,
+                current_url,
+                profile,
+                deadline,
+                bootstrap_attempted,
+            } => match controlled_ready_pending(completion, state_effect, true) {
+                Ok(pending) => ActiveTransition::ProjectSession(SessionProjectionState {
+                    pending,
+                    kind: SessionProjectionKind::ControlledOpen {
+                        requested_url: requested_url.clone(),
+                        current_url: current_url.clone(),
+                        profile: *profile,
+                        deadline: *deadline,
+                        bootstrap_attempted: *bootstrap_attempted,
+                        cumulative_external_io_wall_time: state.cumulative_external_io_wall_time,
+                        session_state_token: None,
+                        settle_resume: Some(SettleProjectionResume {
+                            profile: state.profile,
+                            effective_policy: state.effective_policy,
+                            cumulative_external_io_wall_time: state
+                                .cumulative_external_io_wall_time,
+                            authorizing_navigation: state.authorizing_navigation.clone(),
+                            response: state.response.clone(),
+                        }),
+                    },
+                    phase: SessionProjectionPhase::AwaitingInitialNavigation,
+                }),
+                Err(failure) => ActiveTransition::Fail(failure),
+            },
+            SettleResponse::Navigate {
+                requested_url,
+                source,
+                admitted,
+            } => match controlled_ready_pending(completion, state_effect, true) {
+                Ok(pending) => ActiveTransition::ProjectSession(SessionProjectionState {
+                    pending,
+                    kind: SessionProjectionKind::Navigate {
+                        requested_url: requested_url.clone(),
+                        source: source.clone(),
+                        admitted: admitted.clone(),
+                        cumulative_external_io_wall_time: state.cumulative_external_io_wall_time,
+                        settle_resume: Some(SettleProjectionResume {
+                            profile: state.profile,
+                            effective_policy: state.effective_policy,
+                            cumulative_external_io_wall_time: state
+                                .cumulative_external_io_wall_time,
+                            authorizing_navigation: state.authorizing_navigation.clone(),
+                            response: state.response.clone(),
+                        }),
+                    },
+                    phase: SessionProjectionPhase::AwaitingInitialNavigation,
+                }),
+                Err(failure) => ActiveTransition::Fail(failure),
+            },
+        },
+    }
+}
+
+fn transition_from_navigate_settle_progress(
+    state: &mut NavigateState,
+    progress: settle::SettleProgress,
+    state_effect: RequestStateEffect,
+) -> ActiveTransition {
+    match progress {
+        settle::SettleProgress::Command(command) => ActiveTransition::Submit(command),
+        settle::SettleProgress::Wait(wait) => ActiveTransition::Wait(wait),
+        settle::SettleProgress::Complete(completion) => {
+            let NavigatePhase::Settling { source, admitted } = &state.phase else {
+                return unexpected_navigation_completion(state_effect);
+            };
+            match controlled_ready_pending(completion, state_effect, true) {
+                Ok(pending) => ActiveTransition::ProjectSession(SessionProjectionState {
+                    pending,
+                    kind: SessionProjectionKind::Navigate {
+                        requested_url: state.requested_url.clone(),
+                        source: source.clone(),
+                        admitted: admitted.clone(),
+                        cumulative_external_io_wall_time: state.cumulative_external_io_wall_time,
+                        settle_resume: None,
+                    },
+                    phase: SessionProjectionPhase::AwaitingInitialNavigation,
+                }),
+                Err(failure) => ActiveTransition::Fail(failure),
+            }
+        },
+    }
+}
+
+fn controlled_ready_pending(
+    completion: settle::SettleCompletion,
+    state_effect: RequestStateEffect,
+    fail_stop: bool,
+) -> Result<Box<servo::document_pending::RawPendingSnapshot>, ActiveFailure> {
+    let (pending, code, message, details) = match completion {
+        settle::SettleCompletion::Quiescent { pending, .. }
+        | settle::SettleCompletion::QuiescentWithPersistentWork { pending, .. } => {
+            return Ok(pending);
+        },
+        settle::SettleCompletion::BlockedOnExternalIo {
+            pending, network, ..
+        } => (
+            pending,
+            "blocked_on_external_io",
+            "navigation could not reach controlled_ready while external I/O remained active",
+            Some(json!({ "activeOperations": network.len().to_string() })),
         ),
+        settle::SettleCompletion::BlockedOnOpenEndedWork {
+            pending,
+            persistent,
+            ..
+        } => (
+            pending,
+            "blocked_on_open_ended_work",
+            "navigation could not reach controlled_ready while open-ended work blocked progress",
+            Some(json!({ "persistentWork": persistent.len().to_string() })),
+        ),
+        settle::SettleCompletion::VirtualTimeLimitExceeded {
+            pending,
+            start_virtual_time_ns,
+            requested_virtual_time_ns,
+            limit,
+            ..
+        } => (
+            pending,
+            "virtual_time_limit_exceeded",
+            "navigation could not reach controlled_ready within the virtual-time limit",
+            Some(json!({
+                "limit": limit.as_nanos().to_string(),
+                "startVirtualTimeNs": start_virtual_time_ns.to_string(),
+                "requestedVirtualTimeNs": requested_virtual_time_ns.to_string(),
+            })),
+        ),
+        settle::SettleCompletion::ControlTurnLimitExceeded {
+            pending,
+            limit,
+            control_turns,
+        } => (
+            pending,
+            "control_turn_limit_exceeded",
+            "navigation could not reach controlled_ready within the control-turn limit",
+            Some(json!({
+                "limit": limit.to_string(),
+                "observed": control_turns.to_string(),
+            })),
+        ),
+        settle::SettleCompletion::ExecutionLimitExceeded {
+            pending,
+            budget,
+            limit,
+            observed,
+            ..
+        } => {
+            let (code, kind) = match budget {
+                timers::DocumentExecutionBudget::OrdinaryTasks => {
+                    ("task_limit_exceeded", "ordinary_tasks")
+                },
+                timers::DocumentExecutionBudget::Microtasks => {
+                    ("microtask_limit_exceeded", "microtasks")
+                },
+                timers::DocumentExecutionBudget::RenderingOpportunities => {
+                    ("rendering_limit_exceeded", "rendering_opportunities")
+                },
+                timers::DocumentExecutionBudget::MutationRecords => {
+                    ("mutation_limit_exceeded", "mutations")
+                },
+            };
+            (
+                pending,
+                code,
+                "navigation could not reach controlled_ready within an execution limit",
+                Some(json!({
+                    "kind": kind,
+                    "limit": limit.to_string(),
+                    "observed": observed.to_string(),
+                })),
+            )
+        },
+        settle::SettleCompletion::RuntimeError {
+            pending, failure, ..
+        } => {
+            let (outcome, details) =
+                wire::project_controlled_ready_failure_details(&failure, &pending);
+            let unsupported = outcome == wire::SettleOutcome::UnsupportedWork;
+            (
+                pending,
+                if unsupported {
+                    "unsupported_work"
+                } else {
+                    "runtime_error"
+                },
+                if unsupported {
+                    "navigation encountered work outside the controlled-session support profile"
+                } else {
+                    "navigation settlement reached a runtime error"
+                },
+                Some(
+                    serde_json::to_value(details)
+                        .expect("bounded controlled-ready failure details serialize"),
+                ),
+            )
+        },
+    };
+    let mut error = ProtocolError::operation(code, message, state_effect.as_protocol_str());
+    if let Some(details) = details {
+        error = with_error_details(error, details);
+    }
+    error.fatal = fail_stop;
+    let _ = pending;
+    Err(ActiveFailure { error, fail_stop })
+}
+
+fn restart_session_projection_after_drift(
+    kind: &SessionProjectionKind,
+    state_effect: RequestStateEffect,
+) -> Result<(ActiveOperation, ActiveTransition), ActiveFailure> {
+    if matches!(kind, SessionProjectionKind::Automation { .. }) {
+        return Err(ActiveFailure {
+            error: fatal_operation(
+                "document_authority_changed",
+                "document authority changed while the action result was being stabilized",
+                state_effect.as_protocol_str(),
+            ),
+            fail_stop: true,
+        });
+    }
+    let resume = session_projection_settle_resume(kind);
+    let policy = resume.map_or_else(settle::SettlePolicy::default, |resume| {
+        resume.effective_policy.engine
+    });
+    let mut coordinator = settle::SettleCoordinator::new(policy);
+    let progress = coordinator.start().map_err(|error| match resume {
+        Some(resume) => settle_failure_for_response(error, state_effect, None, &resume.response),
+        None => settle_failure(error, state_effect, None),
+    })?;
+    let transition = match progress {
+        settle::SettleProgress::Command(command) => ActiveTransition::Submit(command),
+        settle::SettleProgress::Wait(_) | settle::SettleProgress::Complete(_) => {
+            return Err(ActiveFailure {
+                error: fatal_operation(
+                    "internal_runtime_failure",
+                    "a fresh settlement coordinator did not request its initial observation",
+                    state_effect.as_protocol_str(),
+                ),
+                fail_stop: true,
+            });
+        },
+    };
+    let operation = if let Some(resume) = resume {
+        ActiveOperation::Settle(SettleState {
+            profile: resume.profile,
+            authorizing_state_token: None,
+            authorizing_navigation: resume.authorizing_navigation.clone(),
+            replacement: None,
+            authority_bound_command: None,
+            latest_pending_target: None,
+            response: resume.response.clone(),
+            coordinator,
+            effective_policy: resume.effective_policy,
+            cumulative_external_io_wall_time: resume.cumulative_external_io_wall_time,
+            waiting: None,
+        })
+    } else {
+        match kind {
+            SessionProjectionKind::ControlledOpen {
+                requested_url,
+                current_url,
+                profile,
+                deadline,
+                bootstrap_attempted,
+                cumulative_external_io_wall_time,
+                settle_resume: None,
+                ..
+            } => ActiveOperation::ControlledOpen(ControlledOpenState {
+                requested_url: requested_url.clone(),
+                current_url: current_url.clone(),
+                profile: *profile,
+                deadline: *deadline,
+                readiness_waiting: None,
+                bootstrap_attempted: *bootstrap_attempted,
+                settlement: Some(ControlledOpenSettlement {
+                    coordinator,
+                    cumulative_external_io_wall_time: *cumulative_external_io_wall_time,
+                    waiting: None,
+                }),
+            }),
+            SessionProjectionKind::Navigate {
+                requested_url,
+                source,
+                admitted,
+                cumulative_external_io_wall_time,
+                settle_resume: None,
+            } => ActiveOperation::Navigate(NavigateState {
+                requested_url: requested_url.clone(),
+                phase: NavigatePhase::Settling {
+                    source: source.clone(),
+                    admitted: admitted.clone(),
+                },
+                coordinator,
+                cumulative_external_io_wall_time: *cumulative_external_io_wall_time,
+                waiting: None,
+            }),
+            SessionProjectionKind::Value {
+                settle_resume: None,
+                ..
+            } => {
+                return Err(ActiveFailure {
+                    error: ProtocolError::operation(
+                        "document_authority_changed",
+                        "document state changed while the session result was being stabilized",
+                        state_effect.as_protocol_str(),
+                    ),
+                    fail_stop: false,
+                });
+            },
+            SessionProjectionKind::ControlledOpen {
+                settle_resume: Some(_),
+                ..
+            }
+            | SessionProjectionKind::Navigate {
+                settle_resume: Some(_),
+                ..
+            }
+            | SessionProjectionKind::Value {
+                settle_resume: Some(_),
+                ..
+            }
+            | SessionProjectionKind::Automation { .. } => {
+                unreachable!("projection resume was handled before legacy restart")
+            },
+        }
+    };
+    Ok((operation, transition))
+}
+
+fn session_projection_settle_resume(
+    kind: &SessionProjectionKind,
+) -> Option<&SettleProjectionResume> {
+    match kind {
+        SessionProjectionKind::Automation { settle_resume, .. } => Some(settle_resume),
+        SessionProjectionKind::Value { settle_resume, .. }
+        | SessionProjectionKind::Navigate { settle_resume, .. }
+        | SessionProjectionKind::ControlledOpen { settle_resume, .. } => settle_resume.as_ref(),
+    }
+}
+
+fn session_projection_settle_resume_mut(
+    kind: &mut SessionProjectionKind,
+) -> Option<&mut SettleProjectionResume> {
+    match kind {
+        SessionProjectionKind::Automation { settle_resume, .. } => Some(settle_resume),
+        SessionProjectionKind::Value { settle_resume, .. }
+        | SessionProjectionKind::Navigate { settle_resume, .. }
+        | SessionProjectionKind::ControlledOpen { settle_resume, .. } => settle_resume.as_mut(),
+    }
+}
+
+fn session_projection_allows_replacement_rearm(kind: &SessionProjectionKind) -> bool {
+    !matches!(
+        kind,
+        SessionProjectionKind::Automation {
+            replacement_rearm: false,
+            ..
+        }
+    )
+}
+
+fn session_projection_suppresses_initial_pump(kind: &SessionProjectionKind) -> bool {
+    session_projection_settle_resume(kind)
+        .is_some_and(|resume| matches!(resume.response, SettleResponse::Automation { .. }))
+}
+
+fn resume_session_projection_at_replacement(
+    resume: &SettleProjectionResume,
+    source: SessionNavigationAuthority,
+    admitted: SessionNavigationAuthority,
+    pending_target: Box<servo::document_pending::PendingTargetObservation>,
+    state_effect: RequestStateEffect,
+) -> Result<(ActiveOperation, ActiveTransition), ActiveFailure> {
+    let Some(admission) = exact_replacement_admission(&source, &admitted) else {
+        return Err(ActiveFailure {
+            error: fatal_operation(
+                "navigation_authority_changed",
+                "session projection did not observe one exact replacement admission",
+                state_effect.as_protocol_str(),
+            ),
+            fail_stop: true,
+        });
+    };
+    let bootstrap = DocumentControlCommand::BootstrapReplacementPipeline {
+        source_pipeline_id: admission.source_pipeline_id,
+        pipeline_id: admission.pipeline_id,
+    };
+    let mut coordinator = settle::SettleCoordinator::new(resume.effective_policy.engine);
+    let command = match coordinator.start_with_replacement_bootstrap(bootstrap.clone()) {
+        Ok(settle::SettleProgress::Command(command)) if command == bootstrap => command,
+        Ok(_) => {
+            return Err(ActiveFailure {
+                error: fatal_operation(
+                    "internal_runtime_failure",
+                    "projection replacement did not issue its exact bootstrap command",
+                    state_effect.as_protocol_str(),
+                ),
+                fail_stop: true,
+            });
+        },
+        Err(error) => {
+            return Err(settle_failure_for_response(
+                error,
+                state_effect,
+                None,
+                &resume.response,
+            ));
+        },
+    };
+    Ok((
+        ActiveOperation::Settle(SettleState {
+            profile: resume.profile,
+            authorizing_state_token: None,
+            authorizing_navigation: Some(source.clone()),
+            replacement: Some(SettleReplacementPhase::Bootstrapping {
+                source,
+                admitted,
+                command: command.clone(),
+            }),
+            authority_bound_command: None,
+            latest_pending_target: Some(pending_target),
+            response: resume.response.clone(),
+            coordinator,
+            effective_policy: resume.effective_policy,
+            cumulative_external_io_wall_time: resume.cumulative_external_io_wall_time,
+            waiting: None,
+        }),
+        ActiveTransition::Submit(command),
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplacementAdmission {
+    source_pipeline_id: servo_base::id::PipelineId,
+    pipeline_id: servo_base::id::PipelineId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplacementActivationObservation {
+    Pending,
+    ActivatedAwaitingSourceExit,
+    ControlledReady,
+    Invalid,
+}
+
+/// Prove the only pending-document shape which may bridge a typed in-process Drive boundary or
+/// start explicit session settlement. This compares two independently owner-captured session
+/// authorities; neither the shell nor ScriptThread fabricates the replacement membership.
+fn exact_replacement_admission(
+    source: &SessionNavigationAuthority,
+    admitted: &SessionNavigationAuthority,
+) -> Option<ReplacementAdmission> {
+    if source.terminal().is_some()
+        || admitted.terminal().is_some()
+        || admitted.url().scheme() != "http" && admitted.url().scheme() != "https"
+        || admitted.document_epoch() != source.document_epoch()
+        || admitted.successful_document_replacements() != source.successful_document_replacements()
+        || admitted.history_revision() < source.history_revision()
+        || admitted.navigation_id().get() != source.navigation_id().get().checked_add(1)?
+    {
+        return None;
+    }
+
+    let before = source.target();
+    let after = admitted.target();
+    let source_active = before.active_top_level?;
+    let [source_pipeline_id] = before.pipelines() else {
+        return None;
+    };
+    let [fully_active_source] = before.fully_active_pipelines() else {
+        return None;
+    };
+    let [pipeline_id] = after.pending_top_level_pipelines() else {
+        return None;
+    };
+    if source_active.pipeline_id != *source_pipeline_id
+        || *fully_active_source != *source_pipeline_id
+        || !before.pending_top_level_pipelines().is_empty()
+        || *pipeline_id == *source_pipeline_id
+        || after.webview_id != before.webview_id
+        || after.event_loop_id != before.event_loop_id
+        || after.unsupported_time_surface != before.unsupported_time_surface
+        || after.active_top_level != Some(source_active)
+        || after.fully_active_pipelines() != [*source_pipeline_id]
+        || after.pipelines().len() != 2
+        || !after.contains_pipeline(*source_pipeline_id)
+        || !after.contains_pipeline(*pipeline_id)
+        || before.navigation_revision.checked_next()? != after.navigation_revision
+        || before.pipeline_membership_revision.checked_next()? != after.pipeline_membership_revision
+    {
+        return None;
+    }
+
+    Some(ReplacementAdmission {
+        source_pipeline_id: *source_pipeline_id,
+        pipeline_id: *pipeline_id,
+    })
+}
+
+fn initial_navigation_reached_controlled_ready(navigation: &SessionNavigationAuthority) -> bool {
+    navigation.navigation_id().get() == 0
+        && navigation.document_epoch().get() == 1
+        && navigation.successful_document_replacements() == 0
+        && navigation.terminal().is_none()
+}
+
+fn session_navigation_reached_controlled_ready(navigation: &SessionNavigationAuthority) -> bool {
+    let target = navigation.target();
+    navigation.document_epoch().get() >= 1
+        && navigation.terminal().is_none()
+        && matches!(navigation.url().scheme(), "http" | "https")
+        && target.active_top_level.is_some()
+        && target.pipelines().len() == 1
+        && target.fully_active_pipelines() == target.pipelines()
+        && target.pending_top_level_pipelines().is_empty()
+}
+
+fn explicit_navigation_chain_reached_controlled_ready(
+    source: &SessionNavigationAuthority,
+    navigation: &SessionNavigationAuthority,
+) -> bool {
+    session_navigation_reached_controlled_ready(navigation)
+        && navigation.target().webview_id == source.target().webview_id
+        && navigation.target().event_loop_id == source.target().event_loop_id
+        && navigation.document_epoch() > source.document_epoch()
+        && navigation.successful_document_replacements() > source.successful_document_replacements()
+}
+
+fn explicit_navigation_reached_controlled_ready(
+    source: &SessionNavigationAuthority,
+    admitted: &SessionNavigationAuthority,
+    observed: &SessionNavigationAuthority,
+) -> bool {
+    let Some(admission) = exact_replacement_admission(source, admitted) else {
+        return false;
+    };
+    let Some(expected_document_epoch) = source.document_epoch().get().checked_add(1) else {
+        return false;
+    };
+    let Some(expected_replacements) = source.successful_document_replacements().checked_add(1)
+    else {
+        return false;
+    };
+    let before = admitted.target();
+    let after = observed.target();
+    observed.navigation_id() == admitted.navigation_id()
+        && observed.document_epoch().get() == expected_document_epoch
+        && observed.successful_document_replacements() == expected_replacements
+        && observed.history_revision() >= admitted.history_revision()
+        && matches!(observed.url().scheme(), "http" | "https")
+        && observed.terminal().is_none()
+        && after.webview_id == before.webview_id
+        && after.event_loop_id == before.event_loop_id
+        && after.unsupported_time_surface == before.unsupported_time_surface
+        && after.active_top_level.is_some_and(|active| {
+            active.pipeline_id == admission.pipeline_id
+                && active.pipeline_id != admission.source_pipeline_id
+        })
+        && after.pipelines() == [admission.pipeline_id]
+        && after.fully_active_pipelines() == [admission.pipeline_id]
+        && after.pending_top_level_pipelines().is_empty()
+        && before
+            .navigation_revision
+            .checked_next()
+            .and_then(|revision| revision.checked_next())
+            == Some(after.navigation_revision)
+        && before.pipeline_membership_revision.checked_next()
+            == Some(after.pipeline_membership_revision)
+}
+
+/// Recognize the sole valid activation state before the asynchronously exiting source pipeline
+/// has left Constellation's pipeline map. This is not controlled-ready and cannot authorize a
+/// public token; settlement must keep pumping until the source membership is removed.
+fn explicit_navigation_activation_target_awaiting_source_exit(
+    source: &SessionNavigationAuthority,
+    admitted: &SessionNavigationAuthority,
+    after: &servo::document_pending::PendingTargetObservation,
+) -> bool {
+    let Some(admission) = exact_replacement_admission(source, admitted) else {
+        return false;
+    };
+    let before = admitted.target();
+    after.webview_id == before.webview_id
+        && after.event_loop_id == before.event_loop_id
+        && after.unsupported_time_surface == before.unsupported_time_surface
+        && after.active_top_level.is_some_and(|active| {
+            active.pipeline_id == admission.pipeline_id
+                && active.pipeline_id != admission.source_pipeline_id
+        })
+        && after.pipelines().len() == 2
+        && after.contains_pipeline(admission.source_pipeline_id)
+        && after.contains_pipeline(admission.pipeline_id)
+        && after.fully_active_pipelines() == [admission.pipeline_id]
+        && after.pending_top_level_pipelines().is_empty()
+        && before
+            .navigation_revision
+            .checked_next()
+            .and_then(|revision| revision.checked_next())
+            == Some(after.navigation_revision)
+        && before.pipeline_membership_revision == after.pipeline_membership_revision
+}
+
+fn explicit_navigation_activated_awaiting_source_exit(
+    source: &SessionNavigationAuthority,
+    admitted: &SessionNavigationAuthority,
+    observed: &SessionNavigationAuthority,
+) -> bool {
+    let Some(expected_document_epoch) = source.document_epoch().get().checked_add(1) else {
+        return false;
+    };
+    let Some(expected_replacements) = source.successful_document_replacements().checked_add(1)
+    else {
+        return false;
+    };
+    observed.navigation_id() == admitted.navigation_id()
+        && observed.document_epoch().get() == expected_document_epoch
+        && observed.successful_document_replacements() == expected_replacements
+        && observed.history_revision() >= admitted.history_revision()
+        && matches!(observed.url().scheme(), "http" | "https")
+        && observed.terminal().is_none()
+        && explicit_navigation_activation_target_awaiting_source_exit(
+            source,
+            admitted,
+            observed.target(),
+        )
+}
+
+fn classify_replacement_activation_observation(
+    source: &SessionNavigationAuthority,
+    admitted: &SessionNavigationAuthority,
+    observed: &SessionNavigationAuthority,
+) -> ReplacementActivationObservation {
+    if explicit_navigation_reached_controlled_ready(source, admitted, observed) {
+        ReplacementActivationObservation::ControlledReady
+    } else if observed == admitted {
+        ReplacementActivationObservation::Pending
+    } else if explicit_navigation_activated_awaiting_source_exit(source, admitted, observed) {
+        ReplacementActivationObservation::ActivatedAwaitingSourceExit
+    } else {
+        ReplacementActivationObservation::Invalid
+    }
+}
+
+fn held_drive_replacement_target_progressed(
+    source: &SessionNavigationAuthority,
+    admitted: &SessionNavigationAuthority,
+    before: &servo::document_pending::PendingTargetObservation,
+    observed: &SessionNavigationAuthority,
+) -> bool {
+    match classify_replacement_activation_observation(source, admitted, observed) {
+        ReplacementActivationObservation::ActivatedAwaitingSourceExit => {
+            before == admitted.target()
+        },
+        ReplacementActivationObservation::ControlledReady => {
+            before == admitted.target()
+                || explicit_navigation_activation_target_awaiting_source_exit(
+                    source, admitted, before,
+                )
+        },
+        ReplacementActivationObservation::Pending | ReplacementActivationObservation::Invalid => {
+            false
+        },
+    }
+}
+
+fn navigation_activation_failure(
+    state_effect: RequestStateEffect,
+    fail_stop: bool,
+) -> ActiveTransition {
+    let mut error = ProtocolError::operation(
+        "navigation_authority_changed",
+        "the admitted navigation did not activate the exact controlled document",
+        state_effect.as_protocol_str(),
+    );
+    error.fatal = fail_stop;
+    ActiveTransition::Fail(ActiveFailure { error, fail_stop })
+}
+
+fn project_session_value<T: serde::Serialize>(
+    result: T,
+    pending: &servo::document_pending::RawPendingSnapshot,
+    snapshot_token: bool,
+    state_effect: RequestStateEffect,
+) -> ActiveTransition {
+    project_session_value_with_resume(result, pending, snapshot_token, state_effect, None)
+}
+
+fn project_session_pending(
+    result: wire::RuntimePendingResult,
+    pending: &servo::document_pending::RawPendingSnapshot,
+    state_effect: RequestStateEffect,
+) -> ActiveTransition {
+    let effective_policy = default_resolved_settle_policy();
+    project_session_value_with_resume(
+        result,
+        pending,
+        false,
+        state_effect,
+        Some(SettleProjectionResume {
+            profile: SessionProfile::ControlledWebSessionV1,
+            effective_policy,
+            cumulative_external_io_wall_time: Duration::ZERO,
+            authorizing_navigation: None,
+            response: SettleResponse::Pending,
+        }),
+    )
+}
+
+fn project_session_value_with_resume<T: serde::Serialize>(
+    result: T,
+    pending: &servo::document_pending::RawPendingSnapshot,
+    snapshot_token: bool,
+    state_effect: RequestStateEffect,
+    settle_resume: Option<SettleProjectionResume>,
+) -> ActiveTransition {
+    match serde_json::to_value(result) {
+        Ok(value) => ActiveTransition::ProjectSession(SessionProjectionState {
+            pending: Box::new(pending.clone()),
+            kind: SessionProjectionKind::Value {
+                value,
+                snapshot_token,
+                settle_resume,
+            },
+            phase: SessionProjectionPhase::AwaitingInitialNavigation,
+        }),
+        Err(error) => ActiveTransition::Fail(ActiveFailure {
+            error: fatal_operation(
+                "internal_runtime_failure",
+                format!("failed to serialize controlled-session result: {error}"),
+                state_effect.as_protocol_str(),
+            ),
+            fail_stop: true,
+        }),
     }
 }
 
@@ -1903,16 +5992,16 @@ fn settle_failure(
     let mutating = command.is_some_and(command_is_mutating);
     let indeterminate = matches!(
         &error,
-        settle::SettleFailure::DriveOneTurnOutcomeIndeterminate(_) |
-            settle::SettleFailure::DriveOutcomeIndeterminate(_) |
-            settle::SettleFailure::AdvanceOutcomeIndeterminate(_)
-    ) || (mutating &&
-        matches!(&error, settle::SettleFailure::InvalidControlOutcome(_)));
+        settle::SettleFailure::DriveOneTurnOutcomeIndeterminate(_)
+            | settle::SettleFailure::DriveOutcomeIndeterminate(_)
+            | settle::SettleFailure::AdvanceOutcomeIndeterminate(_)
+    ) || (mutating
+        && matches!(&error, settle::SettleFailure::InvalidControlOutcome(_)));
     let internal = matches!(
         &error,
-        settle::SettleFailure::InvalidCoordinatorState(_) |
-            settle::SettleFailure::InvalidControlOutcome(_) |
-            settle::SettleFailure::ExternalIoWallTimeRegressed { .. }
+        settle::SettleFailure::InvalidCoordinatorState(_)
+            | settle::SettleFailure::InvalidControlOutcome(_)
+            | settle::SettleFailure::ExternalIoWallTimeRegressed { .. }
     );
     ActiveFailure {
         error: if indeterminate {
@@ -1938,15 +6027,244 @@ fn settle_failure(
     }
 }
 
+fn settle_failure_for_response(
+    error: settle::SettleFailure,
+    state_effect: RequestStateEffect,
+    command: Option<&DocumentControlCommand>,
+    response: &SettleResponse,
+) -> ActiveFailure {
+    let failure = settle_failure(error, state_effect, command);
+    if matches!(response, SettleResponse::Runtime) {
+        failure
+    } else {
+        harden_continuation_failure(failure, state_effect)
+    }
+}
+
+fn harden_continuation_failure(
+    mut failure: ActiveFailure,
+    state_effect: RequestStateEffect,
+) -> ActiveFailure {
+    if state_effect == RequestStateEffect::Partial && !failure.fail_stop {
+        failure.error.fatal = true;
+        failure.error.state_effect = "partial";
+        failure.fail_stop = true;
+    }
+    failure
+}
+
 fn command_is_mutating(command: &DocumentControlCommand) -> bool {
     match command {
         DocumentControlCommand::Observe => false,
-        DocumentControlCommand::DriveOneTurn |
-        DocumentControlCommand::BootstrapInitialPipeline { .. } |
-        DocumentControlCommand::AdvanceTo(_) => true,
+        DocumentControlCommand::DriveOneTurn
+        | DocumentControlCommand::BootstrapInitialPipeline { .. }
+        | DocumentControlCommand::BootstrapReplacementPipeline { .. }
+        | DocumentControlCommand::AdvanceTo(_) => true,
         DocumentControlCommand::Automate(request) => {
             DocumentControlAutomationKind::from_request(request).is_mutating()
         },
+    }
+}
+
+fn receive_outcome_virtual_time_ns(outcome: &DocumentControlReceiveOutcome) -> Option<u128> {
+    match outcome {
+        DocumentControlReceiveOutcome::CommandOutcome(DocumentControlOutcome::Completed(
+            observation,
+        ))
+        | DocumentControlReceiveOutcome::CommandOutcome(
+            DocumentControlOutcome::AutomationCompleted { observation, .. },
+        ) => Some(observation.pending().clock.now.as_nanos()),
+        _ => None,
+    }
+}
+
+fn receive_outcome_pending_target(
+    outcome: &DocumentControlReceiveOutcome,
+) -> Option<&servo::document_pending::PendingTargetObservation> {
+    match outcome {
+        DocumentControlReceiveOutcome::CommandOutcome(DocumentControlOutcome::Completed(
+            observation,
+        ))
+        | DocumentControlReceiveOutcome::CommandOutcome(
+            DocumentControlOutcome::AutomationCompleted { observation, .. },
+        ) => Some(&observation.pending().target),
+        _ => None,
+    }
+}
+
+fn session_state_protocol_error(error: SessionStateError) -> ProtocolError {
+    let code = match error {
+        SessionStateError::InvalidCookie => "invalid_controlled_cookie",
+        _ => error.code(),
+    };
+    let mut protocol = ProtocolError::operation(
+        code,
+        "session-state operation was rejected",
+        match error {
+            SessionStateError::BackendRejected(
+                stasis_shell::session_state::SessionStateBackendStage::CookieReplace
+                | stasis_shell::session_state::SessionStateBackendStage::WebStorageReplace,
+            ) => "indeterminate",
+            _ => "none",
+        },
+    );
+    if matches!(
+        error,
+        SessionStateError::TokenEntropyUnavailable
+            | SessionStateError::TokenSpaceExhausted
+            | SessionStateError::BackendRevisionRegressed
+            | SessionStateError::BackendRejected(
+                stasis_shell::session_state::SessionStateBackendStage::CookieReplace
+                    | stasis_shell::session_state::SessionStateBackendStage::WebStorageReplace
+            )
+    ) {
+        protocol.fatal = true;
+    }
+    protocol
+}
+
+fn harden_session_state_mutation_error(method: &str, mut error: ProtocolError) -> ProtocolError {
+    if matches!(method, "session.cookies.set" | "session.storage.set")
+        && matches!(
+            error.code,
+            "session_state_backend_observe_failed"
+                | "session_state_cookie_replace_failed"
+                | "session_state_web_storage_replace_failed"
+                | "session_state_backend_revision_regressed"
+                | "session_state_token_entropy_unavailable"
+                | "session_state_token_space_exhausted"
+        )
+    {
+        error.fatal = true;
+        error.state_effect = "indeterminate";
+    }
+    error
+}
+
+fn network_evidence_protocol_error(error: EvidenceLedgerError) -> ProtocolError {
+    match error {
+        EvidenceLedgerError::InvalidPageLimit { observed, limit } => with_error_details(
+            ProtocolError::invalid_request("invalid session audit page limit"),
+            json!({
+                "observed": observed,
+                "limit": limit,
+            }),
+        ),
+        error => fatal_operation(
+            "internal_runtime_failure",
+            format!("controlled-network evidence ledger failed: {error:?}"),
+            "none",
+        ),
+    }
+}
+
+fn controlled_network_failure(
+    snapshot: ControlledNetworkSnapshot,
+    state_effect: RequestStateEffect,
+) -> Option<ActiveFailure> {
+    let failure = snapshot.sticky_failure?;
+    let effect = if state_effect == RequestStateEffect::Partial {
+        "partial"
+    } else {
+        "partial"
+    };
+    let (error, fail_stop) = match failure {
+        ControlledNetworkFailure::FixtureMiss => (
+            ProtocolError::operation(
+                "network_fixture_miss",
+                "fixtures_only rejected a request without an immutable matching route",
+                effect,
+            ),
+            false,
+        ),
+        ControlledNetworkFailure::ActiveOperationLimitExceeded => (
+            with_error_details(
+                ProtocolError::operation(
+                    "controlled_network_active_operation_limit_exceeded",
+                    "controlled-network active operation limit was exceeded",
+                    effect,
+                ),
+                json!({
+                    "limit": snapshot.maximum_active_operations,
+                    "observed": snapshot.maximum_active_operations.saturating_add(1),
+                }),
+            ),
+            false,
+        ),
+        ControlledNetworkFailure::UnknownRequestBodyLength => (
+            ProtocolError::operation(
+                "unsupported_network_request_body_length",
+                "controlled network requires a bounded request body length",
+                effect,
+            ),
+            false,
+        ),
+        ControlledNetworkFailure::RequestMetadataRejected => (
+            ProtocolError::operation(
+                "unsupported_network_request_metadata",
+                "controlled network rejected request metadata outside the support profile",
+                effect,
+            ),
+            false,
+        ),
+        ControlledNetworkFailure::CookieSameSiteContextUnsupported => (
+            ProtocolError::operation(
+                "unsupported_cookie_same_site_context",
+                "controlled cookie SameSite context is outside the support profile",
+                effect,
+            ),
+            false,
+        ),
+        ControlledNetworkFailure::PersistentCookieUnsupported => (
+            ProtocolError::operation(
+                "unsupported_persistent_cookie",
+                "controlled sessions support only session cookies",
+                effect,
+            ),
+            false,
+        ),
+        ControlledNetworkFailure::PartitionedCookieUnsupported => (
+            ProtocolError::operation(
+                "unsupported_partitioned_cookie",
+                "controlled sessions do not support partitioned cookies",
+                effect,
+            ),
+            false,
+        ),
+        ControlledNetworkFailure::InvalidCookie => (
+            ProtocolError::operation(
+                "invalid_controlled_cookie",
+                "controlled Set-Cookie metadata was invalid",
+                effect,
+            ),
+            false,
+        ),
+        ControlledNetworkFailure::EvidenceLedgerFailure
+        | ControlledNetworkFailure::LifecycleInvariant
+        | ControlledNetworkFailure::VirtualTimeRegressed => (
+            fatal_operation(
+                "internal_runtime_failure",
+                format!("controlled-network authority failed: {failure:?}"),
+                if failure == ControlledNetworkFailure::VirtualTimeRegressed {
+                    "indeterminate"
+                } else {
+                    state_effect.as_protocol_str()
+                },
+            ),
+            true,
+        ),
+    };
+    Some(ActiveFailure { error, fail_stop })
+}
+
+fn with_error_details(error: ProtocolError, details: Value) -> ProtocolError {
+    match error.with_details(details) {
+        Ok(error) => error,
+        Err(details_error) => fatal_operation(
+            "internal_runtime_failure",
+            format!("failed to construct bounded protocol error details: {details_error}"),
+            "none",
+        ),
     }
 }
 
@@ -1960,6 +6278,7 @@ fn fatal_operation(
         message: message.into(),
         fatal: true,
         state_effect,
+        details: None,
     }
 }
 
@@ -1997,28 +6316,46 @@ struct OpenParams {
     unix_time_origin_ns: Option<wire::DecimalU128>,
     #[serde(default)]
     profile: Option<String>,
+    #[serde(default)]
+    state: Option<SessionStateV1>,
+    #[serde(default)]
+    network: Option<Value>,
 }
 
 impl OpenParams {
-    fn clock_mode(&self) -> Result<(EngineClockMode, &'static str), ProtocolError> {
+    fn configuration(self) -> Result<OpenConfiguration, ProtocolError> {
         match self.clock_mode {
             OpenClockMode::Real => {
-                if self.initial_virtual_time_ns.is_some() ||
-                    self.unix_time_origin_ns.is_some() ||
-                    self.profile.is_some()
+                if self.initial_virtual_time_ns.is_some()
+                    || self.unix_time_origin_ns.is_some()
+                    || self.profile.is_some()
+                    || self.state.is_some()
+                    || self.network.is_some()
                 {
                     return Err(ProtocolError::invalid_request(
-                        "controlled time fields and profile require clockMode controlled",
+                        "controlled time, profile, state, and network fields require clockMode controlled",
                     ));
                 }
-                Ok((EngineClockMode::Real, "load_complete"))
+                Ok(OpenConfiguration {
+                    clock_mode: EngineClockMode::Real,
+                    boundary: "load_complete",
+                    profile: None,
+                    state: None,
+                    network: None,
+                })
             },
             OpenClockMode::Controlled => {
-                if self.profile.as_deref() != Some(CONTROLLED_WEBAPP_V1_PROFILE) {
-                    return Err(ProtocolError::invalid_request(format!(
-                        "controlled sessions require profile {CONTROLLED_WEBAPP_V1_PROFILE}",
-                    )));
-                }
+                let profile = match self.profile.as_deref() {
+                    Some(CONTROLLED_WEBAPP_V1_PROFILE) => SessionProfile::ControlledWebappV1,
+                    Some(CONTROLLED_WEB_SESSION_V1_PROFILE) => {
+                        SessionProfile::ControlledWebSessionV1
+                    },
+                    _ => {
+                        return Err(ProtocolError::invalid_request(format!(
+                            "controlled sessions require profile {CONTROLLED_WEBAPP_V1_PROFILE} or {CONTROLLED_WEB_SESSION_V1_PROFILE}",
+                        )));
+                    },
+                };
                 let unix_origin = self
                     .unix_time_origin_ns
                     .as_ref()
@@ -2028,18 +6365,36 @@ impl OpenParams {
                         "unixTimeOriginNs must be 0 in the controlled MVP",
                     ));
                 }
-                Ok((
-                    EngineClockMode::Controlled {
+                if profile != SessionProfile::ControlledWebSessionV1
+                    && (self.state.is_some() || self.network.is_some())
+                {
+                    return Err(ProtocolError::invalid_request(format!(
+                        "state and network require profile {CONTROLLED_WEB_SESSION_V1_PROFILE}",
+                    )));
+                }
+                Ok(OpenConfiguration {
+                    clock_mode: EngineClockMode::Controlled {
                         initial_time_ns: self
                             .initial_virtual_time_ns
                             .as_ref()
                             .map_or(0, wire::DecimalU128::get),
                     },
-                    "controlled_ready",
-                ))
+                    boundary: "controlled_ready",
+                    profile: Some(profile),
+                    state: self.state,
+                    network: self.network,
+                })
             },
         }
     }
+}
+
+struct OpenConfiguration {
+    clock_mode: EngineClockMode,
+    boundary: &'static str,
+    profile: Option<SessionProfile>,
+    state: Option<SessionStateV1>,
+    network: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -2066,9 +6421,78 @@ struct CancelParams {
 #[serde(deny_unknown_fields)]
 struct CloseParams {}
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyParams {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct SessionAuditParams {
+    #[serde(default)]
+    after_seq: Option<WireU64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 fn parse_params<T: for<'de> Deserialize<'de>>(request: &Request) -> Result<T, ProtocolError> {
+    if let Some(error) = cross_domain_token_error(&request.params) {
+        return Err(error);
+    }
+    serde_json::from_value(request.params.clone()).map_err(|error| {
+        if request.method.starts_with("action.") || request.method.starts_with("dom.") {
+            ProtocolError::invalid_request(format!("invalid {} parameters", request.method))
+        } else {
+            ProtocolError::invalid_request(error.to_string())
+        }
+    })
+}
+
+fn parse_sensitive_params<T: for<'de> Deserialize<'de>>(
+    request: &Request,
+    redacted_message: &'static str,
+) -> Result<T, ProtocolError> {
+    if let Some(error) = cross_domain_token_error(&request.params) {
+        return Err(error);
+    }
     serde_json::from_value(request.params.clone())
-        .map_err(|error| ProtocolError::invalid_request(error.to_string()))
+        .map_err(|_| ProtocolError::invalid_request(redacted_message))
+}
+
+fn cross_domain_token_error(params: &Value) -> Option<ProtocolError> {
+    let object = params.as_object()?;
+    if object
+        .get("expectedStateToken")
+        .is_some_and(|token| serde_json::from_value::<SessionStateToken>(token.clone()).is_ok())
+    {
+        return Some(ProtocolError::operation(
+            "stale_state_token",
+            "expectedStateToken does not authorize the current document state",
+            "none",
+        ));
+    }
+    if object
+        .get("expectedSessionStateToken")
+        .is_some_and(|token| {
+            serde_json::from_value::<wire::DocumentStateToken>(token.clone()).is_ok()
+        })
+    {
+        return Some(ProtocolError::operation(
+            "stale_session_state_token",
+            "expectedSessionStateToken does not authorize the current session state",
+            "none",
+        ));
+    }
+    None
+}
+
+fn serialize_immediate_result<T: serde::Serialize>(result: T) -> Result<Value, ProtocolError> {
+    serde_json::to_value(result).map_err(|error| {
+        fatal_operation(
+            "internal_runtime_failure",
+            format!("failed to serialize public session result: {error}"),
+            "none",
+        )
+    })
 }
 
 fn invalid_state(message: impl Into<String>) -> ProtocolError {
@@ -2077,6 +6501,7 @@ fn invalid_state(message: impl Into<String>) -> ProtocolError {
         message: message.into(),
         fatal: false,
         state_effect: "none",
+        details: None,
     }
 }
 
@@ -2114,29 +6539,59 @@ fn parse_source_identities() -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::rc::Rc;
 
     use super::*;
 
+    const TEST_TOKEN_NAMESPACE_HEX: &str = "71717171717171717171717171717171";
+
+    fn test_document_token(alias: u128) -> String {
+        format!("document:{TEST_TOKEN_NAMESPACE_HEX}:{alias}")
+    }
+
+    fn test_session_state_token(alias: u64) -> String {
+        format!("session:{TEST_TOKEN_NAMESPACE_HEX}:{alias}")
+    }
+
     struct FakeEngine {
         clock_mode: EngineClockMode,
+        document_control_profile: DocumentControlProfile,
         pump_calls: usize,
         cancel_calls: usize,
+        navigation_cancel_calls: usize,
         close_calls: usize,
         submitted: Vec<DocumentControlCommand>,
         polls: VecDeque<EnginePortPoll>,
+        navigation_submitted: Vec<NavigationOperationKind>,
+        navigation_polls: VecDeque<EnginePortNavigationPoll>,
+        network_virtual_times: RefCell<Vec<u128>>,
+        evidence: Rc<RefCell<Vec<(&'static str, u64)>>>,
     }
 
     impl FakeEngine {
         fn controlled() -> Self {
             Self {
                 clock_mode: EngineClockMode::Controlled { initial_time_ns: 0 },
+                document_control_profile: DocumentControlProfile::SingleDocument,
                 pump_calls: 0,
                 cancel_calls: 0,
+                navigation_cancel_calls: 0,
                 close_calls: 0,
                 submitted: Vec::new(),
                 polls: VecDeque::new(),
+                navigation_submitted: Vec::new(),
+                navigation_polls: VecDeque::new(),
+                network_virtual_times: RefCell::new(Vec::new()),
+                evidence: Rc::new(RefCell::new(Vec::new())),
             }
+        }
+
+        fn controlled_session() -> Self {
+            let mut engine = Self::controlled();
+            engine.document_control_profile = DocumentControlProfile::TopLevelSession;
+            engine
         }
     }
 
@@ -2144,15 +6599,21 @@ mod tests {
         fn open_session(
             _url: Url,
             _waker: ShellWaker,
-            clock_mode: EngineClockMode,
+            options: EngineSessionOpenOptions,
         ) -> Result<Self, ProtocolError> {
             Ok(Self {
-                clock_mode,
+                clock_mode: options.clock_mode,
+                document_control_profile: options.document_control_profile,
                 pump_calls: 0,
                 cancel_calls: 0,
+                navigation_cancel_calls: 0,
                 close_calls: 0,
                 submitted: Vec::new(),
                 polls: VecDeque::new(),
+                navigation_submitted: Vec::new(),
+                navigation_polls: VecDeque::new(),
+                network_virtual_times: RefCell::new(Vec::new()),
+                evidence: Rc::new(RefCell::new(Vec::new())),
             })
         }
 
@@ -2166,6 +6627,10 @@ mod tests {
 
         fn clock_mode(&self) -> EngineClockMode {
             self.clock_mode
+        }
+
+        fn document_control_profile(&self) -> DocumentControlProfile {
+            self.document_control_profile
         }
 
         fn evaluate(&self, _expression: &str) -> Result<Value, ProtocolError> {
@@ -2188,6 +6653,85 @@ mod tests {
         fn cancel_control_operation(&mut self) -> Option<EnginePortCompletion> {
             self.cancel_calls += 1;
             None
+        }
+
+        fn submit_session_navigation_observation(
+            &mut self,
+            _timeout: Duration,
+        ) -> Result<(), ProtocolError> {
+            self.navigation_submitted
+                .push(NavigationOperationKind::Observe);
+            Ok(())
+        }
+
+        fn submit_session_navigation(
+            &mut self,
+            _expected: SessionNavigationAuthority,
+            _url: Url,
+            _timeout: Duration,
+        ) -> Result<(), ProtocolError> {
+            self.navigation_submitted
+                .push(NavigationOperationKind::Navigate);
+            Ok(())
+        }
+
+        fn poll_session_navigation(&mut self) -> EnginePortNavigationPoll {
+            self.navigation_polls
+                .pop_front()
+                .unwrap_or(EnginePortNavigationPoll::Idle)
+        }
+
+        fn cancel_session_navigation(&mut self) -> Option<NavigationOperationCompletion> {
+            self.navigation_cancel_calls += 1;
+            None
+        }
+
+        fn set_controlled_network_virtual_time_ns(
+            &self,
+            virtual_time_ns: u128,
+        ) -> Result<(), ProtocolError> {
+            self.network_virtual_times
+                .borrow_mut()
+                .push(virtual_time_ns);
+            Ok(())
+        }
+
+        fn record_navigation_started(&self, authority: &SessionNavigationAuthority) {
+            self.record_navigation_started_id(authority.navigation_id());
+        }
+
+        fn record_navigation_started_id(&self, navigation_id: SessionNavigationId) {
+            self.evidence
+                .borrow_mut()
+                .push(("started", navigation_id.get()));
+        }
+
+        fn record_navigation_committed(&self, authority: &SessionNavigationAuthority) {
+            self.evidence
+                .borrow_mut()
+                .push(("committed", authority.navigation_id().get()));
+        }
+
+        fn record_navigation_failed_id(
+            &self,
+            navigation_id: SessionNavigationId,
+            _reason: NetworkFailureReason,
+        ) {
+            self.evidence
+                .borrow_mut()
+                .push(("failed", navigation_id.get()));
+        }
+
+        fn record_same_document_history_changed(&self, authority: &SessionNavigationAuthority) {
+            self.evidence
+                .borrow_mut()
+                .push(("history", authority.navigation_id().get()));
+        }
+
+        fn record_settlement_terminal(&self, authority: &SessionNavigationAuthority) {
+            self.evidence
+                .borrow_mut()
+                .push(("settled", authority.navigation_id().get()));
         }
 
         fn close(&mut self) {
@@ -2217,6 +6761,304 @@ mod tests {
         }
     }
 
+    fn session_authority(
+        document_epoch: u64,
+        navigation_id: u64,
+        history_revision: u64,
+        successful_document_replacements: u64,
+    ) -> SessionNavigationAuthority {
+        use embedder_traits::document_pending::{
+            PendingActiveTopLevelPipeline, PendingNavigationRevision,
+            PendingPipelineMembershipRevision, PendingTargetObservation,
+        };
+        use embedder_traits::document_session::{DocumentEpoch, HistoryRevision};
+        use servo_base::Epoch;
+        use servo_base::id::{TEST_PIPELINE_ID, TEST_SCRIPT_EVENT_LOOP_ID, TEST_WEBVIEW_ID};
+
+        let target = PendingTargetObservation::new_with_authority(
+            TEST_WEBVIEW_ID,
+            TEST_SCRIPT_EVENT_LOOP_ID,
+            Some(PendingActiveTopLevelPipeline {
+                pipeline_id: TEST_PIPELINE_ID,
+                epoch: Epoch(1),
+            }),
+            PendingNavigationRevision::new(navigation_id),
+            PendingPipelineMembershipRevision::new(document_epoch),
+            None,
+            vec![TEST_PIPELINE_ID],
+            vec![TEST_PIPELINE_ID],
+            Vec::new(),
+        )
+        .unwrap();
+        SessionNavigationAuthority::new_internal(
+            Box::new(target),
+            DocumentEpoch::new(document_epoch),
+            SessionNavigationId::new(navigation_id),
+            HistoryRevision::new(history_revision),
+            successful_document_replacements,
+            servo::ServoUrl::parse("https://example.test/").unwrap(),
+            None,
+        )
+    }
+
+    fn replacement_admission_authority(
+        source: &SessionNavigationAuthority,
+    ) -> SessionNavigationAuthority {
+        use embedder_traits::document_pending::PendingTargetObservation;
+        use embedder_traits::document_session::{DocumentEpoch, HistoryRevision};
+
+        let source_pipeline_id = source.target().active_top_level.unwrap().pipeline_id;
+        let pipeline_id = pipeline_id(source_pipeline_id.index.0.get().checked_add(1).unwrap());
+        let target = PendingTargetObservation::new_with_authority(
+            source.target().webview_id,
+            source.target().event_loop_id,
+            source.target().active_top_level,
+            source.target().navigation_revision.checked_next().unwrap(),
+            source
+                .target()
+                .pipeline_membership_revision
+                .checked_next()
+                .unwrap(),
+            source.target().unsupported_time_surface,
+            vec![source_pipeline_id, pipeline_id],
+            vec![source_pipeline_id],
+            vec![pipeline_id],
+        )
+        .unwrap();
+        SessionNavigationAuthority::new_internal(
+            Box::new(target),
+            DocumentEpoch::new(source.document_epoch().get()),
+            SessionNavigationId::new(source.navigation_id().get().checked_add(1).unwrap()),
+            HistoryRevision::new(source.history_revision().get()),
+            source.successful_document_replacements(),
+            servo::ServoUrl::parse("https://example.test/next").unwrap(),
+            None,
+        )
+    }
+
+    fn activated_replacement_authority(
+        source: &SessionNavigationAuthority,
+        admitted: &SessionNavigationAuthority,
+    ) -> SessionNavigationAuthority {
+        use embedder_traits::document_pending::{
+            PendingActiveTopLevelPipeline, PendingTargetObservation,
+        };
+        use embedder_traits::document_session::{DocumentEpoch, HistoryRevision};
+        use servo_base::Epoch;
+
+        let pipeline_id = admitted.target().pending_top_level_pipelines()[0];
+        let target = PendingTargetObservation::new_with_authority(
+            admitted.target().webview_id,
+            admitted.target().event_loop_id,
+            Some(PendingActiveTopLevelPipeline {
+                pipeline_id,
+                epoch: Epoch(2),
+            }),
+            admitted
+                .target()
+                .navigation_revision
+                .checked_next()
+                .and_then(|revision| revision.checked_next())
+                .unwrap(),
+            admitted
+                .target()
+                .pipeline_membership_revision
+                .checked_next()
+                .unwrap(),
+            admitted.target().unsupported_time_surface,
+            vec![pipeline_id],
+            vec![pipeline_id],
+            Vec::new(),
+        )
+        .unwrap();
+        SessionNavigationAuthority::new_internal(
+            Box::new(target),
+            DocumentEpoch::new(source.document_epoch().get().checked_add(1).unwrap()),
+            admitted.navigation_id(),
+            HistoryRevision::new(admitted.history_revision().get()),
+            source
+                .successful_document_replacements()
+                .checked_add(1)
+                .unwrap(),
+            servo::ServoUrl::parse("https://example.test/final").unwrap(),
+            None,
+        )
+    }
+
+    fn activated_replacement_source_retained_authority(
+        source: &SessionNavigationAuthority,
+        admitted: &SessionNavigationAuthority,
+    ) -> SessionNavigationAuthority {
+        use embedder_traits::document_pending::{
+            PendingActiveTopLevelPipeline, PendingTargetObservation,
+        };
+        use embedder_traits::document_session::{DocumentEpoch, HistoryRevision};
+        use servo_base::Epoch;
+
+        let source_pipeline_id = source.target().active_top_level.unwrap().pipeline_id;
+        let pipeline_id = admitted.target().pending_top_level_pipelines()[0];
+        let target = PendingTargetObservation::new_with_authority(
+            admitted.target().webview_id,
+            admitted.target().event_loop_id,
+            Some(PendingActiveTopLevelPipeline {
+                pipeline_id,
+                epoch: Epoch(2),
+            }),
+            admitted
+                .target()
+                .navigation_revision
+                .checked_next()
+                .and_then(|revision| revision.checked_next())
+                .unwrap(),
+            admitted.target().pipeline_membership_revision,
+            admitted.target().unsupported_time_surface,
+            vec![source_pipeline_id, pipeline_id],
+            vec![pipeline_id],
+            Vec::new(),
+        )
+        .unwrap();
+        SessionNavigationAuthority::new_internal(
+            Box::new(target),
+            DocumentEpoch::new(source.document_epoch().get().checked_add(1).unwrap()),
+            admitted.navigation_id(),
+            HistoryRevision::new(admitted.history_revision().get()),
+            source
+                .successful_document_replacements()
+                .checked_add(1)
+                .unwrap(),
+            servo::ServoUrl::parse("https://example.test/final").unwrap(),
+            None,
+        )
+    }
+
+    fn pending_for_authority(
+        authority: &SessionNavigationAuthority,
+        state_generation: u64,
+    ) -> servo::document_pending::RawPendingSnapshot {
+        use embedder_traits::document_pending::{
+            DomEpoch, PendingAnimatedImageObservation, PendingCanvasObservation, PendingClockMode,
+            PendingClockObservation, PendingInputObservation, PendingLogicalTimerSnapshot,
+            PendingMicrotaskCheckpoint, PendingMicrotaskObservation, PendingNetworkObservation,
+            PendingParserObservation, PendingPipelineRenderingObservation,
+            PendingProducerObservation, PendingProducerStability, PendingRenderingObservation,
+            PendingRenderingPipelineActivity, PendingRuntimeTerminals, PendingSchedulerObservation,
+            PendingSourceSnapshot, RawPendingSnapshot, RuntimeStateGeneration,
+        };
+        use timers::{
+            DocumentClock, DocumentClockConfiguration, DocumentExecutionCounters,
+            DocumentExecutionLimits, DocumentExecutionObservation, DocumentProducerCheckpoint,
+            DocumentProducerFence, DocumentUnixTime, TimerScheduler,
+        };
+
+        let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 5,
+            unix_time_origin_ns: DocumentUnixTime::from_nanos(1_000_000),
+        });
+        let scheduler = TimerScheduler::with_clock(clock.clone());
+        let fence = DocumentProducerFence::default();
+        let microtask_checkpoint = PendingMicrotaskCheckpoint::new(1);
+        let producer_checkpoint = DocumentProducerCheckpoint::ZERO.checked_next().unwrap();
+        let rendering = PendingRenderingObservation::new(
+            None,
+            false,
+            authority
+                .target()
+                .fully_active_pipelines()
+                .iter()
+                .map(|pipeline_id| PendingPipelineRenderingObservation {
+                    pipeline_id: *pipeline_id,
+                    activity: PendingRenderingPipelineActivity::FullyActive,
+                    retained_animation_frame_callbacks: 0,
+                    runnable_animation_frame_callbacks: 0,
+                    document_update_required: false,
+                    pending_animation_events: 0,
+                    finite_animations: 0,
+                    infinite_animations: 0,
+                    unsupported_animations: 0,
+                    animated_images: PendingAnimatedImageObservation::default(),
+                    canvas: PendingCanvasObservation::default(),
+                    pending_fonts: 0,
+                    pending_images: 0,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let pending = RawPendingSnapshot {
+            target: authority.target().clone(),
+            state_generation: RuntimeStateGeneration::new(state_generation),
+            dom_epoch: DomEpoch::new(state_generation),
+            clock: PendingClockObservation {
+                clock_id: clock.id(),
+                mode: PendingClockMode::Controlled,
+                now: clock.now(),
+                unsupported_surface: None,
+            },
+            scheduler: PendingSchedulerObservation {
+                scheduler_id: scheduler.id(),
+                next_deadline: None,
+            },
+            input: PendingInputObservation::default(),
+            microtasks: PendingMicrotaskObservation {
+                event_loop_id: authority.target().event_loop_id,
+                queued: 0,
+                completed_checkpoint: microtask_checkpoint,
+                checkpoint_in_progress: false,
+                terminal: None,
+            },
+            execution: Some(DocumentExecutionObservation {
+                clock_id: clock.id(),
+                limits: DocumentExecutionLimits::CONTROLLED_WEBAPP_V1,
+                counters: DocumentExecutionCounters::default(),
+                terminal: None,
+            }),
+            producers: PendingProducerObservation::new(
+                authority.target().event_loop_id,
+                microtask_checkpoint,
+                producer_checkpoint,
+                fence.snapshot(),
+                PendingProducerStability::FirstEmpty,
+                None,
+            )
+            .unwrap(),
+            parser: PendingParserObservation::default(),
+            network: PendingNetworkObservation::default(),
+            logical_timers: PendingLogicalTimerSnapshot::default(),
+            rendering,
+            sources: PendingSourceSnapshot::default(),
+            terminals: PendingRuntimeTerminals::default(),
+        };
+        pending.validate().unwrap();
+        pending
+    }
+
+    fn observed_outcome(
+        pending: servo::document_pending::RawPendingSnapshot,
+    ) -> DocumentControlReceiveOutcome {
+        DocumentControlReceiveOutcome::CommandOutcome(DocumentControlOutcome::Completed(Box::new(
+            servo::document_control::DocumentControlObservation::new_internal(
+                DocumentControlAction::Observed,
+                Box::new(pending),
+                None,
+            )
+            .unwrap(),
+        )))
+    }
+
+    fn turn_processed_outcome(
+        pending: servo::document_pending::RawPendingSnapshot,
+    ) -> DocumentControlReceiveOutcome {
+        DocumentControlReceiveOutcome::CommandOutcome(DocumentControlOutcome::Completed(Box::new(
+            servo::document_control::DocumentControlObservation::new_internal(
+                DocumentControlAction::TurnProcessed {
+                    microtask_checkpoint_advanced: false,
+                },
+                Box::new(pending),
+                None,
+            )
+            .unwrap(),
+        )))
+    }
+
     fn shell<'a>(
         output: &'a mut Vec<u8>,
         state: ShellState,
@@ -2225,6 +7067,16 @@ mod tests {
         let (_sender, inbox) = reader_channel(2);
         let waker = ShellWaker::default();
         let cursor = waker.snapshot_checked().unwrap();
+        let profile = engine.as_ref().and_then(|engine| {
+            (engine.document_control_profile == DocumentControlProfile::TopLevelSession)
+                .then_some(SessionProfile::ControlledWebSessionV1)
+                .or_else(|| {
+                    engine
+                        .clock_mode
+                        .is_controlled()
+                        .then_some(SessionProfile::ControlledWebappV1)
+                })
+        });
         Shell {
             state,
             engine,
@@ -2234,7 +7086,11 @@ mod tests {
             servo_cursor: cursor,
             writer: ProtocolWriter::new(output),
             active: None,
-            projection: wire::WireProjectionContext::new(),
+            projection: wire::WireProjectionContext::new_with_namespace_internal(
+                stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x71; 16]),
+            ),
+            profile,
+            last_navigation_authority: None,
         }
     }
 
@@ -2259,6 +7115,43 @@ mod tests {
             identities["stasis_revision"].as_str(),
             Some(option_env!("STASIS_REVISION").unwrap_or("uncommitted"))
         );
+    }
+
+    #[test]
+    fn initialize_advertises_the_frozen_v2_profile_and_methods() {
+        let mut bytes = Vec::new();
+        {
+            let mut shell = shell(&mut bytes, ShellState::Spawned, None);
+            assert!(!shell.handle(request("protocol.initialize", None)).unwrap());
+        }
+        let response = frames(&bytes).pop().unwrap();
+        let profiles = response["result"]["capabilities"]["profiles"]
+            .as_array()
+            .unwrap();
+        assert!(
+            profiles
+                .iter()
+                .any(|value| { value.as_str() == Some(CONTROLLED_WEB_SESSION_V1_PROFILE) })
+        );
+        let methods = response["result"]["capabilities"]["methods"]
+            .as_array()
+            .unwrap();
+        for method in [
+            "session.navigate",
+            "session.cookies.get",
+            "session.cookies.set",
+            "session.storage.get",
+            "session.storage.set",
+            "session.state.export",
+            "session.state.import",
+            "session.requests",
+            "session.evidence",
+        ] {
+            assert!(
+                methods.iter().any(|value| value.as_str() == Some(method)),
+                "initialize omitted {method}",
+            );
+        }
     }
 
     #[test]
@@ -2295,9 +7188,11 @@ mod tests {
             let mut shell = shell(&mut bytes, ShellState::Open, Some(FakeEngine::controlled()));
             shell.active = Some(ActiveRequest {
                 request: request_with_id("runtime.pending", "active", Some(SESSION_ID)),
+                profile: Some(SessionProfile::ControlledWebappV1),
                 operation: ActiveOperation::Pending,
                 started_at: Instant::now(),
                 in_flight: None,
+                control_turn_observed: None,
                 needs_initial_pump: false,
                 state_effect: RequestStateEffect::None,
             });
@@ -2324,9 +7219,11 @@ mod tests {
             let mut shell = shell(&mut bytes, ShellState::Open, Some(FakeEngine::controlled()));
             shell.active = Some(ActiveRequest {
                 request: request_with_id("runtime.pending", "same", Some(SESSION_ID)),
+                profile: Some(SessionProfile::ControlledWebappV1),
                 operation: ActiveOperation::Pending,
                 started_at: Instant::now(),
                 in_flight: None,
+                control_turn_observed: None,
                 needs_initial_pump: false,
                 state_effect: RequestStateEffect::None,
             });
@@ -2348,9 +7245,11 @@ mod tests {
             let mut shell = shell(&mut bytes, ShellState::Open, Some(FakeEngine::controlled()));
             shell.active = Some(ActiveRequest {
                 request: request_with_id("runtime.settle", "active", Some(SESSION_ID)),
+                profile: Some(SessionProfile::ControlledWebappV1),
                 operation: ActiveOperation::Pending,
                 started_at: Instant::now(),
                 in_flight: None,
+                control_turn_observed: None,
                 needs_initial_pump: false,
                 state_effect: RequestStateEffect::Partial,
             });
@@ -2372,15 +7271,45 @@ mod tests {
     }
 
     #[test]
+    fn controlled_session_cancellation_is_indeterminate_and_fail_stop() {
+        for state_effect in [RequestStateEffect::None, RequestStateEffect::Partial] {
+            let mut bytes = Vec::new();
+            let mut shell = shell(
+                &mut bytes,
+                ShellState::Open,
+                Some(FakeEngine::controlled_session()),
+            );
+            let active = ActiveRequest {
+                request: request("runtime.settle", Some(SESSION_ID)),
+                profile: Some(SessionProfile::ControlledWebSessionV1),
+                operation: ActiveOperation::Pending,
+                started_at: Instant::now(),
+                in_flight: None,
+                control_turn_observed: None,
+                needs_initial_pump: false,
+                state_effect,
+            };
+
+            let failure = shell.cancel_active_failure(&active);
+            assert!(failure.fail_stop);
+            assert!(failure.error.fatal);
+            assert_eq!(failure.error.code, "outcome_indeterminate");
+            assert_eq!(failure.error.state_effect, "indeterminate");
+        }
+    }
+
+    #[test]
     fn close_terminalizes_active_work_before_its_final_response() {
         let mut bytes = Vec::new();
         {
             let mut shell = shell(&mut bytes, ShellState::Open, Some(FakeEngine::controlled()));
             shell.active = Some(ActiveRequest {
                 request: request_with_id("runtime.settle", "active", Some(SESSION_ID)),
+                profile: Some(SessionProfile::ControlledWebappV1),
                 operation: ActiveOperation::Pending,
                 started_at: Instant::now(),
                 in_flight: None,
+                control_turn_observed: None,
                 needs_initial_pump: false,
                 state_effect: RequestStateEffect::Partial,
             });
@@ -2410,14 +7339,29 @@ mod tests {
             "unixTimeOriginNs": "0"
         }))
         .unwrap();
+        let controlled = controlled.configuration().unwrap();
         assert_eq!(
-            controlled.clock_mode().unwrap(),
-            (
-                EngineClockMode::Controlled {
-                    initial_time_ns: 42
-                },
-                "controlled_ready"
-            )
+            controlled.clock_mode,
+            EngineClockMode::Controlled {
+                initial_time_ns: 42
+            }
+        );
+        assert_eq!(controlled.boundary, "controlled_ready");
+        assert_eq!(controlled.profile, Some(SessionProfile::ControlledWebappV1));
+        assert!(controlled.state.is_none());
+        assert!(controlled.network.is_none());
+
+        let session: OpenParams = serde_json::from_value(json!({
+            "url": "about:blank",
+            "clockMode": "controlled",
+            "profile": CONTROLLED_WEB_SESSION_V1_PROFILE,
+            "initialVirtualTimeNs": "42",
+            "unixTimeOriginNs": "0"
+        }))
+        .unwrap();
+        assert_eq!(
+            session.configuration().unwrap().profile,
+            Some(SessionProfile::ControlledWebSessionV1)
         );
 
         let unsupported: OpenParams = serde_json::from_value(json!({
@@ -2428,7 +7372,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            unsupported.clock_mode().unwrap_err().code,
+            unsupported.configuration().err().unwrap().code,
             "invalid_request"
         );
 
@@ -2449,7 +7393,10 @@ mod tests {
             }),
         ] {
             let params: OpenParams = serde_json::from_value(invalid).unwrap();
-            assert_eq!(params.clock_mode().unwrap_err().code, "invalid_request");
+            assert_eq!(
+                params.configuration().err().unwrap().code,
+                "invalid_request"
+            );
         }
     }
 
@@ -2505,7 +7452,7 @@ mod tests {
             assert!(matches!(
                 shell.active.as_ref().map(|active| &active.operation),
                 Some(ActiveOperation::ControlledOpen(ControlledOpenState {
-                    waiting: Some(_),
+                    readiness_waiting: Some(_),
                     ..
                 }))
             ));
@@ -2521,6 +7468,39 @@ mod tests {
         }
 
         assert!(frames(&bytes).is_empty());
+    }
+
+    #[test]
+    fn settlement_wait_retains_wake_from_in_flight_control_turn() {
+        let mut bytes = Vec::new();
+        let mut shell = shell(&mut bytes, ShellState::Open, Some(FakeEngine::controlled()));
+        let mut active = ActiveRequest {
+            request: request("runtime.settle", Some(SESSION_ID)),
+            profile: Some(SessionProfile::ControlledWebappV1),
+            operation: ActiveOperation::Pending,
+            started_at: Instant::now(),
+            in_flight: Some(DocumentControlCommand::Observe),
+            control_turn_observed: Some(shell.checked_wake_snapshot().unwrap()),
+            needs_initial_pump: true,
+            state_effect: RequestStateEffect::None,
+        };
+        let before_submit = active.control_turn_observed.unwrap();
+
+        // A producer commits after submission but before the forced control pump. That pump may
+        // advance the global cursor before the typed Observe response becomes pollable.
+        servo::EventLoopWaker::wake(&shell.waker);
+        let producer_wake = shell.checked_wake_snapshot().unwrap();
+        shell.servo_cursor = producer_wake;
+        active.needs_initial_pump = false;
+
+        let wait = active.settle_host_wait(shell.servo_cursor, Instant::now(), None);
+        assert_eq!(wait.observed, before_submit);
+        assert!(producer_wake.servo_changed_since(wait.observed));
+
+        // The per-command baseline is single-use. A later wait without a new control turn starts
+        // from the current cursor and cannot replay this old producer wake.
+        let next_wait = active.settle_host_wait(shell.servo_cursor, Instant::now(), None);
+        assert_eq!(next_wait.observed, producer_wake);
     }
 
     #[test]
@@ -2648,11 +7628,17 @@ mod tests {
         {
             let real = FakeEngine {
                 clock_mode: EngineClockMode::Real,
+                document_control_profile: DocumentControlProfile::SingleDocument,
                 pump_calls: 0,
                 cancel_calls: 0,
+                navigation_cancel_calls: 0,
                 close_calls: 0,
                 submitted: Vec::new(),
                 polls: VecDeque::new(),
+                navigation_submitted: Vec::new(),
+                navigation_polls: VecDeque::new(),
+                network_virtual_times: RefCell::new(Vec::new()),
+                evidence: Rc::new(RefCell::new(Vec::new())),
             };
             let mut shell = shell(&mut bytes, ShellState::Open, Some(real));
 
@@ -2696,6 +7682,90 @@ mod tests {
         }
 
         assert!(frames(&bytes).is_empty());
+    }
+
+    #[test]
+    fn controlled_session_document_mutations_observe_navigation_authority_first() {
+        let mut bytes = Vec::new();
+        {
+            let mut shell = shell(
+                &mut bytes,
+                ShellState::Open,
+                Some(FakeEngine::controlled_session()),
+            );
+            let mut fill = request("action.fill", Some(SESSION_ID));
+            fill.params = json!({
+                "selector": "#email",
+                "value": "person@example.test",
+                "expectedStateToken": test_document_token(1),
+            });
+
+            assert!(!shell.handle(fill).unwrap());
+            let engine = shell.engine.as_ref().unwrap();
+            assert!(engine.submitted.is_empty());
+            assert_eq!(
+                engine.navigation_submitted,
+                vec![NavigationOperationKind::Observe]
+            );
+        }
+        assert!(frames(&bytes).is_empty());
+    }
+
+    #[test]
+    fn session_navigate_validates_http_and_starts_with_passive_authority() {
+        let mut bytes = Vec::new();
+        {
+            let mut shell = shell(
+                &mut bytes,
+                ShellState::Open,
+                Some(FakeEngine::controlled_session()),
+            );
+            let mut navigate = request("session.navigate", Some(SESSION_ID));
+            navigate.params = json!({
+                "url": "https://example.test/next",
+                "expectedStateToken": test_document_token(1),
+            });
+            assert!(!shell.handle(navigate).unwrap());
+            assert_eq!(
+                shell.engine.as_ref().unwrap().navigation_submitted,
+                vec![NavigationOperationKind::Observe]
+            );
+            assert!(matches!(
+                shell.active.as_ref().map(|active| &active.operation),
+                Some(ActiveOperation::Navigate(NavigateState {
+                    phase: NavigatePhase::AwaitingAuthority { .. },
+                    ..
+                }))
+            ));
+        }
+        assert!(frames(&bytes).is_empty());
+
+        let mut invalid_bytes = Vec::new();
+        {
+            let mut shell = shell(
+                &mut invalid_bytes,
+                ShellState::Open,
+                Some(FakeEngine::controlled_session()),
+            );
+            let mut navigate = request("session.navigate", Some(SESSION_ID));
+            navigate.params = json!({
+                "url": "file:///tmp/not-supported",
+                "expectedStateToken": test_document_token(1),
+            });
+            assert!(!shell.handle(navigate).unwrap());
+            assert!(
+                shell
+                    .engine
+                    .as_ref()
+                    .unwrap()
+                    .navigation_submitted
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            frames(&invalid_bytes)[0]["error"]["code"],
+            "unsupported_navigation_scheme"
+        );
     }
 
     #[test]
@@ -2744,6 +7814,7 @@ mod tests {
                     Some(ActiveOperation::Automation(AutomationState {
                         kind,
                         unresolved: Some(_),
+                        ..
                     })) if *kind == expected_kind
                 ));
             }
@@ -2795,6 +7866,45 @@ mod tests {
     }
 
     #[test]
+    fn automation_rejections_never_echo_selector_or_select_values() {
+        let secret_selector = "#SECRET-SELECTOR-CANARY";
+        let secret_value = "SECRET-OPTION-CANARY";
+        for error in [
+            DocumentAutomationError::InvalidSelector {
+                selector: secret_selector.into(),
+            },
+            DocumentAutomationError::SelectValueNotFound {
+                selector: secret_selector.into(),
+                value: secret_value.into(),
+            },
+        ] {
+            let protocol = automation_rejection(
+                DocumentControlError::Automation(error),
+                RequestStateEffect::None,
+            );
+            assert!(!protocol.message.contains(secret_selector));
+            assert!(!protocol.message.contains(secret_value));
+            assert_eq!(protocol.message, "document automation request was rejected");
+        }
+
+        let mut malformed = request("dom.extract", Some(SESSION_ID));
+        malformed.params = json!({
+            "rootSelector": secret_selector,
+            "fields": [{
+                "name": "value",
+                "selector": secret_selector,
+                "read": secret_value,
+            }],
+            "expectedGeneration": "1",
+        });
+        let parse_error = parse_params::<wire::DomExtractParams>(&malformed)
+            .err()
+            .unwrap();
+        assert!(!parse_error.message.contains(secret_selector));
+        assert!(!parse_error.message.contains(secret_value));
+    }
+
+    #[test]
     fn automation_rejects_generations_outside_the_runtime_u64_authority() {
         let mut bytes = Vec::new();
         {
@@ -2811,5 +7921,1482 @@ mod tests {
         }
 
         assert_eq!(frames(&bytes)[0]["error"]["code"], "invalid_request");
+    }
+
+    #[test]
+    fn sensitive_parameter_errors_are_fixed_and_redacted() {
+        let secret = "SECRET-CANARY-DO-NOT-ECHO";
+        let mut open = request("session.open", None);
+        open.params = json!({
+            "url": "https://example.test/",
+            "clockMode": secret,
+        });
+        let open_error =
+            parse_sensitive_params::<OpenParams>(&open, "invalid session.open parameters")
+                .err()
+                .unwrap();
+        assert_eq!(open_error.message, "invalid session.open parameters");
+        assert!(!open_error.message.contains(secret));
+
+        let mut cookies = request("session.cookies.set", Some(SESSION_ID));
+        cookies.params = json!({
+            "expectedSessionStateToken": test_session_state_token(1),
+            "cookies": [{"sameSite": secret}],
+        });
+        let cookie_error = parse_sensitive_params::<SessionCookiesSetParamsV1>(
+            &cookies,
+            "invalid session cookie parameters",
+        )
+        .err()
+        .unwrap();
+        assert_eq!(cookie_error.message, "invalid session cookie parameters");
+        assert!(!cookie_error.message.contains(secret));
+
+        let mut storage = request("session.storage.set", Some(SESSION_ID));
+        storage.params = json!({
+            "expectedSessionStateToken": secret,
+            "origins": [],
+        });
+        let storage_error = parse_sensitive_params::<SessionStorageSetParamsV1>(
+            &storage,
+            "invalid session storage parameters",
+        )
+        .err()
+        .unwrap();
+        assert_eq!(storage_error.message, "invalid session storage parameters");
+        assert!(!storage_error.message.contains(secret));
+    }
+
+    #[test]
+    fn token_domains_cannot_substitute_at_public_endpoints() {
+        let mut document_request = request("runtime.pending", Some(SESSION_ID));
+        document_request.params = json!({"expectedStateToken": test_session_state_token(1)});
+        let document_error =
+            parse_params::<wire::SessionRuntimeAdvanceToNextParams>(&document_request)
+                .err()
+                .unwrap();
+        assert_eq!(document_error.code, "stale_state_token");
+        assert_eq!(document_error.state_effect, "none");
+
+        let mut session_request = request("session.cookies.set", Some(SESSION_ID));
+        session_request.params = json!({
+            "expectedSessionStateToken": test_document_token(1),
+            "cookies": [],
+        });
+        let session_error = parse_sensitive_params::<SessionCookiesSetParamsV1>(
+            &session_request,
+            "invalid session cookie parameters",
+        )
+        .err()
+        .unwrap();
+        assert_eq!(session_error.code, "stale_session_state_token");
+        assert_eq!(session_error.state_effect, "none");
+
+        let mut malformed_document = request("runtime.pending", Some(SESSION_ID));
+        malformed_document.params = json!({"expectedStateToken": "session:not-canonical"});
+        let malformed_document_error =
+            parse_params::<wire::SessionRuntimeAdvanceToNextParams>(&malformed_document)
+                .err()
+                .unwrap();
+        assert_eq!(malformed_document_error.code, "invalid_request");
+
+        let mut malformed_session = request("session.cookies.set", Some(SESSION_ID));
+        malformed_session.params = json!({
+            "expectedSessionStateToken": "document:not-canonical",
+            "cookies": [],
+        });
+        let malformed_session_error = parse_sensitive_params::<SessionCookiesSetParamsV1>(
+            &malformed_session,
+            "invalid session cookie parameters",
+        )
+        .err()
+        .unwrap();
+        assert_eq!(malformed_session_error.code, "invalid_request");
+    }
+
+    #[test]
+    fn published_state_import_is_phase_closed_before_secret_inspection() {
+        let secret = "SECRET-IMPORT-CANARY";
+        let mut bytes = Vec::new();
+        {
+            let mut shell = shell(
+                &mut bytes,
+                ShellState::Open,
+                Some(FakeEngine::controlled_session()),
+            );
+            let mut import = request("session.state.import", Some(SESSION_ID));
+            import.params = json!({
+                "expectedSessionStateToken": test_document_token(1),
+                "state": secret,
+            });
+            assert!(!shell.handle(import).unwrap());
+        }
+        let response = frames(&bytes).pop().unwrap();
+        assert_eq!(
+            response["error"]["code"],
+            "session_state_import_phase_closed"
+        );
+        assert!(!response.to_string().contains(secret));
+    }
+
+    #[test]
+    fn app_navigation_limits_preserve_effect_and_fail_stop_after_other_work() {
+        let terminal = SessionNavigationTerminal::HistoryLimitExceeded {
+            limit: 10_000,
+            observed: 10_000,
+            navigation_id: SessionNavigationId::new(7),
+            history_revision: embedder_traits::document_session::HistoryRevision::new(10_000),
+        };
+        let ActiveTransition::Fail(pre_admission) =
+            session_navigation_terminal_failure(terminal, RequestStateEffect::None)
+        else {
+            panic!("terminal navigation must fail");
+        };
+        assert!(!pre_admission.fail_stop);
+        assert!(!pre_admission.error.fatal);
+        assert_eq!(pre_admission.error.state_effect, "none");
+        assert!(pre_admission.error.details.is_some());
+
+        let ActiveTransition::Fail(post_action) =
+            session_navigation_terminal_failure(terminal, RequestStateEffect::Partial)
+        else {
+            panic!("terminal navigation must fail");
+        };
+        assert!(post_action.fail_stop);
+        assert!(post_action.error.fatal);
+        assert_eq!(post_action.error.state_effect, "partial");
+    }
+
+    #[test]
+    fn projection_authority_mismatch_fail_stops_after_partial_work_only() {
+        let mismatch = wire::DocumentStateAuthorityError::NavigationTargetDoesNotMatchPending;
+        let ActiveTransition::Fail(before_work) =
+            mismatched_navigation_authority(mismatch.clone(), RequestStateEffect::None)
+        else {
+            panic!("authority mismatch must fail");
+        };
+        assert!(!before_work.fail_stop);
+        assert!(!before_work.error.fatal);
+        assert_eq!(before_work.error.state_effect, "none");
+
+        let ActiveTransition::Fail(after_work) =
+            mismatched_navigation_authority(mismatch, RequestStateEffect::Partial)
+        else {
+            panic!("authority mismatch must fail");
+        };
+        assert!(after_work.fail_stop);
+        assert!(after_work.error.fatal);
+        assert_eq!(after_work.error.state_effect, "partial");
+    }
+
+    #[test]
+    fn token_entropy_failures_are_secret_free_fatal_runtime_errors() {
+        let ActiveTransition::Fail(document) = document_authority_authorization_failure(
+            wire::DocumentStateAuthorityError::TokenEntropyUnavailable,
+        ) else {
+            panic!("document token entropy failure must fail");
+        };
+        assert!(document.fail_stop);
+        assert!(document.error.fatal);
+        assert_eq!(document.error.code, "runtime_error");
+        assert_eq!(document.error.state_effect, "none");
+        assert!(document.error.details.is_none());
+
+        let session = session_state_protocol_error(SessionStateError::TokenEntropyUnavailable);
+        assert!(session.fatal);
+        assert_eq!(session.code, "session_state_token_entropy_unavailable");
+        assert_eq!(session.state_effect, "none");
+        assert!(session.details.is_none());
+
+        let hardened = harden_session_state_mutation_error("session.storage.set", session);
+        assert!(hardened.fatal);
+        assert_eq!(hardened.state_effect, "indeterminate");
+        assert!(hardened.details.is_none());
+    }
+
+    #[test]
+    fn post_replace_session_state_failures_are_indeterminate_and_fatal() {
+        for code in [
+            "session_state_backend_observe_failed",
+            "session_state_cookie_replace_failed",
+            "session_state_web_storage_replace_failed",
+            "session_state_backend_revision_regressed",
+            "session_state_token_entropy_unavailable",
+            "session_state_token_space_exhausted",
+        ] {
+            let hardened = harden_session_state_mutation_error(
+                "session.cookies.set",
+                ProtocolError::operation(code, "redacted", "none"),
+            );
+            assert!(hardened.fatal, "{code} was not fail-stopped");
+            assert_eq!(hardened.state_effect, "indeterminate", "{code}");
+        }
+        let stale = harden_session_state_mutation_error(
+            "session.storage.set",
+            ProtocolError::operation("stale_session_state_token", "stale", "none"),
+        );
+        assert!(!stale.fatal);
+        assert_eq!(stale.state_effect, "none");
+    }
+
+    #[test]
+    fn registrable_host_cookie_overflow_has_a_distinct_pre_mutation_code() {
+        let error =
+            session_state_protocol_error(SessionStateError::TooManyCookiesPerRegistrableHost);
+        assert_eq!(error.code, "too_many_session_cookies_per_registrable_host");
+        assert!(!error.fatal);
+        assert_eq!(error.state_effect, "none");
+        assert!(error.details.is_none());
+    }
+
+    #[test]
+    fn active_controlled_network_freezes_v2_virtual_advance() {
+        assert!(controlled_network_blocks_virtual_advance(
+            Some(SessionProfile::ControlledWebSessionV1),
+            1,
+        ));
+        assert!(!controlled_network_blocks_virtual_advance(
+            Some(SessionProfile::ControlledWebSessionV1),
+            0,
+        ));
+        assert!(!controlled_network_blocks_virtual_advance(
+            Some(SessionProfile::ControlledWebappV1),
+            1,
+        ));
+    }
+
+    #[test]
+    fn held_drive_refresh_accepts_coalesced_same_document_authority() {
+        let source = session_authority(1, 0, 0, 0);
+        let observed = SessionNavigationAuthority::new_internal(
+            Box::new(source.target().clone()),
+            source.document_epoch(),
+            source.navigation_id(),
+            embedder_traits::document_session::HistoryRevision::new(3),
+            source.successful_document_replacements(),
+            source.url().clone(),
+            None,
+        );
+        let effective_policy = default_resolved_settle_policy();
+        let mut active = ActiveRequest {
+            request: request("runtime.settle", Some(SESSION_ID)),
+            profile: Some(SessionProfile::ControlledWebSessionV1),
+            operation: ActiveOperation::Settle(SettleState {
+                profile: SessionProfile::ControlledWebSessionV1,
+                authorizing_state_token: None,
+                authorizing_navigation: Some(source.clone()),
+                replacement: None,
+                authority_bound_command: Some(DocumentControlCommand::DriveOneTurn),
+                latest_pending_target: Some(Box::new(source.target().clone())),
+                response: SettleResponse::Runtime,
+                coordinator: settle::SettleCoordinator::new(effective_policy.engine),
+                effective_policy,
+                cumulative_external_io_wall_time: Duration::ZERO,
+                waiting: None,
+            }),
+            started_at: Instant::now(),
+            in_flight: None,
+            control_turn_observed: None,
+            needs_initial_pump: false,
+            state_effect: RequestStateEffect::None,
+        };
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x71; 16]),
+        );
+
+        let transition = transition_from_navigation_completion(
+            &mut active,
+            NavigationOperationCompletion::test_response(
+                NavigationOperationKind::Observe,
+                Ok(observed.clone()),
+            ),
+            &mut projection,
+        );
+        assert!(matches!(
+            transition,
+            ActiveTransition::Submit(DocumentControlCommand::DriveOneTurn)
+        ));
+        let ActiveOperation::Settle(state) = &active.operation else {
+            panic!("held Drive lost settlement state");
+        };
+        assert_eq!(state.authorizing_navigation.as_ref(), Some(&observed));
+        assert!(state.authority_bound_command.is_none());
+    }
+
+    #[test]
+    fn queued_replacement_rearms_the_unsubmitted_coordinator_drive_exactly_once() {
+        let source = session_authority(1, 0, 0, 0);
+        let admitted = replacement_admission_authority(&source);
+        let activated = activated_replacement_authority(&source, &admitted);
+        let effective_policy = default_resolved_settle_policy();
+        let mut coordinator = settle::SettleCoordinator::new(effective_policy.engine);
+        assert_eq!(
+            coordinator.start(),
+            Ok(settle::SettleProgress::Command(
+                DocumentControlCommand::Observe
+            )),
+        );
+        let source_pending = pending_for_authority(&source, 7);
+        assert_eq!(
+            coordinator
+                .consume_receive_outcome(observed_outcome(source_pending.clone()), Duration::ZERO,),
+            Ok(settle::SettleProgress::Command(
+                DocumentControlCommand::DriveOneTurn
+            )),
+        );
+        let mut active = ActiveRequest {
+            request: request("runtime.settle", Some(SESSION_ID)),
+            profile: Some(SessionProfile::ControlledWebSessionV1),
+            operation: ActiveOperation::Settle(SettleState {
+                profile: SessionProfile::ControlledWebSessionV1,
+                authorizing_state_token: None,
+                authorizing_navigation: Some(source.clone()),
+                replacement: None,
+                authority_bound_command: Some(DocumentControlCommand::DriveOneTurn),
+                latest_pending_target: Some(Box::new(source.target().clone())),
+                response: SettleResponse::Runtime,
+                coordinator,
+                effective_policy,
+                cumulative_external_io_wall_time: Duration::ZERO,
+                waiting: None,
+            }),
+            started_at: Instant::now(),
+            in_flight: None,
+            control_turn_observed: None,
+            needs_initial_pump: false,
+            state_effect: RequestStateEffect::None,
+        };
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x71; 16]),
+        );
+
+        let bootstrap = DocumentControlCommand::BootstrapReplacementPipeline {
+            source_pipeline_id: source.target().active_top_level.unwrap().pipeline_id,
+            pipeline_id: admitted.target().pending_top_level_pipelines()[0],
+        };
+        assert!(matches!(
+            transition_from_navigation_completion(
+                &mut active,
+                NavigationOperationCompletion::test_response(
+                    NavigationOperationKind::Observe,
+                    Ok(admitted.clone()),
+                ),
+                &mut projection,
+            ),
+            ActiveTransition::Submit(command) if command == bootstrap
+        ));
+        assert_eq!(active.state_effect, RequestStateEffect::Partial);
+        let ActiveOperation::Settle(state) = &active.operation else {
+            panic!("replacement rearm lost settlement state");
+        };
+        assert!(state.authority_bound_command.is_none());
+        assert!(matches!(
+            state.replacement,
+            Some(SettleReplacementPhase::Bootstrapping { .. })
+        ));
+
+        let mut activated_pending = pending_for_authority(&activated, 8);
+        activated_pending.clock = source_pending.clock;
+        activated_pending.scheduler = source_pending.scheduler;
+        activated_pending
+            .execution
+            .as_mut()
+            .expect("test pending has execution authority")
+            .clock_id = activated_pending.clock.clock_id;
+        activated_pending.validate().unwrap();
+        assert!(matches!(
+            transition_from_control_completion(
+                &mut active,
+                bootstrap,
+                turn_processed_outcome(activated_pending),
+                &mut projection,
+                0,
+            ),
+            ActiveTransition::SubmitSessionNavigationObservation {
+                allow_servo_pump: false
+            }
+        ));
+        assert!(matches!(
+            transition_from_navigation_completion(
+                &mut active,
+                NavigationOperationCompletion::test_response(
+                    NavigationOperationKind::Observe,
+                    Ok(activated.clone()),
+                ),
+                &mut projection,
+            ),
+            ActiveTransition::SubmitSessionNavigationObservation {
+                allow_servo_pump: false
+            }
+        ));
+        let ActiveOperation::Settle(state) = &active.operation else {
+            panic!("activated replacement lost settlement state");
+        };
+        assert!(state.replacement.is_none());
+        assert_eq!(
+            state.authority_bound_command,
+            Some(DocumentControlCommand::DriveOneTurn),
+        );
+        assert!(matches!(
+            transition_from_navigation_completion(
+                &mut active,
+                NavigationOperationCompletion::test_response(
+                    NavigationOperationKind::Observe,
+                    Ok(activated),
+                ),
+                &mut projection,
+            ),
+            ActiveTransition::Submit(DocumentControlCommand::DriveOneTurn)
+        ));
+    }
+
+    #[test]
+    fn queued_replacement_rearm_rejects_owner_authority_near_misses() {
+        let source = session_authority(1, 0, 0, 0);
+        let admitted = replacement_admission_authority(&source);
+        let revision_gap = SessionNavigationAuthority::new_internal(
+            Box::new(admitted.target().clone()),
+            admitted.document_epoch(),
+            SessionNavigationId::new(source.navigation_id().get() + 2),
+            admitted.history_revision(),
+            admitted.successful_document_replacements(),
+            admitted.url().clone(),
+            None,
+        );
+        assert!(exact_replacement_admission(&source, &revision_gap).is_none());
+
+        let effective_policy = default_resolved_settle_policy();
+        let mut coordinator = settle::SettleCoordinator::new(effective_policy.engine);
+        assert!(matches!(
+            coordinator.start(),
+            Ok(settle::SettleProgress::Command(
+                DocumentControlCommand::Observe
+            ))
+        ));
+        assert!(matches!(
+            coordinator.consume_receive_outcome(
+                observed_outcome(pending_for_authority(&source, 7)),
+                Duration::ZERO,
+            ),
+            Ok(settle::SettleProgress::Command(
+                DocumentControlCommand::DriveOneTurn
+            ))
+        ));
+        let mut active = ActiveRequest {
+            request: request("runtime.settle", Some(SESSION_ID)),
+            profile: Some(SessionProfile::ControlledWebSessionV1),
+            operation: ActiveOperation::Settle(SettleState {
+                profile: SessionProfile::ControlledWebSessionV1,
+                authorizing_state_token: None,
+                authorizing_navigation: Some(source.clone()),
+                replacement: None,
+                authority_bound_command: Some(DocumentControlCommand::DriveOneTurn),
+                latest_pending_target: Some(Box::new(source.target().clone())),
+                response: SettleResponse::Runtime,
+                coordinator,
+                effective_policy,
+                cumulative_external_io_wall_time: Duration::ZERO,
+                waiting: None,
+            }),
+            started_at: Instant::now(),
+            in_flight: None,
+            control_turn_observed: None,
+            needs_initial_pump: false,
+            state_effect: RequestStateEffect::None,
+        };
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x71; 16]),
+        );
+
+        let ActiveTransition::Fail(failure) = transition_from_navigation_completion(
+            &mut active,
+            NavigationOperationCompletion::test_response(
+                NavigationOperationKind::Observe,
+                Ok(revision_gap),
+            ),
+            &mut projection,
+        ) else {
+            panic!("a near-miss owner admission rearmed the coordinator Drive");
+        };
+        assert!(failure.fail_stop);
+        assert!(failure.error.fatal);
+        assert_eq!(failure.error.code, "navigation_authority_changed");
+    }
+
+    #[test]
+    fn replacement_control_outcome_is_held_until_sole_pipeline_controlled_ready() {
+        let source = session_authority(1, 0, 0, 0);
+        let admitted = replacement_admission_authority(&source);
+        let activated = activated_replacement_authority(&source, &admitted);
+        let effective_policy = default_resolved_settle_policy();
+        let source_pipeline_id = source.target().active_top_level.unwrap().pipeline_id;
+        let pipeline_id = admitted.target().pending_top_level_pipelines()[0];
+        let bootstrap = DocumentControlCommand::BootstrapReplacementPipeline {
+            source_pipeline_id,
+            pipeline_id,
+        };
+        let mut coordinator = settle::SettleCoordinator::new(effective_policy.engine);
+        assert_eq!(
+            coordinator.start_with_replacement_bootstrap(bootstrap.clone()),
+            Ok(settle::SettleProgress::Command(bootstrap.clone())),
+        );
+        let mut active = ActiveRequest {
+            request: request("runtime.settle", Some(SESSION_ID)),
+            profile: Some(SessionProfile::ControlledWebSessionV1),
+            operation: ActiveOperation::Settle(SettleState {
+                profile: SessionProfile::ControlledWebSessionV1,
+                authorizing_state_token: None,
+                authorizing_navigation: Some(source.clone()),
+                replacement: Some(SettleReplacementPhase::Bootstrapping {
+                    source: source.clone(),
+                    admitted: admitted.clone(),
+                    command: bootstrap.clone(),
+                }),
+                authority_bound_command: None,
+                latest_pending_target: Some(Box::new(admitted.target().clone())),
+                response: SettleResponse::Runtime,
+                coordinator,
+                effective_policy,
+                cumulative_external_io_wall_time: Duration::ZERO,
+                waiting: None,
+            }),
+            started_at: Instant::now(),
+            in_flight: None,
+            control_turn_observed: None,
+            needs_initial_pump: false,
+            state_effect: RequestStateEffect::Partial,
+        };
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x71; 16]),
+        );
+
+        let bootstrap_outcome = turn_processed_outcome(pending_for_authority(&activated, 9));
+        let passive = transition_from_control_completion(
+            &mut active,
+            bootstrap,
+            bootstrap_outcome,
+            &mut projection,
+            0,
+        );
+        assert!(matches!(
+            passive,
+            ActiveTransition::SubmitSessionNavigationObservation {
+                allow_servo_pump: false
+            }
+        ));
+
+        let ready = transition_from_navigation_completion(
+            &mut active,
+            NavigationOperationCompletion::test_response(
+                NavigationOperationKind::Observe,
+                Ok(activated.clone()),
+            ),
+            &mut projection,
+        );
+        assert!(matches!(
+            ready,
+            ActiveTransition::SubmitSessionNavigationObservation {
+                allow_servo_pump: false
+            }
+        ));
+        let ActiveOperation::Settle(state) = &active.operation else {
+            panic!("ready replacement lost settlement state");
+        };
+        assert!(state.replacement.is_none());
+        assert_eq!(
+            state.latest_pending_target.as_deref(),
+            Some(activated.target())
+        );
+        assert_eq!(
+            state.authority_bound_command,
+            Some(DocumentControlCommand::DriveOneTurn),
+        );
+
+        let release = transition_from_navigation_completion(
+            &mut active,
+            NavigationOperationCompletion::test_response(
+                NavigationOperationKind::Observe,
+                Ok(activated),
+            ),
+            &mut projection,
+        );
+        assert!(matches!(
+            release,
+            ActiveTransition::Submit(DocumentControlCommand::DriveOneTurn)
+        ));
+        let ActiveOperation::Settle(state) = &active.operation else {
+            panic!("ready Drive release lost settlement state");
+        };
+        assert!(state.authority_bound_command.is_none());
+    }
+
+    #[test]
+    fn source_retained_activation_stays_on_the_coordinator_wait_and_drive_ledger() {
+        let source = session_authority(1, 0, 0, 0);
+        let admitted = replacement_admission_authority(&source);
+        let retained = activated_replacement_source_retained_authority(&source, &admitted);
+        let activated = activated_replacement_authority(&source, &admitted);
+        assert!(held_drive_replacement_target_progressed(
+            &source,
+            &admitted,
+            admitted.target(),
+            &retained,
+        ));
+        assert!(held_drive_replacement_target_progressed(
+            &source,
+            &admitted,
+            retained.target(),
+            &activated,
+        ));
+        assert!(!held_drive_replacement_target_progressed(
+            &source,
+            &admitted,
+            retained.target(),
+            &admitted,
+        ));
+
+        let effective_policy = default_resolved_settle_policy();
+        let bootstrap = DocumentControlCommand::BootstrapReplacementPipeline {
+            source_pipeline_id: source.target().active_top_level.unwrap().pipeline_id,
+            pipeline_id: admitted.target().pending_top_level_pipelines()[0],
+        };
+        let mut coordinator = settle::SettleCoordinator::new(effective_policy.engine);
+        assert_eq!(
+            coordinator.start_with_replacement_bootstrap(bootstrap.clone()),
+            Ok(settle::SettleProgress::Command(bootstrap.clone())),
+        );
+        let mut active = ActiveRequest {
+            request: request("runtime.settle", Some(SESSION_ID)),
+            profile: Some(SessionProfile::ControlledWebSessionV1),
+            operation: ActiveOperation::Settle(SettleState {
+                profile: SessionProfile::ControlledWebSessionV1,
+                authorizing_state_token: None,
+                authorizing_navigation: Some(source.clone()),
+                replacement: Some(SettleReplacementPhase::Bootstrapping {
+                    source,
+                    admitted: admitted.clone(),
+                    command: bootstrap.clone(),
+                }),
+                authority_bound_command: None,
+                latest_pending_target: Some(Box::new(admitted.target().clone())),
+                response: SettleResponse::Runtime,
+                coordinator,
+                effective_policy,
+                cumulative_external_io_wall_time: Duration::ZERO,
+                waiting: None,
+            }),
+            started_at: Instant::now(),
+            in_flight: None,
+            control_turn_observed: None,
+            needs_initial_pump: false,
+            state_effect: RequestStateEffect::Partial,
+        };
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x71; 16]),
+        );
+
+        let bootstrap_pending = pending_for_authority(&admitted, 9);
+        assert!(matches!(
+            transition_from_control_completion(
+                &mut active,
+                bootstrap,
+                turn_processed_outcome(bootstrap_pending.clone()),
+                &mut projection,
+                0,
+            ),
+            ActiveTransition::SubmitSessionNavigationObservation {
+                allow_servo_pump: false
+            }
+        ));
+        let wait = transition_from_navigation_completion(
+            &mut active,
+            NavigationOperationCompletion::test_response(
+                NavigationOperationKind::Observe,
+                Ok(retained.clone()),
+            ),
+            &mut projection,
+        );
+        assert!(matches!(wait, ActiveTransition::Wait(_)));
+        let ActiveOperation::Settle(state) = &mut active.operation else {
+            panic!("retained activation lost settlement state");
+        };
+        assert!(matches!(
+            state.replacement,
+            Some(SettleReplacementPhase::Activating { .. })
+        ));
+
+        let resumed = state.coordinator.resume_after_wake(Duration::ZERO).unwrap();
+        assert!(matches!(
+            transition_from_settle_progress_for_active(
+                state,
+                active.started_at,
+                resumed,
+                active.state_effect,
+                &mut projection,
+            ),
+            ActiveTransition::Submit(DocumentControlCommand::Observe)
+        ));
+        let mut ready_pending = pending_for_authority(&activated, 10);
+        ready_pending.clock = bootstrap_pending.clock;
+        ready_pending.scheduler = bootstrap_pending.scheduler;
+        ready_pending
+            .execution
+            .as_mut()
+            .expect("test pending has execution authority")
+            .clock_id = ready_pending.clock.clock_id;
+        ready_pending.validate().unwrap();
+        assert!(matches!(
+            transition_from_control_completion(
+                &mut active,
+                DocumentControlCommand::Observe,
+                observed_outcome(ready_pending),
+                &mut projection,
+                0,
+            ),
+            ActiveTransition::SubmitSessionNavigationObservation {
+                allow_servo_pump: false
+            }
+        ));
+        assert!(matches!(
+            transition_from_navigation_completion(
+                &mut active,
+                NavigationOperationCompletion::test_response(
+                    NavigationOperationKind::Observe,
+                    Ok(activated.clone()),
+                ),
+                &mut projection,
+            ),
+            ActiveTransition::SubmitSessionNavigationObservation {
+                allow_servo_pump: false
+            }
+        ));
+        let ActiveOperation::Settle(state) = &active.operation else {
+            panic!("ready activation lost settlement state");
+        };
+        assert!(state.replacement.is_none());
+        assert_eq!(state.authorizing_navigation.as_ref(), Some(&activated));
+        assert_eq!(
+            state.latest_pending_target.as_deref(),
+            Some(activated.target())
+        );
+        assert_eq!(
+            state.authority_bound_command,
+            Some(DocumentControlCommand::DriveOneTurn),
+        );
+
+        assert!(matches!(
+            transition_from_navigation_completion(
+                &mut active,
+                NavigationOperationCompletion::test_response(
+                    NavigationOperationKind::Observe,
+                    Ok(activated),
+                ),
+                &mut projection,
+            ),
+            ActiveTransition::Submit(DocumentControlCommand::DriveOneTurn)
+        ));
+    }
+
+    #[test]
+    fn replacement_completion_never_projects_before_controlled_ready() {
+        let source = session_authority(1, 0, 0, 0);
+        let admitted = replacement_admission_authority(&source);
+        let effective_policy = default_resolved_settle_policy();
+        let mut state = SettleState {
+            profile: SessionProfile::ControlledWebSessionV1,
+            authorizing_state_token: None,
+            authorizing_navigation: Some(source.clone()),
+            replacement: Some(SettleReplacementPhase::Activating { source, admitted }),
+            authority_bound_command: None,
+            latest_pending_target: None,
+            response: SettleResponse::Runtime,
+            coordinator: settle::SettleCoordinator::new(effective_policy.engine),
+            effective_policy,
+            cumulative_external_io_wall_time: Duration::ZERO,
+            waiting: None,
+        };
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x71; 16]),
+        );
+        let terminal_pending = Box::new(pending_for_authority(
+            state.authorizing_navigation.as_ref().unwrap(),
+            11,
+        ));
+        let ActiveTransition::Fail(blocked) = transition_from_settle_progress_for_active(
+            &mut state,
+            Instant::now(),
+            settle::SettleProgress::Complete(settle::SettleCompletion::BlockedOnExternalIo {
+                pending: terminal_pending,
+                network: Vec::new(),
+                control_turns: 1,
+            }),
+            RequestStateEffect::Partial,
+            &mut projection,
+        ) else {
+            panic!("an incomplete replacement projected a terminal settlement result");
+        };
+        assert!(blocked.fail_stop);
+        assert!(blocked.error.fatal);
+        assert_eq!(blocked.error.code, "blocked_on_external_io");
+        assert_eq!(blocked.error.state_effect, "partial");
+    }
+
+    #[test]
+    fn pending_projection_rearms_when_replacement_admission_races_its_document_observe() {
+        let source = session_authority(1, 0, 0, 0);
+        let admitted = replacement_admission_authority(&source);
+        let source_pipeline_id = source.target().active_top_level.unwrap().pipeline_id;
+        let pipeline_id = admitted.target().pending_top_level_pipelines()[0];
+        let effective_policy = default_resolved_settle_policy();
+        let mut active = ActiveRequest {
+            request: request("runtime.pending", Some(SESSION_ID)),
+            profile: Some(SessionProfile::ControlledWebSessionV1),
+            operation: ActiveOperation::SessionProjection(SessionProjectionState {
+                pending: Box::new(pending_for_authority(&source, 7)),
+                kind: SessionProjectionKind::Value {
+                    value: json!({ "stateGeneration": "7" }),
+                    snapshot_token: false,
+                    settle_resume: Some(SettleProjectionResume {
+                        profile: SessionProfile::ControlledWebSessionV1,
+                        effective_policy,
+                        cumulative_external_io_wall_time: Duration::ZERO,
+                        authorizing_navigation: None,
+                        response: SettleResponse::Pending,
+                    }),
+                },
+                phase: SessionProjectionPhase::AwaitingPendingObservation {
+                    navigation: source.clone(),
+                },
+            }),
+            started_at: Instant::now(),
+            in_flight: None,
+            control_turn_observed: None,
+            needs_initial_pump: false,
+            state_effect: RequestStateEffect::None,
+        };
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x71; 16]),
+        );
+        let rejected =
+            DocumentControlReceiveOutcome::CommandOutcome(DocumentControlOutcome::Rejected(
+                DocumentControlError::ReplacementPipelineBootstrapRequired {
+                    source_pipeline_id,
+                    pipeline_id,
+                },
+            ));
+
+        let retry = transition_from_control_completion(
+            &mut active,
+            DocumentControlCommand::Observe,
+            rejected,
+            &mut projection,
+            0,
+        );
+        assert!(matches!(
+            retry,
+            ActiveTransition::SubmitSessionNavigationObservation {
+                allow_servo_pump: false
+            }
+        ));
+        assert!(matches!(
+            &active.operation,
+            ActiveOperation::SessionProjection(SessionProjectionState {
+                phase: SessionProjectionPhase::AwaitingReplacementAdmission {
+                    source: observed_source,
+                    source_pipeline_id: observed_source_pipeline_id,
+                    pipeline_id: observed_pipeline_id,
+                },
+                ..
+            }) if observed_source == &source
+                && *observed_source_pipeline_id == source_pipeline_id
+                && *observed_pipeline_id == pipeline_id
+        ));
+
+        let rearmed = transition_from_navigation_completion(
+            &mut active,
+            NavigationOperationCompletion::test_response(
+                NavigationOperationKind::Observe,
+                Ok(admitted),
+            ),
+            &mut projection,
+        );
+        assert!(matches!(
+            rearmed,
+            ActiveTransition::Submit(DocumentControlCommand::BootstrapReplacementPipeline {
+                source_pipeline_id: observed_source,
+                pipeline_id: observed_pipeline,
+            }) if observed_source == source_pipeline_id && observed_pipeline == pipeline_id
+        ));
+        assert!(matches!(
+            &active.operation,
+            ActiveOperation::Settle(SettleState {
+                response: SettleResponse::Pending,
+                replacement: Some(SettleReplacementPhase::Bootstrapping { .. }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn raw_action_projection_preserves_shape_and_uses_fresh_bracketed_generation() {
+        let source = session_authority(1, 0, 0, 0);
+        let action_pending = pending_for_authority(&source, 7);
+        let fresh_pending = pending_for_authority(&source, 9);
+        let mut active = ActiveRequest {
+            request: request("action.activate", Some(SESSION_ID)),
+            profile: Some(SessionProfile::ControlledWebSessionV1),
+            operation: ActiveOperation::Automation(AutomationState {
+                profile: SessionProfile::ControlledWebSessionV1,
+                kind: wire::PublicAutomationKind::Activate,
+                unresolved: None,
+                authorizing_navigation: Some(source.clone()),
+                completed: Some(CompletedAutomation {
+                    result: DocumentAutomationResult::Activated,
+                    pending: Box::new(action_pending),
+                    synchronous_navigation_emitted: false,
+                }),
+            }),
+            started_at: Instant::now(),
+            in_flight: None,
+            control_turn_observed: None,
+            needs_initial_pump: false,
+            state_effect: RequestStateEffect::Partial,
+        };
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x71; 16]),
+        );
+
+        let first = transition_from_navigation_completion(
+            &mut active,
+            NavigationOperationCompletion::test_response(
+                NavigationOperationKind::Observe,
+                Ok(source.clone()),
+            ),
+            &mut projection,
+        );
+        assert!(matches!(
+            first,
+            ActiveTransition::Submit(DocumentControlCommand::Observe)
+        ));
+
+        let second = transition_from_control_completion(
+            &mut active,
+            DocumentControlCommand::Observe,
+            observed_outcome(fresh_pending),
+            &mut projection,
+            0,
+        );
+        assert!(matches!(
+            second,
+            ActiveTransition::SubmitSessionNavigationObservation {
+                allow_servo_pump: false
+            }
+        ));
+
+        let final_transition = transition_from_navigation_completion(
+            &mut active,
+            NavigationOperationCompletion::test_response(
+                NavigationOperationKind::Observe,
+                Ok(source),
+            ),
+            &mut projection,
+        );
+        let ActiveTransition::Complete(value) = final_transition else {
+            panic!("raw action did not complete after its N1/pending/N2 bracket");
+        };
+        assert_eq!(value["stateGeneration"], "9");
+        assert_eq!(value["stateToken"], test_document_token(1));
+        assert!(value.get("outcome").is_none());
+        assert!(value.get("snapshot").is_none());
+    }
+
+    #[test]
+    fn synchronous_action_replacement_enters_common_settlement_without_replay() {
+        let source = session_authority(1, 0, 0, 0);
+        let admitted = replacement_admission_authority(&source);
+        let action_pending = pending_for_authority(&source, 7);
+        let mut active = ActiveRequest {
+            request: request("action.activate", Some(SESSION_ID)),
+            profile: Some(SessionProfile::ControlledWebSessionV1),
+            operation: ActiveOperation::Automation(AutomationState {
+                profile: SessionProfile::ControlledWebSessionV1,
+                kind: wire::PublicAutomationKind::Activate,
+                unresolved: None,
+                authorizing_navigation: Some(source),
+                completed: Some(CompletedAutomation {
+                    result: DocumentAutomationResult::Activated,
+                    pending: Box::new(action_pending),
+                    synchronous_navigation_emitted: true,
+                }),
+            }),
+            started_at: Instant::now(),
+            in_flight: None,
+            control_turn_observed: None,
+            needs_initial_pump: false,
+            state_effect: RequestStateEffect::Partial,
+        };
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x71; 16]),
+        );
+
+        let transition = transition_from_navigation_completion(
+            &mut active,
+            NavigationOperationCompletion::test_response(
+                NavigationOperationKind::Observe,
+                Ok(admitted),
+            ),
+            &mut projection,
+        );
+        assert!(matches!(
+            transition,
+            ActiveTransition::Submit(DocumentControlCommand::BootstrapReplacementPipeline { .. })
+        ));
+        let ActiveOperation::Settle(SettleState {
+            response:
+                SettleResponse::Automation {
+                    kind: wire::PublicAutomationKind::Activate,
+                    result: DocumentAutomationResult::Activated,
+                },
+            replacement: Some(SettleReplacementPhase::Bootstrapping { .. }),
+            ..
+        }) = &active.operation
+        else {
+            panic!("synchronous action replacement did not enter common settlement");
+        };
+        assert!(
+            active.in_flight.is_none(),
+            "the action must not be replayed"
+        );
+    }
+
+    #[test]
+    fn synchronous_action_same_document_change_enters_fresh_projection() {
+        let source = session_authority(1, 0, 0, 0);
+        let changed = SessionNavigationAuthority::new_internal(
+            Box::new(source.target().clone()),
+            source.document_epoch(),
+            source.navigation_id(),
+            embedder_traits::document_session::HistoryRevision::new(2),
+            source.successful_document_replacements(),
+            servo::ServoUrl::parse("https://example.test/#changed").unwrap(),
+            None,
+        );
+        let mut active = ActiveRequest {
+            request: request("action.activate", Some(SESSION_ID)),
+            profile: Some(SessionProfile::ControlledWebSessionV1),
+            operation: ActiveOperation::Automation(AutomationState {
+                profile: SessionProfile::ControlledWebSessionV1,
+                kind: wire::PublicAutomationKind::Activate,
+                unresolved: None,
+                authorizing_navigation: Some(source.clone()),
+                completed: Some(CompletedAutomation {
+                    result: DocumentAutomationResult::Activated,
+                    pending: Box::new(pending_for_authority(&source, 7)),
+                    synchronous_navigation_emitted: true,
+                }),
+            }),
+            started_at: Instant::now(),
+            in_flight: None,
+            control_turn_observed: None,
+            needs_initial_pump: false,
+            state_effect: RequestStateEffect::Partial,
+        };
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x71; 16]),
+        );
+
+        let transition = transition_from_navigation_completion(
+            &mut active,
+            NavigationOperationCompletion::test_response(
+                NavigationOperationKind::Observe,
+                Ok(changed.clone()),
+            ),
+            &mut projection,
+        );
+        assert!(matches!(
+            transition,
+            ActiveTransition::Submit(DocumentControlCommand::Observe)
+        ));
+        assert!(matches!(
+            &active.operation,
+            ActiveOperation::SessionProjection(SessionProjectionState {
+                kind: SessionProjectionKind::Automation {
+                    replacement_rearm: true,
+                    ..
+                },
+                phase: SessionProjectionPhase::AwaitingPendingObservation { navigation },
+                ..
+            }) if navigation == &changed
+        ));
+    }
+
+    #[test]
+    fn open_navigate_and_synchronous_action_share_bounded_replacement_rearm() {
+        let source = session_authority(1, 0, 0, 0);
+        let admitted = replacement_admission_authority(&source);
+        let activated = activated_replacement_authority(&source, &admitted);
+        let admitted_again = replacement_admission_authority(&activated);
+        let activated_again = activated_replacement_authority(&activated, &admitted_again);
+        let requested_url = Url::parse("https://example.test/next").unwrap();
+        let effective_policy = default_resolved_settle_policy();
+        let cumulative_external_io_wall_time = Duration::from_millis(37);
+
+        let action_resume = SettleProjectionResume {
+            profile: SessionProfile::ControlledWebSessionV1,
+            effective_policy,
+            cumulative_external_io_wall_time,
+            authorizing_navigation: Some(source.clone()),
+            response: SettleResponse::Automation {
+                kind: wire::PublicAutomationKind::Activate,
+                result: DocumentAutomationResult::Activated,
+            },
+        };
+        assert!(!session_projection_allows_replacement_rearm(
+            &SessionProjectionKind::Automation {
+                settle_resume: action_resume.clone(),
+                replacement_rearm: false,
+            }
+        ));
+        assert!(session_projection_allows_replacement_rearm(
+            &SessionProjectionKind::Automation {
+                settle_resume: action_resume.clone(),
+                replacement_rearm: true,
+            }
+        ));
+        assert!(session_projection_allows_replacement_rearm(
+            &SessionProjectionKind::ControlledOpen {
+                requested_url: requested_url.clone(),
+                current_url: Url::parse(source.url().as_str()).unwrap(),
+                profile: SessionProfile::ControlledWebSessionV1,
+                deadline: Instant::now(),
+                bootstrap_attempted: true,
+                cumulative_external_io_wall_time,
+                session_state_token: None,
+                settle_resume: Some(action_resume.clone()),
+            }
+        ));
+        assert!(session_projection_allows_replacement_rearm(
+            &SessionProjectionKind::Navigate {
+                requested_url: requested_url.clone(),
+                source: source.clone(),
+                admitted: admitted.clone(),
+                cumulative_external_io_wall_time,
+                settle_resume: Some(action_resume.clone()),
+            }
+        ));
+
+        let responses = [
+            SettleResponse::Automation {
+                kind: wire::PublicAutomationKind::Activate,
+                result: DocumentAutomationResult::Activated,
+            },
+            SettleResponse::ControlledOpen {
+                requested_url: requested_url.clone(),
+                current_url: Url::parse(source.url().as_str()).unwrap(),
+                profile: SessionProfile::ControlledWebSessionV1,
+                deadline: Instant::now(),
+                bootstrap_attempted: true,
+            },
+            SettleResponse::Navigate {
+                requested_url: requested_url.clone(),
+                source: source.clone(),
+                admitted: admitted.clone(),
+            },
+        ];
+        for response in responses {
+            let expected_response = std::mem::discriminant(&response);
+            let resume = SettleProjectionResume {
+                profile: SessionProfile::ControlledWebSessionV1,
+                effective_policy,
+                cumulative_external_io_wall_time,
+                authorizing_navigation: Some(source.clone()),
+                response,
+            };
+            let Ok((operation, transition)) = resume_session_projection_at_replacement(
+                &resume,
+                source.clone(),
+                admitted.clone(),
+                Box::new(source.target().clone()),
+                RequestStateEffect::Partial,
+            ) else {
+                panic!("exact replacement failed to resume common settlement");
+            };
+            assert!(matches!(
+                transition,
+                ActiveTransition::Submit(
+                    DocumentControlCommand::BootstrapReplacementPipeline { .. }
+                )
+            ));
+            let ActiveOperation::Settle(state) = operation else {
+                panic!("replacement carry did not resume common settlement");
+            };
+            assert_eq!(std::mem::discriminant(&state.response), expected_response);
+            assert_eq!(
+                state.cumulative_external_io_wall_time,
+                cumulative_external_io_wall_time,
+            );
+            assert!(matches!(
+                state.replacement,
+                Some(SettleReplacementPhase::Bootstrapping { .. })
+            ));
+        }
+
+        assert!(explicit_navigation_reached_controlled_ready(
+            &source, &admitted, &activated,
+        ));
+        assert_eq!(
+            exact_replacement_admission(&activated, &admitted_again)
+                .map(|admission| admission.pipeline_id),
+            Some(admitted_again.target().pending_top_level_pipelines()[0]),
+        );
+        assert!(explicit_navigation_reached_controlled_ready(
+            &activated,
+            &admitted_again,
+            &activated_again,
+        ));
+        assert!(explicit_navigation_chain_reached_controlled_ready(
+            &source,
+            &activated_again,
+        ));
+        let second_resume = SettleProjectionResume {
+            profile: SessionProfile::ControlledWebSessionV1,
+            effective_policy,
+            cumulative_external_io_wall_time,
+            authorizing_navigation: Some(activated.clone()),
+            response: SettleResponse::Automation {
+                kind: wire::PublicAutomationKind::Activate,
+                result: DocumentAutomationResult::Activated,
+            },
+        };
+        assert!(
+            resume_session_projection_at_replacement(
+                &second_resume,
+                activated.clone(),
+                admitted_again,
+                Box::new(activated.target().clone()),
+                RequestStateEffect::Partial,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn post_action_navigation_drift_and_continuation_rejections_fail_stop() {
+        let source = session_authority(1, 0, 0, 0);
+        let admitted = replacement_admission_authority(&source);
+        for error in [
+            SessionNavigationError::NavigationInProgress,
+            SessionNavigationError::SourceInactive,
+            SessionNavigationError::TargetChanged {
+                expected: Box::new(source.clone()),
+                observed: Box::new(admitted.clone()),
+            },
+        ] {
+            let ActiveTransition::Fail(failure) = session_navigation_failure(
+                error,
+                NavigationOperationKind::Observe,
+                RequestStateEffect::Partial,
+            ) else {
+                panic!("post-action navigation rejection must fail");
+            };
+            assert!(failure.fail_stop);
+            assert!(failure.error.fatal);
+            assert_eq!(failure.error.state_effect, "partial");
+        }
+
+        for response in [
+            SettleResponse::Automation {
+                kind: wire::PublicAutomationKind::Activate,
+                result: DocumentAutomationResult::Activated,
+            },
+            SettleResponse::ControlledOpen {
+                requested_url: Url::parse("https://example.test/").unwrap(),
+                current_url: Url::parse(source.url().as_str()).unwrap(),
+                profile: SessionProfile::ControlledWebSessionV1,
+                deadline: Instant::now(),
+                bootstrap_attempted: true,
+            },
+            SettleResponse::Navigate {
+                requested_url: Url::parse("https://example.test/next").unwrap(),
+                source: source.clone(),
+                admitted: admitted.clone(),
+            },
+        ] {
+            let failure = settle_failure_for_response(
+                settle::SettleFailure::ControlRejected(Box::new(
+                    DocumentControlError::EventLoopUnavailable,
+                )),
+                RequestStateEffect::Partial,
+                None,
+                &response,
+            );
+            assert!(failure.fail_stop);
+            assert!(failure.error.fatal);
+            assert_eq!(failure.error.state_effect, "partial");
+        }
+
+        let mut transport_active = ActiveRequest {
+            request: request("action.activate", Some(SESSION_ID)),
+            profile: Some(SessionProfile::ControlledWebSessionV1),
+            operation: ActiveOperation::Automation(AutomationState {
+                profile: SessionProfile::ControlledWebSessionV1,
+                kind: wire::PublicAutomationKind::Activate,
+                unresolved: None,
+                authorizing_navigation: Some(source),
+                completed: Some(CompletedAutomation {
+                    result: DocumentAutomationResult::Activated,
+                    pending: Box::new(pending_for_authority(&admitted, 7)),
+                    synchronous_navigation_emitted: true,
+                }),
+            }),
+            started_at: Instant::now(),
+            in_flight: None,
+            control_turn_observed: None,
+            needs_initial_pump: false,
+            state_effect: RequestStateEffect::Partial,
+        };
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x71; 16]),
+        );
+        let ActiveTransition::Fail(transport) = transition_from_navigation_completion(
+            &mut transport_active,
+            NavigationOperationCompletion::test_transport_failure(NavigationOperationKind::Observe),
+            &mut projection,
+        ) else {
+            panic!("lost continuation observation must fail");
+        };
+        assert!(transport.fail_stop);
+        assert!(transport.error.fatal);
+        assert_eq!(transport.error.state_effect, "partial");
+    }
+
+    #[test]
+    fn explicit_navigation_requires_the_admitted_replacement_activation() {
+        let source = session_authority(1, 0, 0, 0);
+        let admitted = replacement_admission_authority(&source);
+        let activated_source_retained =
+            activated_replacement_source_retained_authority(&source, &admitted);
+        let activated = activated_replacement_authority(&source, &admitted);
+        assert_eq!(
+            exact_replacement_admission(&source, &admitted),
+            Some(ReplacementAdmission {
+                source_pipeline_id: source.target().active_top_level.unwrap().pipeline_id,
+                pipeline_id: admitted.target().pending_top_level_pipelines()[0],
+            })
+        );
+        assert!(explicit_navigation_reached_controlled_ready(
+            &source, &admitted, &activated,
+        ));
+        assert_eq!(
+            classify_replacement_activation_observation(&source, &admitted, &admitted),
+            ReplacementActivationObservation::Pending,
+        );
+        assert_eq!(
+            classify_replacement_activation_observation(
+                &source,
+                &admitted,
+                &activated_source_retained,
+            ),
+            ReplacementActivationObservation::ActivatedAwaitingSourceExit,
+        );
+        assert_eq!(
+            classify_replacement_activation_observation(&source, &admitted, &activated),
+            ReplacementActivationObservation::ControlledReady,
+        );
+        assert!(!explicit_navigation_reached_controlled_ready(
+            &source, &admitted, &source,
+        ));
+        assert_eq!(
+            classify_replacement_activation_observation(&source, &admitted, &source),
+            ReplacementActivationObservation::Invalid,
+        );
+        assert!(initial_navigation_reached_controlled_ready(&source));
+        assert!(!initial_navigation_reached_controlled_ready(&activated));
+
+        let revision_gap = SessionNavigationAuthority::new_internal(
+            Box::new(admitted.target().clone()),
+            admitted.document_epoch(),
+            SessionNavigationId::new(source.navigation_id().get() + 2),
+            admitted.history_revision(),
+            admitted.successful_document_replacements(),
+            admitted.url().clone(),
+            None,
+        );
+        assert_eq!(exact_replacement_admission(&source, &revision_gap), None);
+    }
+
+    #[test]
+    fn reserved_navigation_start_failure_is_fatal_and_does_not_echo_schemes() {
+        let observed = session_authority(1, 1, 0, 0);
+        let ActiveTransition::Fail(start_failed) = session_navigation_failure(
+            SessionNavigationError::NavigationStartFailed {
+                observed: Box::new(observed),
+            },
+            NavigationOperationKind::Navigate,
+            RequestStateEffect::None,
+        ) else {
+            panic!("navigation start failure must fail");
+        };
+        assert!(start_failed.fail_stop);
+        assert!(start_failed.error.fatal);
+        assert_eq!(start_failed.error.state_effect, "partial");
+        assert_eq!(start_failed.error.details.unwrap()["navigationId"], "1");
+
+        let secret_scheme = "SECRET-SCHEME-CANARY";
+        let ActiveTransition::Fail(unsupported) = session_navigation_failure(
+            SessionNavigationError::UnsupportedScheme {
+                scheme: secret_scheme.into(),
+            },
+            NavigationOperationKind::Observe,
+            RequestStateEffect::Partial,
+        ) else {
+            panic!("unsupported scheme must fail");
+        };
+        assert!(unsupported.fail_stop);
+        assert!(unsupported.error.fatal);
+        assert!(!unsupported.error.message.contains(secret_scheme));
+    }
+
+    #[test]
+    fn app_terminal_evidence_never_records_false_commit_or_settlement() {
+        let mut bytes = Vec::new();
+        let evidence;
+        {
+            let mut shell = shell(
+                &mut bytes,
+                ShellState::Open,
+                Some(FakeEngine::controlled_session()),
+            );
+            let mut fill = request("action.fill", Some(SESSION_ID));
+            fill.params = json!({
+                "selector": "#email",
+                "value": "person@example.test",
+                "expectedStateToken": test_document_token(1),
+            });
+            assert!(!shell.handle(fill).unwrap());
+            shell.active.as_mut().unwrap().state_effect = RequestStateEffect::Partial;
+            evidence = shell.engine.as_ref().unwrap().evidence.clone();
+            shell.engine.as_mut().unwrap().navigation_polls.push_back(
+                EnginePortNavigationPoll::Complete(NavigationOperationCompletion::test_response(
+                    NavigationOperationKind::Observe,
+                    Err(SessionNavigationError::Terminal(
+                        SessionNavigationTerminal::HistoryLimitExceeded {
+                            limit: 10_000,
+                            observed: 10_000,
+                            navigation_id: SessionNavigationId::new(7),
+                            history_revision:
+                                embedder_traits::document_session::HistoryRevision::new(10_000),
+                        },
+                    )),
+                )),
+            );
+            assert!(shell.poll_active_navigation().is_err());
+            assert_eq!(shell.state, ShellState::Closed);
+        }
+        assert_eq!(&*evidence.borrow(), &[("failed", 7)]);
+        let response = frames(&bytes).pop().unwrap();
+        assert_eq!(response["error"]["code"], "history_limit_exceeded");
+        assert_eq!(response["error"]["stateEffect"], "partial");
+        assert_eq!(response["error"]["fatal"], true);
     }
 }

@@ -42,6 +42,7 @@
 //! [`winit_minimal`]: https://github.com/servo/servo/blob/main/components/servo/examples/winit_minimal.rs
 
 mod clipboard_delegate;
+mod controlled_network;
 #[cfg(feature = "gamepad")]
 mod gamepad_delegate;
 #[cfg(feature = "media-gstreamer")]
@@ -71,6 +72,10 @@ pub use media::{
 };
 pub use net::image_cache::should_panic_hook_suppress_termination;
 pub use net_traits::CookieSource;
+#[doc(hidden)]
+pub use net_traits::controlled_network::{
+    ControlledNetworkSession, ControlledNetworkSnapshot, ControlledNetworkTimeError,
+};
 // This API should probably not be exposed in this way. Instead there should be a fully
 // fleshed out public domains API if we want to expose it.
 pub use net_traits::pub_domains::is_reg_domain;
@@ -85,7 +90,7 @@ pub use profile_traits;
 // This should be replaced with an API on ServoBuilder.
 // See <https://github.com/servo/servo/issues/40950>.
 pub use resources;
-pub use servo_base::generic_channel::GenericSender;
+pub use servo_base::generic_channel::{GenericReceiver, GenericSender};
 pub use servo_base::id::WebViewId;
 pub use servo_config::opts::{DiagnosticsLogging, DiagnosticsLoggingOption, Opts, OutputOptions};
 pub use servo_config::prefs::{PrefValue, Preferences, UserAgentPlatform};
@@ -112,7 +117,10 @@ pub use crate::servo::{Servo, ServoBuilder, run_content_process};
 pub use crate::servo_delegate::{ServoDelegate, ServoError};
 pub use crate::site_data_manager::{SiteData, SiteDataManager, StorageType};
 pub use crate::user_content_manager::UserContentManager;
-pub use crate::webview::{WebView, WebViewBuilder};
+pub use crate::webview::{
+    ControlledNetworkConfigurationError, UnpublishedWebViewInitializationError,
+    UnpublishedWebViewInitializer, WebView, WebViewBuilder,
+};
 pub use crate::webview_delegate::{
     AlertDialog, AllowOrDenyRequest, AuthenticationRequest, BluetoothDeviceSelectionRequest,
     ColorPicker, ConfirmDialog, ContextMenu, CreateNewWebViewRequest, EmbedderControl, FilePicker,

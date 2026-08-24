@@ -105,6 +105,18 @@ const DEFAULT_MAX_LENGTH: i32 = -1;
 const DEFAULT_MIN_LENGTH: i32 = -1;
 
 impl HTMLTextAreaElement {
+    pub(crate) fn automation_custom_validity_bytes(&self) -> u64 {
+        self.validity_state
+            .get()
+            .map(|state| state.custom_error_message().len() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Exact UTF-8 bytes in the private value rope without materializing `Value()`.
+    pub(crate) fn automation_text_value_bytes(&self) -> u64 {
+        self.textinput.borrow().len_utf8().0 as u64
+    }
+
     fn new_inherited(
         local_name: LocalName,
         prefix: Option<Prefix>,
@@ -806,9 +818,9 @@ impl VirtualMethods for HTMLTextAreaElement {
                 let action = self.textinput.borrow_mut().handle_keydown(keyboard_event);
                 self.handle_key_reaction(cx, action, event);
             }
-        } else if event.type_() == atom!("compositionstart") ||
-            event.type_() == atom!("compositionupdate") ||
-            event.type_() == atom!("compositionend")
+        } else if event.type_() == atom!("compositionstart")
+            || event.type_() == atom!("compositionupdate")
+            || event.type_() == atom!("compositionend")
         {
             if let Some(compositionevent) = event.downcast::<CompositionEvent>() {
                 if event.type_() == atom!("compositionend") {
@@ -903,9 +915,9 @@ impl Validatable for HTMLTextAreaElement {
         // https://html.spec.whatwg.org/multipage/#enabling-and-disabling-form-controls%3A-the-disabled-attribute%3Abarred-from-constraint-validation
         // https://html.spec.whatwg.org/multipage/#the-textarea-element%3Abarred-from-constraint-validation
         // https://html.spec.whatwg.org/multipage/#the-datalist-element%3Abarred-from-constraint-validation
-        !self.upcast::<Element>().disabled_state() &&
-            !self.ReadOnly() &&
-            !is_barred_by_datalist_ancestor(self.upcast())
+        !self.upcast::<Element>().disabled_state()
+            && !self.ReadOnly()
+            && !is_barred_by_datalist_ancestor(self.upcast())
     }
 
     fn perform_validation(
@@ -922,10 +934,10 @@ impl Validatable for HTMLTextAreaElement {
 
         // https://html.spec.whatwg.org/multipage/#suffering-from-being-missing
         // https://html.spec.whatwg.org/multipage/#the-textarea-element%3Asuffering-from-being-missing
-        if validate_flags.contains(ValidationFlags::VALUE_MISSING) &&
-            self.Required() &&
-            self.is_mutable() &&
-            value_len == 0
+        if validate_flags.contains(ValidationFlags::VALUE_MISSING)
+            && self.Required()
+            && self.is_mutable()
+            && value_len == 0
         {
             failed_flags.insert(ValidationFlags::VALUE_MISSING);
         }

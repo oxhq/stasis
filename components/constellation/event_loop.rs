@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use background_hang_monitor_api::{BackgroundHangMonitorControlMsg, HangAlert};
-use embedder_traits::{DocumentClockConfiguration, ScriptToEmbedderChan};
+use embedder_traits::{DocumentClockConfiguration, DocumentControlProfile, ScriptToEmbedderChan};
 use ipc_channel::IpcError;
 use layout_api::ScriptThreadFactory;
 use log::error;
@@ -33,6 +33,7 @@ pub struct EventLoop {
     document_control_chan: GenericSender<ScriptThreadControlMessage>,
     id: ScriptEventLoopId,
     document_clock: DocumentClockConfiguration,
+    document_control_profile: DocumentControlProfile,
     /// When running in another process, this is an `IpcSender` to the BackgroundHangMonitor
     /// on the other side of the process boundary. When running in the same process, the
     /// BackgroundHangMonitor is shared among all [`EventLoop`]s so this will be `None`.
@@ -69,6 +70,7 @@ impl EventLoop {
         constellation: &mut Constellation<STF, SWF>,
         is_private: bool,
         document_clock: DocumentClockConfiguration,
+        document_control_profile: DocumentControlProfile,
     ) -> Result<Rc<Self>, IpcError> {
         let (script_chan, script_port) =
             servo_base::generic_channel::channel().expect("Pipeline script chan");
@@ -94,6 +96,7 @@ impl EventLoop {
         let initial_script_state = InitialScriptState {
             id: event_loop_id,
             document_clock,
+            document_control_profile,
             script_to_constellation_sender: constellation.script_sender.clone(),
             script_to_embedder_sender,
             namespace_request_sender: constellation.namespace_ipc_sender.clone(),
@@ -141,6 +144,7 @@ impl EventLoop {
         let document_control_chan = initial_script_state.document_control_sender.clone();
         let id = initial_script_state.id;
         let document_clock = initial_script_state.document_clock;
+        let document_control_profile = initial_script_state.document_control_profile;
         let background_hang_monitor_register = constellation
             .background_monitor_register
             .clone()
@@ -158,6 +162,7 @@ impl EventLoop {
             document_control_chan,
             id,
             document_clock,
+            document_control_profile,
             background_hang_monitor_sender: None,
             dont_send_or_sync: PhantomData,
         }
@@ -171,6 +176,7 @@ impl EventLoop {
         let document_control_chan = initial_script_state.document_control_sender.clone();
         let id = initial_script_state.id;
         let document_clock = initial_script_state.document_clock;
+        let document_control_profile = initial_script_state.document_control_profile;
 
         let (background_hand_monitor_sender, backgrond_hand_monitor_receiver) =
             generic_channel::channel().expect("Sampler chan");
@@ -199,6 +205,7 @@ impl EventLoop {
             document_control_chan,
             id,
             document_clock,
+            document_control_profile,
             background_hang_monitor_sender: Some(background_hand_monitor_sender),
             dont_send_or_sync: PhantomData,
         })
@@ -210,6 +217,10 @@ impl EventLoop {
 
     pub(crate) const fn document_clock(&self) -> DocumentClockConfiguration {
         self.document_clock
+    }
+
+    pub(crate) const fn document_control_profile(&self) -> DocumentControlProfile {
+        self.document_control_profile
     }
 
     /// Send a message to the event loop.
@@ -231,8 +242,8 @@ impl EventLoop {
         &self,
         message: &BackgroundHangMonitorControlMsg,
     ) {
-        if let Some(background_hang_monitor_sender) = &self.background_hang_monitor_sender &&
-            let Err(error) = background_hang_monitor_sender.send(message.clone())
+        if let Some(background_hang_monitor_sender) = &self.background_hang_monitor_sender
+            && let Err(error) = background_hang_monitor_sender.send(message.clone())
         {
             error!("Could not send message ({message:?}) to BHM: {error}");
         }

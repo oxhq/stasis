@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Stasis restored controlled session</title>
+</head>
+<body>
+  <main id="restored-state">
+    <output id="restored-status">restoring</output>
+    <output id="restored-email"></output>
+    <output id="restored-role"></output>
+    <output id="restored-flow"></output>
+  </main>
+  <script>
+    document.querySelector("#restored-email").textContent =
+      localStorage.getItem("stasis-email") ?? "missing-email";
+    document.querySelector("#restored-role").textContent =
+      localStorage.getItem("stasis-role") ?? "missing-role";
+    document.querySelector("#restored-flow").textContent =
+      sessionStorage.getItem("stasis-flow") ?? "missing-flow";
+    document.querySelector("#restored-status").textContent = "restored-ready";
+  </script>
+</body>
+</html>

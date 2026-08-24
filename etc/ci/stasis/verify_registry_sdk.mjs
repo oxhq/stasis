@@ -169,7 +169,7 @@ const packageRoot = join(consumerRoot, "node_modules", "@oxhq", "stasis");
 const expectedRevision = values.revision.toLowerCase();
 const expectedVersion = values.version;
 assert.match(expectedRevision, /^[0-9a-f]{40}$/, "--revision must be a full Git commit");
-assert.equal(expectedVersion, "0.1.0", "--version must name the exact stable release");
+assert.equal(expectedVersion, "0.2.0", "--version must name the exact stable release");
 const expectedTarballName = `oxhq-stasis-${expectedVersion}.tgz`;
 const packageStatus = await lstat(packageTarball);
 assert.ok(packageStatus.isFile() && !packageStatus.isSymbolicLink(), "--package must be a regular file");
@@ -270,8 +270,42 @@ const fixtureUrl = `http://127.0.0.1:${address.port}/`;
 let runtime;
 let app;
 let closedCleanly = false;
+let explicitOverrideCacheDirectory;
+let explicitOverrideProbeDirectory;
 let runtimeWorkingDirectory;
 try {
+  explicitOverrideCacheDirectory = await mkdtemp(
+    join(consumerRoot, ".stasis-explicit-override-cache-"),
+  );
+  assert.deepEqual(
+    await readdir(explicitOverrideCacheDirectory),
+    [],
+    "explicit executable override trap cache must start empty",
+  );
+  explicitOverrideProbeDirectory = await mkdtemp(
+    join(consumerRoot, ".stasis-explicit-override-probe-"),
+  );
+  const explicitOverrideMarker = join(explicitOverrideProbeDirectory, "invoked.txt");
+  const explicitOverrideWrapper = join(explicitOverrideProbeDirectory, "stasis-wrapper");
+  const explicitOverrideProof = `stasis-explicit-override-${process.pid}`;
+  await writeFile(
+    explicitOverrideWrapper,
+    [
+      "#!/bin/sh",
+      "set -eu",
+      "umask 077",
+      'printf "%s\\n" "$STASIS_EXPLICIT_OVERRIDE_PROOF" > "$STASIS_EXPLICIT_OVERRIDE_MARKER"',
+      'exec "$STASIS_EXPLICIT_OVERRIDE_BINARY" "$@"',
+      "",
+    ].join("\n"),
+    { encoding: "utf8", flag: "wx", mode: 0o700 },
+  );
+  await access(explicitOverrideWrapper, fsConstants.X_OK);
+  await assert.rejects(
+    access(explicitOverrideMarker, fsConstants.F_OK),
+    (error) => error?.code === "ENOENT",
+    "explicit executable override marker exists before launch",
+  );
   runtimeWorkingDirectory = await mkdtemp(join(consumerRoot, ".stasis-runtime-cwd-"));
   const [consumerRootRealPath, runtimeWorkingDirectoryRealPath] = await Promise.all([
     realpath(consumerRoot),
@@ -309,13 +343,25 @@ try {
   }
 
   runtime = await sdk.launch({
-    executablePath: binary,
+    executablePath: explicitOverrideWrapper,
+    runtimeCacheDirectory: explicitOverrideCacheDirectory,
+    env: {
+      ...process.env,
+      STASIS_EXPLICIT_OVERRIDE_BINARY: binary,
+      STASIS_EXPLICIT_OVERRIDE_MARKER: explicitOverrideMarker,
+      STASIS_EXPLICIT_OVERRIDE_PROOF: explicitOverrideProof,
+    },
     cwd: runtimeWorkingDirectoryRealPath,
     closeTimeoutMs: 30_000,
     ...commandDeadline(),
   });
   const childPid = runtime.pid;
   assert.ok(Number.isSafeInteger(childPid) && childPid > 0, "SDK did not expose the child PID");
+  assert.equal(
+    await readFile(explicitOverrideMarker, "utf8"),
+    `${explicitOverrideProof}\n`,
+    "the supplied executablePath wrapper did not launch the native runtime",
+  );
   assert.equal(runtime.info.protocolVersion, 1);
   assert.equal(runtime.info.implementation.name, "stasis-shell");
   assert.equal(runtime.info.implementation.version, expectedVersion);
@@ -391,6 +437,11 @@ try {
     processStillExists = false;
   }
   assert.equal(processStillExists, false, "Stasis child still exists after graceful close and EOF");
+  assert.deepEqual(
+    await readdir(explicitOverrideCacheDirectory),
+    [],
+    "executablePath unexpectedly accessed the managed runtime cache",
+  );
 
   process.stdout.write(
     `${JSON.stringify({
@@ -416,5 +467,11 @@ try {
   });
   if (runtimeWorkingDirectory !== undefined) {
     await rm(runtimeWorkingDirectory, { recursive: true });
+  }
+  if (explicitOverrideCacheDirectory !== undefined) {
+    await rm(explicitOverrideCacheDirectory, { recursive: true });
+  }
+  if (explicitOverrideProbeDirectory !== undefined) {
+    await rm(explicitOverrideProbeDirectory, { recursive: true });
   }
 }

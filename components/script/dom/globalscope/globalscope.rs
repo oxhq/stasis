@@ -21,7 +21,8 @@ use crossbeam_channel::Sender;
 use devtools_traits::{PageError, ScriptToDevtoolsControlMsg, get_time_stamp};
 use dom_struct::dom_struct;
 use embedder_traits::{
-    ConsoleLogLevel, EmbedderMsg, JavaScriptEvaluationError, ScriptToEmbedderChan,
+    ConsoleLogLevel, DocumentControlProfile, EmbedderMsg, JavaScriptEvaluationError,
+    ScriptToEmbedderChan,
 };
 use fonts::FontContext;
 use indexmap::IndexSet;
@@ -73,6 +74,7 @@ use servo_constellation_traits::{
 };
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
 use storage_traits::StorageThreads;
+use storage_traits::webstorage_thread::WebStorageMutationPolicy;
 use strum::VariantArray;
 use timers::{
     DocumentClock, DocumentClockError, DocumentTimeSurface, TimerControlError, TimerEventRequest,
@@ -229,6 +231,16 @@ fn resource_thread_io_permit(clock: &DocumentClock) -> Fallible<()> {
     time_surface_permit(clock, DocumentTimeSurface::ResourceThreadIo)
 }
 
+fn web_storage_io_permit(clock: &DocumentClock, profile: DocumentControlProfile) -> Fallible<()> {
+    if profile == DocumentControlProfile::TopLevelSession {
+        // TopLevelSession installs the in-memory, revisioned WebStorage backend before the
+        // WebView is published. Its synchronous storage messages are part of the session-state
+        // authority rather than an untracked resource callback.
+        return Ok(());
+    }
+    resource_thread_io_permit(clock)
+}
+
 #[cfg(test)]
 mod pending_persistent_source_tests {
     use servo_base::id::TEST_PIPELINE_ID;
@@ -275,6 +287,30 @@ mod pending_persistent_source_tests {
 
         let realtime = DocumentClock::default();
         assert!(resource_thread_io_permit(&realtime).is_ok());
+        assert_eq!(realtime.unsupported_surface(), None);
+    }
+
+    #[test]
+    fn only_top_level_session_web_storage_bypasses_the_generic_resource_gate() {
+        let controlled = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        });
+        assert!(
+            web_storage_io_permit(&controlled, DocumentControlProfile::TopLevelSession).is_ok()
+        );
+        assert_eq!(controlled.unsupported_surface(), None);
+
+        assert!(
+            web_storage_io_permit(&controlled, DocumentControlProfile::SingleDocument).is_err()
+        );
+        assert_eq!(
+            controlled.unsupported_surface(),
+            Some(DocumentTimeSurface::ResourceThreadIo)
+        );
+
+        let realtime = DocumentClock::default();
+        assert!(web_storage_io_permit(&realtime, DocumentControlProfile::SingleDocument).is_ok());
         assert_eq!(realtime.unsupported_surface(), None);
     }
 
@@ -824,8 +860,8 @@ impl FileListener {
                 },
             },
             Err(_) => match self.state.take() {
-                Some(FileListenerState::Receiving(_, target)) |
-                Some(FileListenerState::Empty(target)) => {
+                Some(FileListenerState::Receiving(_, target))
+                | Some(FileListenerState::Empty(target)) => {
                     let error = Err(Error::Network(None));
 
                     match target {
@@ -1465,15 +1501,15 @@ impl GlobalScope {
         // Step 7, a few preliminary steps.
 
         // - Check the worker is not closing.
-        if let Some(worker) = self.downcast::<WorkerGlobalScope>() &&
-            worker.is_closing()
+        if let Some(worker) = self.downcast::<WorkerGlobalScope>()
+            && worker.is_closing()
         {
             return;
         }
 
         // - Check the associated document is fully-active.
-        if let Some(window) = self.downcast::<Window>() &&
-            !window.Document().is_fully_active()
+        if let Some(window) = self.downcast::<Window>()
+            && !window.Document().is_fully_active()
         {
             return;
         }
@@ -2159,6 +2195,15 @@ impl GlobalScope {
         blob_info.blob_impl.type_string()
     }
 
+    /// Get the byte length of a blob's type string without cloning page-controlled data.
+    pub(crate) fn get_blob_type_string_len(&self, blob_id: &BlobId) -> usize {
+        let blob_state = self.blob_state.borrow();
+        let blob_info = blob_state
+            .get(blob_id)
+            .expect("get_blob_type_string_len called for a unknown blob.");
+        blob_info.blob_impl.type_string_len()
+    }
+
     /// <https://w3c.github.io/FileAPI/#dfn-size>
     pub(crate) fn get_blob_size(&self, blob_id: &BlobId) -> u64 {
         let parent = {
@@ -2556,8 +2601,9 @@ impl GlobalScope {
 
         if let MessagePortState::Managed(_, message_ports) = &*self.message_port_state.borrow() {
             for (id, port) in message_ports.iter() {
-                if !port.explicitly_closed &&
-                    port.port_impl
+                if !port.explicitly_closed
+                    && port
+                        .port_impl
                         .as_ref()
                         .is_some_and(|port_impl| port_impl.entangled_port_id().is_some())
                 {
@@ -2908,6 +2954,25 @@ impl GlobalScope {
     /// been brought under controlled pending authority.
     pub(crate) fn require_resource_thread_io(&self) -> Fallible<()> {
         resource_thread_io_permit(&self.document_clock())
+    }
+
+    /// WebStorage in a top-level controlled session is backed by the session's pre-published,
+    /// in-memory revision authority. Other profiles retain the generic resource-thread guard.
+    pub(crate) fn require_web_storage_io(&self) -> Fallible<()> {
+        web_storage_io_permit(
+            &self.document_clock(),
+            ScriptThread::current_document_control_profile(),
+        )
+    }
+
+    /// Select the immutable page-mutation policy enforced by the WebStorage owner thread.
+    pub(crate) fn web_storage_mutation_policy(&self) -> WebStorageMutationPolicy {
+        match ScriptThread::current_document_control_profile() {
+            DocumentControlProfile::TopLevelSession => {
+                WebStorageMutationPolicy::ControlledSessionV1
+            },
+            DocumentControlProfile::SingleDocument => WebStorageMutationPolicy::Ordinary,
+        }
     }
 
     /// Reject externally-driven subscriptions whose callback lifecycle is not yet controlled.
@@ -3563,8 +3628,8 @@ impl GlobalScope {
                 // Step 2. If the result of Is url potentially trustworthy?
                 // given environment's top-level creation URL is "Potentially Trustworthy", then return true.
                 // Step 3. Return false.
-                if top_level_creation_url.scheme() == "blob" &&
-                    Some(true) == self.inherited_secure_context
+                if top_level_creation_url.scheme() == "blob"
+                    && Some(true) == self.inherited_secure_context
                 {
                     return true;
                 }

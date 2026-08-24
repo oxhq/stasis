@@ -505,7 +505,7 @@ pub enum DocumentControlCommand {
     /// Admit the one initial async fetch-backed root pipeline identified by a preceding passive
     /// Observe readiness rejection.
     BootstrapInitialPipeline {
-        /// Exact pending root pipeline which must still be the strictly qualified front event.
+        /// Exact pending root pipeline which must remain the sole eligible bootstrap owner.
         pipeline_id: PipelineId,
     },
     /// Execute one bounded native operation against the exact target and state generation carried
@@ -516,6 +516,17 @@ pub enum DocumentControlCommand {
     Automate(Box<DocumentAutomationRequest>),
     /// Conditionally advance to and activate the exact deadline bound by a fresh token.
     AdvanceTo(Box<DocumentAdvanceToken>),
+    /// Admit the one replacement async fetch-backed top-level pipeline identified by a
+    /// preceding passive Observe readiness rejection.
+    ///
+    /// This variant is appended so the frozen discriminants of the earlier same-build command
+    /// surface remain unchanged.
+    BootstrapReplacementPipeline {
+        /// Active source document which admitted the replacement.
+        source_pipeline_id: PipelineId,
+        /// Exact pending replacement which must remain the sole eligible bootstrap owner.
+        pipeline_id: PipelineId,
+    },
 }
 
 /// Return whether `after` is the one exact Constellation transition authorized while admitting
@@ -544,6 +555,82 @@ pub fn is_exact_initial_pipeline_activation_transition(
         && after.fully_active_pipelines() == [pipeline_id]
         && after.pending_top_level_pipelines().is_empty()
         && after.pipeline_membership_revision == before.pipeline_membership_revision
+        && after.unsupported_time_surface == before.unsupported_time_surface
+        && before
+            .navigation_revision
+            .checked_next()
+            .and_then(PendingNavigationRevision::checked_next)
+            == Some(after.navigation_revision)
+}
+
+/// Return whether `after` is the exact owner transition immediately produced by activating a
+/// replacement while its old document is closing asynchronously.
+///
+/// The old pipeline remains in Constellation membership until Script acknowledges `ExitPipeline`.
+/// This intermediate authority must never be exposed as a settled document target.
+#[doc(hidden)]
+pub fn is_exact_replacement_pipeline_activation_before_exit_transition(
+    before: &PendingTargetObservation,
+    after: &PendingTargetObservation,
+    source_pipeline_id: PipelineId,
+    pipeline_id: PipelineId,
+) -> bool {
+    let Some(source) = before.active_top_level else {
+        return false;
+    };
+    source_pipeline_id != pipeline_id
+        && source.pipeline_id == source_pipeline_id
+        && before.pipelines().len() == 2
+        && before.contains_pipeline(source_pipeline_id)
+        && before.contains_pipeline(pipeline_id)
+        && before.fully_active_pipelines() == [source_pipeline_id]
+        && before.pending_top_level_pipelines() == [pipeline_id]
+        && after.webview_id == before.webview_id
+        && after.event_loop_id == before.event_loop_id
+        && after.active_top_level.is_some_and(|active| {
+            active.pipeline_id == pipeline_id && active.epoch == source.epoch.next()
+        })
+        && after.pipelines() == before.pipelines()
+        && after.fully_active_pipelines() == [pipeline_id]
+        && after.pending_top_level_pipelines().is_empty()
+        && after.pipeline_membership_revision == before.pipeline_membership_revision
+        && after.unsupported_time_surface == before.unsupported_time_surface
+        && before
+            .navigation_revision
+            .checked_next()
+            .and_then(PendingNavigationRevision::checked_next)
+            == Some(after.navigation_revision)
+}
+
+/// Return whether `after` is the exact final owner transition after a replacement activation and
+/// acknowledgement that the old pipeline exited.
+#[doc(hidden)]
+pub fn is_exact_replacement_pipeline_activation_transition(
+    before: &PendingTargetObservation,
+    after: &PendingTargetObservation,
+    source_pipeline_id: PipelineId,
+    pipeline_id: PipelineId,
+) -> bool {
+    let Some(source) = before.active_top_level else {
+        return false;
+    };
+    source_pipeline_id != pipeline_id
+        && source.pipeline_id == source_pipeline_id
+        && before.pipelines().len() == 2
+        && before.contains_pipeline(source_pipeline_id)
+        && before.contains_pipeline(pipeline_id)
+        && before.fully_active_pipelines() == [source_pipeline_id]
+        && before.pending_top_level_pipelines() == [pipeline_id]
+        && after.webview_id == before.webview_id
+        && after.event_loop_id == before.event_loop_id
+        && after.active_top_level.is_some_and(|active| {
+            active.pipeline_id == pipeline_id && active.epoch == source.epoch.next()
+        })
+        && after.pipelines() == [pipeline_id]
+        && after.fully_active_pipelines() == [pipeline_id]
+        && after.pending_top_level_pipelines().is_empty()
+        && before.pipeline_membership_revision.checked_next()
+            == Some(after.pipeline_membership_revision)
         && after.unsupported_time_surface == before.unsupported_time_surface
         && before
             .navigation_revision
@@ -584,6 +671,11 @@ pub enum DocumentControlAutomationKind {
     Extract,
     Fill,
     Activate,
+    Check,
+    Uncheck,
+    Select,
+    Focus,
+    Submit,
 }
 
 impl DocumentControlAutomationKind {
@@ -601,12 +693,26 @@ impl DocumentControlAutomationKind {
             DocumentAutomationOperation::Extract(_) => Self::Extract,
             DocumentAutomationOperation::Fill { .. } => Self::Fill,
             DocumentAutomationOperation::Activate { .. } => Self::Activate,
+            DocumentAutomationOperation::Check { .. } => Self::Check,
+            DocumentAutomationOperation::Uncheck { .. } => Self::Uncheck,
+            DocumentAutomationOperation::Select { .. } => Self::Select,
+            DocumentAutomationOperation::Focus { .. } => Self::Focus,
+            DocumentAutomationOperation::Submit { .. } => Self::Submit,
         }
     }
 
     /// Whether execution may synchronously mutate the document or invoke page handlers.
     pub const fn is_mutating(self) -> bool {
-        matches!(self, Self::Fill | Self::Activate)
+        matches!(
+            self,
+            Self::Fill
+                | Self::Activate
+                | Self::Check
+                | Self::Uncheck
+                | Self::Select
+                | Self::Focus
+                | Self::Submit
+        )
     }
 
     fn matches_result(self, result: &DocumentAutomationResult) -> bool {
@@ -622,6 +728,11 @@ impl DocumentControlAutomationKind {
                 | (Self::Extract, DocumentAutomationResult::Extract { .. })
                 | (Self::Fill, DocumentAutomationResult::Filled)
                 | (Self::Activate, DocumentAutomationResult::Activated)
+                | (Self::Check, DocumentAutomationResult::Checked { .. })
+                | (Self::Uncheck, DocumentAutomationResult::Checked { .. })
+                | (Self::Select, DocumentAutomationResult::Selected { .. })
+                | (Self::Focus, DocumentAutomationResult::Focused { .. })
+                | (Self::Submit, DocumentAutomationResult::Submitted)
         )
     }
 }
@@ -713,6 +824,10 @@ pub enum DocumentControlOutcome {
     AutomationCompleted {
         result: DocumentAutomationResult,
         observation: Box<DocumentControlObservation>,
+        /// Whether executing the action synchronously emitted at least one top-level document
+        /// replacement or same-document session-authority message. Queued default actions and
+        /// later task, timer, fetch, or microtask work are deliberately excluded.
+        synchronous_navigation_emitted: bool,
     },
     /// The command was definitively rejected before its page-state mutation.
     Rejected(DocumentControlError),
@@ -749,6 +864,7 @@ impl DocumentControlOutcome {
             Self::AutomationCompleted {
                 result,
                 observation,
+                synchronous_navigation_emitted,
             } => {
                 observation
                     .validate()
@@ -765,6 +881,13 @@ impl DocumentControlOutcome {
                     return Err(
                         DocumentControlOutcomeInvariantError::AutomationResultMismatch {
                             expected: operation,
+                        },
+                    );
+                }
+                if *synchronous_navigation_emitted && !operation.is_mutating() {
+                    return Err(
+                        DocumentControlOutcomeInvariantError::ReadOnlyAutomationNavigationEmission {
+                            operation,
                         },
                     );
                 }
@@ -812,6 +935,19 @@ impl DocumentControlOutcome {
                 },
             ),
             (
+                command,
+                Self::Rejected(DocumentControlError::ReplacementPipelineBootstrapRequired {
+                    source_pipeline_id,
+                    pipeline_id,
+                }),
+            ) if !matches!(command, DocumentControlCommand::Observe) => Err(
+                DocumentControlOutcomeInvariantError::ReplacementPipelineBootstrapRejectionForCommand {
+                    command: DocumentControlCommandKind::from_command(command),
+                    source_pipeline_id: *source_pipeline_id,
+                    pipeline_id: *pipeline_id,
+                },
+            ),
+            (
                 DocumentControlCommand::BootstrapInitialPipeline {
                     pipeline_id: expected,
                 },
@@ -836,6 +972,37 @@ impl DocumentControlOutcome {
                     observed: *observed,
                 },
             ),
+            (
+                DocumentControlCommand::BootstrapReplacementPipeline {
+                    source_pipeline_id: expected_source,
+                    pipeline_id: expected_pipeline,
+                },
+                Self::Rejected(DocumentControlError::ReplacementPipelineBootstrapUnavailable {
+                    source_pipeline_id: observed_source,
+                    pipeline_id: observed_pipeline,
+                }),
+            ) if expected_source == observed_source && expected_pipeline == observed_pipeline => {
+                Ok(())
+            },
+            (
+                command,
+                Self::Rejected(DocumentControlError::ReplacementPipelineBootstrapUnavailable {
+                    source_pipeline_id: observed_source,
+                    pipeline_id: observed_pipeline,
+                }),
+            ) => Err(
+                DocumentControlOutcomeInvariantError::ReplacementPipelineBootstrapUnavailableForCommand {
+                    command: DocumentControlCommandKind::from_command(command),
+                    expected: match command {
+                        DocumentControlCommand::BootstrapReplacementPipeline {
+                            source_pipeline_id,
+                            pipeline_id,
+                        } => Some((*source_pipeline_id, *pipeline_id)),
+                        _ => None,
+                    },
+                    observed: (*observed_source, *observed_pipeline),
+                },
+            ),
             (DocumentControlCommand::DriveOneTurn, Self::Rejected(error))
                 if error.is_pending_capture_failure() =>
             {
@@ -856,6 +1023,15 @@ impl DocumentControlOutcome {
                     },
                 )
             },
+            (
+                DocumentControlCommand::BootstrapReplacementPipeline { .. },
+                Self::Rejected(error),
+            ) if error.is_pending_capture_failure() => Err(
+                DocumentControlOutcomeInvariantError::PendingCaptureRejectionForMutatingCommand {
+                    command: DocumentControlCommandKind::BootstrapReplacementPipeline,
+                    error: Box::new(error.clone()),
+                },
+            ),
             (DocumentControlCommand::AdvanceTo(_), Self::Rejected(error))
                 if error.is_pending_capture_failure() =>
             {
@@ -937,10 +1113,30 @@ impl DocumentControlOutcome {
                 }
             },
             (
+                DocumentControlCommand::BootstrapReplacementPipeline { .. },
+                Self::Completed(observation),
+            ) => {
+                if matches!(
+                    observation.action,
+                    DocumentControlAction::TurnProcessed { .. }
+                        | DocumentControlAction::ExecutionTerminated
+                ) {
+                    Ok(())
+                } else {
+                    Err(
+                        DocumentControlOutcomeInvariantError::CompletedActionMismatch {
+                            command: DocumentControlCommandKind::BootstrapReplacementPipeline,
+                            observed: observation.action,
+                        },
+                    )
+                }
+            },
+            (
                 DocumentControlCommand::Automate(request),
                 Self::AutomationCompleted {
                     result,
                     observation,
+                    synchronous_navigation_emitted: _,
                 },
             ) => {
                 let expected_kind = DocumentControlAutomationKind::from_request(request);
@@ -1039,7 +1235,8 @@ impl DocumentControlOutcome {
             },
             (
                 DocumentControlCommand::DriveOneTurn
-                | DocumentControlCommand::BootstrapInitialPipeline { .. },
+                | DocumentControlCommand::BootstrapInitialPipeline { .. }
+                | DocumentControlCommand::BootstrapReplacementPipeline { .. },
                 Self::DriveOneTurnOutcomeIndeterminate { .. },
             ) => Ok(()),
             (
@@ -1157,6 +1354,8 @@ pub enum DocumentControlCommandKind {
     Automate,
     /// Activate one token-bound timer.
     AdvanceTo,
+    /// Admit the strictly qualified replacement top-level pipeline.
+    BootstrapReplacementPipeline,
 }
 
 impl DocumentControlCommandKind {
@@ -1169,6 +1368,9 @@ impl DocumentControlCommandKind {
             },
             DocumentControlCommand::Automate(_) => Self::Automate,
             DocumentControlCommand::AdvanceTo(_) => Self::AdvanceTo,
+            DocumentControlCommand::BootstrapReplacementPipeline { .. } => {
+                Self::BootstrapReplacementPipeline
+            },
         }
     }
 }
@@ -1241,6 +1443,25 @@ pub enum DocumentControlOutcomeInvariantError {
         /// Pipeline carried by the rejection.
         observed: PipelineId,
     },
+    /// Replacement pipeline bootstrap is a passive readiness rejection emitted only for Observe.
+    ReplacementPipelineBootstrapRejectionForCommand {
+        /// Command which incorrectly carried the readiness rejection.
+        command: DocumentControlCommandKind,
+        /// Active source document which admitted the replacement.
+        source_pipeline_id: PipelineId,
+        /// Replacement pipeline awaiting its one explicit bootstrap turn.
+        pipeline_id: PipelineId,
+    },
+    /// A replacement-bootstrap-unavailable rejection belonged to another command or pipeline
+    /// pair.
+    ReplacementPipelineBootstrapUnavailableForCommand {
+        /// Submitted command class.
+        command: DocumentControlCommandKind,
+        /// Source/replacement pair bound by a bootstrap command, or `None` for another command.
+        expected: Option<(PipelineId, PipelineId)>,
+        /// Source/replacement pair carried by the rejection.
+        observed: (PipelineId, PipelineId),
+    },
     /// A definitive rejection named a native failure which can occur after a mutation began.
     AutomationMutationRejection {
         /// Mutating operation whose outcome can no longer be proven definitive.
@@ -1276,6 +1497,10 @@ pub enum DocumentControlOutcomeInvariantError {
     },
     /// A read-only native automation operation cannot have an indeterminate page mutation.
     ReadOnlyAutomationIndeterminate {
+        operation: DocumentControlAutomationKind,
+    },
+    /// A read-only native automation operation cannot synchronously emit navigation authority.
+    ReadOnlyAutomationNavigationEmission {
         operation: DocumentControlAutomationKind,
     },
     /// An indeterminate outcome belonged to a different command class.
@@ -1392,7 +1617,7 @@ pub enum DocumentControlError {
         /// Pending root pipeline which the bootstrap turn must admit.
         pipeline_id: PipelineId,
     },
-    /// The requested initial root bootstrap is no longer the exact qualified front event.
+    /// The requested initial root bootstrap is no longer the sole eligible queued owner.
     InitialPipelineBootstrapUnavailable {
         /// Pipeline named by the rejected one-shot bootstrap command.
         pipeline_id: PipelineId,
@@ -1447,11 +1672,38 @@ pub enum DocumentControlError {
     ChannelClosed,
     /// The checked per-WebView cancellation sequence was exhausted.
     CancellationSequenceOverflow,
+    /// The exact fetch-backed replacement SpawnPipeline is ready for one explicit bootstrap
+    /// turn.
+    ReplacementPipelineBootstrapRequired {
+        /// Active document which admitted the pending replacement.
+        source_pipeline_id: PipelineId,
+        /// Pending replacement pipeline which the bootstrap turn must admit.
+        pipeline_id: PipelineId,
+    },
+    /// The requested replacement bootstrap is no longer the sole eligible queued owner.
+    ReplacementPipelineBootstrapUnavailable {
+        /// Active source named by the rejected one-shot bootstrap command.
+        source_pipeline_id: PipelineId,
+        /// Pending replacement named by the rejected one-shot bootstrap command.
+        pipeline_id: PipelineId,
+    },
 }
 
 impl DocumentControlError {
     /// Revalidate any authoritative payload carried by this error after deserialization.
     pub fn validate(&self) -> Result<(), DocumentControlErrorInvariantError> {
+        if matches!(
+            self,
+            Self::ReplacementPipelineBootstrapRequired {
+                source_pipeline_id,
+                pipeline_id,
+            } | Self::ReplacementPipelineBootstrapUnavailable {
+                source_pipeline_id,
+                pipeline_id,
+            } if source_pipeline_id == pipeline_id
+        ) {
+            return Err(DocumentControlErrorInvariantError::ReplacementPipelineBootstrapAliased);
+        }
         let Self::TargetChanged { expected, observed } = self else {
             return Ok(());
         };
@@ -1480,6 +1732,8 @@ impl DocumentControlError {
 /// A structurally invalid authoritative payload in a definitive control error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DocumentControlErrorInvariantError {
+    /// A replacement bootstrap named its active source as the replacement pipeline.
+    ReplacementPipelineBootstrapAliased,
     /// The target authority established at admission was malformed.
     TargetChangedExpected(PendingSnapshotInvariantError),
     /// The live target authority observed during capture was malformed.
@@ -1655,6 +1909,9 @@ impl DocumentControlReceiver {
             DocumentControlCommand::BootstrapInitialPipeline { .. } => {
                 DocumentControlReceiveOutcome::DriveOneTurnOutcomeIndeterminate(failure)
             },
+            DocumentControlCommand::BootstrapReplacementPipeline { .. } => {
+                DocumentControlReceiveOutcome::DriveOneTurnOutcomeIndeterminate(failure)
+            },
             DocumentControlCommand::Automate(request) => {
                 let operation = DocumentControlAutomationKind::from_request(request);
                 if operation.is_mutating() {
@@ -1737,6 +1994,13 @@ mod tests {
         let bytes = postcard::to_stdvec(&value).unwrap();
         let decoded = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(value, decoded);
+    }
+
+    fn second_pipeline_id() -> PipelineId {
+        PipelineId {
+            namespace_id: TEST_NAMESPACE,
+            index: Index::new(TEST_PIPELINE_ID.index.0.get() + 1).unwrap(),
+        }
     }
 
     fn stable_producers(
@@ -1923,6 +2187,10 @@ mod tests {
         assert_postcard_round_trip(DocumentControlCommand::BootstrapInitialPipeline {
             pipeline_id: TEST_PIPELINE_ID,
         });
+        assert_postcard_round_trip(DocumentControlCommand::BootstrapReplacementPipeline {
+            source_pipeline_id: TEST_PIPELINE_ID,
+            pipeline_id: second_pipeline_id(),
+        });
         let text_command = automation_command(DocumentAutomationOperation::TextContent {
             selector: "#status".into(),
         });
@@ -1964,6 +2232,7 @@ mod tests {
                 value: "ready".into(),
             },
             observation: Box::new(observation),
+            synchronous_navigation_emitted: false,
         };
         completed
             .validate_for_command(&DocumentControlCommand::Automate(request))
@@ -2036,6 +2305,70 @@ mod tests {
     }
 
     #[test]
+    fn replacement_pipeline_bootstrap_is_observe_only_and_pair_bound() {
+        let replacement_pipeline_id = second_pipeline_id();
+        let required = DocumentControlOutcome::Rejected(
+            DocumentControlError::ReplacementPipelineBootstrapRequired {
+                source_pipeline_id: TEST_PIPELINE_ID,
+                pipeline_id: replacement_pipeline_id,
+            },
+        );
+        required
+            .validate_for_command(&DocumentControlCommand::Observe)
+            .unwrap();
+        assert!(matches!(
+            required.validate_for_command(&DocumentControlCommand::DriveOneTurn),
+            Err(
+                DocumentControlOutcomeInvariantError::ReplacementPipelineBootstrapRejectionForCommand {
+                    command: DocumentControlCommandKind::DriveOneTurn,
+                    source_pipeline_id: TEST_PIPELINE_ID,
+                    pipeline_id,
+                }
+            ) if pipeline_id == replacement_pipeline_id
+        ));
+
+        let command = DocumentControlCommand::BootstrapReplacementPipeline {
+            source_pipeline_id: TEST_PIPELINE_ID,
+            pipeline_id: replacement_pipeline_id,
+        };
+        let unavailable = DocumentControlOutcome::Rejected(
+            DocumentControlError::ReplacementPipelineBootstrapUnavailable {
+                source_pipeline_id: TEST_PIPELINE_ID,
+                pipeline_id: replacement_pipeline_id,
+            },
+        );
+        unavailable.validate_for_command(&command).unwrap();
+        assert!(matches!(
+            unavailable.validate_for_command(&DocumentControlCommand::BootstrapReplacementPipeline {
+                source_pipeline_id: replacement_pipeline_id,
+                pipeline_id: TEST_PIPELINE_ID,
+            }),
+            Err(
+                DocumentControlOutcomeInvariantError::ReplacementPipelineBootstrapUnavailableForCommand {
+                    command: DocumentControlCommandKind::BootstrapReplacementPipeline,
+                    expected: Some(expected),
+                    observed,
+                }
+            ) if expected == (replacement_pipeline_id, TEST_PIPELINE_ID)
+                && observed == (TEST_PIPELINE_ID, replacement_pipeline_id)
+        ));
+        assert!(matches!(
+            DocumentControlOutcome::Rejected(
+                DocumentControlError::ReplacementPipelineBootstrapRequired {
+                    source_pipeline_id: TEST_PIPELINE_ID,
+                    pipeline_id: TEST_PIPELINE_ID,
+                },
+            )
+            .validate_for_command(&DocumentControlCommand::Observe),
+            Err(DocumentControlOutcomeInvariantError::Rejection(
+                DocumentControlErrorInvariantError::ReplacementPipelineBootstrapAliased,
+            ))
+        ));
+        assert_postcard_round_trip(required);
+        assert_postcard_round_trip(unavailable);
+    }
+
+    #[test]
     fn execution_termination_is_an_authoritative_completed_drive_or_bootstrap() {
         let terminated = completed_outcome(
             DocumentControlAction::ExecutionTerminated,
@@ -2047,6 +2380,12 @@ mod tests {
         terminated
             .validate_for_command(&DocumentControlCommand::BootstrapInitialPipeline {
                 pipeline_id: TEST_PIPELINE_ID,
+            })
+            .unwrap();
+        terminated
+            .validate_for_command(&DocumentControlCommand::BootstrapReplacementPipeline {
+                source_pipeline_id: TEST_PIPELINE_ID,
+                pipeline_id: second_pipeline_id(),
             })
             .unwrap();
         assert!(matches!(
@@ -2198,6 +2537,99 @@ mod tests {
             &before,
             &unsupported_surface_changed,
             TEST_PIPELINE_ID,
+        ));
+    }
+
+    #[test]
+    fn replacement_pipeline_activation_requires_exact_activation_then_exit() {
+        let replacement_pipeline_id = second_pipeline_id();
+        let before = PendingTargetObservation::new_with_authority(
+            TEST_WEBVIEW_ID,
+            TEST_SCRIPT_EVENT_LOOP_ID,
+            Some(PendingActiveTopLevelPipeline {
+                pipeline_id: TEST_PIPELINE_ID,
+                epoch: Epoch(7),
+            }),
+            PendingNavigationRevision::new(3),
+            PendingPipelineMembershipRevision::new(9),
+            None,
+            vec![TEST_PIPELINE_ID, replacement_pipeline_id],
+            vec![TEST_PIPELINE_ID],
+            vec![replacement_pipeline_id],
+        )
+        .unwrap();
+        let before_exit = PendingTargetObservation::new_with_authority(
+            TEST_WEBVIEW_ID,
+            TEST_SCRIPT_EVENT_LOOP_ID,
+            Some(PendingActiveTopLevelPipeline {
+                pipeline_id: replacement_pipeline_id,
+                epoch: Epoch(8),
+            }),
+            PendingNavigationRevision::new(5),
+            PendingPipelineMembershipRevision::new(9),
+            None,
+            vec![TEST_PIPELINE_ID, replacement_pipeline_id],
+            vec![replacement_pipeline_id],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            is_exact_replacement_pipeline_activation_before_exit_transition(
+                &before,
+                &before_exit,
+                TEST_PIPELINE_ID,
+                replacement_pipeline_id,
+            )
+        );
+        assert!(!is_exact_replacement_pipeline_activation_transition(
+            &before,
+            &before_exit,
+            TEST_PIPELINE_ID,
+            replacement_pipeline_id,
+        ));
+
+        let after_exit = PendingTargetObservation::new_with_authority(
+            TEST_WEBVIEW_ID,
+            TEST_SCRIPT_EVENT_LOOP_ID,
+            Some(PendingActiveTopLevelPipeline {
+                pipeline_id: replacement_pipeline_id,
+                epoch: Epoch(8),
+            }),
+            PendingNavigationRevision::new(5),
+            PendingPipelineMembershipRevision::new(10),
+            None,
+            vec![replacement_pipeline_id],
+            vec![replacement_pipeline_id],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(is_exact_replacement_pipeline_activation_transition(
+            &before,
+            &after_exit,
+            TEST_PIPELINE_ID,
+            replacement_pipeline_id,
+        ));
+
+        let mut wrong_epoch = after_exit.clone();
+        wrong_epoch.active_top_level = Some(PendingActiveTopLevelPipeline {
+            pipeline_id: replacement_pipeline_id,
+            epoch: Epoch(9),
+        });
+        assert!(!is_exact_replacement_pipeline_activation_transition(
+            &before,
+            &wrong_epoch,
+            TEST_PIPELINE_ID,
+            replacement_pipeline_id,
+        ));
+
+        let mut skipped_membership = after_exit;
+        skipped_membership.pipeline_membership_revision =
+            PendingPipelineMembershipRevision::new(11);
+        assert!(!is_exact_replacement_pipeline_activation_transition(
+            &before,
+            &skipped_membership,
+            TEST_PIPELINE_ID,
+            replacement_pipeline_id,
         ));
     }
 
@@ -2665,6 +3097,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            synchronous_navigation_emitted: false,
         }
     }
 
@@ -2749,6 +3182,46 @@ mod tests {
 
     #[test]
     fn standalone_automation_outcomes_validate_action_result_and_mutability() {
+        let mut read_only_navigation = automation_completed_outcome(
+            DocumentControlAutomationKind::TextContent,
+            DocumentAutomationResult::TextContent {
+                value: "ready".into(),
+            },
+            eligible_pending(),
+        );
+        let DocumentControlOutcome::AutomationCompleted {
+            synchronous_navigation_emitted,
+            ..
+        } = &mut read_only_navigation
+        else {
+            unreachable!();
+        };
+        *synchronous_navigation_emitted = true;
+        assert!(matches!(
+            read_only_navigation.validate(),
+            Err(
+                DocumentControlOutcomeInvariantError::ReadOnlyAutomationNavigationEmission {
+                    operation: DocumentControlAutomationKind::TextContent,
+                }
+            )
+        ));
+
+        let mut mutating_navigation = automation_completed_outcome(
+            DocumentControlAutomationKind::Activate,
+            DocumentAutomationResult::Activated,
+            eligible_pending(),
+        );
+        let DocumentControlOutcome::AutomationCompleted {
+            synchronous_navigation_emitted,
+            ..
+        } = &mut mutating_navigation
+        else {
+            unreachable!();
+        };
+        *synchronous_navigation_emitted = true;
+        mutating_navigation.validate().unwrap();
+        assert_postcard_round_trip(mutating_navigation);
+
         let wrong_result = automation_completed_outcome(
             DocumentControlAutomationKind::TextContent,
             DocumentAutomationResult::QueryCount { count: 1 },
@@ -2775,6 +3248,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            synchronous_navigation_emitted: false,
         };
         assert!(matches!(
             wrong_action.validate(),
@@ -3005,6 +3479,18 @@ mod tests {
             )
         );
 
+        let replacement_bootstrap = DocumentControlCommand::BootstrapReplacementPipeline {
+            source_pipeline_id: TEST_PIPELINE_ID,
+            pipeline_id: second_pipeline_id(),
+        };
+        let (_response, receiver) = cancellable_receiver(&replacement_bootstrap, &cancellations);
+        assert_eq!(
+            receiver.recv_timeout(Duration::ZERO),
+            DocumentControlReceiveOutcome::DriveOneTurnOutcomeIndeterminate(
+                DocumentControlTransportFailure::TimedOut
+            )
+        );
+
         let bootstrap = DocumentControlCommand::BootstrapInitialPipeline {
             pipeline_id: TEST_PIPELINE_ID,
         };
@@ -3030,7 +3516,7 @@ mod tests {
             ) if token_id == token.id() && *target == *token.target() &&
                 deadline == token.deadline()
         ));
-        assert_eq!(cancellations.load(Ordering::SeqCst), 4);
+        assert_eq!(cancellations.load(Ordering::SeqCst), 5);
     }
 
     #[test]

@@ -48,3 +48,4 @@ webrender_api = { workspace = true }
 
 [dev-dependencies]
 postcard = { workspace = true }
+serde_json = { workspace = true }

@@ -3,15 +3,22 @@ import test from "node:test";
 
 import {
   CONTROLLED_WEBAPP_V1_PROFILE,
+  CONTROLLED_WEB_SESSION_V1_PROFILE,
   SETTLEMENT_EVIDENCE_MAX_ITEMS,
   settlementEvidence,
 } from "../src/evidence.js";
 import type {
+  DocumentStateToken,
   ExternalIoSnapshot,
   PendingSnapshot,
+  SessionSettleResult,
   SettleResult,
   UnsupportedWork,
 } from "../src/types.js";
+import type { SettlementEvidenceV1, SettlementEvidenceV2 } from "../src/evidence.js";
+
+const documentToken = (alias: bigint): DocumentStateToken =>
+  `document:33333333333333333333333333333333:${alias}` as DocumentStateToken;
 
 const baseResult = {
   virtualTimeNs: 10n,
@@ -37,10 +44,11 @@ const baseResult = {
   unsupportedWork: [],
 };
 
-test("settlement evidence projects a quiescent terminal snapshot", () => {
+test("v1 settlement evidence remains shape-identical for a legacy result", () => {
   const result: SettleResult = { ...baseResult, outcome: "quiescent" };
+  const evidence: SettlementEvidenceV1 = settlementEvidence(result);
 
-  assert.deepEqual(settlementEvidence(result), {
+  assert.deepEqual(evidence, {
     schemaVersion: 1,
     completeness: "terminal_snapshot",
     profile: CONTROLLED_WEBAPP_V1_PROFILE,
@@ -51,6 +59,103 @@ test("settlement evidence projects a quiescent terminal snapshot", () => {
     reason: { kind: "quiescent" },
     bounds: { maxItems: SETTLEMENT_EVIDENCE_MAX_ITEMS },
   });
+  assert.deepEqual(Object.keys(evidence), [
+    "schemaVersion",
+    "completeness",
+    "profile",
+    "outcome",
+    "virtualTimeNs",
+    "stateGeneration",
+    "domEpoch",
+    "bounds",
+    "reason",
+  ]);
+  assert.equal(Object.hasOwn(evidence, "stateToken"), false);
+});
+
+test("v2 settlement evidence includes only the exact document state token", () => {
+  const stateToken = documentToken(7n);
+  const result = {
+    ...baseResult,
+    outcome: "quiescent" as const,
+    stateToken,
+    snapshot: { ...baseResult.snapshot, stateToken },
+    sessionStateToken: "must-not-leak",
+  } as SessionSettleResult & { sessionStateToken: string };
+  const evidence: SettlementEvidenceV2 = settlementEvidence(result);
+
+  assert.deepEqual(evidence, {
+    schemaVersion: 2,
+    completeness: "terminal_snapshot",
+    profile: CONTROLLED_WEB_SESSION_V1_PROFILE,
+    stateToken,
+    outcome: "quiescent",
+    virtualTimeNs: 10n,
+    stateGeneration: 30n,
+    domEpoch: 40n,
+    reason: { kind: "quiescent" },
+    bounds: { maxItems: SETTLEMENT_EVIDENCE_MAX_ITEMS },
+  });
+  assert.equal(Object.hasOwn(evidence, "sessionStateToken"), false);
+});
+
+test("v2 settlement evidence uses the same bounded redacted reason projection", () => {
+  const stateToken = documentToken(8n);
+  const externalIo = Array.from(
+    { length: SETTLEMENT_EVIDENCE_MAX_ITEMS + 1 },
+    (_, index) =>
+      ({
+        sourceId: String(index + 1),
+        kind: "fetch",
+        phase: "awaiting_response",
+        owner: "script",
+        loadBlocking: "non_blocking",
+        startedAtNs: BigInt(index),
+        url: `https://example.test/private?token=${index}`,
+      }) as ExternalIoSnapshot,
+  );
+  const result = {
+    ...baseResult,
+    outcome: "blocked_on_external_io" as const,
+    externalIo,
+    stateToken,
+    snapshot: { ...baseResult.snapshot, stateToken },
+  } as SessionSettleResult;
+  const evidence = settlementEvidence(result);
+
+  assert.equal(evidence.reason.kind, "external_io");
+  if (evidence.reason.kind !== "external_io") return;
+  assert.equal(evidence.reason.items.length, SETTLEMENT_EVIDENCE_MAX_ITEMS);
+  assert.equal(evidence.reason.omitted, 1);
+  assert.deepEqual(evidence.reason.items[0], {
+    sourceId: "1",
+    kind: "fetch",
+    phase: "awaiting_response",
+    owner: "script",
+    loadBlocking: "non_blocking",
+    startedAtNs: 0n,
+  });
+});
+
+test("session evidence fails closed on ambiguous or mismatched token binding", () => {
+  const stateToken = documentToken(9n);
+  const resultOnly = {
+    ...baseResult,
+    outcome: "quiescent" as const,
+    stateToken,
+  } as unknown as SessionSettleResult;
+  assert.throws(() => settlementEvidence(resultOnly), /both the result and its snapshot/u);
+
+  const mismatch = {
+    ...baseResult,
+    outcome: "quiescent" as const,
+    stateToken,
+    snapshot: {
+      ...baseResult.snapshot,
+      stateToken: documentToken(10n),
+    },
+  } as SessionSettleResult;
+  assert.throws(() => settlementEvidence(mismatch), /disagrees with its snapshot/u);
 });
 
 test("settlement evidence caps blockers at 32 and reports the omitted count", () => {

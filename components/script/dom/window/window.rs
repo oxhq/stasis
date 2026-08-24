@@ -1700,9 +1700,9 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
             let is_auxiliary = window_proxy.is_auxiliary();
 
             // https://html.spec.whatwg.org/multipage/#script-closable
-            let is_script_closable = (self.is_top_level() && history_length == 1) ||
-                is_auxiliary ||
-                pref!(dom_allow_scripts_to_close_windows);
+            let is_script_closable = (self.is_top_level() && history_length == 1)
+                || is_auxiliary
+                || pref!(dom_allow_scripts_to_close_windows);
 
             // TODO: rest of Step 3:
             // Is the incumbent settings object's responsible browsing context familiar with current?
@@ -1765,7 +1765,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-sessionstorage>
     fn GetSessionStorage(&self, cx: &mut JSContext) -> Fallible<DomRoot<Storage>> {
-        self.as_global_scope().require_resource_thread_io()?;
+        self.as_global_scope().require_web_storage_io()?;
 
         // Step 1. If this's associated Document's session storage holder is non-null,
         // then return this's associated Document's session storage holder.
@@ -1794,7 +1794,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-localstorage>
     fn GetLocalStorage(&self, cx: &mut JSContext) -> Fallible<DomRoot<Storage>> {
-        self.as_global_scope().require_resource_thread_io()?;
+        self.as_global_scope().require_web_storage_io()?;
 
         // Step 1. If this's associated Document's local storage holder is non-null,
         // then return this's associated Document's local storage holder.
@@ -2181,8 +2181,8 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
                 iframe
                     .browsing_context_id()
                     .as_ref()
-                    .map(BrowsingContextId::to_string) ==
-                    Some(browsing_context_id.to_string())
+                    .map(BrowsingContextId::to_string)
+                    == Some(browsing_context_id.to_string())
             })
             .and_then(|iframe| iframe.GetContentWindow())
     }
@@ -2626,10 +2626,10 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
                     return true;
                 }
                 match type_ {
-                    HTMLElementTypeId::HTMLEmbedElement |
-                    HTMLElementTypeId::HTMLFormElement |
-                    HTMLElementTypeId::HTMLImageElement |
-                    HTMLElementTypeId::HTMLObjectElement => {
+                    HTMLElementTypeId::HTMLEmbedElement
+                    | HTMLElementTypeId::HTMLFormElement
+                    | HTMLElementTypeId::HTMLImageElement
+                    | HTMLElementTypeId::HTMLObjectElement => {
                         elem.get_name().as_ref() == Some(&self.name)
                     },
                     _ => false,
@@ -2911,8 +2911,8 @@ impl Window {
         // layouts (for queries and scrolling) are not blocked, as they do not display
         // anything and script expects the layout to be up-to-date after they run.
         let pipeline_id = self.pipeline_id();
-        if reflow_goal == ReflowGoal::UpdateTheRendering &&
-            self.layout_blocker.get().layout_blocked()
+        if reflow_goal == ReflowGoal::UpdateTheRendering
+            && self.layout_blocker.get().layout_blocked()
         {
             debug!("Suppressing pre-load-event reflow pipeline {pipeline_id}");
             return Default::default();
@@ -2941,8 +2941,8 @@ impl Window {
             // If the viewport changed and viewport units were used, all nodes need
             // to be restyled, because we currently do not track which ones rely on
             // viewport units.
-            if restyle_reason.contains(RestyleReason::ViewportChanged) &&
-                self.layout().device().used_viewport_size()
+            if restyle_reason.contains(RestyleReason::ViewportChanged)
+                && self.layout().device().used_viewport_size()
             {
                 document.dirty_all_nodes(cx.no_gc());
             }
@@ -3015,8 +3015,8 @@ impl Window {
             reflow_result.pending_svg_elements_for_serialization,
         );
 
-        if let Some(candidate) = &reflow_result.lcp_candidate &&
-            let Some(node_address) = reflow_result.lcp_node_address
+        if let Some(candidate) = &reflow_result.lcp_candidate
+            && let Some(node_address) = reflow_result.lcp_node_address
         {
             self.process_lcp_candidate_post_reflow(candidate, node_address, &document);
         }
@@ -3059,8 +3059,8 @@ impl Window {
         // See http://testthewebforward.org/docs/reftests.html
         // and https://web-platform-tests.org/writing-tests/crashtest.html
         if document.GetDocumentElement().is_some_and(|elem| {
-            elem.has_class(&atom!("reftest-wait"), CaseSensitivity::CaseSensitive) ||
-                elem.has_class(&Atom::from("test-wait"), CaseSensitivity::CaseSensitive)
+            elem.has_class(&atom!("reftest-wait"), CaseSensitivity::CaseSensitive)
+                || elem.has_class(&Atom::from("test-wait"), CaseSensitivity::CaseSensitive)
         }) {
             return;
         }
@@ -3073,8 +3073,8 @@ impl Window {
             return;
         }
 
-        if !self.pending_layout_images.borrow().is_empty() ||
-            !self.pending_images_for_rasterization.borrow().is_empty()
+        if !self.pending_layout_images.borrow().is_empty()
+            || !self.pending_images_for_rasterization.borrow().is_empty()
         {
             return;
         }
@@ -3619,8 +3619,8 @@ impl Window {
     ) {
         // We doesn't need to do anything if the following condition is fulfilled. Since there are no JS listener
         // to fire and we could reconstruct visual viewport from layout viewport in case JS access it.
-        if pinch_zoom_infos.rect == Rect::from_size(self.viewport_details().size) &&
-            self.visual_viewport.get().is_none()
+        if pinch_zoom_infos.rect == Rect::from_size(self.viewport_details().size)
+            && self.visual_viewport.get().is_none()
         {
             return;
         }
@@ -3945,10 +3945,29 @@ impl Window {
     }
 
     pub(crate) fn send_to_constellation(&self, msg: ScriptToConstellationMessage) {
-        self.as_global_scope()
+        let records_synchronous_navigation = self.is_top_level()
+            && matches!(
+                &msg,
+                ScriptToConstellationMessage::LoadUrl(..)
+                    | ScriptToConstellationMessage::NavigatedToFragment(..)
+                    | ScriptToConstellationMessage::TraverseHistory(..)
+                    | ScriptToConstellationMessage::PushHistoryState(..)
+                    | ScriptToConstellationMessage::ReplaceHistoryState(..)
+            );
+        let send_result = self
+            .as_global_scope()
             .script_to_constellation_chan()
-            .send(msg)
-            .unwrap();
+            .send(msg);
+        let captured = records_synchronous_navigation
+            && ScriptThread::record_synchronous_navigation_emission(
+                true,
+                self.webview_id(),
+                self.pipeline_id(),
+                send_result.is_ok(),
+            );
+        if !captured || send_result.is_ok() {
+            send_result.unwrap();
+        }
     }
 
     #[cfg(feature = "webxr")]
@@ -4478,10 +4497,10 @@ fn is_named_element_with_name_attribute(elem: &Element) -> bool {
     };
     matches!(
         type_,
-        HTMLElementTypeId::HTMLEmbedElement |
-            HTMLElementTypeId::HTMLFormElement |
-            HTMLElementTypeId::HTMLImageElement |
-            HTMLElementTypeId::HTMLObjectElement
+        HTMLElementTypeId::HTMLEmbedElement
+            | HTMLElementTypeId::HTMLFormElement
+            | HTMLElementTypeId::HTMLImageElement
+            | HTMLElementTypeId::HTMLObjectElement
     )
 }
 

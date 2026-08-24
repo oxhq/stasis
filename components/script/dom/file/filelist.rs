@@ -65,6 +65,11 @@ impl FileList {
     pub(crate) fn iter_files(&self) -> Iter<'_, Dom<File>> {
         self.list.iter()
     }
+
+    /// Return the exact selected-file count without iterating or cloning the backing list.
+    pub(crate) fn automation_len(&self) -> u64 {
+        u64::try_from(self.list.len()).unwrap_or(u64::MAX)
+    }
 }
 
 impl Serializable for FileList {

@@ -40,7 +40,8 @@ use devtools_traits::{
     ScriptToDevtoolsControlMsg, WorkerId,
 };
 use embedder_traits::document_automation::{
-    DocumentAutomationError, DocumentAutomationOperation, DocumentAutomationRequest,
+    DocumentAutomationError, DocumentAutomationOperation, DocumentAutomationOperationKind,
+    DocumentAutomationRequest,
 };
 use embedder_traits::document_control::{
     DocumentAdvanceToken, DocumentAdvanceTokenId, DocumentAdvanceTokenInvariantError,
@@ -48,6 +49,7 @@ use embedder_traits::document_control::{
     DocumentControlCommand, DocumentControlError, DocumentControlObservation,
     DocumentControlObservationInvariantError, DocumentControlOutcome, DocumentControlRequestId,
     DocumentPendingFact, is_exact_initial_pipeline_activation_transition,
+    is_exact_replacement_pipeline_activation_transition,
 };
 use embedder_traits::document_pending::{
     PendingAnimatedImageObservation, PendingAnimatedImageUnsupportedCounts,
@@ -63,9 +65,9 @@ use embedder_traits::document_pending::{
 };
 use embedder_traits::user_contents::{UserContentManagerId, UserContents, UserScript};
 use embedder_traits::{
-    EmbedderControlId, EmbedderControlResponse, EmbedderMsg, FocusSequenceNumber,
-    InputEventOutcome, JavaScriptEvaluationError, JavaScriptEvaluationId, MediaSessionActionType,
-    ScriptToEmbedderChan, Theme, ViewportDetails, WebDriverScriptCommand,
+    DocumentControlProfile, EmbedderControlId, EmbedderControlResponse, EmbedderMsg,
+    FocusSequenceNumber, InputEventOutcome, JavaScriptEvaluationError, JavaScriptEvaluationId,
+    MediaSessionActionType, ScriptToEmbedderChan, Theme, ViewportDetails, WebDriverScriptCommand,
 };
 use encoding_rs::Encoding;
 use fonts::{FontContext, SystemFontServiceProxy, WebFontLoadEvent};
@@ -232,7 +234,7 @@ unsafe_no_jsmanaged_fields!(TaskQueue<MainThreadScriptMsg>);
 type NodeIdSet = HashSet<String>;
 
 const CONTROLLED_INPUT_BATCH_LIMIT: usize = 64;
-const INITIAL_PIPELINE_ACTIVATION_AUTHORITY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CONTROLLED_AUTHORITY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ControlledInputBatch {
@@ -273,11 +275,35 @@ enum InitialPipelineActivationAuthority {
     Failed,
 }
 
+enum ReplacementPipelineBootstrapWaitOutcome {
+    Ready { event_index: usize },
+    Cancelled,
+    Rejected(DocumentControlError),
+    Failed,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InitialPipelineActivationWaitInterruption {
     Closing,
     TerminalLifecycle,
     UnrelatedPipelineExit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplacementPipelineBootstrapQueuedEvent {
+    Ordinary,
+    Lifecycle,
+    ImmediateBarrier,
+    Spawn(PipelineId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplacementPipelineBootstrapQueueState {
+    AwaitingInput,
+    Ready { event_index: usize },
+    Interrupted,
+    InputRevisionOverflow,
+    Unavailable,
 }
 
 #[derive(Clone, Copy)]
@@ -504,6 +530,62 @@ fn is_controlled_lifecycle_event(event: &MixedMessage) -> bool {
     )
 }
 
+fn replacement_pipeline_bootstrap_queued_event(
+    event: &MixedMessage,
+) -> ReplacementPipelineBootstrapQueuedEvent {
+    match event {
+        MixedMessage::FromConstellation(ScriptThreadMessage::SpawnPipeline(info)) => {
+            ReplacementPipelineBootstrapQueuedEvent::Spawn(info.new_pipeline_id)
+        },
+        event if is_controlled_lifecycle_event(event) => {
+            ReplacementPipelineBootstrapQueuedEvent::Lifecycle
+        },
+        MixedMessage::FromConstellation(ScriptThreadMessage::ExitFullScreen(_)) => {
+            ReplacementPipelineBootstrapQueuedEvent::ImmediateBarrier
+        },
+        _ => ReplacementPipelineBootstrapQueuedEvent::Ordinary,
+    }
+}
+
+/// Select the sole exact replacement SpawnPipeline only after owner intake is complete.
+///
+/// Servo's ordinary loop processes SpawnPipeline while retaining sequential input for later, so
+/// an exact replacement may pass ordinary source-document backlog. Lifecycle input anywhere and
+/// immediate input which arrived before SpawnPipeline remain barriers. A saturated intake cannot
+/// prove that a second SpawnPipeline is not still waiting in the receiver suffix.
+fn replacement_pipeline_bootstrap_classified_position(
+    events: impl IntoIterator<Item = ReplacementPipelineBootstrapQueuedEvent>,
+    intake_saturated: bool,
+    pipeline_id: PipelineId,
+) -> ReplacementPipelineBootstrapQueueState {
+    let mut candidate = None;
+    for (event_index, event) in events.into_iter().enumerate() {
+        match event {
+            ReplacementPipelineBootstrapQueuedEvent::Ordinary => {},
+            ReplacementPipelineBootstrapQueuedEvent::Lifecycle => {
+                return ReplacementPipelineBootstrapQueueState::Interrupted;
+            },
+            ReplacementPipelineBootstrapQueuedEvent::ImmediateBarrier if candidate.is_none() => {
+                return ReplacementPipelineBootstrapQueueState::Unavailable;
+            },
+            ReplacementPipelineBootstrapQueuedEvent::ImmediateBarrier => {},
+            ReplacementPipelineBootstrapQueuedEvent::Spawn(observed_pipeline_id) => {
+                if observed_pipeline_id != pipeline_id || candidate.replace(event_index).is_some() {
+                    return ReplacementPipelineBootstrapQueueState::Unavailable;
+                }
+            },
+        }
+    }
+
+    if intake_saturated {
+        return ReplacementPipelineBootstrapQueueState::AwaitingInput;
+    }
+    candidate.map_or(
+        ReplacementPipelineBootstrapQueueState::AwaitingInput,
+        |event_index| ReplacementPipelineBootstrapQueueState::Ready { event_index },
+    )
+}
+
 fn initial_pipeline_activation_wait_interrupted(
     awaited_pipeline_id: PipelineId,
     closing: bool,
@@ -578,11 +660,28 @@ struct InitialPipelineBootstrapFacts {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplacementPipelineBootstrapFacts {
+    source_pipeline_id: PipelineId,
+    pipeline_id: PipelineId,
+    webview_id: WebViewId,
+    browsing_context_id: BrowsingContextId,
+    parent_pipeline_id: Option<PipelineId>,
+    local_document_pipeline_id: Option<PipelineId>,
+    local_document_count: usize,
+    local_incomplete_load_count: usize,
+    local_parser_context_count: usize,
+    is_http_or_https: bool,
+    has_javascript_result: bool,
+    has_srcdoc: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InitialPipelineActivationFacts {
     pipeline_id: PipelineId,
     webview_id: WebViewId,
     browsing_context_id: BrowsingContextId,
     parent_pipeline_id: Option<PipelineId>,
+    local_document_pipeline_id: Option<PipelineId>,
     local_document_count: usize,
     local_incomplete_load_count: usize,
     local_parser_context_count: usize,
@@ -623,6 +722,36 @@ fn initial_pipeline_bootstrap_pipeline(
         .then_some(facts.pipeline_id)
 }
 
+/// Qualify only the replacement root SpawnPipeline admitted beside one active source document.
+fn replacement_pipeline_bootstrap_pipeline(
+    target: &PendingTargetObservation,
+    facts: ReplacementPipelineBootstrapFacts,
+) -> Option<PipelineId> {
+    let active = target.active_top_level?;
+    let only_pending = match target.pending_top_level_pipelines() {
+        [pipeline_id] => *pipeline_id,
+        _ => return None,
+    };
+    (facts.source_pipeline_id != facts.pipeline_id
+        && active.pipeline_id == facts.source_pipeline_id
+        && target.pipelines().len() == 2
+        && target.contains_pipeline(facts.source_pipeline_id)
+        && target.contains_pipeline(facts.pipeline_id)
+        && target.fully_active_pipelines() == [facts.source_pipeline_id]
+        && only_pending == facts.pipeline_id
+        && facts.webview_id == target.webview_id
+        && facts.browsing_context_id == target.webview_id
+        && facts.parent_pipeline_id.is_none()
+        && facts.local_document_pipeline_id == Some(facts.source_pipeline_id)
+        && facts.local_document_count == 1
+        && facts.local_incomplete_load_count == 0
+        && facts.local_parser_context_count == 0
+        && facts.is_http_or_https
+        && !facts.has_javascript_result
+        && !facts.has_srcdoc)
+        .then_some(facts.pipeline_id)
+}
+
 /// Qualify only the response-headers turn which transforms the already-bootstrapped pending root
 /// into the same active root. The actual target transition is authorized separately by the
 /// Constellation after it processes the correlated `ActivateDocument` message.
@@ -630,22 +759,29 @@ fn initial_pipeline_activation_pipeline(
     target: &PendingTargetObservation,
     facts: InitialPipelineActivationFacts,
 ) -> Option<PipelineId> {
-    let only_pipeline = match target.pipelines() {
-        [pipeline_id] => *pipeline_id,
-        _ => return None,
-    };
     let only_pending = match target.pending_top_level_pipelines() {
         [pipeline_id] => *pipeline_id,
         _ => return None,
     };
-    (target.active_top_level.is_none()
+    let exact_initial_target = target.active_top_level.is_none()
+        && target.pipelines() == [facts.pipeline_id]
         && target.fully_active_pipelines().is_empty()
-        && only_pipeline == facts.pipeline_id
+        && facts.local_document_pipeline_id.is_none()
+        && facts.local_document_count == 0;
+    let exact_replacement_target = target.active_top_level.is_some_and(|active| {
+        active.pipeline_id != facts.pipeline_id
+            && facts.local_document_pipeline_id == Some(active.pipeline_id)
+            && target.pipelines().len() == 2
+            && target.contains_pipeline(active.pipeline_id)
+            && target.contains_pipeline(facts.pipeline_id)
+            && target.fully_active_pipelines() == [active.pipeline_id]
+            && facts.local_document_count == 1
+    });
+    ((exact_initial_target || exact_replacement_target)
         && only_pending == facts.pipeline_id
         && facts.webview_id == target.webview_id
         && facts.browsing_context_id == target.webview_id
         && facts.parent_pipeline_id.is_none()
-        && facts.local_document_count == 0
         && facts.local_incomplete_load_count == 1
         && facts.local_parser_context_count == 1
         && facts.parser_pipeline_id == Some(facts.pipeline_id)
@@ -670,8 +806,10 @@ fn checked_pending_count(count: usize) -> Result<u64, DocumentControlError> {
 }
 
 /// The native executor performs all fallible selector and element validation before activation.
-/// A failed fill DOM operation, however, can have reached the value setter before Servo reports
-/// the error, so it cannot be represented as a definitive rejection.
+/// A failed fill or submit DOM operation can have reached the value setter/request-submit path
+/// before Servo reports the error. Select also deliberately maps every fallible post-event rescan
+/// to a select DOM-operation error: synchronous handlers have already observed the mutation, so
+/// none can be a definitive rejection.
 fn automation_error_may_follow_mutation(
     request: &DocumentAutomationRequest,
     error: &DocumentAutomationError,
@@ -680,7 +818,19 @@ fn automation_error_may_follow_mutation(
         (request.operation(), error),
         (
             DocumentAutomationOperation::Fill { .. },
-            DocumentAutomationError::DomOperationFailed { .. }
+            DocumentAutomationError::DomOperationFailed {
+                operation: DocumentAutomationOperationKind::Fill,
+            }
+        ) | (
+            DocumentAutomationOperation::Select { .. },
+            DocumentAutomationError::DomOperationFailed {
+                operation: DocumentAutomationOperationKind::Select,
+            }
+        ) | (
+            DocumentAutomationOperation::Submit { .. },
+            DocumentAutomationError::DomOperationFailed {
+                operation: DocumentAutomationOperationKind::Submit,
+            }
         )
     )
 }
@@ -819,6 +969,102 @@ fn dom_mutation_epoch_tracker_for_clock(
         .then(|| RefCell::new(DomMutationEpochTracker::default()))
 }
 
+fn admit_controlled_session_history_revision(
+    profile: DocumentControlProfile,
+    revision: &Cell<u64>,
+) -> bool {
+    if profile != DocumentControlProfile::TopLevelSession {
+        return true;
+    }
+    let Some(next_revision) = revision.get().checked_add(1) else {
+        return false;
+    };
+    if next_revision > embedder_traits::CONTROLLED_SESSION_MAX_HISTORY_REVISIONS {
+        return false;
+    }
+    revision.set(next_revision);
+    true
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SynchronousNavigationEmissionCapture {
+    #[default]
+    Inactive,
+    Active {
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        emissions: u64,
+    },
+    Failed {
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        failure: SynchronousNavigationEmissionCaptureFailure,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SynchronousNavigationEmissionCaptureFailure {
+    CaptureCorrupted,
+    EmissionLimitExceeded,
+    SendFailed,
+}
+
+fn record_synchronous_navigation_emission(
+    capture: SynchronousNavigationEmissionCapture,
+    webview_id: WebViewId,
+    pipeline_id: PipelineId,
+    send_succeeded: bool,
+) -> SynchronousNavigationEmissionCapture {
+    match capture {
+        SynchronousNavigationEmissionCapture::Inactive => {
+            SynchronousNavigationEmissionCapture::Inactive
+        },
+        SynchronousNavigationEmissionCapture::Active {
+            webview_id: captured_webview_id,
+            pipeline_id: captured_pipeline_id,
+            ..
+        }
+        | SynchronousNavigationEmissionCapture::Failed {
+            webview_id: captured_webview_id,
+            pipeline_id: captured_pipeline_id,
+            ..
+        } if captured_webview_id != webview_id || captured_pipeline_id != pipeline_id => capture,
+        SynchronousNavigationEmissionCapture::Failed { .. } => capture,
+        SynchronousNavigationEmissionCapture::Active { .. } if !send_succeeded => {
+            SynchronousNavigationEmissionCapture::Failed {
+                webview_id,
+                pipeline_id,
+                failure: SynchronousNavigationEmissionCaptureFailure::SendFailed,
+            }
+        },
+        SynchronousNavigationEmissionCapture::Active { emissions, .. } => emissions
+            .checked_add(1)
+            .filter(|next| *next <= embedder_traits::CONTROLLED_SESSION_MAX_HISTORY_REVISIONS)
+            .map(|emissions| SynchronousNavigationEmissionCapture::Active {
+                webview_id,
+                pipeline_id,
+                emissions,
+            })
+            .unwrap_or(SynchronousNavigationEmissionCapture::Failed {
+                webview_id,
+                pipeline_id,
+                failure: SynchronousNavigationEmissionCaptureFailure::EmissionLimitExceeded,
+            }),
+    }
+}
+
+fn controlled_session_redirect_limit_before_next_fetch(
+    profile: DocumentControlProfile,
+    is_top_level: bool,
+    current_url_list_len: usize,
+) -> Option<u64> {
+    if profile != DocumentControlProfile::TopLevelSession || !is_top_level {
+        return None;
+    }
+    let observed = u64::try_from(current_url_list_len).unwrap_or(u64::MAX);
+    (observed > embedder_traits::CONTROLLED_SESSION_MAX_REDIRECTS).then_some(observed)
+}
+
 #[derive(JSTraceable)]
 // ScriptThread instances are rooted on creation, so this is okay
 #[cfg_attr(crown, expect(crown::unrooted_must_root))]
@@ -882,6 +1128,18 @@ pub struct ScriptThread {
     /// The document-observable clock shared by this event loop's Window realms and timer queue.
     #[no_trace]
     document_clock: DocumentClock,
+
+    /// The immutable top-level document authority selected independently from the clock.
+    #[no_trace]
+    document_control_profile: DocumentControlProfile,
+
+    /// Script-side pre-mutation mirror of Constellation's session history revision.
+    controlled_session_history_revision: Cell<u64>,
+
+    /// Checked capture of successful top-level authority messages emitted synchronously by the
+    /// currently executing v2 mutating automation command.
+    #[no_trace]
+    controlled_automation_navigation_capture: Cell<SynchronousNavigationEmissionCapture>,
 
     /// Session-scoped work accounting installed before controlled navigation begins.
     #[no_trace]
@@ -1262,6 +1520,118 @@ impl ScriptThread {
         with_script_thread(|script_thread| script_thread.document_clock.clone())
     }
 
+    /// Return the top-level document authority for the current ScriptThread.
+    pub(crate) fn current_document_control_profile() -> DocumentControlProfile {
+        with_script_thread(|script_thread| script_thread.document_control_profile)
+    }
+
+    /// Admit one same-document authority change before script-visible history mutation.
+    pub(crate) fn admit_controlled_session_history_change() -> bool {
+        with_script_thread(|script_thread| {
+            admit_controlled_session_history_revision(
+                script_thread.document_control_profile,
+                &script_thread.controlled_session_history_revision,
+            )
+        })
+    }
+
+    fn begin_synchronous_navigation_emission_capture(
+        &self,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+    ) -> Result<(), ()> {
+        match self.controlled_automation_navigation_capture.replace(
+            SynchronousNavigationEmissionCapture::Active {
+                webview_id,
+                pipeline_id,
+                emissions: 0,
+            },
+        ) {
+            SynchronousNavigationEmissionCapture::Inactive => Ok(()),
+            _ => {
+                self.controlled_automation_navigation_capture.set(
+                    SynchronousNavigationEmissionCapture::Failed {
+                        webview_id,
+                        pipeline_id,
+                        failure: SynchronousNavigationEmissionCaptureFailure::CaptureCorrupted,
+                    },
+                );
+                Err(())
+            },
+        }
+    }
+
+    fn finish_synchronous_navigation_emission_capture(
+        &self,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+    ) -> Result<bool, ()> {
+        match self
+            .controlled_automation_navigation_capture
+            .replace(SynchronousNavigationEmissionCapture::Inactive)
+        {
+            SynchronousNavigationEmissionCapture::Active {
+                webview_id: captured_webview_id,
+                pipeline_id: captured_pipeline_id,
+                emissions,
+            } if captured_webview_id == webview_id && captured_pipeline_id == pipeline_id => {
+                Ok(emissions > 0)
+            },
+            SynchronousNavigationEmissionCapture::Inactive
+            | SynchronousNavigationEmissionCapture::Active { .. }
+            | SynchronousNavigationEmissionCapture::Failed { .. } => Err(()),
+        }
+    }
+
+    /// Record one successful or failed synchronous top-level authority-message send.
+    ///
+    /// The return value is true only when a v2 mutating automation capture owns the send. Callers
+    /// use this to suppress their ordinary transport panic/error after latching a failure so the
+    /// command can complete as explicitly indeterminate instead.
+    pub(crate) fn record_synchronous_navigation_emission(
+        is_top_level: bool,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        send_succeeded: bool,
+    ) -> bool {
+        if !is_top_level {
+            return false;
+        }
+        with_optional_script_thread(|script_thread| {
+            let Some(script_thread) = script_thread else {
+                return false;
+            };
+            let capture = script_thread.controlled_automation_navigation_capture.get();
+            if matches!(capture, SynchronousNavigationEmissionCapture::Inactive) {
+                return false;
+            }
+            let capture_matches_sender = matches!(
+                capture,
+                SynchronousNavigationEmissionCapture::Active {
+                    webview_id: captured_webview_id,
+                    pipeline_id: captured_pipeline_id,
+                    ..
+                } | SynchronousNavigationEmissionCapture::Failed {
+                    webview_id: captured_webview_id,
+                    pipeline_id: captured_pipeline_id,
+                    ..
+                } if captured_webview_id == webview_id && captured_pipeline_id == pipeline_id
+            );
+            if !capture_matches_sender {
+                return false;
+            }
+            script_thread.controlled_automation_navigation_capture.set(
+                record_synchronous_navigation_emission(
+                    capture,
+                    webview_id,
+                    pipeline_id,
+                    send_succeeded,
+                ),
+            );
+            true
+        })
+    }
+
     /// Return producer tracking shared by main-thread task senders on this ScriptThread.
     pub(crate) fn document_producer_fence(&self) -> Option<DocumentProducerFence> {
         self.document_producer_fence.clone()
@@ -1530,6 +1900,7 @@ impl ScriptThread {
         // The clock mode is immutable and selected by the WebView before its initial navigation.
         // Every Window and timer queue on this event loop shares this one clock domain.
         let document_clock = DocumentClock::new(state.document_clock);
+        let document_control_profile = state.document_control_profile;
         let document_execution_ledger = document_clock.is_controlled().then(|| {
             DocumentExecutionLedger::new(
                 document_clock.id(),
@@ -1672,6 +2043,11 @@ impl ScriptThread {
                         document_clock.clone(),
                     )),
                     document_clock,
+                    document_control_profile,
+                    controlled_session_history_revision: Cell::new(0),
+                    controlled_automation_navigation_capture: Cell::new(
+                        SynchronousNavigationEmissionCapture::Inactive,
+                    ),
                     document_execution_ledger,
                     document_producer_fence,
                     controlled_input,
@@ -2301,6 +2677,7 @@ impl ScriptThread {
             &command,
             DocumentControlCommand::DriveOneTurn
                 | DocumentControlCommand::BootstrapInitialPipeline { .. }
+                | DocumentControlCommand::BootstrapReplacementPipeline { .. }
         ) {
             self.task_queue.start_event_loop_iteration();
         }
@@ -2313,6 +2690,7 @@ impl ScriptThread {
             let outcome = match &command {
                 DocumentControlCommand::DriveOneTurn
                 | DocumentControlCommand::BootstrapInitialPipeline { .. }
+                | DocumentControlCommand::BootstrapReplacementPipeline { .. }
                     if is_pending_capture_error(&error) =>
                 {
                     DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate {
@@ -2348,6 +2726,15 @@ impl ScriptThread {
                     DocumentControlOutcome::Rejected(
                         DocumentControlError::InitialPipelineBootstrapRequired { pipeline_id },
                     )
+                } else if let Some((source_pipeline_id, pipeline_id)) =
+                    self.pending_replacement_pipeline_bootstrap_event(&target)
+                {
+                    DocumentControlOutcome::Rejected(
+                        DocumentControlError::ReplacementPipelineBootstrapRequired {
+                            source_pipeline_id,
+                            pipeline_id,
+                        },
+                    )
                 } else {
                     self.capture_controlled_pending(
                         &target,
@@ -2372,11 +2759,57 @@ impl ScriptThread {
                 }
                 true
             },
-            DocumentControlCommand::BootstrapInitialPipeline { pipeline_id } => {
-                if self.initial_pipeline_bootstrap_event(&target) != Some(pipeline_id) {
-                    let outcome = DocumentControlOutcome::Rejected(
+            bootstrap @ (DocumentControlCommand::BootstrapInitialPipeline { .. }
+            | DocumentControlCommand::BootstrapReplacementPipeline { .. }) => {
+                let (_pipeline_id, event_index, qualified, unavailable) = match bootstrap {
+                    DocumentControlCommand::BootstrapInitialPipeline { pipeline_id } => (
+                        pipeline_id,
+                        0,
+                        self.initial_pipeline_bootstrap_event(&target) == Some(pipeline_id),
                         DocumentControlError::InitialPipelineBootstrapUnavailable { pipeline_id },
-                    );
+                    ),
+                    DocumentControlCommand::BootstrapReplacementPipeline {
+                        source_pipeline_id,
+                        pipeline_id,
+                    } => {
+                        let event_index = match self.await_replacement_pipeline_bootstrap_event(
+                            active,
+                            &target,
+                            source_pipeline_id,
+                            pipeline_id,
+                        ) {
+                            ReplacementPipelineBootstrapWaitOutcome::Ready { event_index } => {
+                                event_index
+                            },
+                            ReplacementPipelineBootstrapWaitOutcome::Cancelled => return true,
+                            ReplacementPipelineBootstrapWaitOutcome::Rejected(error) => {
+                                let outcome = DocumentControlOutcome::Rejected(error);
+                                if !self.drain_active_controls_until_quiet(active) {
+                                    self.send_document_control_response(
+                                        request_id,
+                                        cancellation_id,
+                                        target,
+                                        outcome,
+                                    );
+                                }
+                                return true;
+                            },
+                            ReplacementPipelineBootstrapWaitOutcome::Failed => return false,
+                        };
+                        (
+                            pipeline_id,
+                            event_index,
+                            true,
+                            DocumentControlError::ReplacementPipelineBootstrapUnavailable {
+                                source_pipeline_id,
+                                pipeline_id,
+                            },
+                        )
+                    },
+                    _ => unreachable!("the bootstrap command was matched above"),
+                };
+                if !qualified {
+                    let outcome = DocumentControlOutcome::Rejected(unavailable);
                     if !self.drain_active_controls_until_quiet(active) {
                         self.send_document_control_response(
                             request_id,
@@ -2388,13 +2821,19 @@ impl ScriptThread {
                     return true;
                 }
 
+                // This is the final cancellation intake before the bootstrap mutation. The ready
+                // queue is not touched between this barrier and removal, so an owner-observed
+                // cancellation leaves the selected SpawnPipeline and every predecessor intact.
+                if self.drain_active_controls_until_quiet(active) {
+                    return true;
+                }
                 let bootstrap_admitted = {
                     let input = self
                         .controlled_input
                         .as_ref()
                         .expect("the controlled loop requires an owner input queue")
                         .borrow();
-                    self.admit_controlled_event(input.ready.front())
+                    self.admit_controlled_event(input.ready.get(event_index))
                 };
                 if !bootstrap_admitted {
                     let outcome = self.controlled_drive_completion(
@@ -2422,8 +2861,8 @@ impl ScriptThread {
                     .expect("the controlled loop requires an owner input queue")
                     .borrow_mut()
                     .ready
-                    .pop_front()
-                    .expect("validated initial bootstrap event must remain queued");
+                    .remove(event_index)
+                    .expect("validated pipeline bootstrap event must remain queued");
                 if !self.process_one_controlled_event(cx, event) {
                     return false;
                 }
@@ -2756,15 +3195,45 @@ impl ScriptThread {
             return;
         }
 
+        let capture_synchronous_navigation = operation.is_mutating()
+            && self.document_control_profile == DocumentControlProfile::TopLevelSession;
+        if capture_synchronous_navigation
+            && self
+                .begin_synchronous_navigation_emission_capture(
+                    target.webview_id,
+                    active_pipeline.pipeline_id,
+                )
+                .is_err()
+        {
+            indeterminate();
+            return;
+        }
+
         let execution = {
             let mut realm = enter_auto_realm(cx, &*document);
             let cx = &mut realm.current_realm();
             execute_prevalidated_document_automation(cx, &document, &request)
         };
+        let synchronous_navigation_emitted = if capture_synchronous_navigation {
+            match self.finish_synchronous_navigation_emission_capture(
+                target.webview_id,
+                active_pipeline.pipeline_id,
+            ) {
+                Ok(emitted) => emitted,
+                Err(()) => {
+                    indeterminate();
+                    return;
+                },
+            }
+        } else {
+            false
+        };
         let result = match execution {
             Ok(result) => result,
             Err(error) => {
-                if automation_error_may_follow_mutation(&request, &error) {
+                if synchronous_navigation_emitted
+                    || automation_error_may_follow_mutation(&request, &error)
+                {
                     indeterminate();
                 } else {
                     reject(DocumentControlError::Automation(error));
@@ -2799,6 +3268,7 @@ impl ScriptThread {
             Ok(observation) => DocumentControlOutcome::AutomationCompleted {
                 result,
                 observation: Box::new(observation),
+                synchronous_navigation_emitted,
             },
             Err(error) if operation.is_mutating() => {
                 let _ = error;
@@ -3805,6 +4275,212 @@ impl ScriptThread {
         Some(pipeline_id)
     }
 
+    /// Return the sole exact replacement SpawnPipeline after complete owner intake.
+    ///
+    /// Ordinary source-document events may precede it because Servo gives SpawnPipeline intake
+    /// priority over the sequential backlog. Lifecycle and earlier immediate events are barriers.
+    fn replacement_pipeline_bootstrap_event_position(
+        &self,
+        target: &PendingTargetObservation,
+        source_pipeline_id: PipelineId,
+        pipeline_id: PipelineId,
+    ) -> ReplacementPipelineBootstrapQueueState {
+        let document_ids = self
+            .documents
+            .borrow()
+            .iter()
+            .map(|(pipeline_id, _)| pipeline_id)
+            .collect::<Vec<_>>();
+        let local_document_pipeline_id = match document_ids.as_slice() {
+            [pipeline_id] => Some(*pipeline_id),
+            _ => None,
+        };
+        let local_incomplete_load_count = self.incomplete_loads.borrow().len();
+        let local_parser_context_count = self.incomplete_parser_contexts.0.borrow().len();
+        let input = self
+            .controlled_input
+            .as_ref()
+            .expect("the controlled loop requires an owner input queue")
+            .borrow();
+        if input.revision_overflowed() {
+            return ReplacementPipelineBootstrapQueueState::InputRevisionOverflow;
+        }
+        let queue_state = replacement_pipeline_bootstrap_classified_position(
+            input
+                .ready
+                .iter()
+                .map(replacement_pipeline_bootstrap_queued_event),
+            input.intake_saturated(),
+            pipeline_id,
+        );
+        let ReplacementPipelineBootstrapQueueState::Ready { event_index } = queue_state else {
+            return queue_state;
+        };
+        let MixedMessage::FromConstellation(ScriptThreadMessage::SpawnPipeline(info)) =
+            input.ready.get(event_index).expect("qualified queue index")
+        else {
+            return ReplacementPipelineBootstrapQueueState::Unavailable;
+        };
+        let facts = ReplacementPipelineBootstrapFacts {
+            source_pipeline_id,
+            pipeline_id: info.new_pipeline_id,
+            webview_id: info.webview_id,
+            browsing_context_id: info.browsing_context_id,
+            parent_pipeline_id: info.parent_info,
+            local_document_pipeline_id,
+            local_document_count: document_ids.len(),
+            local_incomplete_load_count,
+            local_parser_context_count,
+            is_http_or_https: matches!(info.load_data.url.scheme(), "http" | "https"),
+            has_javascript_result: info.load_data.js_eval_result.is_some(),
+            has_srcdoc: !info.load_data.srcdoc.is_empty(),
+        };
+        let pipeline_id = replacement_pipeline_bootstrap_pipeline(target, facts).or_else(|| {
+            warn!("replacement bootstrap facts did not qualify: {facts:?}");
+            None
+        });
+        let Some(pipeline_id) = pipeline_id else {
+            return ReplacementPipelineBootstrapQueueState::Unavailable;
+        };
+        drop(input);
+        if self
+            .validate_controlled_target_projection(target, Some(pipeline_id), None)
+            .is_err()
+        {
+            return ReplacementPipelineBootstrapQueueState::Unavailable;
+        }
+        ReplacementPipelineBootstrapQueueState::Ready { event_index }
+    }
+
+    fn replacement_pipeline_bootstrap_event(
+        &self,
+        target: &PendingTargetObservation,
+        source_pipeline_id: PipelineId,
+        pipeline_id: PipelineId,
+    ) -> Option<PipelineId> {
+        matches!(
+            self.replacement_pipeline_bootstrap_event_position(
+                target,
+                source_pipeline_id,
+                pipeline_id,
+            ),
+            ReplacementPipelineBootstrapQueueState::Ready { .. }
+        )
+        .then_some(pipeline_id)
+    }
+
+    /// Await owner admission of the exact replacement SpawnPipeline without running ordinary
+    /// input. The control lane is drained after every bounded ordinary-input batch so cancellation
+    /// cannot be starved by a saturated producer stream. Owner-observed cancellation wins until
+    /// the caller removes the selected event, which is the bootstrap linearization point.
+    fn await_replacement_pipeline_bootstrap_event(
+        &self,
+        active: (DocumentControlRequestId, DocumentControlCancellationId),
+        target: &PendingTargetObservation,
+        source_pipeline_id: PipelineId,
+        pipeline_id: PipelineId,
+    ) -> ReplacementPipelineBootstrapWaitOutcome {
+        let unavailable = || DocumentControlError::ReplacementPipelineBootstrapUnavailable {
+            source_pipeline_id,
+            pipeline_id,
+        };
+        loop {
+            let ordinary = self.drain_ready_controlled_inputs();
+            if self.drain_active_controls_until_quiet(active) {
+                return ReplacementPipelineBootstrapWaitOutcome::Cancelled;
+            }
+            if self.closing.load(Ordering::SeqCst) {
+                self.prepare_for_shutdown_inner();
+                self.controlled_input
+                    .as_ref()
+                    .expect("the controlled loop requires an owner input queue")
+                    .borrow_mut()
+                    .retire_control(active);
+                return ReplacementPipelineBootstrapWaitOutcome::Failed;
+            }
+
+            match self.replacement_pipeline_bootstrap_event_position(
+                target,
+                source_pipeline_id,
+                pipeline_id,
+            ) {
+                ReplacementPipelineBootstrapQueueState::Ready { event_index } => {
+                    // This is the final owner-control barrier before the caller removes the event.
+                    // No ordinary intake runs between this check and that removal, so the selected
+                    // index and the relative order of every retained event remain stable.
+                    if self.drain_active_controls_until_quiet(active) {
+                        return ReplacementPipelineBootstrapWaitOutcome::Cancelled;
+                    }
+                    if self.closing.load(Ordering::SeqCst) {
+                        self.prepare_for_shutdown_inner();
+                        self.controlled_input
+                            .as_ref()
+                            .expect("the controlled loop requires an owner input queue")
+                            .borrow_mut()
+                            .retire_control(active);
+                        return ReplacementPipelineBootstrapWaitOutcome::Failed;
+                    }
+                    return ReplacementPipelineBootstrapWaitOutcome::Ready { event_index };
+                },
+                ReplacementPipelineBootstrapQueueState::Interrupted
+                | ReplacementPipelineBootstrapQueueState::Unavailable => {
+                    return ReplacementPipelineBootstrapWaitOutcome::Rejected(unavailable());
+                },
+                ReplacementPipelineBootstrapQueueState::InputRevisionOverflow => {
+                    return ReplacementPipelineBootstrapWaitOutcome::Rejected(
+                        DocumentControlError::InputRevisionOverflow,
+                    );
+                },
+                ReplacementPipelineBootstrapQueueState::AwaitingInput => {},
+            }
+
+            if ordinary.saturated {
+                continue;
+            }
+            match self
+                .receivers
+                .recv_document_control_timeout(CONTROLLED_AUTHORITY_POLL_INTERVAL)
+            {
+                DocumentControlWaitResult::Message(ScriptThreadControlMessage::Cancel {
+                    request_id,
+                    cancellation_id,
+                }) if (request_id, cancellation_id) == active => {
+                    self.controlled_input
+                        .as_ref()
+                        .expect("the controlled loop requires an owner input queue")
+                        .borrow_mut()
+                        .retire_control(active);
+                    return ReplacementPipelineBootstrapWaitOutcome::Cancelled;
+                },
+                DocumentControlWaitResult::Message(message) => {
+                    self.admit_controlled_command(message);
+                },
+                DocumentControlWaitResult::TimedOut => {},
+                DocumentControlWaitResult::Closed => {
+                    self.controlled_input
+                        .as_ref()
+                        .expect("the controlled loop requires an owner input queue")
+                        .borrow_mut()
+                        .retire_control(active);
+                    return ReplacementPipelineBootstrapWaitOutcome::Failed;
+                },
+            }
+        }
+    }
+
+    fn pending_replacement_pipeline_bootstrap_event(
+        &self,
+        target: &PendingTargetObservation,
+    ) -> Option<(PipelineId, PipelineId)> {
+        let source_pipeline_id = target.active_top_level?.pipeline_id;
+        let [pipeline_id] = target.pending_top_level_pipelines() else {
+            return None;
+        };
+        let pipeline_id = *pipeline_id;
+        self.replacement_pipeline_bootstrap_event(target, source_pipeline_id, pipeline_id)?;
+        Some((source_pipeline_id, pipeline_id))
+    }
+
     /// Return the sole response-headers event which can synchronously emit the first correlated
     /// top-level activation. Redirect, cancellation, 204/205, nested, replacement, and
     /// synchronous-content paths are excluded before the event is removed from owner input.
@@ -3841,6 +4517,16 @@ impl ScriptThread {
             [(pipeline_id, _)] => Some(*pipeline_id),
             _ => None,
         };
+        let document_ids = self
+            .documents
+            .borrow()
+            .iter()
+            .map(|(pipeline_id, _)| pipeline_id)
+            .collect::<Vec<_>>();
+        let local_document_pipeline_id = match document_ids.as_slice() {
+            [pipeline_id] => Some(*pipeline_id),
+            _ => None,
+        };
         let pipeline_id = initial_pipeline_activation_pipeline(
             target,
             InitialPipelineActivationFacts {
@@ -3848,7 +4534,8 @@ impl ScriptThread {
                 webview_id: load.webview_id,
                 browsing_context_id: load.browsing_context_id,
                 parent_pipeline_id: load.parent_info,
-                local_document_count: self.documents.borrow().iter().count(),
+                local_document_pipeline_id,
+                local_document_count: document_ids.len(),
                 local_incomplete_load_count: incomplete_loads.len(),
                 local_parser_context_count: parser_contexts.len(),
                 parser_pipeline_id,
@@ -3894,6 +4581,75 @@ impl ScriptThread {
         Ok(())
     }
 
+    fn resolve_initial_pipeline_activation_control(
+        &self,
+        active: (DocumentControlRequestId, DocumentControlCancellationId),
+        pipeline_id: PipelineId,
+        before: &PendingTargetObservation,
+        before_terminals: &PendingRuntimeTerminals,
+        message: ScriptThreadControlMessage,
+    ) -> Option<InitialPipelineActivationAuthority> {
+        match message {
+            ScriptThreadControlMessage::Cancel {
+                request_id,
+                cancellation_id,
+            } if (request_id, cancellation_id) == active => {
+                self.controlled_input
+                    .as_ref()
+                    .expect("the controlled loop requires an owner input queue")
+                    .borrow_mut()
+                    .retire_control(active);
+                Some(InitialPipelineActivationAuthority::Cancelled)
+            },
+            ScriptThreadControlMessage::Command {
+                request_id,
+                cancellation_id,
+                target,
+                target_terminals,
+                command,
+            } if (request_id, cancellation_id) == active => {
+                let authorized = matches!(command, DocumentControlCommand::DriveOneTurn)
+                    && target_terminals == *before_terminals
+                    && before.active_top_level.map_or_else(
+                        || {
+                            is_exact_initial_pipeline_activation_transition(
+                                before,
+                                &target,
+                                pipeline_id,
+                            )
+                        },
+                        |source| {
+                            is_exact_replacement_pipeline_activation_transition(
+                                before,
+                                &target,
+                                source.pipeline_id,
+                                pipeline_id,
+                            )
+                        },
+                    )
+                    && self
+                        .validate_initial_pipeline_activation_local_target(&target, pipeline_id)
+                        .is_ok();
+                if !authorized {
+                    self.controlled_input
+                        .as_ref()
+                        .expect("the controlled loop requires an owner input queue")
+                        .borrow_mut()
+                        .retire_control(active);
+                    return Some(InitialPipelineActivationAuthority::Failed);
+                }
+                Some(InitialPipelineActivationAuthority::Authorized {
+                    target,
+                    target_terminals,
+                })
+            },
+            message => {
+                self.admit_controlled_command(message);
+                None
+            },
+        }
+    }
+
     /// Wait only for the exact Constellation authority produced by the correlated activation.
     /// Ordinary input is admitted, but cannot execute while the already-linearized headers turn
     /// is unresolved. Forced shutdown and lifecycle input can interrupt the bounded wait.
@@ -3905,6 +4661,7 @@ impl ScriptThread {
         before: &PendingTargetObservation,
         before_terminals: &PendingRuntimeTerminals,
     ) -> InitialPipelineActivationAuthority {
+        let mut deferred_active_command = None;
         loop {
             let ordinary = self.drain_ready_controlled_inputs();
             let closing = self.closing.load(Ordering::SeqCst);
@@ -3952,17 +4709,84 @@ impl ScriptThread {
                         .retire_control(active);
                     return InitialPipelineActivationAuthority::Failed;
                 },
-                None if ordinary.saturated => continue,
                 None => {},
+            }
+
+            // The exact reroute and cancellation use the priority control lane. Poll it before a
+            // saturated ordinary-input batch can continue, otherwise an always-ready resource
+            // stream can starve the authority handoff indefinitely. Retain an exact command until
+            // a non-saturated intake proves there is no unseen lifecycle suffix; cancellation is
+            // still resolved immediately.
+            loop {
+                match self.receivers.recv_document_control_timeout(Duration::ZERO) {
+                    DocumentControlWaitResult::Message(message) => {
+                        let is_active_command = matches!(
+                            &message,
+                            ScriptThreadControlMessage::Command {
+                                request_id,
+                                cancellation_id,
+                                ..
+                            } if (*request_id, *cancellation_id) == active
+                        );
+                        if is_active_command {
+                            if deferred_active_command.replace(message).is_some() {
+                                self.controlled_input
+                                    .as_ref()
+                                    .expect("the controlled loop requires an owner input queue")
+                                    .borrow_mut()
+                                    .retire_control(active);
+                                return InitialPipelineActivationAuthority::Failed;
+                            }
+                            continue;
+                        }
+                        if let Some(authority) = self.resolve_initial_pipeline_activation_control(
+                            active,
+                            pipeline_id,
+                            before,
+                            before_terminals,
+                            message,
+                        ) {
+                            return authority;
+                        }
+                    },
+                    DocumentControlWaitResult::TimedOut => break,
+                    DocumentControlWaitResult::Closed => {
+                        self.controlled_input
+                            .as_ref()
+                            .expect("the controlled loop requires an owner input queue")
+                            .borrow_mut()
+                            .retire_control(active);
+                        return InitialPipelineActivationAuthority::Failed;
+                    },
+                }
+            }
+            if ordinary.saturated {
+                continue;
+            }
+            if let Some(message) = deferred_active_command.take() {
+                return self
+                    .resolve_initial_pipeline_activation_control(
+                        active,
+                        pipeline_id,
+                        before,
+                        before_terminals,
+                        message,
+                    )
+                    .expect("a retained active command must resolve the authority wait");
             }
 
             let message = match self
                 .receivers
-                .recv_document_control_timeout(INITIAL_PIPELINE_ACTIVATION_AUTHORITY_POLL_INTERVAL)
+                .recv_document_control_timeout(CONTROLLED_AUTHORITY_POLL_INTERVAL)
             {
                 DocumentControlWaitResult::Message(message) => message,
                 DocumentControlWaitResult::TimedOut => continue,
                 DocumentControlWaitResult::Closed => {
+                    self.controlled_input
+                        .as_ref()
+                        .expect("the controlled loop requires an owner input queue")
+                        .borrow_mut()
+                        .retire_control(active);
                     return InitialPipelineActivationAuthority::Failed;
                 },
             };
@@ -3975,44 +4799,14 @@ impl ScriptThread {
                     .retire_control(active);
                 return InitialPipelineActivationAuthority::Failed;
             }
-            match message {
-                ScriptThreadControlMessage::Cancel {
-                    request_id,
-                    cancellation_id,
-                } if (request_id, cancellation_id) == active => {
-                    self.controlled_input
-                        .as_ref()
-                        .expect("the controlled loop requires an owner input queue")
-                        .borrow_mut()
-                        .retire_control(active);
-                    return InitialPipelineActivationAuthority::Cancelled;
-                },
-                ScriptThreadControlMessage::Command {
-                    request_id,
-                    cancellation_id,
-                    target,
-                    target_terminals,
-                    command,
-                } if (request_id, cancellation_id) == active => {
-                    if !matches!(command, DocumentControlCommand::DriveOneTurn)
-                        || target_terminals != *before_terminals
-                        || !is_exact_initial_pipeline_activation_transition(
-                            before,
-                            &target,
-                            pipeline_id,
-                        )
-                        || self
-                            .validate_initial_pipeline_activation_local_target(&target, pipeline_id)
-                            .is_err()
-                    {
-                        return InitialPipelineActivationAuthority::Failed;
-                    }
-                    return InitialPipelineActivationAuthority::Authorized {
-                        target,
-                        target_terminals,
-                    };
-                },
-                message => self.admit_controlled_command(message),
+            if let Some(authority) = self.resolve_initial_pipeline_activation_control(
+                active,
+                pipeline_id,
+                before,
+                before_terminals,
+                message,
+            ) {
+                return authority;
             }
         }
     }
@@ -7161,6 +7955,21 @@ impl ScriptThread {
             return;
         };
 
+        if let Some(observed_redirect) = controlled_session_redirect_limit_before_next_fetch(
+            self.document_control_profile,
+            incomplete_load.parent_info.is_none(),
+            incomplete_load.url_list.len(),
+        ) {
+            let _ = self.senders.pipeline_to_constellation_sender.send((
+                incomplete_load.webview_id,
+                id,
+                ScriptToConstellationMessage::ControlledSessionRedirectLimitExceeded {
+                    observed: observed_redirect,
+                },
+            ));
+            return;
+        }
+
         // Update the `url_list` of the incomplete load to track all redirects. This will be reflected
         // in the new `RequestBuilder` as well.
         incomplete_load.url_list.push(metadata.final_url.clone());
@@ -7635,6 +8444,167 @@ impl Drop for ScriptThread {
 }
 
 #[cfg(test)]
+mod controlled_session_history_tests {
+    use std::cell::Cell;
+
+    use embedder_traits::{
+        CONTROLLED_SESSION_MAX_HISTORY_REVISIONS, CONTROLLED_SESSION_MAX_REDIRECTS,
+        DocumentControlProfile,
+    };
+    use servo_base::id::{PipelineId, PipelineNamespaceId, TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
+
+    use super::{
+        SynchronousNavigationEmissionCapture, SynchronousNavigationEmissionCaptureFailure,
+        admit_controlled_session_history_revision,
+        controlled_session_redirect_limit_before_next_fetch,
+        record_synchronous_navigation_emission,
+    };
+
+    #[test]
+    fn synchronous_navigation_capture_counts_success_and_latches_send_failure() {
+        let active = SynchronousNavigationEmissionCapture::Active {
+            webview_id: TEST_WEBVIEW_ID,
+            pipeline_id: TEST_PIPELINE_ID,
+            emissions: 0,
+        };
+        let counted =
+            record_synchronous_navigation_emission(active, TEST_WEBVIEW_ID, TEST_PIPELINE_ID, true);
+        assert_eq!(
+            counted,
+            SynchronousNavigationEmissionCapture::Active {
+                webview_id: TEST_WEBVIEW_ID,
+                pipeline_id: TEST_PIPELINE_ID,
+                emissions: 1,
+            }
+        );
+        assert_eq!(
+            record_synchronous_navigation_emission(
+                counted,
+                TEST_WEBVIEW_ID,
+                TEST_PIPELINE_ID,
+                false,
+            ),
+            SynchronousNavigationEmissionCapture::Failed {
+                webview_id: TEST_WEBVIEW_ID,
+                pipeline_id: TEST_PIPELINE_ID,
+                failure: SynchronousNavigationEmissionCaptureFailure::SendFailed,
+            }
+        );
+    }
+
+    #[test]
+    fn synchronous_navigation_capture_fails_closed_at_its_checked_bound() {
+        let at_limit = SynchronousNavigationEmissionCapture::Active {
+            webview_id: TEST_WEBVIEW_ID,
+            pipeline_id: TEST_PIPELINE_ID,
+            emissions: CONTROLLED_SESSION_MAX_HISTORY_REVISIONS,
+        };
+        assert_eq!(
+            record_synchronous_navigation_emission(
+                at_limit,
+                TEST_WEBVIEW_ID,
+                TEST_PIPELINE_ID,
+                true,
+            ),
+            SynchronousNavigationEmissionCapture::Failed {
+                webview_id: TEST_WEBVIEW_ID,
+                pipeline_id: TEST_PIPELINE_ID,
+                failure: SynchronousNavigationEmissionCaptureFailure::EmissionLimitExceeded,
+            }
+        );
+    }
+
+    #[test]
+    fn synchronous_navigation_capture_ignores_a_foreign_top_level_pipeline() {
+        let active = SynchronousNavigationEmissionCapture::Active {
+            webview_id: TEST_WEBVIEW_ID,
+            pipeline_id: TEST_PIPELINE_ID,
+            emissions: 0,
+        };
+        let foreign_pipeline = PipelineId {
+            namespace_id: PipelineNamespaceId(4321),
+            index: TEST_PIPELINE_ID.index,
+        };
+        assert_eq!(
+            record_synchronous_navigation_emission(active, TEST_WEBVIEW_ID, foreign_pipeline, true,),
+            active
+        );
+    }
+
+    #[test]
+    fn inactive_synchronous_navigation_capture_ignores_later_work() {
+        assert_eq!(
+            record_synchronous_navigation_emission(
+                SynchronousNavigationEmissionCapture::Inactive,
+                TEST_WEBVIEW_ID,
+                TEST_PIPELINE_ID,
+                true,
+            ),
+            SynchronousNavigationEmissionCapture::Inactive
+        );
+    }
+
+    #[test]
+    fn session_history_limit_rejects_before_the_revision_cell_is_mutated() {
+        let revision = Cell::new(CONTROLLED_SESSION_MAX_HISTORY_REVISIONS);
+
+        assert!(!admit_controlled_session_history_revision(
+            DocumentControlProfile::TopLevelSession,
+            &revision,
+        ));
+        assert_eq!(revision.get(), CONTROLLED_SESSION_MAX_HISTORY_REVISIONS);
+    }
+
+    #[test]
+    fn session_history_limit_admits_max_then_rejects_max_plus_one_without_revision_drift() {
+        let revision = Cell::new(CONTROLLED_SESSION_MAX_HISTORY_REVISIONS - 1);
+
+        assert!(admit_controlled_session_history_revision(
+            DocumentControlProfile::TopLevelSession,
+            &revision,
+        ));
+        assert_eq!(revision.get(), CONTROLLED_SESSION_MAX_HISTORY_REVISIONS);
+
+        assert!(!admit_controlled_session_history_revision(
+            DocumentControlProfile::TopLevelSession,
+            &revision,
+        ));
+        assert_eq!(revision.get(), CONTROLLED_SESSION_MAX_HISTORY_REVISIONS);
+    }
+
+    #[test]
+    fn single_document_profile_does_not_opt_into_session_history_accounting() {
+        let revision = Cell::new(7);
+
+        assert!(admit_controlled_session_history_revision(
+            DocumentControlProfile::SingleDocument,
+            &revision,
+        ));
+        assert_eq!(revision.get(), 7);
+    }
+
+    #[test]
+    fn redirect_hop_twenty_one_is_rejected_before_its_fetch_starts() {
+        assert_eq!(
+            controlled_session_redirect_limit_before_next_fetch(
+                DocumentControlProfile::TopLevelSession,
+                true,
+                CONTROLLED_SESSION_MAX_REDIRECTS as usize,
+            ),
+            None,
+        );
+        assert_eq!(
+            controlled_session_redirect_limit_before_next_fetch(
+                DocumentControlProfile::TopLevelSession,
+                true,
+                CONTROLLED_SESSION_MAX_REDIRECTS as usize + 1,
+            ),
+            Some(CONTROLLED_SESSION_MAX_REDIRECTS + 1),
+        );
+    }
+}
+
+#[cfg(test)]
 mod dom_mutation_epoch_tests {
     use servo_base::id::{BrowsingContextId, TEST_WEBVIEW_ID, WebViewId};
     use timers::{DocumentClock, DocumentClockConfiguration, DocumentUnixTime};
@@ -7763,10 +8733,14 @@ mod controlled_input_tests {
         CONTROLLED_INPUT_BATCH_LIMIT, ControlledInputBatch, ControlledInputState,
         ControlledLogicalTimerOwnerObservation, InitialPipelineActivationFacts,
         InitialPipelineActivationWaitInterruption, InitialPipelineBootstrapFacts,
-        MainThreadScriptMsg, MixedMessage, ScriptThread,
-        controlled_event_consumes_ordinary_task_budget, controlled_input_state_for_clock,
-        initial_pipeline_activation_pipeline, initial_pipeline_activation_wait_interrupted,
-        initial_pipeline_bootstrap_pipeline, take_controlled_lifecycle_event, take_controlled_turn,
+        MainThreadScriptMsg, MixedMessage, ReplacementPipelineBootstrapFacts,
+        ReplacementPipelineBootstrapQueueState, ReplacementPipelineBootstrapQueuedEvent,
+        ScriptThread, controlled_event_consumes_ordinary_task_budget,
+        controlled_input_state_for_clock, initial_pipeline_activation_pipeline,
+        initial_pipeline_activation_wait_interrupted, initial_pipeline_bootstrap_pipeline,
+        replacement_pipeline_bootstrap_classified_position,
+        replacement_pipeline_bootstrap_pipeline, replacement_pipeline_bootstrap_queued_event,
+        take_controlled_lifecycle_event, take_controlled_turn,
     };
 
     #[test]
@@ -7932,6 +8906,153 @@ mod controlled_input_tests {
     }
 
     #[test]
+    fn replacement_bootstrap_selects_exact_spawn_through_ordinary_backlog() {
+        let replacement = second_pipeline_id();
+        let events = [
+            ReplacementPipelineBootstrapQueuedEvent::Ordinary,
+            ReplacementPipelineBootstrapQueuedEvent::Spawn(replacement),
+            ReplacementPipelineBootstrapQueuedEvent::Ordinary,
+        ];
+
+        let state = replacement_pipeline_bootstrap_classified_position(events, false, replacement);
+        assert_eq!(
+            state,
+            ReplacementPipelineBootstrapQueueState::Ready { event_index: 1 }
+        );
+
+        let mut retained = std::collections::VecDeque::from(events);
+        retained.remove(1);
+        assert_eq!(
+            retained,
+            std::collections::VecDeque::from([
+                ReplacementPipelineBootstrapQueuedEvent::Ordinary,
+                ReplacementPipelineBootstrapQueuedEvent::Ordinary,
+            ])
+        );
+    }
+
+    #[test]
+    fn replacement_bootstrap_waits_until_saturated_intake_is_complete() {
+        let replacement = second_pipeline_id();
+        let events = [
+            ReplacementPipelineBootstrapQueuedEvent::Ordinary,
+            ReplacementPipelineBootstrapQueuedEvent::Spawn(replacement),
+        ];
+
+        assert_eq!(
+            replacement_pipeline_bootstrap_classified_position([], false, replacement),
+            ReplacementPipelineBootstrapQueueState::AwaitingInput,
+            "cross-channel delivery lag is not definitive unavailability"
+        );
+        assert_eq!(
+            replacement_pipeline_bootstrap_classified_position(events, true, replacement),
+            ReplacementPipelineBootstrapQueueState::AwaitingInput
+        );
+        assert_eq!(
+            replacement_pipeline_bootstrap_classified_position(events, false, replacement),
+            ReplacementPipelineBootstrapQueueState::Ready { event_index: 1 }
+        );
+    }
+
+    #[test]
+    fn replacement_bootstrap_never_leapfrogs_lifecycle_or_immediate_input() {
+        let replacement = second_pipeline_id();
+        for events in [
+            [
+                ReplacementPipelineBootstrapQueuedEvent::Lifecycle,
+                ReplacementPipelineBootstrapQueuedEvent::Spawn(replacement),
+            ],
+            [
+                ReplacementPipelineBootstrapQueuedEvent::Spawn(replacement),
+                ReplacementPipelineBootstrapQueuedEvent::Lifecycle,
+            ],
+        ] {
+            assert_eq!(
+                replacement_pipeline_bootstrap_classified_position(events, false, replacement),
+                ReplacementPipelineBootstrapQueueState::Interrupted
+            );
+        }
+        assert_eq!(
+            replacement_pipeline_bootstrap_classified_position(
+                [
+                    ReplacementPipelineBootstrapQueuedEvent::ImmediateBarrier,
+                    ReplacementPipelineBootstrapQueuedEvent::Spawn(replacement),
+                ],
+                false,
+                replacement,
+            ),
+            ReplacementPipelineBootstrapQueueState::Unavailable
+        );
+        assert_eq!(
+            replacement_pipeline_bootstrap_classified_position(
+                [
+                    ReplacementPipelineBootstrapQueuedEvent::Spawn(replacement),
+                    ReplacementPipelineBootstrapQueuedEvent::ImmediateBarrier,
+                ],
+                false,
+                replacement,
+            ),
+            ReplacementPipelineBootstrapQueueState::Ready { event_index: 0 }
+        );
+    }
+
+    #[test]
+    fn replacement_bootstrap_classifies_real_owner_queue_barriers() {
+        assert_eq!(
+            replacement_pipeline_bootstrap_queued_event(&MixedMessage::FromConstellation(
+                ScriptThreadMessage::ExitPipeline(
+                    TEST_WEBVIEW_ID,
+                    TEST_PIPELINE_ID,
+                    DiscardBrowsingContext::No,
+                ),
+            )),
+            ReplacementPipelineBootstrapQueuedEvent::Lifecycle
+        );
+        assert_eq!(
+            replacement_pipeline_bootstrap_queued_event(&MixedMessage::FromConstellation(
+                ScriptThreadMessage::ExitScriptThread,
+            )),
+            ReplacementPipelineBootstrapQueuedEvent::Lifecycle
+        );
+        assert_eq!(
+            replacement_pipeline_bootstrap_queued_event(&MixedMessage::FromConstellation(
+                ScriptThreadMessage::ExitFullScreen(TEST_PIPELINE_ID),
+            )),
+            ReplacementPipelineBootstrapQueuedEvent::ImmediateBarrier
+        );
+        assert_eq!(
+            replacement_pipeline_bootstrap_queued_event(&MixedMessage::TimerFired),
+            ReplacementPipelineBootstrapQueuedEvent::Ordinary
+        );
+    }
+
+    #[test]
+    fn replacement_bootstrap_rejects_wrong_or_ambiguous_spawn_without_selection() {
+        let replacement = second_pipeline_id();
+        assert_eq!(
+            replacement_pipeline_bootstrap_classified_position(
+                [ReplacementPipelineBootstrapQueuedEvent::Spawn(
+                    TEST_PIPELINE_ID
+                )],
+                false,
+                replacement,
+            ),
+            ReplacementPipelineBootstrapQueueState::Unavailable
+        );
+        assert_eq!(
+            replacement_pipeline_bootstrap_classified_position(
+                [
+                    ReplacementPipelineBootstrapQueuedEvent::Spawn(replacement),
+                    ReplacementPipelineBootstrapQueuedEvent::Spawn(replacement),
+                ],
+                false,
+                replacement,
+            ),
+            ReplacementPipelineBootstrapQueueState::Unavailable
+        );
+    }
+
+    #[test]
     fn initial_activation_wait_observes_shutdown_and_lifecycle_without_consuming_input() {
         let ordinary = std::collections::VecDeque::from([MixedMessage::TimerFired]);
         assert_eq!(
@@ -8040,10 +9161,64 @@ mod controlled_input_tests {
             webview_id: TEST_WEBVIEW_ID,
             browsing_context_id: TEST_BROWSING_CONTEXT_ID,
             parent_pipeline_id: None,
+            local_document_pipeline_id: None,
             local_document_count: 0,
             local_incomplete_load_count: 1,
             local_parser_context_count: 1,
             parser_pipeline_id: Some(TEST_PIPELINE_ID),
+            is_http_or_https: true,
+            has_javascript_result: false,
+            has_srcdoc: false,
+            response_will_activate: true,
+        }
+    }
+
+    fn replacement_bootstrap_target() -> PendingTargetObservation {
+        PendingTargetObservation::new_with_authority(
+            TEST_WEBVIEW_ID,
+            ScriptEventLoopId::new(),
+            Some(PendingActiveTopLevelPipeline {
+                pipeline_id: TEST_PIPELINE_ID,
+                epoch: Epoch(1),
+            }),
+            PendingNavigationRevision::new(2),
+            PendingPipelineMembershipRevision::new(2),
+            None,
+            vec![TEST_PIPELINE_ID, second_pipeline_id()],
+            vec![TEST_PIPELINE_ID],
+            vec![second_pipeline_id()],
+        )
+        .unwrap()
+    }
+
+    fn replacement_bootstrap_facts() -> ReplacementPipelineBootstrapFacts {
+        ReplacementPipelineBootstrapFacts {
+            source_pipeline_id: TEST_PIPELINE_ID,
+            pipeline_id: second_pipeline_id(),
+            webview_id: TEST_WEBVIEW_ID,
+            browsing_context_id: TEST_BROWSING_CONTEXT_ID,
+            parent_pipeline_id: None,
+            local_document_pipeline_id: Some(TEST_PIPELINE_ID),
+            local_document_count: 1,
+            local_incomplete_load_count: 0,
+            local_parser_context_count: 0,
+            is_http_or_https: true,
+            has_javascript_result: false,
+            has_srcdoc: false,
+        }
+    }
+
+    fn replacement_activation_facts() -> InitialPipelineActivationFacts {
+        InitialPipelineActivationFacts {
+            pipeline_id: second_pipeline_id(),
+            webview_id: TEST_WEBVIEW_ID,
+            browsing_context_id: TEST_BROWSING_CONTEXT_ID,
+            parent_pipeline_id: None,
+            local_document_pipeline_id: Some(TEST_PIPELINE_ID),
+            local_document_count: 1,
+            local_incomplete_load_count: 1,
+            local_parser_context_count: 1,
+            parser_pipeline_id: Some(second_pipeline_id()),
             is_http_or_https: true,
             has_javascript_result: false,
             has_srcdoc: false,
@@ -8162,6 +9337,75 @@ mod controlled_input_tests {
     }
 
     #[test]
+    fn replacement_bootstrap_accepts_only_exact_active_source_and_pending_root() {
+        let target = replacement_bootstrap_target();
+        assert_eq!(
+            replacement_pipeline_bootstrap_pipeline(&target, replacement_bootstrap_facts()),
+            Some(second_pipeline_id())
+        );
+        assert_eq!(
+            replacement_pipeline_bootstrap_pipeline(&target, replacement_bootstrap_facts()),
+            Some(second_pipeline_id()),
+            "passive qualification remains non-consuming"
+        );
+
+        for facts in [
+            ReplacementPipelineBootstrapFacts {
+                source_pipeline_id: second_pipeline_id(),
+                ..replacement_bootstrap_facts()
+            },
+            ReplacementPipelineBootstrapFacts {
+                pipeline_id: TEST_PIPELINE_ID,
+                ..replacement_bootstrap_facts()
+            },
+            ReplacementPipelineBootstrapFacts {
+                local_document_pipeline_id: Some(second_pipeline_id()),
+                ..replacement_bootstrap_facts()
+            },
+            ReplacementPipelineBootstrapFacts {
+                local_document_count: 2,
+                ..replacement_bootstrap_facts()
+            },
+            ReplacementPipelineBootstrapFacts {
+                local_incomplete_load_count: 1,
+                ..replacement_bootstrap_facts()
+            },
+            ReplacementPipelineBootstrapFacts {
+                local_parser_context_count: 1,
+                ..replacement_bootstrap_facts()
+            },
+            ReplacementPipelineBootstrapFacts {
+                parent_pipeline_id: Some(TEST_PIPELINE_ID),
+                ..replacement_bootstrap_facts()
+            },
+            ReplacementPipelineBootstrapFacts {
+                is_http_or_https: false,
+                ..replacement_bootstrap_facts()
+            },
+            ReplacementPipelineBootstrapFacts {
+                has_javascript_result: true,
+                ..replacement_bootstrap_facts()
+            },
+            ReplacementPipelineBootstrapFacts {
+                has_srcdoc: true,
+                ..replacement_bootstrap_facts()
+            },
+        ] {
+            assert_eq!(
+                replacement_pipeline_bootstrap_pipeline(&target, facts),
+                None
+            );
+        }
+        assert_eq!(
+            replacement_pipeline_bootstrap_pipeline(
+                &initial_bootstrap_target(),
+                replacement_bootstrap_facts(),
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn initial_activation_accepts_only_one_bootstrapped_http_headers_turn() {
         let target = initial_bootstrap_target();
         assert_eq!(
@@ -8179,6 +9423,7 @@ mod controlled_input_tests {
                 ..initial_activation_facts()
             },
             InitialPipelineActivationFacts {
+                local_document_pipeline_id: Some(second_pipeline_id()),
                 local_document_count: 1,
                 ..initial_activation_facts()
             },
@@ -8213,6 +9458,41 @@ mod controlled_input_tests {
     }
 
     #[test]
+    fn replacement_activation_accepts_only_the_pending_pipeline_headers_turn() {
+        let target = replacement_bootstrap_target();
+        assert_eq!(
+            initial_pipeline_activation_pipeline(&target, replacement_activation_facts()),
+            Some(second_pipeline_id())
+        );
+
+        for facts in [
+            InitialPipelineActivationFacts {
+                pipeline_id: TEST_PIPELINE_ID,
+                parser_pipeline_id: Some(TEST_PIPELINE_ID),
+                ..replacement_activation_facts()
+            },
+            InitialPipelineActivationFacts {
+                local_document_pipeline_id: Some(second_pipeline_id()),
+                ..replacement_activation_facts()
+            },
+            InitialPipelineActivationFacts {
+                local_document_count: 0,
+                ..replacement_activation_facts()
+            },
+            InitialPipelineActivationFacts {
+                parser_pipeline_id: Some(TEST_PIPELINE_ID),
+                ..replacement_activation_facts()
+            },
+            InitialPipelineActivationFacts {
+                response_will_activate: false,
+                ..replacement_activation_facts()
+            },
+        ] {
+            assert_eq!(initial_pipeline_activation_pipeline(&target, facts), None);
+        }
+    }
+
+    #[test]
     fn logical_timer_capture_preserves_owner_terminal_without_scheduler_reentry() {
         let terminal = PendingLogicalTimerTerminalObservation {
             pipeline_id: TEST_PIPELINE_ID,
@@ -8228,6 +9508,33 @@ mod controlled_input_tests {
 
         assert!(facts.is_empty());
         assert_eq!(terminals, vec![terminal]);
+    }
+
+    #[test]
+    fn active_cancellation_leaves_owner_ready_input_untouched() {
+        let request_id = DocumentControlRequestId::new(7);
+        let cancellation_id = DocumentControlCancellationId::new(11);
+        let mut state = ControlledInputState::default();
+        state.admit(MixedMessage::TimerFired);
+        state.admit(MixedMessage::FromScript(MainThreadScriptMsg::WakeUp));
+        let before_revision = state.revision().unwrap();
+        let mut controls = [ScriptThreadControlMessage::Cancel {
+            request_id,
+            cancellation_id,
+        }]
+        .into_iter();
+
+        let batch =
+            state.drain_controls_bounded(&mut controls, Some((request_id, cancellation_id)));
+
+        assert!(batch.active_cancelled);
+        assert_eq!(state.revision().unwrap(), before_revision);
+        assert_eq!(state.ready_len(), 2);
+        assert!(matches!(state.pop_front(), Some(MixedMessage::TimerFired)));
+        assert!(matches!(
+            state.pop_front(),
+            Some(MixedMessage::FromScript(MainThreadScriptMsg::WakeUp))
+        ));
     }
 
     #[test]

@@ -1,15 +1,23 @@
 import type {
+  DocumentStateToken,
   ExternalIoSnapshot,
   PersistentWork,
+  SessionSettleResult,
   SettleFailureCode,
   SettleLimit,
   SettleOutcome,
   SettleResult,
   UnsupportedWork,
 } from "./types.js";
-import { CONTROLLED_WEBAPP_V1_PROFILE } from "./profile.js";
+import {
+  CONTROLLED_WEBAPP_V1_PROFILE,
+  CONTROLLED_WEB_SESSION_V1_PROFILE,
+} from "./profile.js";
 
-export { CONTROLLED_WEBAPP_V1_PROFILE } from "./profile.js";
+export {
+  CONTROLLED_WEBAPP_V1_PROFILE,
+  CONTROLLED_WEB_SESSION_V1_PROFILE,
+} from "./profile.js";
 
 export const SETTLEMENT_EVIDENCE_MAX_ITEMS = 32 as const;
 
@@ -55,8 +63,45 @@ export interface SettlementEvidenceV1 {
   };
 }
 
+/** A bounded v0.2 terminal snapshot bound to one exact controlled-session document state. */
+export interface SettlementEvidenceV2 {
+  readonly schemaVersion: 2;
+  readonly completeness: "terminal_snapshot";
+  readonly profile: typeof CONTROLLED_WEB_SESSION_V1_PROFILE;
+  readonly stateToken: DocumentStateToken;
+  readonly outcome: SettleOutcome;
+  readonly virtualTimeNs: bigint;
+  readonly stateGeneration: bigint;
+  readonly domEpoch: bigint;
+  readonly reason: SettlementEvidenceReason;
+  readonly bounds: {
+    readonly maxItems: typeof SETTLEMENT_EVIDENCE_MAX_ITEMS;
+  };
+}
+
 /** Build a bounded, redacted terminal-settlement explanation without mutating the result. */
-export function settlementEvidence(result: SettleResult): SettlementEvidenceV1 {
+export function settlementEvidence(result: SessionSettleResult): SettlementEvidenceV2;
+export function settlementEvidence(result: SettleResult): SettlementEvidenceV1;
+export function settlementEvidence(
+  result: SettleResult | SessionSettleResult,
+): SettlementEvidenceV1 | SettlementEvidenceV2 {
+  const stateToken = sessionDocumentStateToken(result);
+  const reason = settlementEvidenceReason(result);
+  if (stateToken !== null) {
+    return {
+      schemaVersion: 2,
+      completeness: "terminal_snapshot",
+      profile: CONTROLLED_WEB_SESSION_V1_PROFILE,
+      stateToken,
+      outcome: result.outcome,
+      virtualTimeNs: result.virtualTimeNs,
+      stateGeneration: result.stateGeneration,
+      domEpoch: result.domEpoch,
+      reason,
+      bounds: { maxItems: SETTLEMENT_EVIDENCE_MAX_ITEMS },
+    };
+  }
+
   const base = {
     schemaVersion: 1 as const,
     completeness: "terminal_snapshot" as const,
@@ -68,27 +113,28 @@ export function settlementEvidence(result: SettleResult): SettlementEvidenceV1 {
     bounds: { maxItems: SETTLEMENT_EVIDENCE_MAX_ITEMS },
   };
 
+  return { ...base, reason };
+}
+
+function settlementEvidenceReason(result: SettleResult): SettlementEvidenceReason {
   switch (result.outcome) {
     case "quiescent":
-      return { ...base, reason: { kind: "quiescent" } };
+      return { kind: "quiescent" };
 
     case "quiescent_with_persistent_work":
     case "blocked_on_open_ended_work": {
       const { items, omitted } = boundedCopy(result.persistentWork, copyPersistentWork);
-      return { ...base, reason: { kind: "persistent_work", items, omitted } };
+      return { kind: "persistent_work", items, omitted };
     }
 
     case "blocked_on_external_io": {
       const { items, omitted } = boundedCopy(result.externalIo, copyExternalIo);
-      return { ...base, reason: { kind: "external_io", items, omitted } };
+      return { kind: "external_io", items, omitted };
     }
 
     case "unsupported_work": {
       const { items, omitted } = boundedCopy(result.unsupportedWork, copyUnsupportedWork);
-      return {
-        ...base,
-        reason: { kind: "unsupported_work", code: result.failure.code, items, omitted },
-      };
+      return { kind: "unsupported_work", code: result.failure.code, items, omitted };
     }
 
     case "virtual_time_limit_exceeded":
@@ -97,11 +143,39 @@ export function settlementEvidence(result: SettleResult): SettlementEvidenceV1 {
     case "rendering_limit_exceeded":
     case "mutation_limit_exceeded":
     case "control_turn_limit_exceeded":
-      return { ...base, reason: { kind: "limit", limit: copyLimit(result.limit) } };
+      return { kind: "limit", limit: copyLimit(result.limit) };
 
     case "runtime_error":
-      return { ...base, reason: { kind: "runtime_error", code: result.failure.code } };
+      return { kind: "runtime_error", code: result.failure.code };
   }
+}
+
+function sessionDocumentStateToken(
+  result: SettleResult | SessionSettleResult,
+): DocumentStateToken | null {
+  const resultRecord = result as unknown as Record<string, unknown>;
+  const snapshotValue = resultRecord.snapshot;
+  const snapshotRecord =
+    typeof snapshotValue === "object" && snapshotValue !== null && !Array.isArray(snapshotValue)
+      ? (snapshotValue as Record<string, unknown>)
+      : null;
+  const resultHasToken = Object.hasOwn(resultRecord, "stateToken");
+  const snapshotHasToken = snapshotRecord !== null && Object.hasOwn(snapshotRecord, "stateToken");
+  if (!resultHasToken && !snapshotHasToken) return null;
+  if (!resultHasToken || !snapshotHasToken) {
+    throw new TypeError(
+      "Session settlement evidence requires stateToken on both the result and its snapshot",
+    );
+  }
+  const stateToken = resultRecord.stateToken;
+  const snapshotStateToken = snapshotRecord.stateToken;
+  if (typeof stateToken !== "string" || stateToken.length === 0) {
+    throw new TypeError("Session settlement evidence requires a non-empty stateToken");
+  }
+  if (snapshotStateToken !== stateToken) {
+    throw new TypeError("Session settlement evidence stateToken disagrees with its snapshot");
+  }
+  return stateToken as DocumentStateToken;
 }
 
 function boundedCopy<Input, Output>(

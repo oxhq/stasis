@@ -84,6 +84,8 @@ mod from_embedder {
                 Self::SetAccessibilityActive(..) => target!("SetAccessibilityActive"),
                 Self::DocumentControl { .. } => target!("DocumentControl"),
                 Self::CancelDocumentControl { .. } => target!("CancelDocumentControl"),
+                Self::ObserveSessionNavigation { .. } => target!("ObserveSessionNavigation"),
+                Self::NavigateControlledSession { .. } => target!("NavigateControlledSession"),
             }
         }
     }
@@ -167,6 +169,15 @@ mod from_script {
                 Self::LoadComplete => target!("LoadComplete"),
                 Self::LoadUrl(..) => target!("LoadUrl"),
                 Self::AbortLoadUrl => target!("AbortLoadUrl"),
+                Self::ControlledSessionRedirectLimitExceeded { .. } => {
+                    target!("ControlledSessionRedirectLimitExceeded")
+                },
+                Self::ControlledSessionHistoryLimitExceeded => {
+                    target!("ControlledSessionHistoryLimitExceeded")
+                },
+                Self::ControlledSessionUnsupportedNavigationScheme { .. } => {
+                    target!("ControlledSessionUnsupportedNavigationScheme")
+                },
                 Self::PostMessage { .. } => target!("PostMessage"),
                 Self::NavigatedToFragment(..) => target!("NavigatedToFragment"),
                 Self::TraverseHistory(..) => target!("TraverseHistory"),

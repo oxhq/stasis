@@ -562,6 +562,8 @@ pub enum DocumentTimeSurface {
     NativeMedia,
     /// An embedder-owned control or dialog lifecycle that is not yet controlled.
     EmbedderControl,
+    /// Script-requested session-history traversal (`back`, `forward`, or `go`).
+    HistoryTraversal,
 }
 
 impl DocumentTimeSurface {
@@ -588,6 +590,7 @@ impl DocumentTimeSurface {
             15 => Some(Self::ExternalSubscription),
             16 => Some(Self::NativeMedia),
             17 => Some(Self::EmbedderControl),
+            18 => Some(Self::HistoryTraversal),
             _ => None,
         }
     }

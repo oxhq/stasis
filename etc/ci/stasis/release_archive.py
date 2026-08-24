@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and verify the exact Stasis 0.1.0 native release archives."""
+"""Build and verify the exact Stasis 0.2.0 native release archives."""
 
 from __future__ import annotations
 
@@ -20,11 +20,19 @@ from pathlib import Path
 from typing import BinaryIO, Iterable
 
 
-STABLE_VERSION = "0.1.0"
+STABLE_VERSION = "0.2.0"
 VERSION_RE = re.compile(re.escape(STABLE_VERSION))
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 RUN_ID_RE = re.compile(r"[1-9][0-9]*")
+FROZEN_V1_PROFILE = Path("profiles/controlled-webapp-v1.json")
+FROZEN_V1_PROFILE_SHA256 = (
+    "6e262edf0f8be11a1cece28f68f00d59fdac68b79b0a670ac891d36998720100"
+)
+FROZEN_V2_PROFILE = Path("profiles/controlled-web-session-v1.json")
+FROZEN_V2_PROFILE_SHA256 = (
+    "06ae92c6320b820bdf12bd5c8efb75f322db7bfec259fbc4b9fe1793ac296ea5"
+)
 
 BINARY_NAME = "stasis"
 THIRD_PARTY_NAME = "THIRD_PARTY_LICENSES.html"
@@ -274,6 +282,30 @@ def parse_sidecar(filename: Path, expected_label: str) -> str:
 def require_regular_file(filename: Path, description: str) -> None:
     if filename.is_symlink() or not filename.is_file():
         raise ReleaseError(f"{description} is not a regular file: {filename}")
+
+
+def verify_frozen_v1_profile(source_root: Path) -> dict[str, str]:
+    filename = source_root / FROZEN_V1_PROFILE
+    require_regular_file(filename, "frozen controlled-webapp-v1 profile")
+    actual = sha256_file(filename)
+    if actual != FROZEN_V1_PROFILE_SHA256:
+        raise ReleaseError(
+            "frozen controlled-webapp-v1 profile SHA-256 differs: "
+            f"expected {FROZEN_V1_PROFILE_SHA256}, got {actual}"
+        )
+    return {"path": FROZEN_V1_PROFILE.as_posix(), "sha256": actual}
+
+
+def verify_frozen_v2_profile(source_root: Path) -> dict[str, str]:
+    filename = source_root / FROZEN_V2_PROFILE
+    require_regular_file(filename, "frozen controlled-web-session-v1 profile")
+    actual = sha256_file(filename)
+    if actual != FROZEN_V2_PROFILE_SHA256:
+        raise ReleaseError(
+            "frozen controlled-web-session-v1 profile SHA-256 differs: "
+            f"expected {FROZEN_V2_PROFILE_SHA256}, got {actual}"
+        )
+    return {"path": FROZEN_V2_PROFILE.as_posix(), "sha256": actual}
 
 
 def normalized_tar_info(name: str, *, directory: bool, executable: bool = False) -> tarfile.TarInfo:
@@ -836,6 +868,32 @@ def verify_gate_proof(
 def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="stasis-release-self-test-") as temporary:
         root = Path(temporary)
+        repository_root = Path(__file__).resolve().parents[3]
+        verify_frozen_v1_profile(repository_root)
+        verify_frozen_v2_profile(repository_root)
+        frozen_profile_root = root / "frozen-profile-source"
+        frozen_v1_profile = frozen_profile_root / FROZEN_V1_PROFILE
+        frozen_v1_profile.parent.mkdir(parents=True)
+        shutil.copyfile(repository_root / FROZEN_V1_PROFILE, frozen_v1_profile)
+        verify_frozen_v1_profile(frozen_profile_root)
+        frozen_v1_profile.write_bytes(frozen_v1_profile.read_bytes() + b"\n")
+        try:
+            verify_frozen_v1_profile(frozen_profile_root)
+        except ReleaseError:
+            pass
+        else:
+            raise ReleaseError("self-test accepted a changed frozen v1 profile")
+        frozen_v2_profile = frozen_profile_root / FROZEN_V2_PROFILE
+        frozen_v2_profile.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(repository_root / FROZEN_V2_PROFILE, frozen_v2_profile)
+        verify_frozen_v2_profile(frozen_profile_root)
+        frozen_v2_profile.write_bytes(frozen_v2_profile.read_bytes() + b"\n")
+        try:
+            verify_frozen_v2_profile(frozen_profile_root)
+        except ReleaseError:
+            pass
+        else:
+            raise ReleaseError("self-test accepted a changed frozen v2 profile")
         version = STABLE_VERSION
         revision = "1" * 40
         repository = "https://github.com/oxhq/stasis"
@@ -997,7 +1055,7 @@ def self_test() -> None:
         else:
             raise ReleaseError("self-test accepted Linux metadata as macOS metadata")
 
-        for invalid_version in ("0.1.0-alpha.0", "0.1.1", "v0.1.0"):
+        for invalid_version in ("0.1.0-alpha.0", "0.2.0-alpha.0", "0.2.1", "v0.2.0"):
             try:
                 validate_identity(invalid_version, "macos-aarch64", revision, repository)
             except ReleaseError:
@@ -1187,6 +1245,12 @@ def parser() -> argparse.ArgumentParser:
     verify_proof.add_argument("--run-id", required=True)
     verify_proof.add_argument("--run-attempt", required=True)
 
+    verify_frozen_profile = subparsers.add_parser("verify-frozen-v1-profile")
+    verify_frozen_profile.add_argument("--source-root", type=Path, required=True)
+
+    verify_frozen_v2 = subparsers.add_parser("verify-frozen-v2-profile")
+    verify_frozen_v2.add_argument("--source-root", type=Path, required=True)
+
     subparsers.add_parser("self-test")
     return argument_parser
 
@@ -1234,6 +1298,10 @@ def main() -> None:
             run_id=arguments.run_id,
             run_attempt=arguments.run_attempt,
         )
+    elif arguments.command == "verify-frozen-v1-profile":
+        result = verify_frozen_v1_profile(arguments.source_root)
+    elif arguments.command == "verify-frozen-v2-profile":
+        result = verify_frozen_v2_profile(arguments.source_root)
     else:
         self_test()
         return

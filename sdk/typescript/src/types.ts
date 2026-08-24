@@ -1,4 +1,20 @@
-import type { SupportProfile } from "./profile.js";
+import type {
+  CONTROLLED_WEB_SESSION_V1_PROFILE,
+  LegacySupportProfile,
+} from "./profile.js";
+
+declare const documentStateTokenBrand: unique symbol;
+declare const sessionStateTokenBrand: unique symbol;
+
+/** Opaque, process-local authority for exactly one active session document state. */
+export type DocumentStateToken = string & {
+  readonly [documentStateTokenBrand]: "DocumentStateToken";
+};
+
+/** Opaque, process-local authority for cookie and Web Storage state owned by one session. */
+export type SessionStateToken = string & {
+  readonly [sessionStateTokenBrand]: "SessionStateToken";
+};
 
 export interface CommandOptions {
   signal?: AbortSignal;
@@ -80,7 +96,101 @@ export type ClockOptions =
 export interface OpenOptions extends CommandOptions {
   clock?: ClockOptions;
   /** Defaults to controlled-webapp-v1 for a controlled open and is forbidden for real time. */
-  profile?: SupportProfile;
+  profile?: LegacySupportProfile;
+}
+
+export type ControlledClockOptions = Extract<ClockOptions, { mode: "controlled" }>;
+
+export type NetworkMode = "fixtures_only" | "mixed" | "live";
+
+export type NetworkUrlMatcher =
+  | { readonly exact: string; readonly prefix?: never; readonly glob?: never }
+  | { readonly exact?: never; readonly prefix: string; readonly glob?: never }
+  | { readonly exact?: never; readonly prefix?: never; readonly glob: string };
+
+export interface NetworkRouteMatch {
+  readonly method: string;
+  readonly url: NetworkUrlMatcher;
+}
+
+export type NetworkBody =
+  | { readonly utf8: string; readonly base64?: never }
+  | { readonly utf8?: never; readonly base64: string };
+
+export interface NetworkFulfillment {
+  readonly status: number;
+  /** Ordered pairs preserve duplicate response fields such as Set-Cookie. */
+  readonly headers?: readonly (readonly [string, string])[];
+  readonly body?: NetworkBody;
+}
+
+export type NetworkAbortReason =
+  | "blocked_by_fixture"
+  | "connection_reset"
+  | "network_error";
+
+export type NetworkRoute =
+  | {
+      readonly match: NetworkRouteMatch;
+      readonly fulfill: NetworkFulfillment;
+      readonly abort?: never;
+    }
+  | {
+      readonly match: NetworkRouteMatch;
+      readonly fulfill?: never;
+      readonly abort: { readonly reason: NetworkAbortReason };
+    };
+
+export interface SessionNetworkOptions {
+  readonly mode: NetworkMode;
+  /** First match wins. A fixtures_only miss is a typed failure, never ambient network. */
+  readonly routes: readonly NetworkRoute[];
+}
+
+export type CookieSameSite = "unspecified" | "strict" | "lax" | "none";
+
+export interface SessionCookie {
+  readonly name: string;
+  readonly value: string;
+  readonly domain: string;
+  readonly path: string;
+  readonly hostOnly: boolean;
+  readonly secure: boolean;
+  readonly httpOnly: boolean;
+  readonly sameSite: CookieSameSite;
+  /** The first v0.2 contract imports only session cookies. */
+  readonly expiresUnixTimeNs: null;
+  readonly partitioned: false;
+  readonly creationSequence: bigint;
+  readonly lastAccessSequence: bigint;
+}
+
+export interface SessionStorageEntry {
+  readonly key: string;
+  readonly value: string;
+}
+
+export interface SessionOriginState {
+  readonly origin: string;
+  readonly localStorage: readonly SessionStorageEntry[];
+  readonly sessionStorage: readonly SessionStorageEntry[];
+}
+
+export interface SessionState {
+  readonly schemaVersion: 1;
+  readonly profile: typeof CONTROLLED_WEB_SESSION_V1_PROFILE;
+  readonly sensitive: true;
+  readonly sessionStorageScope: "top_level_browsing_context";
+  readonly cookies: readonly SessionCookie[];
+  readonly origins: readonly SessionOriginState[];
+}
+
+export interface SessionOpenOptions extends CommandOptions {
+  clock?: ControlledClockOptions;
+  /** Imported atomically before the initial navigation begins. */
+  state?: SessionState;
+  /** Immutable interception policy for the lifetime of this session. */
+  network?: SessionNetworkOptions;
 }
 
 export interface RuntimeInfo {
@@ -131,7 +241,8 @@ export type TimeSurface =
   | "resource_thread_io"
   | "external_subscription"
   | "native_media"
-  | "embedder_control";
+  | "embedder_control"
+  | "history_traversal";
 
 export type ProducerStability =
   | "not_checkpointed"
@@ -532,3 +643,220 @@ export type AdvanceToNextResult =
       stateGeneration: bigint;
       snapshot: PendingSnapshot;
     };
+
+/** Authoritative state after a v0.2 session automation mutation. */
+export interface SessionAutomationMutationResult extends AutomationMutationResult {
+  stateToken: DocumentStateToken;
+}
+
+export interface SessionFocusResult extends SessionAutomationMutationResult {
+  focused: boolean;
+}
+
+export interface SessionCheckResult extends SessionAutomationMutationResult {
+  changed: boolean;
+  checked: boolean;
+}
+
+export interface SessionSelectResult extends SessionAutomationMutationResult {
+  changed: boolean;
+  values: string[];
+}
+
+export interface SessionSubmitResult extends SessionAutomationMutationResult {
+  submitted: true;
+}
+
+export interface SessionQueryResult extends QueryResult {
+  stateToken: DocumentStateToken;
+}
+
+export interface SessionTextResult {
+  value: string;
+  stateGeneration: bigint;
+  stateToken: DocumentStateToken;
+}
+
+export type SessionExtractRead = ExtractRead | "attribute" | "resolved_url";
+
+export type SessionExtractField =
+  | {
+      readonly name: string;
+      readonly selector: string;
+      readonly read: ExtractRead;
+      readonly attribute?: never;
+    }
+  | {
+      readonly name: string;
+      readonly selector: string;
+      readonly read: "attribute" | "resolved_url";
+      readonly attribute: string;
+    };
+
+export interface SessionExtractPlan {
+  readonly rootSelector: string;
+  readonly fields: readonly SessionExtractField[];
+}
+
+export interface SessionExtractValue {
+  name: string;
+  value: string | null;
+}
+
+export interface SessionExtractRow {
+  /** Field order is preserved exactly as requested. */
+  fields: SessionExtractValue[];
+}
+
+export interface SessionExtractResult {
+  /** Root match order and each row's field order are preserved. */
+  rows: SessionExtractRow[];
+  stateGeneration: bigint;
+  stateToken: DocumentStateToken;
+}
+
+export interface SessionPendingSnapshot extends PendingSnapshot {
+  stateToken: DocumentStateToken;
+}
+
+export type SessionSettleResult = SettleResult & {
+  stateToken: DocumentStateToken;
+  snapshot: SessionPendingSnapshot;
+};
+
+export type SessionAdvanceToNextResult = AdvanceToNextResult & {
+  stateToken: DocumentStateToken;
+  snapshot: SessionPendingSnapshot;
+};
+
+export interface SessionNavigateResult {
+  requestedUrl: string;
+  url: string;
+  boundary: "controlled_ready";
+  stateGeneration: bigint;
+  domEpoch: bigint;
+  documentEpoch: bigint;
+  navigationId: bigint;
+  historyRevision: bigint;
+  stateToken: DocumentStateToken;
+}
+
+export interface SessionCookiesResult {
+  cookies: SessionCookie[];
+  sessionStateToken: SessionStateToken;
+}
+
+export interface SessionStorageResult {
+  origins: SessionOriginState[];
+  sessionStateToken: SessionStateToken;
+}
+
+export interface SessionStateExportResult {
+  state: SessionState;
+  sessionStateToken: SessionStateToken;
+}
+
+export interface SessionStateMutationResult {
+  sessionStateToken: SessionStateToken;
+}
+
+export interface SessionAuditOptions extends CommandOptions {
+  /** Return entries strictly after this session-local cursor. */
+  afterSeq?: bigint;
+  /** Bounded page request. The runtime may return fewer entries. */
+  limit?: number;
+}
+
+export interface SessionAuditBounds {
+  maxRecords: number;
+  maxMetadataBytes: number;
+  maxPageItems: number;
+}
+
+export interface SessionSafeUrl {
+  origin: string;
+  path: string;
+  /** UTF-8-byte-sorted unique names only. Query values are intentionally unavailable. */
+  queryKeys: string[];
+}
+
+/** Bounded request metadata. Header, query, cookie, credential, and body values are absent. */
+export interface SessionRequestRecord {
+  seq: bigint;
+  requestId: string;
+  redirectParentId?: string;
+  method: string;
+  url: SessionSafeUrl;
+  resourceKind: NetworkKind;
+  mainFrame: boolean;
+  headerNames: string[];
+  bodyBytes: bigint;
+}
+
+export interface SessionRequestsResult {
+  records: SessionRequestRecord[];
+  firstRetainedSeq?: bigint;
+  nextAfterSeq?: bigint;
+  latestSeq?: bigint;
+  complete: boolean;
+  hasMore: boolean;
+  droppedThroughSeq?: bigint;
+  bounds: SessionAuditBounds;
+  stateToken: DocumentStateToken;
+}
+
+/** Stable failure vocabulary for schema-2 request and navigation evidence. */
+export type SessionEvidenceFailureReason =
+  | "blocked_by_fixture"
+  | "fixture_miss"
+  | "cancelled"
+  | "connection_reset"
+  | "network_error"
+  | "navigation_error"
+  | "document_transition_limit_exceeded"
+  | "redirect_limit_exceeded"
+  | "history_limit_exceeded";
+
+export type SessionEvidenceEvent =
+  | { kind: "request_started"; requestId: string }
+  | {
+      kind: "route_decided";
+      requestId: string;
+      decision: "fixture_fulfill" | "fixture_abort" | "live";
+    }
+  | { kind: "response_headers"; requestId: string; status: number }
+  | { kind: "redirect"; requestId: string; nextRequestId: string }
+  | { kind: "request_completed"; requestId: string }
+  | {
+      kind: "request_failed";
+      requestId: string;
+      reason: SessionEvidenceFailureReason;
+    }
+  | { kind: "navigation_started"; navigationId: bigint }
+  | { kind: "navigation_committed"; navigationId: bigint }
+  | {
+      kind: "navigation_failed";
+      navigationId: bigint;
+      reason: SessionEvidenceFailureReason;
+    }
+  | { kind: "same_document_history_changed"; navigationId: bigint }
+  | { kind: "settlement_terminal"; navigationId: bigint };
+
+export type SessionEvidenceRecord = {
+  seq: bigint;
+  atVirtualNs: bigint;
+} & SessionEvidenceEvent;
+
+/** Bounded, redacted session audit evidence. Sensitive values never enter this shape. */
+export interface SessionEvidenceResult {
+  schemaVersion: 2;
+  records: SessionEvidenceRecord[];
+  firstRetainedSeq?: bigint;
+  nextAfterSeq?: bigint;
+  latestSeq?: bigint;
+  complete: boolean;
+  hasMore: boolean;
+  droppedThroughSeq?: bigint;
+  bounds: SessionAuditBounds;
+  stateToken: DocumentStateToken;
+}

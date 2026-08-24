@@ -10,7 +10,7 @@ use std::cell::Cell;
 
 use content_security_policy::sandboxing_directive::SandboxingFlagSet;
 use embedder_traits::user_contents::UserContentManagerId;
-use embedder_traits::{Theme, ViewportDetails, WebDriverLoadStatus};
+use embedder_traits::{DocumentControlProfile, Theme, ViewportDetails, WebDriverLoadStatus};
 use http::header;
 use js::context::JSContext;
 use net_traits::blob_url_store::UrlWithBlobClaim;
@@ -57,9 +57,7 @@ pub struct NavigationListener {
 }
 
 impl NavigationListener {
-    pub(crate) fn into_callback(
-        self,
-    ) -> Result<BoxedFetchCallback, ScriptEventLoopSendError> {
+    pub(crate) fn into_callback(self) -> Result<BoxedFetchCallback, ScriptEventLoopSendError> {
         let event_loop_sender = self.event_loop_sender.clone();
         event_loop_sender.fence_fetch_until_eof(Box::new(move |response_msg| {
             self.notify_fetch(response_msg)
@@ -309,8 +307,8 @@ pub(crate) fn determine_the_origin(
     }
 
     // Step 4. If url matches about:blank and sourceOrigin is non-null, then return sourceOrigin.
-    if url.as_str() == "about:blank" &&
-        let Some(source_origin) = source_origin
+    if url.as_str() == "about:blank"
+        && let Some(source_origin) = source_origin
     {
         return source_origin;
     }
@@ -327,6 +325,12 @@ fn navigate_to_fragment(
     history_handling: NavigationHistoryBehavior,
 ) {
     let doc = window.Document();
+    if !ScriptThread::admit_controlled_session_history_change() {
+        window.send_to_constellation(
+            ScriptToConstellationMessage::ControlledSessionHistoryLimitExceeded,
+        );
+        return;
+    }
     // Step 1. Let navigation be navigable's active window's navigation API.
     // TODO
     // Step 2. Let destinationNavigationAPIState be navigable's active session history entry's navigation API state.
@@ -395,10 +399,26 @@ pub(crate) fn navigate(
     // Step 4 and 5
     let pipeline_id = window.pipeline_id();
     let window_proxy = window.window_proxy();
-    if let Some(active) = window_proxy.currently_active() &&
-        pipeline_id == active &&
-        doc.is_prompting_or_unloading()
+    if let Some(active) = window_proxy.currently_active()
+        && pipeline_id == active
+        && doc.is_prompting_or_unloading()
     {
+        return;
+    }
+
+    // The controlled-session profile admits only HTTP(S) top-level documents. Report an
+    // application scheme rejection to the Constellation owner before javascript: evaluation,
+    // fetch setup, pipeline creation, or navigation identity admission can have an effect.
+    if window_proxy.parent().is_none()
+        && ScriptThread::current_document_control_profile()
+            == DocumentControlProfile::TopLevelSession
+        && !matches!(load_data.url.scheme(), "http" | "https")
+    {
+        window.send_to_constellation(
+            ScriptToConstellationMessage::ControlledSessionUnsupportedNavigationScheme {
+                scheme: load_data.url.scheme().to_owned(),
+            },
+        );
         return;
     }
 
@@ -462,13 +482,16 @@ pub(crate) fn navigate(
 
     // controlled-webapp-v1 owns exactly one active top-level document. Refuse an
     // application-initiated replacement while the initiating document is still authoritative,
-    // before navigation can start a fetch or ask the constellation to create a pipeline. Keeping
-    // the current document intact lets the action response complete determinately; the sticky
-    // clock terminal is then reported by the next settlement as typed unsupported work.
-    // Same-document fragment navigation above does not replace that authority and remains valid.
+    // before navigation can start a fetch or ask the constellation to create a pipeline. A
+    // checked TopLevelSession profile instead permits the request; Constellation must then force
+    // the WebView's already-bound controlled event loop rather than silently creating another.
+    // Same-document fragment navigation above does not replace either authority and remains valid.
     if window_proxy.parent().is_none() {
         let clock = window.as_global_scope().document_clock();
-        if clock.is_controlled() {
+        if clock.is_controlled()
+            && ScriptThread::current_document_control_profile()
+                == DocumentControlProfile::SingleDocument
+        {
             let _ = clock.require_surface(DocumentTimeSurface::CrossEventLoopNavigation);
             return;
         }

@@ -10,6 +10,7 @@ use js::context::JSContext;
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 
+use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
 use crate::dom::bindings::codegen::Bindings::ElementInternalsBinding::{
     ElementInternalsMethods, ValidityStateFlags,
 };
@@ -18,12 +19,13 @@ use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom, ToLayoutOptional};
 use crate::dom::bindings::str::{DOMString, USVString};
+use crate::dom::blob::Blob;
 use crate::dom::customstateset::CustomStateSet;
 use crate::dom::element::Element;
 use crate::dom::file::File;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmlformelement::{
-    FormDatum, FormDatumUnrooted, FormDatumValue, HTMLFormElement,
+    FormDatum, FormDatumUnrooted, FormDatumValue, FormDatumValueUnrooted, HTMLFormElement,
 };
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::nodelist::NodeList;
@@ -83,6 +85,58 @@ pub(crate) struct ElementInternals {
 }
 
 impl ElementInternals {
+    /// Return the stored submission-entry cardinality without rooting or cloning its values.
+    /// Single string/file values conservatively count one even when an empty `name` later omits
+    /// that entry; FormData cardinality is exact.
+    pub(crate) fn automation_submission_entry_count(&self) -> u64 {
+        match &*self.submission_value.borrow() {
+            SubmissionValue::None => 0,
+            SubmissionValue::USVString(_) | SubmissionValue::File(_) => 1,
+            SubmissionValue::FormData(datums) => u64::try_from(datums.len()).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Exact page-controlled string, file-type, and file-body bytes which entry construction can
+    /// clone/read. The caller charges [`Self::automation_submission_entry_count`] before invoking
+    /// this loop so empty FormData entries cannot bypass the work budget.
+    pub(crate) fn automation_submission_bounds(&self) -> (u64, u64) {
+        fn add_file(bounds: &mut (u64, u64), file: &File) {
+            bounds.0 = bounds
+                .0
+                .saturating_add(file.name().len() as u64)
+                .saturating_add(file.upcast::<Blob>().automation_type_bytes());
+            bounds.1 = bounds.1.saturating_add(file.upcast::<Blob>().Size());
+        }
+
+        let mut bounds = (0u64, 0u64);
+        match &*self.submission_value.borrow() {
+            SubmissionValue::None => {},
+            SubmissionValue::USVString(value) => {
+                bounds.0 = bounds.0.saturating_add(value.0.len() as u64);
+            },
+            SubmissionValue::File(file) => add_file(&mut bounds, file),
+            SubmissionValue::FormData(datums) => {
+                for datum in datums {
+                    bounds.0 = bounds
+                        .0
+                        .saturating_add(datum.ty.len() as u64)
+                        .saturating_add(datum.name.len() as u64);
+                    match &datum.value {
+                        FormDatumValueUnrooted::String(value) => {
+                            bounds.0 = bounds.0.saturating_add(value.len() as u64);
+                        },
+                        FormDatumValueUnrooted::File(file) => add_file(&mut bounds, file),
+                    }
+                }
+            },
+        }
+        bounds.0 = bounds
+            .0
+            .saturating_add(self.validation_message.borrow().len() as u64)
+            .saturating_add(self.custom_validity_error_message.borrow().len() as u64);
+        bounds
+    }
+
     fn new_inherited(target_element: &HTMLElement) -> ElementInternals {
         ElementInternals {
             reflector_: Reflector::new(),
@@ -186,9 +240,9 @@ impl ElementInternals {
     }
 
     pub(crate) fn is_invalid(&self, cx: &mut JSContext) -> bool {
-        self.is_target_form_associated() &&
-            self.is_instance_validatable() &&
-            !self.satisfies_constraints(cx)
+        self.is_target_form_associated()
+            && self.is_instance_validatable()
+            && !self.satisfies_constraints(cx)
     }
 
     pub(crate) fn custom_states_for_layout<'a>(&'a self) -> Option<LayoutDom<'a, CustomStateSet>> {
@@ -432,8 +486,8 @@ impl Validatable for ElementInternals {
         // The form-associated custom element is barred from constraint validation,
         // if the readonly attribute is specified, the element is disabled,
         // or the element has a datalist element ancestor.
-        !self.as_element().read_write_state() &&
-            !self.as_element().disabled_state() &&
-            !is_barred_by_datalist_ancestor(self.target_element.upcast::<Node>())
+        !self.as_element().read_write_state()
+            && !self.as_element().disabled_state()
+            && !is_barred_by_datalist_ancestor(self.target_element.upcast::<Node>())
     }
 }

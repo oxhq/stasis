@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Stasis controlled session second document</title>
+</head>
+<body>
+  <main id="second-document">
+    <h1>Second document</h1>
+    <output id="second-status">second-pending</output>
+    <output id="second-email"></output>
+    <output id="second-role"></output>
+    <output id="second-flow"></output>
+    <output id="detail-value"></output>
+  </main>
+  <script>
+    history.replaceState({ settled: true }, "", `${location.pathname}${location.search}#settled`);
+    document.querySelector("#second-email").textContent =
+      localStorage.getItem("stasis-email") ?? "missing-email";
+    document.querySelector("#second-role").textContent =
+      localStorage.getItem("stasis-role") ?? "missing-role";
+    document.querySelector("#second-flow").textContent =
+      sessionStorage.getItem("stasis-flow") ?? "missing-flow";
+    fetch("/api/details?token=fixture-secret-detail")
+      .then((response) => {
+        if (!response.ok) throw new Error(`details failed: ${response.status}`);
+        return response.json();
+      })
+      .then((details) => {
+        document.querySelector("#detail-value").textContent = details.value;
+        document.querySelector("#second-status").textContent = "second-ready";
+      });
+  </script>
+</body>
+</html>

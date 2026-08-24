@@ -5,12 +5,16 @@
 use malloc_size_of::malloc_size_of_is_0;
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::{self, GenericCallback, GenericSend, GenericSender, SendResult};
+use servo_base::id::WebViewId;
 use servo_url::ImmutableOrigin;
 
 use crate::cache_storage::CacheStorageThreadMessage;
 use crate::client_storage::{ClientStorageThreadHandle, ClientStorageThreadMessage};
 use crate::indexeddb::IndexedDBThreadMsg;
-use crate::webstorage_thread::{OriginDescriptor, WebStorageThreadMsg, WebStorageType};
+use crate::webstorage_thread::{
+    OriginDescriptor, WebStorageStateError, WebStorageStateSnapshotV1, WebStorageThreadMsg,
+    WebStorageType,
+};
 
 pub mod cache_storage;
 pub mod client_storage;
@@ -96,6 +100,35 @@ impl StorageThreads {
                 sites,
             ));
         let _ = receiver.recv();
+    }
+
+    pub fn webstorage_state(
+        &self,
+        webview_id: WebViewId,
+    ) -> Result<WebStorageStateSnapshotV1, WebStorageStateError> {
+        let (sender, receiver) = generic_channel::channel().unwrap();
+        let _ = self
+            .web_storage_thread
+            .send(WebStorageThreadMsg::ExportState { sender, webview_id });
+        receiver.recv().unwrap()
+    }
+
+    pub fn replace_webstorage_state(
+        &self,
+        webview_id: WebViewId,
+        expected_revision: u64,
+        snapshot: WebStorageStateSnapshotV1,
+    ) -> Result<u64, WebStorageStateError> {
+        let (sender, receiver) = generic_channel::channel().unwrap();
+        let _ = self
+            .web_storage_thread
+            .send(WebStorageThreadMsg::ReplaceState {
+                sender,
+                webview_id,
+                expected_revision,
+                snapshot,
+            });
+        receiver.recv().unwrap()
     }
 }
 

@@ -33,16 +33,23 @@ use net::hsts::HstsEntry;
 use net::protocols::ProtocolRegistry;
 use net::request_interceptor::RequestInterceptor;
 use net_traits::blob_url_store::{BlobTokenCommunicator, UrlWithBlobClaim};
+use net_traits::controlled_network::{
+    ControlledNetworkAction, ControlledNetworkRequest, ControlledNetworkSession,
+    ControlledNetworkTerminal,
+};
 use net_traits::filemanager_thread::FileTokenCheck;
 use net_traits::http_status::HttpStatus;
+use net_traits::network_evidence::EvidenceResourceKind;
 use net_traits::request::{
-    Destination, RedirectMode, Referrer, Request, RequestBuilder, RequestMode,
+    CredentialsMode, Destination, RedirectMode, Referrer, Request, RequestBuilder, RequestMode,
+    RequestOriginatingApi,
 };
 use net_traits::response::{CacheState, Response, ResponseBody, ResponseType};
 use net_traits::{
-    FetchTaskTarget, IncludeSubdomains, NetworkError, ReferrerPolicy, ResourceFetchTiming,
-    ResourceTimingType, get_current_locale,
+    CookieSource, FetchTaskTarget, IncludeSubdomains, NetworkError, ReferrerPolicy,
+    ResourceFetchTiming, ResourceTimingType, get_current_locale,
 };
+use serde_json::{Value, json};
 use servo_base::id::{TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
 use servo_url::{ImmutableOrigin, ServoUrl};
 use tokio::sync::Mutex as TokioMutex;
@@ -328,8 +335,8 @@ fn test_cors_preflight_fetch() {
     let handler =
         move |request: HyperRequest<Incoming>,
               response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
-            if request.method() == Method::OPTIONS &&
-                state.clone().fetch_add(1, Ordering::SeqCst) == 0
+            if request.method() == Method::OPTIONS
+                && state.clone().fetch_add(1, Ordering::SeqCst) == 0
             {
                 assert!(
                     request
@@ -400,8 +407,8 @@ fn test_cors_preflight_cache_fetch() {
     let handler =
         move |request: HyperRequest<Incoming>,
               response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
-            if request.method() == Method::OPTIONS &&
-                state.clone().fetch_add(1, Ordering::SeqCst) == 0
+            if request.method() == Method::OPTIONS
+                && state.clone().fetch_add(1, Ordering::SeqCst) == 0
             {
                 assert!(
                     request
@@ -475,8 +482,8 @@ fn test_cors_preflight_fetch_network_error() {
     let handler =
         move |request: HyperRequest<Incoming>,
               response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
-            if request.method() == Method::OPTIONS &&
-                state.clone().fetch_add(1, Ordering::SeqCst) == 0
+            if request.method() == Method::OPTIONS
+                && state.clone().fetch_add(1, Ordering::SeqCst) == 0
             {
                 assert!(
                     request
@@ -1611,5 +1618,471 @@ fn test_fetch_request_intercepted() {
         response.status.message(),
         STATUS_MESSAGE,
         "The status_message was not set correctly!"
+    );
+}
+
+fn controlled_fixture_cookie_fetch(
+    credentials_mode: CredentialsMode,
+    cookie_headers: &'static [&'static str],
+) -> (
+    Response,
+    embedder_traits::WebResourceLoadTerminal,
+    Option<String>,
+) {
+    let (embedder_proxy, embedder_receiver) = create_generic_embedder_proxy_and_receiver();
+    let (terminal_sender, terminal_receiver) = std::sync::mpsc::sync_channel(1);
+
+    std::thread::spawn(move || {
+        loop {
+            match embedder_receiver.recv().unwrap() {
+                net::embedder::NetToEmbedderMsg::WebResourceRequested(
+                    _,
+                    web_resource_request,
+                    response_sender,
+                ) => {
+                    response_sender
+                        .send(embedder_traits::WebResourceResponseMsg::ControlledSession {
+                            top_level_url: web_resource_request.url.clone(),
+                        })
+                        .unwrap();
+                    let mut headers = HeaderMap::new();
+                    for cookie in cookie_headers {
+                        headers.append(header::SET_COOKIE, HeaderValue::from_static(cookie));
+                    }
+                    let response =
+                        embedder_traits::WebResourceResponse::new(web_resource_request.url.clone())
+                            .headers(headers)
+                            .status_code(StatusCode::OK);
+                    response_sender
+                        .send(embedder_traits::WebResourceResponseMsg::Start(response))
+                        .unwrap();
+                    response_sender
+                        .send(embedder_traits::WebResourceResponseMsg::FinishLoad)
+                        .unwrap();
+                },
+                net::embedder::NetToEmbedderMsg::WebResourceFinished(_, _, terminal) => {
+                    terminal_sender.send(terminal).unwrap();
+                    break;
+                },
+                _ => {},
+            }
+        }
+    });
+
+    let mut context = FetchContext {
+        state: Arc::new(create_http_state(None)),
+        user_agent: DEFAULT_USER_AGENT.into(),
+        devtools_chan: None,
+        filemanager: FileManager::new(
+            embedder_proxy.clone(),
+            BlobTokenCommunicator::stub_for_testing(),
+        ),
+        file_token: FileTokenCheck::NotRequired,
+        request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
+        cancellation_listener: Arc::new(Default::default()),
+        timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
+        protocols: Arc::new(ProtocolRegistry::default()),
+        websocket_chan: None,
+        ca_certificates: CACertificates::Default,
+        ignore_certificate_errors: false,
+        preloaded_resources: Default::default(),
+        in_flight_keep_alive_records: Default::default(),
+    };
+    let url = ServoUrl::parse("https://www.example.org/").unwrap();
+    let request = RequestBuilder::new(
+        Some(TEST_WEBVIEW_ID),
+        UrlWithBlobClaim::new(url.clone(), None),
+        Referrer::NoReferrer,
+    )
+    .origin(url.origin())
+    .credentials_mode(credentials_mode)
+    .policy_container(Default::default())
+    .build();
+    let response = fetch_with_context(request, &mut context);
+    let terminal = terminal_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    let cookies = context
+        .state
+        .cookie_jar
+        .write()
+        .cookies_for_url(&url, CookieSource::HTTP);
+    (response, terminal, cookies)
+}
+
+fn observed_empty_destination_resource_kind(
+    originating_api: RequestOriginatingApi,
+) -> embedder_traits::WebResourceKind {
+    let _ = net::test_util::create_generic_embedder_proxy::<net::embedder::NetToEmbedderMsg>();
+    let (embedder_proxy, embedder_receiver) = create_generic_embedder_proxy_and_receiver();
+    let (kind_sender, kind_receiver) = std::sync::mpsc::sync_channel(1);
+    let embedder_thread = std::thread::spawn(move || {
+        loop {
+            match embedder_receiver.recv().unwrap() {
+                net::embedder::NetToEmbedderMsg::WebResourceRequested(
+                    _,
+                    web_resource_request,
+                    response_sender,
+                ) => {
+                    kind_sender
+                        .send(web_resource_request.controlled_resource_kind)
+                        .unwrap();
+                    response_sender
+                        .send(embedder_traits::WebResourceResponseMsg::CancelLoad)
+                        .unwrap();
+                },
+                net::embedder::NetToEmbedderMsg::WebResourceFinished(..) => break,
+                _ => {},
+            }
+        }
+    });
+
+    let url = ServoUrl::parse("https://www.example.org/empty-destination").unwrap();
+    let request = RequestBuilder::new(
+        Some(TEST_WEBVIEW_ID),
+        UrlWithBlobClaim::new(url.clone(), None),
+        Referrer::NoReferrer,
+    )
+    .origin(url.origin())
+    .originating_api(originating_api)
+    .policy_container(Default::default())
+    .build();
+    let mut context = new_fetch_context(None, Some(embedder_proxy));
+    assert!(fetch_with_context(request, &mut context).is_network_error());
+    embedder_thread.join().unwrap();
+
+    kind_receiver.recv().unwrap()
+}
+
+#[test]
+fn controlled_resource_kind_distinguishes_fetch_and_xml_http_request() {
+    assert_eq!(
+        net_traits::network_evidence::EvidenceResourceKind::from(
+            observed_empty_destination_resource_kind(RequestOriginatingApi::Fetch),
+        ),
+        net_traits::network_evidence::EvidenceResourceKind::Fetch
+    );
+    assert_eq!(
+        net_traits::network_evidence::EvidenceResourceKind::from(
+            observed_empty_destination_resource_kind(RequestOriginatingApi::XmlHttpRequest),
+        ),
+        net_traits::network_evidence::EvidenceResourceKind::XmlHttpRequest
+    );
+}
+
+#[test]
+fn controlled_resource_kind_keeps_other_empty_destination_requests_unclassified() {
+    assert_eq!(
+        net_traits::network_evidence::EvidenceResourceKind::from(
+            observed_empty_destination_resource_kind(RequestOriginatingApi::Unclassified),
+        ),
+        net_traits::network_evidence::EvidenceResourceKind::UnclassifiedProducerIo
+    );
+}
+
+fn controlled_follow_redirect_evidence(
+    originating_api: RequestOriginatingApi,
+    expected_resource_kind: &str,
+) {
+    let handler =
+        move |request: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            match request.uri().path() {
+                "/start" => {
+                    *response.status_mut() = StatusCode::FOUND;
+                    response
+                        .headers_mut()
+                        .insert(header::LOCATION, HeaderValue::from_static("/final"));
+                },
+                "/final" => {
+                    *response.body_mut() = make_body(b"redirect-complete".to_vec());
+                },
+                path => panic!("unexpected controlled redirect path: {path}"),
+            }
+        };
+    let (_server, mut start_url) = make_server(handler);
+    start_url.as_mut_url().set_path("/start");
+    let request_url = start_url.url();
+    let top_level_url = request_url.clone().into_url();
+
+    let session = ControlledNetworkSession::from_json(
+        json!({
+            "mode": "live",
+            "routes": [],
+        }),
+        0,
+    )
+    .unwrap();
+    let controlled_session = session.clone();
+    let (embedder_proxy, embedder_receiver) = create_generic_embedder_proxy_and_receiver();
+    let embedder_thread = std::thread::spawn(move || {
+        let mut requested_loads = Vec::new();
+        let mut terminals = Vec::new();
+        let mut predecessor_redirect_terminal_seen = false;
+
+        loop {
+            match embedder_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("timed out waiting for controlled redirect lifecycle")
+            {
+                net::embedder::NetToEmbedderMsg::WebResourceRequested(
+                    _,
+                    web_resource_request,
+                    response_sender,
+                ) => {
+                    if requested_loads.len() == 1 {
+                        assert!(
+                            predecessor_redirect_terminal_seen,
+                            "successor began before its predecessor 3xx terminal"
+                        );
+                        assert_eq!(
+                            web_resource_request.controlled_load_id.redirect_parent(),
+                            requested_loads.first().copied()
+                        );
+                    }
+                    requested_loads.push(web_resource_request.controlled_load_id);
+                    let header_names = web_resource_request
+                        .headers
+                        .keys()
+                        .map(HeaderName::as_str)
+                        .collect::<Vec<_>>();
+                    assert!(matches!(
+                        controlled_session.begin(ControlledNetworkRequest {
+                            load_id: web_resource_request.controlled_load_id,
+                            method: web_resource_request.method.as_str(),
+                            url: &web_resource_request.url,
+                            resource_kind: EvidenceResourceKind::from(
+                                web_resource_request.controlled_resource_kind,
+                            ),
+                            main_frame: web_resource_request.is_for_main_frame,
+                            header_names: &header_names,
+                            body_bytes: web_resource_request.controlled_body_bytes,
+                        }),
+                        ControlledNetworkAction::Passthrough { .. }
+                    ));
+                    response_sender
+                        .send(embedder_traits::WebResourceResponseMsg::ControlledSession {
+                            top_level_url: top_level_url.clone(),
+                        })
+                        .unwrap();
+                    response_sender
+                        .send(embedder_traits::WebResourceResponseMsg::DoNotIntercept)
+                        .unwrap();
+                },
+                net::embedder::NetToEmbedderMsg::WebResourceFinished(_, load_id, terminal) => {
+                    let (status, controlled_terminal) = match terminal {
+                        embedder_traits::WebResourceLoadTerminal::Completed {
+                            status,
+                            response_bytes,
+                        } => (
+                            status,
+                            ControlledNetworkTerminal::Completed {
+                                status,
+                                response_bytes,
+                            },
+                        ),
+                        other => panic!("unexpected controlled redirect terminal: {other:?}"),
+                    };
+                    if requested_loads.first() == Some(&load_id) && status == 302 {
+                        predecessor_redirect_terminal_seen = true;
+                    }
+                    controlled_session.live_terminal(load_id, controlled_terminal);
+                    terminals.push((load_id, status));
+                    if requested_loads.len() == 2 && terminals.len() == 3 {
+                        break;
+                    }
+                },
+                _ => {},
+            }
+        }
+
+        assert_eq!(requested_loads.len(), 2);
+        assert_eq!(terminals.len(), 3);
+        assert_eq!(terminals[0], (requested_loads[0], 302));
+        assert_eq!(terminals[1], (requested_loads[1], 200));
+        // The outer Fetch boundary still reports its final response against the predecessor ID;
+        // controlled-network terminal handling must remain idempotent for that late notice.
+        assert_eq!(terminals[2], (requested_loads[0], 200));
+    });
+
+    let request = RequestBuilder::new(
+        Some(TEST_WEBVIEW_ID),
+        UrlWithBlobClaim::new(request_url.clone(), None),
+        Referrer::NoReferrer,
+    )
+    .origin(request_url.origin())
+    .originating_api(originating_api)
+    .policy_container(Default::default())
+    .build();
+    let mut context = new_fetch_context(None, Some(embedder_proxy));
+    let response = fetch_with_context(request, &mut context);
+    assert_eq!(response.status.code(), StatusCode::OK);
+    embedder_thread.join().unwrap();
+
+    assert_eq!(session.snapshot().active_operations, 0);
+    let requests = serde_json::to_value(session.requests_page(None, 32).unwrap()).unwrap();
+    let records = requests["records"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["url"]["path"], "/start");
+    assert_eq!(records[0]["resourceKind"], expected_resource_kind);
+    assert_eq!(records[1]["url"]["path"], "/final");
+    assert_eq!(records[1]["resourceKind"], expected_resource_kind);
+    assert_eq!(records[1]["redirectParentId"], "1");
+
+    let evidence = serde_json::to_value(session.evidence_page(None, 32).unwrap()).unwrap();
+    let evidence_records = evidence["records"].as_array().unwrap();
+    let contains = |expected: Value| evidence_records.iter().any(|record| record == &expected);
+    assert!(contains(json!({
+        "seq": "3",
+        "atVirtualNs": "0",
+        "kind": "response_headers",
+        "requestId": "1",
+        "status": 302,
+    })));
+    assert!(contains(json!({
+        "seq": "4",
+        "atVirtualNs": "0",
+        "kind": "request_completed",
+        "requestId": "1",
+    })));
+    assert!(evidence_records.iter().any(|record| {
+        record["kind"] == "redirect" && record["requestId"] == "1" && record["nextRequestId"] == "2"
+    }));
+    assert!(evidence_records.iter().any(|record| {
+        record["kind"] == "response_headers"
+            && record["requestId"] == "2"
+            && record["status"] == 200
+    }));
+    assert!(
+        evidence_records
+            .iter()
+            .any(|record| { record["kind"] == "request_completed" && record["requestId"] == "2" })
+    );
+}
+
+#[test]
+fn controlled_fetch_follow_redirect_records_each_hop_terminal() {
+    controlled_follow_redirect_evidence(RequestOriginatingApi::Fetch, "fetch");
+}
+
+#[test]
+fn controlled_xhr_follow_redirect_records_each_hop_terminal() {
+    controlled_follow_redirect_evidence(RequestOriginatingApi::XmlHttpRequest, "xml_http_request");
+}
+
+#[test]
+fn controlled_fixture_cookie_failure_is_atomic_and_reaches_typed_terminal() {
+    let (response, terminal, cookies) = controlled_fixture_cookie_fetch(
+        CredentialsMode::Include,
+        &["first=valid", "persistent=blocked; Max-Age=60"],
+    );
+    assert!(response.is_network_error());
+    assert_eq!(cookies, None);
+    assert_eq!(
+        terminal,
+        embedder_traits::WebResourceLoadTerminal::ControlledCookiePolicyRejected(
+            embedder_traits::WebResourceCookiePolicyFailure::PersistentCookieUnsupported,
+        )
+    );
+}
+
+#[test]
+fn controlled_fixture_credentials_omit_never_mutates_cookie_jar() {
+    let (response, terminal, cookies) =
+        controlled_fixture_cookie_fetch(CredentialsMode::Omit, &["omitted=never-stored"]);
+    assert!(!response.is_network_error());
+    assert_eq!(cookies, None);
+    assert!(matches!(
+        terminal,
+        embedder_traits::WebResourceLoadTerminal::Completed { status: 200, .. }
+    ));
+}
+
+#[test]
+fn controlled_live_cookie_failure_survives_http_fetch_param_replacement() {
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                HeaderValue::from_static(
+                    "persistent=blocked; Expires=Wed, 21 Oct 2037 07:28:00 GMT",
+                ),
+            );
+            *response.body_mut() = make_body(Vec::new());
+        };
+    let (_server, url) = make_server(handler);
+    let request_url = url.url();
+    let (embedder_proxy, embedder_receiver) = create_generic_embedder_proxy_and_receiver();
+    let (terminal_sender, terminal_receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        loop {
+            match embedder_receiver.recv().unwrap() {
+                net::embedder::NetToEmbedderMsg::WebResourceRequested(
+                    _,
+                    web_resource_request,
+                    response_sender,
+                ) => {
+                    response_sender
+                        .send(embedder_traits::WebResourceResponseMsg::ControlledSession {
+                            top_level_url: web_resource_request.url,
+                        })
+                        .unwrap();
+                    response_sender
+                        .send(embedder_traits::WebResourceResponseMsg::DoNotIntercept)
+                        .unwrap();
+                },
+                net::embedder::NetToEmbedderMsg::WebResourceFinished(_, _, terminal) => {
+                    terminal_sender.send(terminal).unwrap();
+                    break;
+                },
+                _ => {},
+            }
+        }
+    });
+
+    let mut context = FetchContext {
+        state: Arc::new(create_http_state(None)),
+        user_agent: DEFAULT_USER_AGENT.into(),
+        devtools_chan: None,
+        filemanager: FileManager::new(
+            embedder_proxy.clone(),
+            BlobTokenCommunicator::stub_for_testing(),
+        ),
+        file_token: FileTokenCheck::NotRequired,
+        request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
+        cancellation_listener: Arc::new(Default::default()),
+        timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
+        protocols: Arc::new(ProtocolRegistry::default()),
+        websocket_chan: None,
+        ca_certificates: CACertificates::Default,
+        ignore_certificate_errors: false,
+        preloaded_resources: Default::default(),
+        in_flight_keep_alive_records: Default::default(),
+    };
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
+        .origin(request_url.origin())
+        .credentials_mode(CredentialsMode::Include)
+        .policy_container(Default::default())
+        .build();
+    let response = fetch_with_context(request, &mut context);
+    let terminal = terminal_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+
+    assert!(response.is_network_error());
+    assert_eq!(
+        context
+            .state
+            .cookie_jar
+            .write()
+            .cookies_for_url(&request_url, CookieSource::HTTP),
+        None
+    );
+    assert_eq!(
+        terminal,
+        embedder_traits::WebResourceLoadTerminal::ControlledCookiePolicyRejected(
+            embedder_traits::WebResourceCookiePolicyFailure::PersistentCookieUnsupported,
+        )
     );
 }

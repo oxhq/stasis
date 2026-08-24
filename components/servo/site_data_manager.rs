@@ -8,11 +8,16 @@ use bitflags::bitflags;
 use cookie::Cookie;
 use log::warn;
 use net_traits::pub_domains::registered_domain_name;
-use net_traits::{CookieOperationId, ResourceThreads, SiteDescriptor};
+use net_traits::{
+    CookieOperationId, CookieStateError, CookieStateSnapshotV1, ResourceThreads, SiteDescriptor,
+};
 use rustc_hash::FxHashMap;
+use servo_base::id::WebViewId;
 use servo_url::ServoUrl;
 use storage_traits::StorageThreads;
-use storage_traits::webstorage_thread::{OriginDescriptor, WebStorageType};
+use storage_traits::webstorage_thread::{
+    OriginDescriptor, WebStorageStateError, WebStorageStateSnapshotV1, WebStorageType,
+};
 use url::Url;
 
 use crate::CookieSource;
@@ -119,6 +124,43 @@ impl SiteDataManager {
             next_cookie_op_id: Cell::new(0),
             pending_cookie_callbacks: RefCell::new(FxHashMap::default()),
         }
+    }
+
+    /// Return the versioned, bounded public cookie state used by controlled sessions.
+    pub fn cookie_state(&self) -> Result<CookieStateSnapshotV1, CookieStateError> {
+        self.public_resource_threads.cookie_state()
+    }
+
+    /// Atomically replace public cookie state if its observed revision is still current.
+    pub fn replace_cookie_state(
+        &self,
+        expected_revision: u64,
+        snapshot: CookieStateSnapshotV1,
+    ) -> Result<u64, CookieStateError> {
+        self.public_resource_threads
+            .replace_cookie_state(expected_revision, snapshot)
+    }
+
+    /// Return all public local storage plus one WebView's scoped session storage.
+    pub fn webstorage_state(
+        &self,
+        webview_id: WebViewId,
+    ) -> Result<WebStorageStateSnapshotV1, WebStorageStateError> {
+        self.public_storage_threads.webstorage_state(webview_id)
+    }
+
+    /// Atomically replace public local storage and one WebView's scoped session storage.
+    pub fn replace_webstorage_state(
+        &self,
+        webview_id: WebViewId,
+        expected_revision: u64,
+        snapshot: WebStorageStateSnapshotV1,
+    ) -> Result<u64, WebStorageStateError> {
+        self.public_storage_threads.replace_webstorage_state(
+            webview_id,
+            expected_revision,
+            snapshot,
+        )
     }
 
     /// Return a list of sites that have associated site data.

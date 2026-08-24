@@ -10,25 +10,30 @@ use accesskit::{
     Node as AccesskitNode, NodeId, Role, Tree, TreeId, TreeUpdate, Uuid as AccesskitUuid,
 };
 use dpi::PhysicalSize;
-use embedder_traits::{
-    ContextMenuAction, ContextMenuItem, Cursor, DocumentClockConfiguration, DocumentClockError,
-    DocumentTimeSurface, EmbedderControlId, EmbedderControlRequest, Image, InputEvent,
-    InputEventAndId, InputEventId, JSValue, JavaScriptEvaluationError, LoadStatus,
-    MediaSessionActionType, NewWebViewDetails, ScreenGeometry, ScreenshotCaptureError, Scroll,
-    Theme, TraversalId, UrlRequest, ViewportDetails, WebViewPoint, WebViewRect,
-    validate_document_clock_configuration,
-};
 use embedder_traits::document_control::{
     DocumentControlCancellationId, DocumentControlCommand, DocumentControlError,
     DocumentControlOutcome, DocumentControlReceiver,
 };
+use embedder_traits::document_session::{SessionNavigationAuthority, SessionNavigationError};
+use embedder_traits::{
+    ContextMenuAction, ContextMenuItem, Cursor, DocumentClockConfiguration, DocumentClockError,
+    DocumentControlProfile, DocumentControlProfileError, DocumentTimeSurface, EmbedderControlId,
+    EmbedderControlRequest, Image, InputEvent, InputEventAndId, InputEventId, JSValue,
+    JavaScriptEvaluationError, LoadStatus, MediaSessionActionType, NewWebViewDetails,
+    ScreenGeometry, ScreenshotCaptureError, Scroll, Theme, TraversalId, UrlRequest,
+    ViewportDetails, WebViewPoint, WebViewRect, validate_document_clock_configuration,
+    validate_document_control_profile,
+};
 use euclid::{Scale, Size2D};
 use image::RgbaImage;
 use log::debug;
+use net_traits::controlled_network::{
+    ControlledNetworkSession, ControlledNetworkSnapshot, ControlledNetworkTimeError,
+};
 use paint_api::WebViewTrait;
 use paint_api::rendering_context::RenderingContext;
 use servo_base::Epoch;
-use servo_base::generic_channel::{GenericCallback, GenericSender};
+use servo_base::generic_channel::{GenericCallback, GenericReceiver, GenericSender};
 use servo_base::id::WebViewId;
 use servo_config::pref;
 use servo_constellation_traits::{
@@ -46,6 +51,7 @@ use crate::clipboard_delegate::{ClipboardDelegate, DefaultClipboardDelegate};
 use crate::gamepad_delegate::{DefaultGamepadDelegate, GamepadDelegate};
 use crate::responders::IpcResponder;
 use crate::servo::PendingHandledInputEvent;
+use crate::site_data_manager::SiteDataManager;
 use crate::webview_delegate::{CreateNewWebViewRequest, DefaultWebViewDelegate, WebViewDelegate};
 use crate::{
     ColorPicker, ContextMenu, EmbedderControl, InputMethodControl, SelectElement, Servo,
@@ -123,6 +129,11 @@ pub(crate) struct WebViewInner {
     rendering_context: Rc<dyn RenderingContext>,
     user_content_manager: Option<Rc<UserContentManager>>,
     document_clock: ValidatedDocumentClockConfiguration,
+    document_control_profile: DocumentControlProfile,
+    controlled_network_session: Option<ControlledNetworkSession>,
+    /// Active top-level site for controlled cookie policy. Before the first history commit this is
+    /// the builder URL, so a cross-site initial redirect cannot redefine its own cookie context.
+    controlled_cookie_top_level_url: Option<Url>,
     /// Checked per-WebView nonce for exact document-control response abandonment.
     next_document_control_cancellation_id: u64,
     hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
@@ -151,9 +162,7 @@ pub(crate) struct ValidatedDocumentClockConfiguration(DocumentClockConfiguration
 impl ValidatedDocumentClockConfiguration {
     const REALTIME: Self = Self(DocumentClockConfiguration::Realtime);
 
-    fn try_new(
-        configuration: DocumentClockConfiguration,
-    ) -> Result<Self, DocumentClockError> {
+    fn try_new(configuration: DocumentClockConfiguration) -> Result<Self, DocumentClockError> {
         validate_document_clock_configuration(configuration)?;
         Ok(Self(configuration))
     }
@@ -173,13 +182,27 @@ impl Drop for WebViewInner {
 }
 
 impl WebView {
-    pub(crate) fn new(mut builder: WebViewBuilder) -> Self {
+    pub(crate) fn new(builder: WebViewBuilder) -> Self {
+        debug_assert!(builder.unpublished_initializer.is_none());
+        Self::new_checked(builder)
+            .expect("ordinary WebView construction has no unpublished initializer")
+    }
+
+    fn new_checked(
+        mut builder: WebViewBuilder,
+    ) -> Result<Self, UnpublishedWebViewInitializationError> {
         let servo = builder.servo;
         let painter_id = servo
             .paint_mut()
             .register_rendering_context(builder.rendering_context.clone());
 
         let id = WebViewId::new(painter_id);
+        if let Some(initializer) = builder.unpublished_initializer.take()
+            && let Err(error) = initializer(id, servo.site_data_manager())
+        {
+            servo.paint_mut().discard_unpublished_webview(id);
+            return Err(error);
+        }
         let webview = Self(Rc::new(RefCell::new(WebViewInner {
             id,
             servo: servo.clone(),
@@ -207,6 +230,9 @@ impl WebView {
             back_forward_list_index: 0,
             user_content_manager: builder.user_content_manager.clone(),
             document_clock: builder.document_clock,
+            document_control_profile: builder.document_control_profile,
+            controlled_network_session: builder.controlled_network_session,
+            controlled_cookie_top_level_url: builder.url.clone(),
             next_document_control_cancellation_id: 0,
         })));
 
@@ -233,6 +259,7 @@ impl WebView {
             viewport_details,
             user_content_manager_id,
             document_clock: builder.document_clock.get(),
+            document_control_profile: builder.document_control_profile,
         };
 
         // There are two possibilities here. Either the WebView is a new toplevel
@@ -259,7 +286,7 @@ impl WebView {
             },
         }
 
-        webview
+        Ok(webview)
     }
 
     fn inner(&self) -> Ref<'_, WebViewInner> {
@@ -278,6 +305,7 @@ impl WebView {
             servo: self.inner().servo.clone(),
             responder: IpcResponder::new(response_sender, None),
             document_clock: self.inner().document_clock,
+            document_control_profile: self.inner().document_control_profile,
         };
         self.delegate().request_create_new(self.clone(), request);
     }
@@ -311,6 +339,36 @@ impl WebView {
     /// Get the [`WebViewDelegate`] associated with this [`WebView`].
     pub fn delegate(&self) -> Rc<dyn WebViewDelegate> {
         self.inner().delegate.clone()
+    }
+
+    #[doc(hidden)]
+    pub fn controlled_network_session(&self) -> Option<ControlledNetworkSession> {
+        self.inner().controlled_network_session.clone()
+    }
+
+    #[doc(hidden)]
+    pub fn controlled_network_snapshot(&self) -> Option<ControlledNetworkSnapshot> {
+        self.inner()
+            .controlled_network_session
+            .as_ref()
+            .map(ControlledNetworkSession::snapshot)
+    }
+
+    #[doc(hidden)]
+    pub fn controlled_cookie_top_level_url(&self) -> Option<Url> {
+        self.inner().controlled_cookie_top_level_url.clone()
+    }
+
+    #[doc(hidden)]
+    pub fn set_controlled_network_virtual_time_ns(
+        &self,
+        virtual_time_ns: u128,
+    ) -> Result<(), ControlledNetworkTimeError> {
+        self.inner()
+            .controlled_network_session
+            .as_ref()
+            .expect("controlled-network access requires an installed session")
+            .set_virtual_time_ns(virtual_time_ns)
     }
 
     /// Get the [`ClipboardDelegate`] associated with this [`WebView`].
@@ -845,6 +903,54 @@ impl WebView {
         Ok(receiver)
     }
 
+    /// Capture the checked v2 session-navigation authority owned by Constellation.
+    #[doc(hidden)]
+    pub fn observe_session_navigation(
+        &self,
+        response_waker: impl FnOnce() + Send + 'static,
+    ) -> Result<
+        GenericReceiver<Result<SessionNavigationAuthority, SessionNavigationError>>,
+        SessionNavigationError,
+    > {
+        let (response, receiver) = GenericCallback::<
+            Result<SessionNavigationAuthority, SessionNavigationError>,
+        >::new_blocking_notifying(response_waker)
+        .map_err(|_| SessionNavigationError::ChannelClosed)?;
+        self.inner().servo.constellation_proxy().send(
+            EmbedderToConstellationMessage::ObserveSessionNavigation {
+                webview_id: self.id(),
+                response,
+            },
+        );
+        Ok(receiver)
+    }
+
+    /// Admit an HTTP(S) replacement against one exact v2 session authority snapshot.
+    #[doc(hidden)]
+    pub fn navigate_controlled_session(
+        &self,
+        expected: SessionNavigationAuthority,
+        url: Url,
+        response_waker: impl FnOnce() + Send + 'static,
+    ) -> Result<
+        GenericReceiver<Result<SessionNavigationAuthority, SessionNavigationError>>,
+        SessionNavigationError,
+    > {
+        let (response, receiver) = GenericCallback::<
+            Result<SessionNavigationAuthority, SessionNavigationError>,
+        >::new_blocking_notifying(response_waker)
+        .map_err(|_| SessionNavigationError::ChannelClosed)?;
+        self.inner().servo.constellation_proxy().send(
+            EmbedderToConstellationMessage::NavigateControlledSession {
+                webview_id: self.id(),
+                expected: Box::new(expected),
+                url: ServoUrl::from_url(url),
+                response,
+            },
+        );
+        Ok(receiver)
+    }
+
     /// Asynchronously take a screenshot of the [`WebView`] contents, given a `rect` or the whole
     /// viewport, if no `rect` is given.
     ///
@@ -881,6 +987,11 @@ impl WebView {
                 .into_iter()
                 .map(ServoUrl::into_url)
                 .collect();
+            let controlled_cookie_top_level_url = inner_mut
+                .back_forward_list
+                .get(inner_mut.back_forward_list_index)
+                .cloned();
+            inner_mut.controlled_cookie_top_level_url = controlled_cookie_top_level_url;
         }
 
         let back_forward_list = self.inner().back_forward_list.clone();
@@ -1115,6 +1226,10 @@ pub struct WebViewBuilder {
     user_content_manager: Option<Rc<UserContentManager>>,
     document_clock: ValidatedDocumentClockConfiguration,
     document_clock_is_inherited: bool,
+    document_control_profile: DocumentControlProfile,
+    document_control_profile_is_inherited: bool,
+    controlled_network_session: Option<ControlledNetworkSession>,
+    unpublished_initializer: Option<UnpublishedWebViewInitializer>,
     clipboard_delegate: Option<Rc<dyn ClipboardDelegate>>,
     #[cfg(feature = "gamepad")]
     gamepad_delegate: Option<Rc<dyn GamepadDelegate>>,
@@ -1136,6 +1251,10 @@ impl WebViewBuilder {
             user_content_manager: None,
             document_clock: ValidatedDocumentClockConfiguration::REALTIME,
             document_clock_is_inherited: false,
+            document_control_profile: DocumentControlProfile::SingleDocument,
+            document_control_profile_is_inherited: false,
+            controlled_network_session: None,
+            unpublished_initializer: None,
             clipboard_delegate: None,
             #[cfg(feature = "gamepad")]
             gamepad_delegate: None,
@@ -1147,11 +1266,14 @@ impl WebViewBuilder {
         rendering_context: Rc<dyn RenderingContext>,
         responder: IpcResponder<Option<NewWebViewDetails>>,
         document_clock: ValidatedDocumentClockConfiguration,
+        document_control_profile: DocumentControlProfile,
     ) -> Self {
         let mut builder = Self::new(servo, rendering_context);
         builder.create_new_webview_responder = Some(responder);
         builder.document_clock = document_clock;
         builder.document_clock_is_inherited = true;
+        builder.document_control_profile = document_control_profile;
+        builder.document_control_profile_is_inherited = true;
         builder
     }
 
@@ -1214,6 +1336,74 @@ impl WebViewBuilder {
         Ok(self)
     }
 
+    /// Select whether controlled authority is limited to one document or may span top-level
+    /// replacement documents in this WebView.
+    ///
+    /// This is an internal automation seam. The single-document default preserves
+    /// controlled-webapp-v1. Select a controlled clock before selecting
+    /// [`DocumentControlProfile::TopLevelSession`]. Auxiliary WebViews inherit the profile and
+    /// cannot override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a checked [`DocumentControlProfileError`] if session authority is selected for a
+    /// realtime WebView, or an auxiliary WebView attempts to change its inherited profile.
+    #[doc(hidden)]
+    pub fn document_control_profile(
+        mut self,
+        document_control_profile: DocumentControlProfile,
+    ) -> Result<Self, DocumentControlProfileError> {
+        if self.document_control_profile_is_inherited {
+            return if self.document_control_profile == document_control_profile {
+                Ok(self)
+            } else {
+                Err(DocumentControlProfileError::InheritedProfileMismatch)
+            };
+        }
+        validate_document_control_profile(document_control_profile, self.document_clock.get())?;
+        self.document_control_profile = document_control_profile;
+        Ok(self)
+    }
+
+    /// Install an immutable controlled-network session before the initial navigation is sent.
+    /// The v0.1 single-document and realtime paths cannot install this controller.
+    #[doc(hidden)]
+    pub fn controlled_network_session(
+        mut self,
+        session: ControlledNetworkSession,
+    ) -> Result<Self, ControlledNetworkConfigurationError> {
+        if self.create_new_webview_responder.is_some() {
+            return Err(ControlledNetworkConfigurationError::AuxiliaryWebView);
+        }
+        if self.document_clock.get() == DocumentClockConfiguration::Realtime {
+            return Err(ControlledNetworkConfigurationError::ControlledClockRequired);
+        }
+        if self.document_control_profile != DocumentControlProfile::TopLevelSession {
+            return Err(ControlledNetworkConfigurationError::TopLevelSessionRequired);
+        }
+        self.controlled_network_session = Some(session);
+        Ok(self)
+    }
+
+    /// Install a one-shot state initializer after WebViewId allocation and before any WebView
+    /// publication or initial navigation. This hook is restricted to top-level controlled
+    /// sessions and deliberately receives only the privileged site-data boundary.
+    #[doc(hidden)]
+    pub fn unpublished_initializer(
+        mut self,
+        initializer: UnpublishedWebViewInitializer,
+    ) -> Result<Self, UnpublishedWebViewInitializationError> {
+        if self.create_new_webview_responder.is_some()
+            || self.document_control_profile != DocumentControlProfile::TopLevelSession
+            || self.document_clock.get() == DocumentClockConfiguration::Realtime
+            || self.unpublished_initializer.is_some()
+        {
+            return Err(UnpublishedWebViewInitializationError::InvalidConfiguration);
+        }
+        self.unpublished_initializer = Some(initializer);
+        Ok(self)
+    }
+
     /// Set the [`ClipboardDelegate`] for the `WebView` being created. The same
     /// [`ClipboardDelegate`] can be shared among multiple `WebView`s.
     pub fn clipboard_delegate(mut self, clipboard_delegate: Rc<dyn ClipboardDelegate>) -> Self {
@@ -1231,8 +1421,37 @@ impl WebViewBuilder {
 
     /// Create the [`WebView`] using the configuration specified in this [`WebViewBuilder`].
     pub fn build(self) -> WebView {
+        assert!(
+            self.unpublished_initializer.is_none(),
+            "use build_checked when an unpublished initializer is installed"
+        );
         WebView::new(self)
     }
+
+    /// Build a controlled session whose one-shot unpublished initializer may reject creation.
+    #[doc(hidden)]
+    pub fn build_checked(self) -> Result<WebView, UnpublishedWebViewInitializationError> {
+        WebView::new_checked(self)
+    }
+}
+
+/// One-shot initialization boundary used only before a controlled-session WebView is published.
+pub type UnpublishedWebViewInitializer = Box<
+    dyn FnOnce(WebViewId, &SiteDataManager) -> Result<(), UnpublishedWebViewInitializationError>,
+>;
+
+/// Redacted construction failures. Product-specific state errors remain in the caller-owned cell.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnpublishedWebViewInitializationError {
+    InvalidConfiguration,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlledNetworkConfigurationError {
+    ControlledClockRequired,
+    TopLevelSessionRequired,
+    AuxiliaryWebView,
 }
 
 #[cfg(test)]

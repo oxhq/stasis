@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use cookie::Cookie;
 use embedder_traits::{
-    AuthenticationResponse, EmbedderControlId, FilePickerRequest, WebResourceRequest,
-    WebResourceResponseMsg,
+    AuthenticationResponse, EmbedderControlId, FilePickerRequest, WebResourceLoadId,
+    WebResourceLoadTerminal, WebResourceRequest, WebResourceResponseMsg,
 };
 use net_traits::CookieOperationId;
 use servo_base::id::WebViewId;
@@ -27,6 +27,12 @@ pub enum NetToEmbedderMsg {
         Option<WebViewId>,
         WebResourceRequest,
         TokioSender<WebResourceResponseMsg>,
+    ),
+    /// Terminal metadata for a prior HTTP(S) request. This carries no URL, headers, or body.
+    WebResourceFinished(
+        Option<WebViewId>,
+        WebResourceLoadId,
+        WebResourceLoadTerminal,
     ),
     /// Request authentication for a load or navigation from the embedder.
     RequestAuthentication(
