@@ -1569,7 +1569,14 @@ jobs:
           set -euo pipefail
           test "$(LC_ALL=C getconf GNU_LIBC_VERSION)" = 'glibc 2.35'
           sudo apt-get update
-          sudo apt-get install --yes xvfb
+          sudo apt-get install --yes \
+            libegl1 \
+            libfontconfig1 \
+            libgl1-mesa-dri \
+            libstdc++6 \
+            xvfb \
+            zlib1g
+          python3 -c 'import ctypes; ctypes.CDLL("libEGL.so.1")'
 
       - name: Set up Node without publication credentials
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
