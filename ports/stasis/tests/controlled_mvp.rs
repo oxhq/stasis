@@ -442,7 +442,7 @@ fn recursive_timers_terminate_with_the_typed_engine_limit() {
     assert_eq!(settled["limit"]["kind"], "ordinary_tasks");
     assert_eq!(settled["limit"]["limit"], "100000");
     assert_eq!(settled["limit"]["observed"], "100001");
-    shell.close_cleanly();
+    shell.close_cleanly_with_timeout(BOUNDED_STRESS_RESPONSE_TIMEOUT);
 }
 
 #[test]
@@ -496,7 +496,7 @@ fn recursive_animation_frames_terminate_with_the_typed_rendering_limit() {
     assert_eq!(settled["limit"]["kind"], "rendering_opportunities");
     assert_eq!(settled["limit"]["limit"], "10000");
     assert_eq!(settled["limit"]["observed"], "10001");
-    shell.close_cleanly();
+    shell.close_cleanly_with_timeout(BOUNDED_STRESS_RESPONSE_TIMEOUT);
 }
 
 #[test]
@@ -1521,9 +1521,14 @@ impl TestShell {
     }
 
     fn close_cleanly(&mut self) {
+        self.close_cleanly_with_timeout(RESPONSE_TIMEOUT);
+    }
+
+    fn close_cleanly_with_timeout(&mut self, timeout: Duration) {
         let id = self.next_id("close");
         let request = Requests::close(id, self.session_id());
-        let response = self.call(request);
+        let id = self.send(request);
+        let response = self.wait_for_response_with_timeout(&id, timeout);
         assert_eq!(expect_result(response)["state"], "closed");
         assert!(
             self.outstanding_requests.is_empty() && self.response_backlog.is_empty(),
@@ -1580,7 +1585,7 @@ impl TestShell {
                 !remaining.is_zero(),
                 "timed out waiting for terminal response to request {request_id}"
             );
-            let frame = self.receive_frame(remaining);
+            let frame = self.receive_frame(request_id, remaining);
             match frame["type"].as_str() {
                 Some("event") => self.events.push(frame),
                 Some("response") => {
@@ -1605,13 +1610,15 @@ impl TestShell {
         }
     }
 
-    fn receive_frame(&mut self, timeout: Duration) -> Value {
+    fn receive_frame(&mut self, request_id: &str, timeout: Duration) -> Value {
         let line = match self.output.recv_timeout(timeout) {
             Ok(OutputRead::Line(line)) => line,
             Ok(OutputRead::Error(error)) => panic!("failed to read protocol stdout: {error}"),
             Ok(OutputRead::Eof) => panic!("stasis stdout reached EOF before a response"),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                panic!("timed out waiting for stasis protocol output")
+                panic!(
+                    "timed out waiting {timeout:?} for stasis protocol output for request {request_id}"
+                )
             },
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("stasis protocol output reader disconnected")
