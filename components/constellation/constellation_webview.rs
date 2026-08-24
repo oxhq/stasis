@@ -4,8 +4,15 @@
 
 use std::collections::VecDeque;
 
+use embedder_traits::document_session::{
+    CONTROLLED_SESSION_MAX_DOCUMENT_REPLACEMENTS, CONTROLLED_SESSION_MAX_HISTORY_REVISIONS,
+    DocumentEpoch, HistoryRevision, SessionNavigationCounter, SessionNavigationId,
+    SessionNavigationTerminal,
+};
 use embedder_traits::user_contents::UserContentManagerId;
-use embedder_traits::{DocumentClockConfiguration, InputEvent, MouseLeftViewportEvent, Theme};
+use embedder_traits::{
+    DocumentClockConfiguration, DocumentControlProfile, InputEvent, MouseLeftViewportEvent, Theme,
+};
 use euclid::Point2D;
 use log::{debug, warn};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -52,6 +59,18 @@ pub(crate) struct TopLevelPipelineActivation {
     pub old_pipeline_id: Option<PipelineId>,
     pub old_epoch: Epoch,
     pub new_epoch: Epoch,
+}
+
+/// Recoverable failure from an application-initiated controlled-session navigation.
+///
+/// This is deliberately separate from sticky session authority and is reported exactly once to
+/// the embedder. Configured-limit and scheme variants have no authority effect; a start failure
+/// follows a successfully reserved navigation identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ApplicationSessionNavigationFailure {
+    Terminal(SessionNavigationTerminal),
+    UnsupportedScheme { scheme: String },
+    NavigationStartFailed,
 }
 
 /// The `Constellation`'s view of a `WebView` in the embedding layer. This tracks all of the
@@ -119,6 +138,30 @@ pub(crate) struct ConstellationWebView {
     /// The immutable clock mode selected before this WebView's initial navigation.
     document_clock: DocumentClockConfiguration,
 
+    /// The immutable top-level document authority selected independently from the clock.
+    document_control_profile: DocumentControlProfile,
+
+    /// Checked active-document identity for controlled-web-session-v1 only.
+    document_epoch: u64,
+
+    /// Checked identity reserved at each replacement navigation admission.
+    session_navigation_id: u64,
+
+    /// Checked session-monotonic same-document history authority.
+    history_revision: u64,
+
+    /// Successful replacement activations after the initial document.
+    successful_document_replacements: u64,
+
+    /// Sticky arithmetic or post-network redirect terminal.
+    session_navigation_terminal: Option<SessionNavigationTerminal>,
+
+    /// Pre-mutation failure from an application-initiated document or history change.
+    ///
+    /// Unlike [`Self::session_navigation_terminal`], this is not sticky authority. The rejected
+    /// operation has no state effect, and passive session observation consumes the failure once.
+    pending_application_navigation_failure: Option<ApplicationSessionNavigationFailure>,
+
     /// The single script event loop allowed to own a controlled WebView.
     controlled_event_loop_id: Option<ScriptEventLoopId>,
 
@@ -144,11 +187,19 @@ impl ConstellationWebView {
         focused_browsing_context_id: BrowsingContextId,
         user_content_manager_id: Option<UserContentManagerId>,
         document_clock: DocumentClockConfiguration,
+        document_control_profile: DocumentControlProfile,
     ) -> Self {
         Self {
             webview_id,
             user_content_manager_id,
             document_clock,
+            document_control_profile,
+            document_epoch: 0,
+            session_navigation_id: 0,
+            history_revision: 0,
+            successful_document_replacements: 0,
+            session_navigation_terminal: None,
+            pending_application_navigation_failure: None,
             controlled_event_loop_id: None,
             document_time_failure: None,
             active_top_level_pipeline_id: None,
@@ -171,6 +222,236 @@ impl ConstellationWebView {
 
     pub(crate) const fn document_clock(&self) -> DocumentClockConfiguration {
         self.document_clock
+    }
+
+    pub(crate) const fn document_control_profile(&self) -> DocumentControlProfile {
+        self.document_control_profile
+    }
+
+    pub(crate) fn permits_session_history_traversal(&self) -> bool {
+        self.document_control_profile != DocumentControlProfile::TopLevelSession
+    }
+
+    /// Reject every history-traversal ingress for the session profile and retain a target-owned
+    /// unsupported terminal. Script normally rejects before sending, but embedder/devtools paths
+    /// must not be able to bypass that DOM boundary and later appear quiescent.
+    pub(crate) fn reject_session_history_traversal(&mut self) -> bool {
+        if self.permits_session_history_traversal() {
+            return false;
+        }
+        self.fail_document_time(DocumentTimeSurface::HistoryTraversal);
+        true
+    }
+
+    pub(crate) const fn session_navigation_authority(
+        &self,
+    ) -> (
+        DocumentEpoch,
+        SessionNavigationId,
+        HistoryRevision,
+        u64,
+        Option<SessionNavigationTerminal>,
+    ) {
+        (
+            DocumentEpoch::new(self.document_epoch),
+            SessionNavigationId::new(self.session_navigation_id),
+            HistoryRevision::new(self.history_revision),
+            self.successful_document_replacements,
+            self.session_navigation_terminal,
+        )
+    }
+
+    /// Reserve a never-reused replacement identity before network start.
+    pub(crate) fn admit_session_document_replacement(
+        &mut self,
+    ) -> Result<SessionNavigationId, SessionNavigationTerminal> {
+        if let Some(terminal) = self.session_navigation_terminal {
+            return Err(terminal);
+        }
+        let Some(next_navigation_id) = self.session_navigation_id.checked_add(1) else {
+            let terminal = SessionNavigationTerminal::CounterOverflow {
+                counter: SessionNavigationCounter::NavigationId,
+            };
+            self.session_navigation_terminal = Some(terminal);
+            return Err(terminal);
+        };
+        if self.successful_document_replacements >= CONTROLLED_SESSION_MAX_DOCUMENT_REPLACEMENTS {
+            let terminal = SessionNavigationTerminal::DocumentTransitionLimitExceeded {
+                limit: CONTROLLED_SESSION_MAX_DOCUMENT_REPLACEMENTS,
+                observed: self.successful_document_replacements.saturating_add(1),
+                next_navigation_id: SessionNavigationId::new(next_navigation_id),
+            };
+            return Err(terminal);
+        }
+        // Reserve only after admission. A failed configured-limit check has no state effect and
+        // leaves the previous authority reusable; a later fetch failure never reuses this ID.
+        self.session_navigation_id = next_navigation_id;
+        Ok(SessionNavigationId::new(next_navigation_id))
+    }
+
+    /// Admit an application-initiated replacement and retain a pre-admission rejection for the
+    /// next passive session observation.
+    pub(crate) fn admit_application_session_document_replacement(&mut self, scheme: &str) -> bool {
+        if self.document_control_profile != DocumentControlProfile::TopLevelSession {
+            return false;
+        }
+        if self.session_navigation_terminal.is_some() {
+            return false;
+        }
+        if self.reject_application_session_navigation_scheme(scheme) {
+            return false;
+        }
+        match self.admit_session_document_replacement() {
+            Ok(_) => true,
+            Err(terminal) => {
+                self.retain_application_configured_limit(terminal);
+                false
+            },
+        }
+    }
+
+    /// Reject an application top-level scheme before JavaScript evaluation, fetch, or admission.
+    pub(crate) fn reject_application_session_navigation_scheme(&mut self, scheme: &str) -> bool {
+        if self.document_control_profile != DocumentControlProfile::TopLevelSession
+            || self.session_navigation_terminal.is_some()
+            || matches!(scheme, "http" | "https")
+        {
+            return false;
+        }
+        self.retain_application_navigation_failure(
+            ApplicationSessionNavigationFailure::UnsupportedScheme {
+                scheme: scheme.to_owned(),
+            },
+        );
+        true
+    }
+
+    /// Admit one fragment, pushState, or replaceState authority change before mutation.
+    pub(crate) fn admit_session_history_change(
+        &mut self,
+    ) -> Result<HistoryRevision, SessionNavigationTerminal> {
+        if let Some(terminal) = self.session_navigation_terminal {
+            return Err(terminal);
+        }
+        let Some(next_revision) = self.history_revision.checked_add(1) else {
+            let terminal = SessionNavigationTerminal::CounterOverflow {
+                counter: SessionNavigationCounter::HistoryRevision,
+            };
+            self.session_navigation_terminal = Some(terminal);
+            return Err(terminal);
+        };
+        if next_revision > CONTROLLED_SESSION_MAX_HISTORY_REVISIONS {
+            let terminal = SessionNavigationTerminal::HistoryLimitExceeded {
+                limit: CONTROLLED_SESSION_MAX_HISTORY_REVISIONS,
+                observed: next_revision,
+                navigation_id: SessionNavigationId::new(self.session_navigation_id),
+                history_revision: HistoryRevision::new(self.history_revision),
+            };
+            return Err(terminal);
+        }
+        self.history_revision = next_revision;
+        Ok(HistoryRevision::new(next_revision))
+    }
+
+    /// Admit an application-initiated same-document change and retain a configured-limit
+    /// rejection for the next passive session observation.
+    pub(crate) fn admit_application_session_history_change(&mut self) -> bool {
+        if self.document_control_profile != DocumentControlProfile::TopLevelSession {
+            return false;
+        }
+        match self.admit_session_history_change() {
+            Ok(_) => true,
+            Err(terminal) => {
+                self.retain_application_configured_limit(terminal);
+                false
+            },
+        }
+    }
+
+    fn retain_application_navigation_failure(
+        &mut self,
+        failure: ApplicationSessionNavigationFailure,
+    ) {
+        if self.pending_application_navigation_failure.is_some() {
+            return;
+        }
+        self.pending_application_navigation_failure = Some(failure);
+    }
+
+    fn retain_application_configured_limit(&mut self, terminal: SessionNavigationTerminal) {
+        if matches!(
+            terminal,
+            SessionNavigationTerminal::DocumentTransitionLimitExceeded { .. }
+                | SessionNavigationTerminal::HistoryLimitExceeded { .. }
+        ) {
+            self.retain_application_navigation_failure(
+                ApplicationSessionNavigationFailure::Terminal(terminal),
+            );
+        }
+    }
+
+    /// Retain failure after application admission reserved an identity but pipeline start failed.
+    pub(crate) fn note_application_session_navigation_start_failed(&mut self) {
+        if self.document_control_profile != DocumentControlProfile::TopLevelSession
+            || self.session_navigation_terminal.is_some()
+        {
+            return;
+        }
+        self.retain_application_navigation_failure(
+            ApplicationSessionNavigationFailure::NavigationStartFailed,
+        );
+    }
+
+    pub(crate) fn take_application_navigation_failure(
+        &mut self,
+    ) -> Option<ApplicationSessionNavigationFailure> {
+        self.pending_application_navigation_failure.take()
+    }
+
+    pub(crate) fn fail_session_redirect_limit(&mut self, observed: u64) {
+        if self.document_control_profile != DocumentControlProfile::TopLevelSession
+            || self.session_navigation_terminal.is_some()
+        {
+            return;
+        }
+        self.session_navigation_terminal = Some(SessionNavigationTerminal::RedirectLimitExceeded {
+            limit: embedder_traits::CONTROLLED_SESSION_MAX_REDIRECTS,
+            observed,
+            navigation_id: SessionNavigationId::new(self.session_navigation_id),
+        });
+    }
+
+    fn note_session_document_activation(&mut self, replacing_active_document: bool) {
+        if self.document_control_profile != DocumentControlProfile::TopLevelSession
+            || self.session_navigation_terminal.is_some()
+        {
+            return;
+        }
+        let Some(next_document_epoch) = self.document_epoch.checked_add(1) else {
+            self.session_navigation_terminal = Some(SessionNavigationTerminal::CounterOverflow {
+                counter: SessionNavigationCounter::DocumentEpoch,
+            });
+            return;
+        };
+        if replacing_active_document {
+            let Some(next_replacements) = self.successful_document_replacements.checked_add(1)
+            else {
+                self.session_navigation_terminal =
+                    Some(SessionNavigationTerminal::CounterOverflow {
+                        counter: SessionNavigationCounter::SuccessfulDocumentReplacements,
+                    });
+                return;
+            };
+            if next_replacements > CONTROLLED_SESSION_MAX_DOCUMENT_REPLACEMENTS {
+                self.session_navigation_terminal =
+                    Some(SessionNavigationTerminal::CounterOverflow {
+                        counter: SessionNavigationCounter::SuccessfulDocumentReplacements,
+                    });
+                return;
+            }
+            self.successful_document_replacements = next_replacements;
+        }
+        self.document_epoch = next_document_epoch;
     }
 
     pub(crate) const fn controlled_event_loop_id(&self) -> Option<ScriptEventLoopId> {
@@ -206,8 +487,8 @@ impl ConstellationWebView {
     }
 
     pub(crate) fn fail_document_time(&mut self, surface: DocumentTimeSurface) {
-        if self.document_clock != DocumentClockConfiguration::Realtime &&
-            self.document_time_failure.is_none()
+        if self.document_clock != DocumentClockConfiguration::Realtime
+            && self.document_time_failure.is_none()
         {
             self.document_time_failure = Some(surface);
         }
@@ -307,6 +588,7 @@ impl ConstellationWebView {
 
         self.advance_navigation_revision_by(1)?;
         let old_pipeline_id = self.active_top_level_pipeline_id;
+        self.note_session_document_activation(old_pipeline_id.is_some());
         let old_epoch = self.active_top_level_pipeline_epoch;
         let new_epoch = old_epoch.next();
         self.active_top_level_pipeline_id = Some(new_pipeline_id);
@@ -512,7 +794,7 @@ impl ConstellationWebView {
 
 #[cfg(test)]
 mod tests {
-    use embedder_traits::ViewportDetails;
+    use embedder_traits::{CONTROLLED_SESSION_MAX_REDIRECTS, ViewportDetails};
     use servo_base::id::{
         PipelineNamespaceId, ScriptEventLoopId, TEST_BROWSING_CONTEXT_ID,
         TEST_BROWSING_CONTEXT_INDEX, TEST_PIPELINE_INDEX, TEST_SCRIPT_EVENT_LOOP_ID,
@@ -561,6 +843,20 @@ mod tests {
                 initial_time_ns: 7,
                 unix_time_origin_ns: DocumentUnixTime::from_nanos(11),
             },
+            DocumentControlProfile::SingleDocument,
+        )
+    }
+
+    fn controlled_session_webview() -> ConstellationWebView {
+        ConstellationWebView::new(
+            TEST_WEBVIEW_ID,
+            TEST_BROWSING_CONTEXT_ID,
+            None,
+            DocumentClockConfiguration::Controlled {
+                initial_time_ns: 7,
+                unix_time_origin_ns: DocumentUnixTime::from_nanos(11),
+            },
+            DocumentControlProfile::TopLevelSession,
         )
     }
 
@@ -618,6 +914,7 @@ mod tests {
             TEST_BROWSING_CONTEXT_ID,
             None,
             DocumentClockConfiguration::Realtime,
+            DocumentControlProfile::SingleDocument,
         );
         assert!(
             webview
@@ -630,6 +927,439 @@ mod tests {
         webview.fail_document_time(DocumentTimeSurface::AuxiliaryWebView);
         assert_eq!(webview.controlled_event_loop_id(), None);
         assert_eq!(webview.document_time_failure(), None);
+    }
+
+    #[test]
+    fn webview_retains_the_checked_control_profile_independently_from_its_clock() {
+        let webview = ConstellationWebView::new(
+            TEST_WEBVIEW_ID,
+            TEST_BROWSING_CONTEXT_ID,
+            None,
+            DocumentClockConfiguration::Controlled {
+                initial_time_ns: 7,
+                unix_time_origin_ns: DocumentUnixTime::from_nanos(11),
+            },
+            DocumentControlProfile::TopLevelSession,
+        );
+
+        assert_eq!(
+            webview.document_control_profile(),
+            DocumentControlProfile::TopLevelSession,
+        );
+        assert_eq!(webview.controlled_event_loop_id(), None);
+    }
+
+    #[test]
+    fn session_identity_starts_at_zero_and_initial_activation_only_advances_document_epoch() {
+        let mut webview = controlled_session_webview();
+        assert_eq!(
+            webview.session_navigation_authority(),
+            (
+                DocumentEpoch::new(0),
+                SessionNavigationId::new(0),
+                HistoryRevision::new(0),
+                0,
+                None,
+            )
+        );
+
+        assert!(matches!(
+            webview.activate_top_level_pipeline(pipeline_id(10)),
+            Ok(Some(_))
+        ));
+        assert_eq!(
+            webview.session_navigation_authority().0,
+            DocumentEpoch::new(1)
+        );
+        assert_eq!(
+            webview.session_navigation_authority().1,
+            SessionNavigationId::new(0)
+        );
+        assert_eq!(webview.session_navigation_authority().3, 0);
+    }
+
+    #[test]
+    fn session_replacement_reserves_identity_before_activation() {
+        let mut webview = controlled_session_webview();
+        assert!(matches!(
+            webview.activate_top_level_pipeline(pipeline_id(10)),
+            Ok(Some(_))
+        ));
+        assert_eq!(
+            webview.admit_session_document_replacement(),
+            Ok(SessionNavigationId::new(1))
+        );
+        assert_eq!(
+            webview.session_navigation_authority().0,
+            DocumentEpoch::new(1)
+        );
+        assert_eq!(
+            webview.session_navigation_authority().1,
+            SessionNavigationId::new(1)
+        );
+
+        assert!(matches!(
+            webview.activate_top_level_pipeline(pipeline_id(11)),
+            Ok(Some(_))
+        ));
+        assert_eq!(
+            webview.session_navigation_authority().0,
+            DocumentEpoch::new(2)
+        );
+        assert_eq!(webview.session_navigation_authority().3, 1);
+    }
+
+    #[test]
+    fn session_authority_observation_is_stable_until_checked_admission() {
+        let mut webview = controlled_session_webview();
+        assert!(matches!(
+            webview.activate_top_level_pipeline(pipeline_id(10)),
+            Ok(Some(_))
+        ));
+        let observed = webview.session_navigation_authority();
+
+        assert_eq!(webview.session_navigation_authority(), observed);
+        assert_eq!(
+            webview.admit_session_history_change(),
+            Ok(HistoryRevision::new(1))
+        );
+        assert_eq!(
+            webview.session_navigation_authority(),
+            (
+                observed.0,
+                observed.1,
+                HistoryRevision::new(1),
+                observed.3,
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn session_replacement_limit_has_no_state_effect_and_does_not_consume_an_id() {
+        let mut webview = controlled_session_webview();
+        webview.successful_document_replacements = CONTROLLED_SESSION_MAX_DOCUMENT_REPLACEMENTS;
+        let expected = SessionNavigationTerminal::DocumentTransitionLimitExceeded {
+            limit: CONTROLLED_SESSION_MAX_DOCUMENT_REPLACEMENTS,
+            observed: CONTROLLED_SESSION_MAX_DOCUMENT_REPLACEMENTS + 1,
+            next_navigation_id: SessionNavigationId::new(1),
+        };
+
+        assert_eq!(webview.admit_session_document_replacement(), Err(expected));
+        assert_eq!(webview.admit_session_document_replacement(), Err(expected));
+        assert_eq!(
+            webview.session_navigation_authority().1,
+            SessionNavigationId::new(0)
+        );
+        assert_eq!(webview.session_navigation_authority().4, None);
+    }
+
+    #[test]
+    fn session_replacement_limit_admits_max_then_rejects_max_plus_one_without_authority_drift() {
+        let mut webview = controlled_session_webview();
+        assert!(matches!(
+            webview.activate_top_level_pipeline(pipeline_id(10)),
+            Ok(Some(_))
+        ));
+        webview.successful_document_replacements = CONTROLLED_SESSION_MAX_DOCUMENT_REPLACEMENTS - 1;
+
+        assert_eq!(
+            webview.admit_session_document_replacement(),
+            Ok(SessionNavigationId::new(1))
+        );
+        assert!(matches!(
+            webview.activate_top_level_pipeline(pipeline_id(11)),
+            Ok(Some(_))
+        ));
+        let authority_at_limit = webview.session_navigation_authority();
+        assert_eq!(
+            authority_at_limit,
+            (
+                DocumentEpoch::new(2),
+                SessionNavigationId::new(1),
+                HistoryRevision::new(0),
+                CONTROLLED_SESSION_MAX_DOCUMENT_REPLACEMENTS,
+                None,
+            )
+        );
+
+        assert_eq!(
+            webview.admit_session_document_replacement(),
+            Err(SessionNavigationTerminal::DocumentTransitionLimitExceeded {
+                limit: CONTROLLED_SESSION_MAX_DOCUMENT_REPLACEMENTS,
+                observed: CONTROLLED_SESSION_MAX_DOCUMENT_REPLACEMENTS + 1,
+                next_navigation_id: SessionNavigationId::new(2),
+            })
+        );
+        assert_eq!(webview.session_navigation_authority(), authority_at_limit);
+    }
+
+    #[test]
+    fn application_replacement_limit_is_observed_once_without_changing_authority() {
+        let mut webview = controlled_session_webview();
+        webview.successful_document_replacements = CONTROLLED_SESSION_MAX_DOCUMENT_REPLACEMENTS;
+        let authority = webview.session_navigation_authority();
+        let expected = SessionNavigationTerminal::DocumentTransitionLimitExceeded {
+            limit: CONTROLLED_SESSION_MAX_DOCUMENT_REPLACEMENTS,
+            observed: CONTROLLED_SESSION_MAX_DOCUMENT_REPLACEMENTS + 1,
+            next_navigation_id: SessionNavigationId::new(1),
+        };
+
+        assert!(!webview.admit_application_session_document_replacement("https"));
+        assert_eq!(webview.session_navigation_authority(), authority);
+        assert_eq!(
+            webview.take_application_navigation_failure(),
+            Some(ApplicationSessionNavigationFailure::Terminal(expected))
+        );
+        assert_eq!(webview.take_application_navigation_failure(), None);
+        assert_eq!(webview.session_navigation_authority(), authority);
+    }
+
+    #[test]
+    fn application_unsupported_scheme_is_observed_once_before_admission() {
+        let mut webview = controlled_session_webview();
+        assert!(matches!(
+            webview.activate_top_level_pipeline(pipeline_id(10)),
+            Ok(Some(_))
+        ));
+        let authority = webview.session_navigation_authority();
+
+        assert!(webview.reject_application_session_navigation_scheme("file"));
+        assert!(webview.reject_application_session_navigation_scheme("data"));
+        assert_eq!(webview.session_navigation_authority(), authority);
+        assert_eq!(
+            webview.take_application_navigation_failure(),
+            Some(ApplicationSessionNavigationFailure::UnsupportedScheme {
+                scheme: "file".to_owned(),
+            })
+        );
+        assert_eq!(webview.take_application_navigation_failure(), None);
+        assert_eq!(webview.session_navigation_authority(), authority);
+    }
+
+    #[test]
+    fn single_document_profile_does_not_latch_application_scheme_failures() {
+        let mut webview = controlled_webview();
+        let authority = webview.session_navigation_authority();
+
+        assert!(!webview.reject_application_session_navigation_scheme("file"));
+        assert_eq!(webview.take_application_navigation_failure(), None);
+        assert_eq!(webview.session_navigation_authority(), authority);
+    }
+
+    #[test]
+    fn application_start_failure_is_observed_once_after_identity_reservation() {
+        let mut webview = controlled_session_webview();
+        assert!(matches!(
+            webview.activate_top_level_pipeline(pipeline_id(10)),
+            Ok(Some(_))
+        ));
+        let before_admission = webview.session_navigation_authority();
+
+        assert!(webview.admit_application_session_document_replacement("https"));
+        let reserved_authority = webview.session_navigation_authority();
+        assert_eq!(reserved_authority.0, before_admission.0);
+        assert_eq!(reserved_authority.1, SessionNavigationId::new(1));
+        assert_eq!(reserved_authority.2, before_admission.2);
+        assert_eq!(reserved_authority.3, before_admission.3);
+        assert_eq!(reserved_authority.4, None);
+
+        webview.note_application_session_navigation_start_failed();
+        assert_eq!(webview.session_navigation_authority(), reserved_authority);
+        assert_eq!(
+            webview.take_application_navigation_failure(),
+            Some(ApplicationSessionNavigationFailure::NavigationStartFailed)
+        );
+        assert_eq!(webview.take_application_navigation_failure(), None);
+        assert_eq!(webview.session_navigation_authority(), reserved_authority);
+    }
+
+    #[test]
+    fn application_same_document_paths_advance_only_monotonic_history_authority() {
+        let mut webview = controlled_session_webview();
+        let pipeline_id = pipeline_id(10);
+        assert!(matches!(
+            webview.activate_top_level_pipeline(pipeline_id),
+            Ok(Some(_))
+        ));
+        let target_before = webview.top_level_navigation_snapshot().unwrap();
+        let mut authority_before = webview.session_navigation_authority();
+
+        // These are the three ScriptToConstellation paths which share this admission owner:
+        // PushHistoryState, ReplaceHistoryState, and NavigatedToFragment.
+        for path in ["pushState", "replaceState", "fragment"] {
+            assert!(
+                webview.admit_application_session_history_change(),
+                "{path} must be admitted below the frozen bound",
+            );
+            let authority_after = webview.session_navigation_authority();
+            assert_eq!(authority_after.0, authority_before.0, "{path}");
+            assert_eq!(authority_after.1, authority_before.1, "{path}");
+            assert_eq!(
+                authority_after.2.get(),
+                authority_before.2.get() + 1,
+                "{path}",
+            );
+            assert_eq!(authority_after.3, authority_before.3, "{path}");
+            assert_eq!(authority_after.4, None, "{path}");
+            assert_eq!(
+                webview.top_level_navigation_snapshot().unwrap(),
+                target_before,
+                "{path} must not rotate PendingTarget navigation authority",
+            );
+            authority_before = authority_after;
+        }
+    }
+
+    #[test]
+    fn session_history_limit_rejects_without_mutating_authority() {
+        let mut webview = controlled_session_webview();
+        webview.session_navigation_id = 17;
+        webview.history_revision = CONTROLLED_SESSION_MAX_HISTORY_REVISIONS;
+        let expected = SessionNavigationTerminal::HistoryLimitExceeded {
+            limit: CONTROLLED_SESSION_MAX_HISTORY_REVISIONS,
+            observed: CONTROLLED_SESSION_MAX_HISTORY_REVISIONS + 1,
+            navigation_id: SessionNavigationId::new(17),
+            history_revision: HistoryRevision::new(CONTROLLED_SESSION_MAX_HISTORY_REVISIONS),
+        };
+
+        assert_eq!(webview.admit_session_history_change(), Err(expected));
+        assert_eq!(webview.admit_session_history_change(), Err(expected));
+        assert_eq!(
+            webview.session_navigation_authority().2,
+            HistoryRevision::new(CONTROLLED_SESSION_MAX_HISTORY_REVISIONS)
+        );
+        assert_eq!(webview.session_navigation_authority().4, None);
+    }
+
+    #[test]
+    fn session_history_limit_admits_max_then_rejects_max_plus_one_without_authority_drift() {
+        let mut webview = controlled_session_webview();
+        webview.session_navigation_id = 17;
+        webview.history_revision = CONTROLLED_SESSION_MAX_HISTORY_REVISIONS - 1;
+
+        assert_eq!(
+            webview.admit_session_history_change(),
+            Ok(HistoryRevision::new(
+                CONTROLLED_SESSION_MAX_HISTORY_REVISIONS
+            ))
+        );
+        let authority_at_limit = webview.session_navigation_authority();
+        assert_eq!(
+            authority_at_limit,
+            (
+                DocumentEpoch::new(0),
+                SessionNavigationId::new(17),
+                HistoryRevision::new(CONTROLLED_SESSION_MAX_HISTORY_REVISIONS),
+                0,
+                None,
+            )
+        );
+
+        assert_eq!(
+            webview.admit_session_history_change(),
+            Err(SessionNavigationTerminal::HistoryLimitExceeded {
+                limit: CONTROLLED_SESSION_MAX_HISTORY_REVISIONS,
+                observed: CONTROLLED_SESSION_MAX_HISTORY_REVISIONS + 1,
+                navigation_id: SessionNavigationId::new(17),
+                history_revision: HistoryRevision::new(CONTROLLED_SESSION_MAX_HISTORY_REVISIONS),
+            })
+        );
+        assert_eq!(webview.session_navigation_authority(), authority_at_limit);
+    }
+
+    #[test]
+    fn application_history_limit_is_observed_once_without_changing_authority() {
+        let mut webview = controlled_session_webview();
+        webview.session_navigation_id = 17;
+        webview.history_revision = CONTROLLED_SESSION_MAX_HISTORY_REVISIONS;
+        let authority = webview.session_navigation_authority();
+        let expected = SessionNavigationTerminal::HistoryLimitExceeded {
+            limit: CONTROLLED_SESSION_MAX_HISTORY_REVISIONS,
+            observed: CONTROLLED_SESSION_MAX_HISTORY_REVISIONS + 1,
+            navigation_id: SessionNavigationId::new(17),
+            history_revision: HistoryRevision::new(CONTROLLED_SESSION_MAX_HISTORY_REVISIONS),
+        };
+
+        assert!(!webview.admit_application_session_history_change());
+        assert_eq!(webview.session_navigation_authority(), authority);
+        assert_eq!(
+            webview.take_application_navigation_failure(),
+            Some(ApplicationSessionNavigationFailure::Terminal(expected))
+        );
+        assert_eq!(webview.take_application_navigation_failure(), None);
+        assert_eq!(webview.session_navigation_authority(), authority);
+    }
+
+    #[test]
+    fn session_counter_overflow_is_sticky_and_fail_stop() {
+        let mut webview = controlled_session_webview();
+        webview.session_navigation_id = u64::MAX;
+        let expected = SessionNavigationTerminal::CounterOverflow {
+            counter: SessionNavigationCounter::NavigationId,
+        };
+
+        assert_eq!(webview.admit_session_document_replacement(), Err(expected));
+        assert_eq!(webview.admit_session_document_replacement(), Err(expected));
+        assert_eq!(
+            webview.session_navigation_authority().1,
+            SessionNavigationId::new(u64::MAX)
+        );
+        assert_eq!(webview.session_navigation_authority().4, Some(expected));
+    }
+
+    #[test]
+    fn session_redirect_limit_is_typed_against_the_reserved_navigation() {
+        let mut webview = controlled_session_webview();
+        assert_eq!(
+            webview.admit_session_document_replacement(),
+            Ok(SessionNavigationId::new(1))
+        );
+        webview.fail_session_redirect_limit(CONTROLLED_SESSION_MAX_REDIRECTS + 1);
+
+        assert_eq!(
+            webview.session_navigation_authority().4,
+            Some(SessionNavigationTerminal::RedirectLimitExceeded {
+                limit: CONTROLLED_SESSION_MAX_REDIRECTS,
+                observed: CONTROLLED_SESSION_MAX_REDIRECTS + 1,
+                navigation_id: SessionNavigationId::new(1),
+            })
+        );
+    }
+
+    #[test]
+    fn single_document_profile_does_not_project_v2_session_identity() {
+        let mut webview = controlled_webview();
+        assert!(matches!(
+            webview.activate_top_level_pipeline(pipeline_id(10)),
+            Ok(Some(_))
+        ));
+        assert_eq!(
+            webview.session_navigation_authority(),
+            (
+                DocumentEpoch::new(0),
+                SessionNavigationId::new(0),
+                HistoryRevision::new(0),
+                0,
+                None,
+            )
+        );
+        assert!(webview.permits_session_history_traversal());
+    }
+
+    #[test]
+    fn top_level_session_rejects_history_traversal_by_profile() {
+        let mut session = controlled_session_webview();
+        assert!(!session.permits_session_history_traversal());
+        assert!(session.reject_session_history_traversal());
+        assert_eq!(
+            session.document_time_failure(),
+            Some(DocumentTimeSurface::HistoryTraversal)
+        );
+
+        let mut single_document = controlled_webview();
+        assert!(!single_document.reject_session_history_traversal());
+        assert_eq!(single_document.document_time_failure(), None);
     }
 
     #[test]
@@ -681,11 +1411,8 @@ mod tests {
         let mut webview = controlled_webview();
         let pipeline_id = pipeline_id(10);
         assert_eq!(
-            webview.add_pending_change(pending_change(
-                pipeline_id,
-                TEST_BROWSING_CONTEXT_ID,
-                None,
-            )),
+            webview
+                .add_pending_change(pending_change(pipeline_id, TEST_BROWSING_CONTEXT_ID, None,)),
             Ok(())
         );
         assert!(matches!(
@@ -736,10 +1463,7 @@ mod tests {
             return;
         };
         assert_eq!(snapshot.navigation_revision, 3);
-        assert_eq!(
-            snapshot.pending_pipeline_ids,
-            vec![replacement_pipeline_id]
-        );
+        assert_eq!(snapshot.pending_pipeline_ids, vec![replacement_pipeline_id]);
     }
 
     #[test]
@@ -860,11 +1584,8 @@ mod tests {
         let pipeline_id = pipeline_id(10);
 
         assert_eq!(
-            webview.add_pending_change(pending_change(
-                pipeline_id,
-                TEST_BROWSING_CONTEXT_ID,
-                None,
-            )),
+            webview
+                .add_pending_change(pending_change(pipeline_id, TEST_BROWSING_CONTEXT_ID, None,)),
             Ok(())
         );
         assert_eq!(webview.navigation_revision, u64::MAX);
@@ -894,10 +1615,7 @@ mod tests {
 
         assert_eq!(
             webview.pipeline_membership_revision(),
-            (
-                u64::MAX,
-                Some(PipelineMembershipRevisionError::Overflow)
-            )
+            (u64::MAX, Some(PipelineMembershipRevisionError::Overflow))
         );
     }
 }

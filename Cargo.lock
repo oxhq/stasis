@@ -8163,6 +8163,7 @@ dependencies = [
  "postcard",
  "rustc-hash 2.1.3",
  "serde",
+ "serde_json",
  "servo-base",
  "servo-geometry",
  "servo-hyper-serde",
@@ -8724,6 +8725,7 @@ dependencies = [
  "sea-query",
  "sea-query-rusqlite",
  "serde",
+ "serde_json",
  "servo-base",
  "servo-config",
  "servo-default-resources",
@@ -8760,6 +8762,7 @@ dependencies = [
 name = "servo-net-traits"
 version = "0.5.0"
 dependencies = [
+ "base64 0.23.1",
  "content-security-policy",
  "cookie 0.18.2",
  "crossbeam-channel",
@@ -8780,6 +8783,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_bytes",
+ "serde_json",
  "servo-base",
  "servo-config",
  "servo-default-resources",
@@ -9181,6 +9185,7 @@ dependencies = [
  "sea-query",
  "sea-query-rusqlite",
  "serde",
+ "serde_json",
  "servo-base",
  "servo-config",
  "servo-default-resources",
@@ -9790,15 +9795,18 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stasis-shell"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dpi",
+ "rand 0.10.2",
  "rustls",
  "serde",
  "serde_json",
  "servo",
  "servo-base",
  "servo-embedder-traits",
+ "servo-net-traits",
+ "servo-storage-traits",
  "servo-timers",
  "url",
 ]

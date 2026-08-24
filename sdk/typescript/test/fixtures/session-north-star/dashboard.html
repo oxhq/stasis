@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <base href="/">
+  <title>Stasis controlled session dashboard</title>
+</head>
+<body>
+  <main id="dashboard">
+    <h1>Dashboard</h1>
+    <output id="status">dashboard-pending</output>
+    <output id="trace">dashboard</output>
+    <dl>
+      <dt>Email</dt><dd id="account-email"></dd>
+      <dt>Role</dt><dd id="account-role"></dd>
+      <dt>Flow</dt><dd id="flow-state"></dd>
+    </dl>
+    <a class="next" href="redirect-next?secret=fixture-secret-navigation">Continue</a>
+  </main>
+  <script>
+    const trace = ["dashboard"];
+    const renderTrace = () => {
+      document.querySelector("#trace").textContent = trace.join(",");
+    };
+
+    history.pushState({ step: 1 }, "", "/dashboard?source=handoff&step=1#ready");
+    trace.push("history");
+    renderTrace();
+
+    fetch("/api/profile?nonce=fixture-secret-profile")
+      .then((response) => {
+        if (!response.ok) throw new Error(`profile failed: ${response.status}`);
+        trace.push("fetch");
+        return response.json();
+      })
+      .then((profile) => {
+        trace.push("promise");
+        document.querySelector("#account-email").textContent =
+          localStorage.getItem("stasis-email") ?? "missing-email";
+        document.querySelector("#account-role").textContent = profile.role;
+        document.querySelector("#flow-state").textContent =
+          sessionStorage.getItem("stasis-flow") ?? "missing-flow";
+        queueMicrotask(() => {
+          trace.push("microtask");
+          setTimeout(() => {
+            trace.push("timer");
+            requestAnimationFrame(() => {
+              trace.push("raf");
+              renderTrace();
+              document.querySelector("#status").textContent = "dashboard-ready";
+            });
+          }, 250);
+        });
+      });
+  </script>
+</body>
+</html>

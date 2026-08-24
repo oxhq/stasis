@@ -6,6 +6,7 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 
 use dom_struct::dom_struct;
+use embedder_traits::DocumentControlProfile;
 use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::{JSVal, NullValue, UndefinedValue};
@@ -20,6 +21,7 @@ use servo_constellation_traits::{
     StructuredSerializedData, TraversalDirection,
 };
 use servo_url::ServoUrl;
+use timers::{DocumentClock, DocumentTimeSurface};
 
 use crate::dom::bindings::codegen::Bindings::HistoryBinding::HistoryMethods;
 use crate::dom::bindings::codegen::Bindings::LocationBinding::Location_Binding::LocationMethods;
@@ -35,10 +37,20 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::hashchangeevent::HashChangeEvent;
 use crate::dom::popstateevent::PopStateEvent;
 use crate::dom::window::Window;
+use crate::event_loop::script_thread::ScriptThread;
 
 enum PushOrReplace {
     Push,
     Replace,
+}
+
+fn history_traversal_permit(clock: &DocumentClock, profile: DocumentControlProfile) -> ErrorResult {
+    if profile != DocumentControlProfile::TopLevelSession {
+        return Ok(());
+    }
+    clock
+        .require_surface(DocumentTimeSurface::HistoryTraversal)
+        .map_err(|error| Error::NotSupported(Some(error.to_string())))
 }
 
 /// <https://html.spec.whatwg.org/multipage/#the-history-interface>
@@ -75,7 +87,14 @@ impl History {
         if !self.window.Document().is_fully_active() {
             return Err(Error::Security(None));
         }
-        let _ = self
+        // The session profile deliberately defers history traversal. Latch the exact unsupported
+        // surface before rejecting the DOM call so a caught exception cannot later be presented as
+        // a quiescent controlled settlement.
+        history_traversal_permit(
+            &self.window.as_global_scope().document_clock(),
+            ScriptThread::current_document_control_profile(),
+        )?;
+        let send_result = self
             .window
             .as_global_scope()
             .script_to_constellation_chan()
@@ -86,6 +105,12 @@ impl History {
                     HistoryTraversalSource::Script,
                 ),
             ));
+        let _ = ScriptThread::record_synchronous_navigation_emission(
+            self.window.is_top_level(),
+            self.window.webview_id(),
+            self.window.pipeline_id(),
+            send_result.is_ok(),
+        );
         Ok(())
     }
 
@@ -235,17 +260,32 @@ impl History {
             None => document.url(),
         };
 
+        if !ScriptThread::admit_controlled_session_history_change() {
+            let _ = self
+                .window
+                .as_global_scope()
+                .script_to_constellation_chan()
+                .send(ScriptToConstellationMessage::ControlledSessionHistoryLimitExceeded);
+            return Ok(());
+        }
+
         // Step 8
         let state_id = match push_or_replace {
             PushOrReplace::Push => {
                 let state_id = HistoryStateId::new();
                 self.state_id.set(Some(state_id));
                 let msg = ScriptToConstellationMessage::PushHistoryState(state_id, new_url.clone());
-                let _ = self
+                let send_result = self
                     .window
                     .as_global_scope()
                     .script_to_constellation_chan()
                     .send(msg);
+                let _ = ScriptThread::record_synchronous_navigation_emission(
+                    self.window.is_top_level(),
+                    self.window.webview_id(),
+                    self.window.pipeline_id(),
+                    send_result.is_ok(),
+                );
                 state_id
             },
             PushOrReplace::Replace => {
@@ -259,11 +299,17 @@ impl History {
                 };
                 let msg =
                     ScriptToConstellationMessage::ReplaceHistoryState(state_id, new_url.clone());
-                let _ = self
+                let send_result = self
                     .window
                     .as_global_scope()
                     .script_to_constellation_chan()
                     .send(msg);
+                let _ = ScriptThread::record_synchronous_navigation_emission(
+                    self.window.is_top_level(),
+                    self.window.webview_id(),
+                    self.window.pipeline_id(),
+                    send_result.is_ok(),
+                );
                 state_id
             },
         };
@@ -305,11 +351,11 @@ impl History {
     fn can_have_url_rewritten(document_url: &ServoUrl, target_url: &ServoUrl) -> bool {
         // Step 2. If targetURL and documentURL differ in their scheme, username,
         // password, host, or port components, then return false.
-        if target_url.scheme() != document_url.scheme() ||
-            target_url.username() != document_url.username() ||
-            target_url.password() != document_url.password() ||
-            target_url.host() != document_url.host() ||
-            target_url.port() != document_url.port()
+        if target_url.scheme() != document_url.scheme()
+            || target_url.username() != document_url.username()
+            || target_url.password() != document_url.password()
+            || target_url.host() != document_url.host()
+            || target_url.port() != document_url.port()
         {
             return false;
         }
@@ -334,6 +380,45 @@ impl History {
 
         // Step 6. Return true.
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use timers::{DocumentClockConfiguration, DocumentUnixTime};
+
+    use super::*;
+
+    #[test]
+    fn controlled_history_traversal_rejects_and_latches_unsupported_surface() {
+        let realtime = DocumentClock::default();
+        assert!(
+            history_traversal_permit(&realtime, DocumentControlProfile::TopLevelSession).is_ok()
+        );
+        assert_eq!(realtime.unsupported_surface(), None);
+
+        let controlled_v1 = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        });
+        assert!(
+            history_traversal_permit(&controlled_v1, DocumentControlProfile::SingleDocument)
+                .is_ok()
+        );
+        assert_eq!(controlled_v1.unsupported_surface(), None);
+
+        let controlled_v2 = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::default(),
+        });
+        assert!(matches!(
+            history_traversal_permit(&controlled_v2, DocumentControlProfile::TopLevelSession),
+            Err(Error::NotSupported(_))
+        ));
+        assert_eq!(
+            controlled_v2.unsupported_surface(),
+            Some(DocumentTimeSurface::HistoryTraversal)
+        );
     }
 }
 

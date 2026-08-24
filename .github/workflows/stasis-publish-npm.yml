@@ -9,7 +9,7 @@ on:
       release_tag:
         description: Immutable stable release tag to verify
         required: true
-        default: v0.1.0
+        default: v0.2.0
         type: string
       publication_run_id:
         description: Release-event workflow run that published the npm package
@@ -41,11 +41,11 @@ jobs:
             github.event_name == 'release'
               && github.event.release.draft == false
               && github.event.release.prerelease == false
-              && github.event.release.tag_name == 'v0.1.0'
+              && github.event.release.tag_name == 'v0.2.0'
           )
           || (
             github.event_name == 'workflow_dispatch'
-              && inputs.release_tag == 'v0.1.0'
+              && inputs.release_tag == 'v0.2.0'
           )
         )
     runs-on: macos-15
@@ -55,6 +55,7 @@ jobs:
       attestations: read
       contents: read
     outputs:
+      attest_run_attempt: ${{ steps.inputs.outputs.attest_run_attempt }}
       linux_run_attempt: ${{ steps.inputs.outputs.linux_run_attempt }}
       macos_run_attempt: ${{ steps.inputs.outputs.macos_run_attempt }}
       native_binary_sha256: ${{ steps.inputs.outputs.native_binary_sha256 }}
@@ -157,8 +158,8 @@ jobs:
           cargo_version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("ports/stasis/Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')
           sdk_version=$(node -p 'JSON.parse(require("node:fs").readFileSync("sdk/typescript/package.json", "utf8")).version')
           version=${TAG#v}
-          if [[ "$version" != '0.1.0' || "$cargo_version" != "$version" || "$sdk_version" != "$version" ]]; then
-            echo 'native, SDK, and release tag versions do not match stable 0.1.0' >&2
+          if [[ "$version" != '0.2.0' || "$cargo_version" != "$version" || "$sdk_version" != "$version" ]]; then
+            echo 'native, SDK, and release tag versions do not match stable 0.2.0' >&2
             exit 1
           fi
           bundle="stasis-${version}-${STASIS_PLATFORM}"
@@ -310,7 +311,7 @@ jobs:
           gh api --paginate --slurp \
             "repos/$GITHUB_REPOSITORY/actions/runs/$package_run_id/jobs?filter=all&per_page=100" \
             > package-job-pages.json
-          read -r overall_run_attempt macos_run_attempt linux_run_attempt sdk_run_attempt < <(
+          read -r overall_run_attempt macos_run_attempt linux_run_attempt sdk_run_attempt attest_run_attempt < <(
             PACKAGE_RUN_ID="$package_run_id" \
               MACOS_CLAIM_ATTEMPT="$macos_claim_attempt" \
               LINUX_CLAIM_ATTEMPT="$linux_claim_attempt" \
@@ -462,6 +463,7 @@ jobs:
               "macos-aarch64": "Package and gate macos-aarch64",
               "linux-x86_64": "Package and gate linux-x86_64",
               "sdk": "Bind both native runtimes and gate the TypeScript package",
+              "attest": "Attest exact credential-free package outputs",
           }
           producer_jobs = {name: {} for name in producer_names.values()}
           seen_jobs = set()
@@ -519,18 +521,28 @@ jobs:
               or selected["linux-x86_64"] > selected["sdk"]
           ):
               raise SystemExit("selected SDK producer predates a selected native producer")
+          attest_attempts = producer_jobs[producer_names["attest"]]
+          if not attest_attempts:
+              raise SystemExit("no package attestation producer job exists")
+          attest_attempt = max(attest_attempts)
+          if attest_attempts[attest_attempt] != ("completed", "success"):
+              raise SystemExit("latest package attestation producer job did not succeed")
+          if max(selected.values()) > attest_attempt:
+              raise SystemExit("selected package attestation predates a selected producer")
           print(
               overall_attempt,
               selected["macos-aarch64"],
               selected["linux-x86_64"],
               selected["sdk"],
+              attest_attempt,
           )
           PY
           )
           if [[ ! "$overall_run_attempt" =~ ^[1-9][0-9]*$ \
             || ! "$macos_run_attempt" =~ ^[1-9][0-9]*$ \
             || ! "$linux_run_attempt" =~ ^[1-9][0-9]*$ \
-            || ! "$sdk_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
+            || ! "$sdk_run_attempt" =~ ^[1-9][0-9]*$ \
+            || ! "$attest_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
             echo 'selected package producer attempts are invalid' >&2
             exit 1
           fi
@@ -549,15 +561,6 @@ jobs:
               --run-id "$package_run_id" \
               --run-attempt "$producer_attempt"
           done
-          for release_asset in release-assets/*/* gate-proof/*/* runtime-manifest/*; do
-            gh attestation verify "$release_asset" \
-              --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
-              --source-digest "$STASIS_REVISION" \
-              --source-ref "refs/heads/$DEFAULT_BRANCH" \
-              --deny-self-hosted-runners
-          done
-
           binary_sha256=$(awk '{print $1}' \
             "release-assets/macos-aarch64/$STASIS_BINARY_SHA256")
           test "$binary_sha256" = "$(jq -er '.binary.sha256' \
@@ -577,20 +580,45 @@ jobs:
             --native-binary-sha256 "$binary_sha256" \
             --run-id "$package_run_id" \
             --run-attempt "$sdk_run_attempt"
-          for sdk_asset in pregated-sdk/* package-runtime-manifest/*; do
-            gh attestation verify "$sdk_asset" \
-              --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
-              --source-digest "$STASIS_REVISION" \
-              --source-ref "refs/heads/$DEFAULT_BRANCH" \
-              --deny-self-hosted-runners
+          provenance_subjects=(
+            release-assets/*/*
+            gate-proof/*/*
+            runtime-manifest/*
+            pregated-sdk/*
+          )
+          test "${#provenance_subjects[@]}" -eq 11
+          provenance_json="$RUNNER_TEMP/stasis-publish-input-provenance.json"
+          gh attestation verify "${provenance_subjects[0]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
+            --source-digest "$STASIS_REVISION" \
+            --source-ref "refs/heads/$DEFAULT_BRANCH" \
+            --deny-self-hosted-runners \
+            --limit 100 \
+            --format json > "$provenance_json"
+          provenance_verifier=(
+            python3 etc/ci/stasis/verify_build_provenance.py verify
+            --verification-json "$provenance_json"
+            --repository "$GITHUB_REPOSITORY"
+            --workflow .github/workflows/stasis-package.yml
+            --revision "$STASIS_REVISION"
+            --source-ref "refs/heads/$DEFAULT_BRANCH"
+            --server-url "$GITHUB_SERVER_URL"
+            --run-id "$package_run_id"
+            --run-attempt "$attest_run_attempt"
+            --expected-subject-count 11
+          )
+          for provenance_subject in "${provenance_subjects[@]}"; do
+            provenance_verifier+=(--subject "$provenance_subject")
           done
+          "${provenance_verifier[@]}"
           {
             echo "NPM_TARBALL=$GITHUB_WORKSPACE/pregated-sdk/oxhq-stasis-${STASIS_VERSION}.tgz"
             echo "PACKAGE_RUN_ID=$package_run_id"
             echo "MACOS_RUN_ATTEMPT=$macos_run_attempt"
             echo "LINUX_RUN_ATTEMPT=$linux_run_attempt"
             echo "SDK_RUN_ATTEMPT=$sdk_run_attempt"
+            echo "ATTEST_RUN_ATTEMPT=$attest_run_attempt"
             echo "STASIS_NATIVE_BINARY_SHA256=$binary_sha256"
           } >> "$GITHUB_ENV"
           {
@@ -598,6 +626,7 @@ jobs:
             echo "macos_run_attempt=$macos_run_attempt"
             echo "linux_run_attempt=$linux_run_attempt"
             echo "sdk_run_attempt=$sdk_run_attempt"
+            echo "attest_run_attempt=$attest_run_attempt"
             echo "native_binary_sha256=$binary_sha256"
             echo "staged_artifact_name=verified-stasis-npm-package-attempt-$GITHUB_RUN_ATTEMPT"
           } >> "$GITHUB_OUTPUT"
@@ -664,15 +693,36 @@ jobs:
           cp sdk/typescript/test/fixtures/public-package-north-star.mjs \
             "$consumer/public-package-north-star.mjs"
           cp sdk/typescript/test/fixtures/north-star.html "$consumer/north-star.html"
-          north_star_log="$RUNNER_TEMP/stasis-prepublish-north-star.jsonl"
+          cp sdk/typescript/test/fixtures/public-package-session-north-star.mjs \
+            "$consumer/public-package-session-north-star.mjs"
+          cp -R sdk/typescript/test/fixtures/session-north-star \
+            "$consumer/session-north-star"
+          v1_north_star_log="$RUNNER_TEMP/stasis-prepublish-v1-north-star.jsonl"
           (
             cd "$consumer"
-            unset STASIS_NORTH_STAR_BINARY
+            unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_TOKEN \
+              STASIS_NORTH_STAR_BINARY STASIS_SESSION_NORTH_STAR_BINARY
             node ./public-package-north-star.mjs
-          ) 2>&1 | tee "$north_star_log"
-          grep -F '"proof":"stasis-v0.1-north-star"' "$north_star_log"
-          grep -F '"runs":3' "$north_star_log"
-          cat "$north_star_log" >> "$gate_log"
+          ) 2>&1 | tee "$v1_north_star_log"
+          grep -F '"proof":"stasis-v0.1-north-star"' "$v1_north_star_log"
+          grep -F '"runs":3' "$v1_north_star_log"
+          explicit_runtime_cache="$RUNNER_TEMP/stasis-prepublish-explicit-runtime-cache"
+          mkdir "$explicit_runtime_cache"
+          v2_north_star_log="$RUNNER_TEMP/stasis-prepublish-v2-session-north-star.jsonl"
+          (
+            cd "$consumer"
+            unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_TOKEN \
+              STASIS_NORTH_STAR_BINARY STASIS_SESSION_NORTH_STAR_RUNTIME_CACHE
+            export STASIS_SESSION_NORTH_STAR_BINARY="$RUNNER_TEMP/stasis-published-release/$STASIS_BUNDLE/stasis"
+            export STASIS_SESSION_NORTH_STAR_RUNTIME_CACHE="$explicit_runtime_cache"
+            node ./public-package-session-north-star.mjs
+          ) 2>&1 | tee "$v2_north_star_log"
+          grep -F '"proof":"stasis-v0.2-session-north-star"' "$v2_north_star_log"
+          grep -F '"runs":3' "$v2_north_star_log"
+          grep -F '"sessions":6' "$v2_north_star_log"
+          grep -F '"runtimeAcquisition":"explicit-executable-override-cache-bypassed"' \
+            "$v2_north_star_log"
+          cat "$v1_north_star_log" "$v2_north_star_log" >> "$gate_log"
           cp "$gate_log" "$staged_gate_log"
           python3 etc/ci/stasis/npm_release.py create-proof \
             --package "$NPM_TARBALL" \
@@ -702,7 +752,7 @@ jobs:
     needs: verify
     if: needs.verify.result == 'success' && github.event_name == 'release'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     environment:
       name: npm
     permissions:
@@ -711,6 +761,8 @@ jobs:
       contents: read
       id-token: write
     env:
+      ATTEST_RUN_ATTEMPT: ${{ needs.verify.outputs.attest_run_attempt }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       GH_TOKEN: ${{ github.token }}
       LINUX_RUN_ATTEMPT: ${{ needs.verify.outputs.linux_run_attempt }}
       MACOS_RUN_ATTEMPT: ${{ needs.verify.outputs.macos_run_attempt }}
@@ -1085,7 +1137,7 @@ jobs:
           prepublish_run_attempt = os.environ["PREPUBLISH_RUN_ATTEMPT"]
           current_publish_attempt = os.environ["GITHUB_RUN_ATTEMPT"]
           binary_digest = os.environ["STASIS_NATIVE_BINARY_SHA256"]
-          if version != "0.1.0":
+          if version != "0.2.0":
               raise SystemExit("invalid staged SDK version")
           if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
               raise SystemExit("invalid staged SDK revision")
@@ -1222,7 +1274,8 @@ jobs:
           ):
               raise SystemExit("prepublish SDK proof is not bound to its staged gate log")
           gate_records = []
-          north_star_records = []
+          v1_north_star_records = []
+          v2_session_north_star_records = []
           try:
               prepublish_log_text = prepublish_log_bytes.decode("utf-8")
           except UnicodeError as error:
@@ -1237,12 +1290,19 @@ jobs:
               if isinstance(record, dict) and record.get("gate") == "sdk-act-settle-inspect":
                   gate_records.append(record)
               if isinstance(record, dict) and record.get("proof") == "stasis-v0.1-north-star":
-                  north_star_records.append(record)
+                  v1_north_star_records.append(record)
+              if (
+                  isinstance(record, dict)
+                  and record.get("proof") == "stasis-v0.2-session-north-star"
+              ):
+                  v2_session_north_star_records.append(record)
           if len(gate_records) != 1:
               raise SystemExit("prepublish SDK log has no unique structured gate success")
-          if len(north_star_records) != 1:
-              raise SystemExit("prepublish SDK log has no unique North Star proof")
-          north_star = north_star_records[0]
+          if len(v1_north_star_records) != 1:
+              raise SystemExit("prepublish SDK log has no unique frozen v1 North Star proof")
+          if len(v2_session_north_star_records) != 1:
+              raise SystemExit("prepublish SDK log has no unique v0.2 session North Star proof")
+          north_star = v1_north_star_records[0]
           expected_evidence_shape = {
               "schemaVersion": 1,
               "completeness": "terminal_snapshot",
@@ -1269,7 +1329,93 @@ jobs:
               or north_star.get("cardCount") != "3"
               or north_star.get("evidenceShape") != expected_evidence_shape
           ):
-              raise SystemExit("prepublish North Star proof changed or is incomplete")
+              raise SystemExit("prepublish frozen v1 North Star proof changed or is incomplete")
+          session_north_star = v2_session_north_star_records[0]
+          navigation = session_north_star.get("navigation")
+          interaction = session_north_star.get("interaction")
+          crawler = session_north_star.get("crawler")
+          audit = session_north_star.get("audit")
+          state = session_north_star.get("state")
+          if (
+              set(session_north_star) != {
+                  "proof", "runs", "sessions", "negativeSessions", "profile",
+                  "boundary", "outcome", "restoredOutcome", "staleTokenError",
+                  "fixtureMissError", "cleanClose", "runtimeAcquisition", "navigation",
+                  "interaction", "crawler", "audit", "state",
+              }
+              or session_north_star.get("runs") != 3
+              or session_north_star.get("sessions") != 6
+              or session_north_star.get("negativeSessions") != 1
+              or session_north_star.get("profile") != "controlled-web-session-v1"
+              or session_north_star.get("boundary") != "controlled_ready"
+              or session_north_star.get("outcome") != "quiescent"
+              or session_north_star.get("restoredOutcome") != "quiescent"
+              or session_north_star.get("staleTokenError") != "stale_state_token"
+              or session_north_star.get("fixtureMissError") != "network_fixture_miss"
+              or session_north_star.get("cleanClose") is not True
+              or session_north_star.get("runtimeAcquisition")
+                  != "explicit-executable-override-cache-bypassed"
+              or not isinstance(navigation, dict)
+              or set(navigation) != {
+                  "documentEpoch", "navigationId", "historyRevision",
+              }
+              or any(
+                  not isinstance(navigation.get(field), str)
+                  or re.fullmatch(r"[1-9][0-9]*", navigation[field]) is None
+                  for field in ("documentEpoch", "navigationId", "historyRevision")
+              )
+              or int(navigation["documentEpoch"]) < 3
+              or int(navigation["navigationId"]) < 2
+              or int(navigation["historyRevision"]) < 1
+              or interaction != {
+                  "activation": "activated=1",
+                  "focus": "email=1",
+                  "check": "input=2,change=2,checked=false",
+                  "select": "input=1,change=1,values=north|west",
+              }
+              or crawler != {
+                  "pages": 3,
+                  "freshSessions": 3,
+                  "concurrency": 2,
+                  "maxDepth": 1,
+                  "network": "fixtures_only",
+                  "allCrawled": True,
+              }
+              or not isinstance(audit, dict)
+              or set(audit) != {
+                  "schemaVersion", "requestCount", "evidenceCount", "redirectEvents",
+                  "sameDocumentHistoryEvents", "settlementEvents", "redacted",
+              }
+              or audit.get("schemaVersion") != 2
+              or type(audit.get("requestCount")) is not int
+              or audit["requestCount"] < 9
+              or type(audit.get("evidenceCount")) is not int
+              or audit["evidenceCount"] < 9
+              or type(audit.get("redirectEvents")) is not int
+              or audit["redirectEvents"] < 3
+              or type(audit.get("sameDocumentHistoryEvents")) is not int
+              or audit["sameDocumentHistoryEvents"] < 2
+              or type(audit.get("settlementEvents")) is not int
+              or audit["settlementEvents"] < 3
+              or audit.get("redacted") is not True
+              or not isinstance(state, dict)
+              or set(state) != {
+                  "schemaVersion", "cookieCount", "originCount", "localStorageKeys",
+                  "sessionStorageKeys", "sessionStorageScope", "restored",
+              }
+              or state.get("schemaVersion") != 1
+              or type(state.get("cookieCount")) is not int
+              or state["cookieCount"] < 1
+              or type(state.get("originCount")) is not int
+              or state["originCount"] < 1
+              or state.get("localStorageKeys") != ["stasis-email", "stasis-role"]
+              or state.get("sessionStorageKeys") != ["stasis-flow"]
+              or state.get("sessionStorageScope") != "top_level_browsing_context"
+              or state.get("restored") is not True
+          ):
+              raise SystemExit(
+                  "prepublish v0.2 session North Star proof changed or is incomplete"
+              )
           gate_record = gate_records[0]
           wall_elapsed = gate_record.get("wallElapsedMs")
           expected_gate_fields = {
@@ -1298,15 +1444,159 @@ jobs:
           ):
               raise SystemExit("prepublish SDK gate record does not prove the selected artifacts")
           PY
-          for sdk_asset in \
-            "verified-sdk/oxhq-stasis-${STASIS_VERSION}.tgz" \
-            "verified-sdk/stasis-${STASIS_VERSION}-typescript-act-settle-inspect.json"; do
-            gh attestation verify "$sdk_asset" \
-              --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
-              --source-digest "$STASIS_REVISION" \
-              --deny-self-hosted-runners
-          done
+          provenance_subjects=(
+            "verified-sdk/oxhq-stasis-${STASIS_VERSION}.tgz"
+            "verified-sdk/stasis-${STASIS_VERSION}-typescript-act-settle-inspect.json"
+          )
+          provenance_json="$RUNNER_TEMP/stasis-staged-sdk-provenance.json"
+          gh attestation verify "${provenance_subjects[0]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
+            --source-digest "$STASIS_REVISION" \
+            --source-ref "refs/heads/$DEFAULT_BRANCH" \
+            --deny-self-hosted-runners \
+            --limit 100 \
+            --format json > "$provenance_json"
+          PROVENANCE_JSON="$provenance_json" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+
+          def strict_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate object key {key!r}")
+                  value[key] = item
+              return value
+
+          def nested(value, *keys):
+              for key in keys:
+                  if not isinstance(value, dict):
+                      return None
+                  value = value.get(key)
+              return value
+
+          def sha256(filename):
+              digest = hashlib.sha256()
+              with filename.open("rb") as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          try:
+              document = json.loads(
+                  pathlib.Path(os.environ["PROVENANCE_JSON"]).read_text(encoding="utf-8"),
+                  object_pairs_hook=strict_object,
+                  parse_constant=lambda value: (_ for _ in ()).throw(
+                      ValueError(f"non-finite number {value!r}")
+                  ),
+              )
+          except (OSError, UnicodeError, ValueError, RecursionError) as error:
+              raise SystemExit(f"cannot read strict staged SDK provenance JSON: {error}") from error
+          if not isinstance(document, list) or not document:
+              raise SystemExit("staged SDK provenance verification returned no statements")
+
+          version = os.environ["STASIS_VERSION"]
+          revision = os.environ["STASIS_REVISION"]
+          source_ref = f"refs/heads/{os.environ['DEFAULT_BRANCH']}"
+          repository = os.environ["GITHUB_REPOSITORY"]
+          repository_uri = f"https://github.com/{repository}"
+          signer_uri = (
+              f"{repository_uri}/.github/workflows/stasis-package.yml@{source_ref}"
+          )
+          invocation_uri = (
+              f"{repository_uri}/actions/runs/{os.environ['PACKAGE_RUN_ID']}/attempts/"
+              f"{os.environ['ATTEST_RUN_ATTEMPT']}"
+          )
+          candidates = []
+          for record in document:
+              certificate_invocation = nested(
+                  record, "verificationResult", "signature", "certificate", "runInvocationURI"
+              )
+              predicate_invocation = nested(
+                  record, "verificationResult", "statement", "predicate", "runDetails",
+                  "metadata", "invocationId",
+              )
+              if certificate_invocation == invocation_uri or predicate_invocation == invocation_uri:
+                  candidates.append(record)
+          if len(candidates) != 1:
+              raise SystemExit("staged SDK did not resolve to one exact package attestation")
+
+          result = nested(candidates[0], "verificationResult")
+          certificate = nested(result, "signature", "certificate")
+          expected_certificate = {
+              "subjectAlternativeName": signer_uri,
+              "githubWorkflowSHA": revision,
+              "githubWorkflowRepository": repository,
+              "githubWorkflowRef": source_ref,
+              "runnerEnvironment": "github-hosted",
+              "sourceRepositoryURI": repository_uri,
+              "sourceRepositoryDigest": revision,
+              "sourceRepositoryRef": source_ref,
+              "buildSignerURI": signer_uri,
+              "runInvocationURI": invocation_uri,
+          }
+          if not isinstance(certificate, dict) or any(
+              certificate.get(key) != value for key, value in expected_certificate.items()
+          ):
+              raise SystemExit("staged SDK verified certificate identity changed")
+
+          statement = nested(result, "statement")
+          if (
+              not isinstance(statement, dict)
+              or statement.get("_type") != "https://in-toto.io/Statement/v1"
+              or statement.get("predicateType") != "https://slsa.dev/provenance/v1"
+          ):
+              raise SystemExit("staged SDK provenance statement type changed")
+          expected_names = {f"stasis-{version}-runtime-manifest.json"}
+          for platform in ("macos-aarch64", "linux-x86_64"):
+              bundle = f"stasis-{version}-{platform}"
+              archive = f"{bundle}.tar.gz"
+              expected_names.update({
+                  archive,
+                  f"{archive}.sha256",
+                  f"{bundle}.binary.sha256",
+                  f"{bundle}-act-settle-inspect.json",
+              })
+          sdk_names = {
+              f"oxhq-stasis-{version}.tgz",
+              f"stasis-{version}-typescript-act-settle-inspect.json",
+          }
+          expected_names.update(sdk_names)
+          actual_subjects = {}
+          for subject in statement.get("subject", []):
+              if not isinstance(subject, dict) or set(subject) != {"name", "digest"}:
+                  raise SystemExit("staged SDK provenance subject shape changed")
+              name = subject.get("name")
+              digest = subject.get("digest")
+              if (
+                  not isinstance(name, str)
+                  or name in actual_subjects
+                  or not isinstance(digest, dict)
+                  or set(digest) != {"sha256"}
+                  or re.fullmatch(r"[0-9a-f]{64}", digest.get("sha256", "")) is None
+              ):
+                  raise SystemExit("staged SDK provenance subject is malformed")
+              actual_subjects[name] = digest["sha256"]
+          if set(actual_subjects) != expected_names:
+              raise SystemExit("staged SDK provenance subject inventory changed")
+          local_subjects = {}
+          for name in sdk_names:
+              filename = pathlib.Path("verified-sdk", name)
+              if filename.is_symlink() or not filename.is_file():
+                  raise SystemExit("staged SDK provenance file identity is invalid")
+              local_subjects[name] = sha256(filename)
+          if any(actual_subjects[name] != digest for name, digest in local_subjects.items()):
+              raise SystemExit("staged SDK provenance digest binding changed")
+          predicate = statement.get("predicate")
+          if nested(predicate, "runDetails", "metadata") != {"invocationId": invocation_uri}:
+              raise SystemExit("staged SDK SLSA invocation identity changed")
+          if nested(predicate, "runDetails", "builder") != {"id": signer_uri}:
+              raise SystemExit("staged SDK SLSA builder identity changed")
+          PY
           echo "NPM_TARBALL=$GITHUB_WORKSPACE/verified-sdk/oxhq-stasis-${STASIS_VERSION}.tgz" >> "$GITHUB_ENV"
 
       - name: Activate pinned npm client
@@ -1315,6 +1605,11 @@ jobs:
           set -euo pipefail
           npm install --global npm@11.19.0 --registry="$NPM_CONFIG_REGISTRY"
           test "$(npm --version)" = '11.19.0'
+          scope_registry=$(npm config get '@oxhq:registry')
+          if [[ "$scope_registry" != 'undefined' && "$scope_registry" != "$NPM_CONFIG_REGISTRY" ]]; then
+            echo "unexpected @oxhq registry: $scope_registry" >&2
+            exit 1
+          fi
 
       - id: npm-state
         name: Resolve immutable npm publication state
@@ -1327,20 +1622,108 @@ jobs:
             process.stdout.write("sha512-" + crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));
           ' "$NPM_TARBALL")
           echo "NPM_LOCAL_INTEGRITY=$local_integrity" >> "$GITHUB_ENV"
+          view_json="$RUNNER_TEMP/stasis-npm-view.json"
+          view_stderr="$RUNNER_TEMP/stasis-npm-view.stderr"
           set +e
-          existing_integrity=$(npm view "@oxhq/stasis@$STASIS_VERSION" dist.integrity --json \
-            --registry="$NPM_CONFIG_REGISTRY" 2>/dev/null)
+          npm view "@oxhq/stasis@$STASIS_VERSION" dist.integrity --json \
+            --prefer-online \
+            --registry="$NPM_CONFIG_REGISTRY" \
+            > "$view_json" 2> "$view_stderr"
           view_status=$?
           set -e
-          if [[ $view_status -eq 0 && -n "$existing_integrity" && "$existing_integrity" != 'null' ]]; then
-            existing_integrity=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]))' "$existing_integrity")
+          if [[ $view_status -eq 0 ]]; then
+            if ! existing_integrity=$(jq -er '
+              if type == "string" and length > 0 then .
+              else error("npm view returned no immutable integrity")
+              end
+            ' "$view_json"); then
+              cat "$view_stderr" >&2
+              echo 'npm view succeeded without one JSON integrity string; refusing to publish' >&2
+              exit 1
+            fi
             if [[ "$existing_integrity" != "$local_integrity" ]]; then
               echo "@oxhq/stasis@$STASIS_VERSION already exists with different bytes" >&2
               exit 1
             fi
             echo 'publish_required=false' >> "$GITHUB_OUTPUT"
           else
-            echo 'publish_required=true' >> "$GITHUB_OUTPUT"
+            if [[ $view_status -eq 1 ]] && python3 - "$view_json" <<'PY'
+          import json
+          import math
+          import pathlib
+          import sys
+
+          def strict_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate object key {key!r}")
+                  value[key] = item
+              return value
+
+          def strict_float(value):
+              parsed = float(value)
+              if not math.isfinite(parsed):
+                  raise ValueError(f"non-finite number {value!r}")
+              return parsed
+
+          def strict_constant(value):
+              raise ValueError(f"non-finite number {value!r}")
+
+          def strict_json_loads(document):
+              return json.loads(
+                  document,
+                  object_pairs_hook=strict_object,
+                  parse_float=strict_float,
+                  parse_constant=strict_constant,
+              )
+
+          def is_e404(document):
+              return (
+                  isinstance(document, dict)
+                  and set(document) == {"error"}
+                  and isinstance(document["error"], dict)
+                  and document["error"].get("code") == "E404"
+              )
+
+          if not is_e404(strict_json_loads('{"error":{"code":"E404"}}')):
+              raise SystemExit("npm E404 classifier self-test rejected its positive case")
+          for rejected in (
+              '{"error":{"code":"E500"}}',
+              '{"error":{"code":"E404"},"extra":true}',
+              '"E404"',
+              '[]',
+          ):
+              if is_e404(strict_json_loads(rejected)):
+                  raise SystemExit("npm E404 classifier self-test accepted a negative case")
+          for ambiguous in (
+              '{"error":{"code":"E500"},"error":{"code":"E404"}}',
+              '{"error":{"code":"E500","code":"E404"}}',
+          ):
+              try:
+                  strict_json_loads(ambiguous)
+              except ValueError:
+                  pass
+              else:
+                  raise SystemExit("npm E404 classifier self-test accepted duplicate JSON keys")
+
+          response_file = pathlib.Path(sys.argv[1])
+          try:
+              response_size = response_file.stat().st_size
+              if response_size <= 0 or response_size > 64 * 1024:
+                  raise ValueError("response size is outside the classifier limit")
+              response = strict_json_loads(response_file.read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, ValueError, RecursionError):
+              raise SystemExit(1)
+          raise SystemExit(0 if is_e404(response) else 1)
+          PY
+            then
+              echo 'publish_required=true' >> "$GITHUB_OUTPUT"
+            else
+              cat "$view_stderr" >&2
+              echo "npm view failed without a confirmed public-registry E404 (exit $view_status); refusing to publish" >&2
+              exit 1
+            fi
           fi
 
       - name: Recheck immutable release identity immediately before npm mutation
@@ -1434,6 +1817,272 @@ jobs:
           registry_packages=("$RUNNER_TEMP"/stasis-registry-pack/*.tgz)
           test ${#registry_packages[@]} -eq 1
           cmp "$NPM_TARBALL" "${registry_packages[0]}"
+
+          audit_consumer="$RUNNER_TEMP/stasis-credentialed-audit-consumer"
+          mkdir "$audit_consumer"
+          (
+            cd "$audit_consumer"
+            npm init --yes > /dev/null
+            npm install --ignore-scripts "@oxhq/stasis@$STASIS_VERSION" \
+              --registry="$NPM_CONFIG_REGISTRY"
+          )
+          audit_json="$RUNNER_TEMP/stasis-credentialed-registry-audit.json"
+          audit_stderr="$RUNNER_TEMP/stasis-credentialed-registry-audit.stderr"
+          attestations_ready=false
+          for attempt in {1..60}; do
+            set +e
+            (
+              cd "$audit_consumer"
+              npm audit signatures --json --include-attestations \
+                --registry="$NPM_CONFIG_REGISTRY" \
+                > "$audit_json" 2> "$audit_stderr"
+            )
+            audit_status=$?
+            set -e
+            if [[ $audit_status -eq 0 ]] && jq -e \
+              --arg version "$STASIS_VERSION" \
+              --arg registry "$NPM_CONFIG_REGISTRY" \
+              --arg provenance_predicate "https://slsa.dev/provenance/v1" \
+              --arg publish_predicate "https://github.com/npm/attestation/tree/main/specs/publish/v0.1" '
+                (keys | sort) == ["invalid", "missing", "verified"]
+                and .invalid == []
+                and .missing == []
+                and (.verified | type) == "array"
+                and (.verified | length) == 1
+                and .verified[0].name == "@oxhq/stasis"
+                and .verified[0].version == $version
+                and .verified[0].registry == $registry
+                and .verified[0].attestations.provenance.predicateType == $provenance_predicate
+                and (.verified[0].attestationBundles | type) == "array"
+                and (.verified[0].attestationBundles | length) == 2
+                and (
+                  [.verified[0].attestationBundles[].predicateType] | sort
+                ) == ([$provenance_predicate, $publish_predicate] | sort)
+              ' "$audit_json" > /dev/null; then
+              attestations_ready=true
+              break
+            fi
+            if [[ $attempt -lt 60 ]]; then
+              sleep 10
+            fi
+          done
+          if [[ "$attestations_ready" != 'true' ]]; then
+            cat "$audit_stderr" >&2
+            echo 'npm registry did not converge to one verified publish attestation and one SLSA provenance bundle' >&2
+            exit 1
+          fi
+          PUBLICATION_RUN_ID="$GITHUB_RUN_ID" \
+            PUBLICATION_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            python3 - "$audit_json" "$NPM_TARBALL" <<'PY'
+          import base64
+          import hashlib
+          import json
+          import math
+          import os
+          import pathlib
+          import re
+          import sys
+
+          def strict_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate object key {key!r}")
+                  value[key] = item
+              return value
+
+          def strict_float(value):
+              parsed = float(value)
+              if not math.isfinite(parsed):
+                  raise ValueError(f"non-finite number {value!r}")
+              return parsed
+
+          def strict_constant(value):
+              raise ValueError(f"non-finite number {value!r}")
+
+          def strict_json_loads(document, context):
+              try:
+                  return json.loads(
+                      document,
+                      object_pairs_hook=strict_object,
+                      parse_float=strict_float,
+                      parse_constant=strict_constant,
+                  )
+              except (ValueError, RecursionError) as error:
+                  raise SystemExit(f"{context} is invalid strict JSON: {error}") from error
+
+          audit_file = pathlib.Path(sys.argv[1])
+          if audit_file.stat().st_size <= 0 or audit_file.stat().st_size > 16 * 1024 * 1024:
+              raise SystemExit("npm signature audit size is outside the verification limit")
+          audit = strict_json_loads(
+              audit_file.read_text(encoding="utf-8"), "npm signature audit"
+          )
+          tarball = pathlib.Path(sys.argv[2])
+          version = os.environ["STASIS_VERSION"]
+          revision = os.environ["STASIS_REVISION"]
+          repository = os.environ["GITHUB_REPOSITORY"]
+          server_url = os.environ["GITHUB_SERVER_URL"]
+          run_id = os.environ["PUBLICATION_RUN_ID"]
+          expected_attempt = int(os.environ["PUBLICATION_RUN_ATTEMPT"])
+
+          verified = audit.get("verified")
+          if not isinstance(verified, list) or len(verified) != 1:
+              raise SystemExit("npm audit did not return exactly one verified package")
+          entry = verified[0]
+          if not isinstance(entry, dict):
+              raise SystemExit("npm audit verified package entry is not an object")
+          expected_attestation_url = (
+              f"https://registry.npmjs.org/-/npm/v1/attestations/"
+              f"@oxhq%2fstasis@{version}"
+          )
+          attestations = entry.get("attestations")
+          if not isinstance(attestations, dict) or attestations.get("url") != expected_attestation_url:
+              raise SystemExit("npm attestation URL is not the exact public registry identity")
+
+          expected_sha512_state = hashlib.sha512()
+          with tarball.open("rb") as tarball_source:
+              for chunk in iter(lambda: tarball_source.read(1024 * 1024), b""):
+                  expected_sha512_state.update(chunk)
+          expected_sha512 = expected_sha512_state.hexdigest()
+          expected_subject = [{
+              "name": f"pkg:npm/%40oxhq/stasis@{version}",
+              "digest": {"sha512": expected_sha512},
+          }]
+
+          provenance_predicate_type = "https://slsa.dev/provenance/v1"
+          publish_predicate_type = (
+              "https://github.com/npm/attestation/tree/main/specs/publish/v0.1"
+          )
+          bundles = entry.get("attestationBundles")
+          if (
+              not isinstance(bundles, list)
+              or len(bundles) != 2
+              or any(not isinstance(item, dict) for item in bundles)
+          ):
+              raise SystemExit("npm audit did not return exactly two verified attestation bundles")
+          bundles_by_type = {}
+          for bundle in bundles:
+              predicate_type = bundle.get("predicateType")
+              if (
+                  predicate_type not in {provenance_predicate_type, publish_predicate_type}
+                  or predicate_type in bundles_by_type
+              ):
+                  raise SystemExit("npm audit attestation predicate inventory changed")
+              bundles_by_type[predicate_type] = bundle
+          if set(bundles_by_type) != {provenance_predicate_type, publish_predicate_type}:
+              raise SystemExit("npm audit omitted required provenance or publish attestation")
+
+          def decode_statement(bundle, context):
+              bundle_body = bundle.get("bundle")
+              if not isinstance(bundle_body, dict):
+                  raise SystemExit(f"{context} bundle body is missing")
+              envelope = bundle_body.get("dsseEnvelope")
+              if (
+                  not isinstance(envelope, dict)
+                  or envelope.get("payloadType") != "application/vnd.in-toto+json"
+              ):
+                  raise SystemExit(f"{context} DSSE envelope type changed")
+              signatures = envelope.get("signatures")
+              if (
+                  not isinstance(signatures, list)
+                  or not signatures
+                  or any(
+                      not isinstance(signature, dict)
+                      or not isinstance(signature.get("sig"), str)
+                      or not signature["sig"]
+                      for signature in signatures
+                  )
+              ):
+                  raise SystemExit(f"{context} DSSE envelope has no verified signature")
+              payload_value = envelope.get("payload")
+              if not isinstance(payload_value, str):
+                  raise SystemExit(f"{context} DSSE payload is missing")
+              try:
+                  payload = base64.b64decode(payload_value, validate=True)
+                  statement = strict_json_loads(payload.decode("utf-8"), f"{context} statement")
+              except (ValueError, UnicodeDecodeError) as error:
+                  raise SystemExit(f"{context} DSSE payload is invalid") from error
+              if not isinstance(statement, dict):
+                  raise SystemExit(f"{context} statement is not an object")
+              return statement
+
+          publish_statement = decode_statement(
+              bundles_by_type[publish_predicate_type], "npm publish attestation"
+          )
+          if set(publish_statement) != {"_type", "subject", "predicateType", "predicate"}:
+              raise SystemExit("npm publish attestation statement schema changed")
+          if publish_statement.get("_type") != "https://in-toto.io/Statement/v0.1":
+              raise SystemExit("npm publish attestation is not an in-toto v0.1 statement")
+          if publish_statement.get("predicateType") != publish_predicate_type:
+              raise SystemExit("npm publish attestation predicate type changed")
+          if publish_statement.get("subject") != expected_subject:
+              raise SystemExit("npm publish attestation does not bind the exact registry tarball")
+          expected_publish_predicate = {
+              "name": "@oxhq/stasis",
+              "version": version,
+              "registry": "https://registry.npmjs.org",
+          }
+          if publish_statement.get("predicate") != expected_publish_predicate:
+              raise SystemExit("npm publish attestation registry predicate changed")
+
+          statement = decode_statement(
+              bundles_by_type[provenance_predicate_type], "npm provenance"
+          )
+          if set(statement) != {"_type", "subject", "predicateType", "predicate"}:
+              raise SystemExit("npm provenance statement schema changed")
+          if statement.get("_type") != "https://in-toto.io/Statement/v1":
+              raise SystemExit("npm provenance is not an in-toto v1 statement")
+          if statement.get("predicateType") != provenance_predicate_type:
+              raise SystemExit("npm provenance predicate type changed")
+          if statement.get("subject") != expected_subject:
+              raise SystemExit("npm provenance subject does not bind the exact registry tarball")
+
+          predicate = statement.get("predicate")
+          if not isinstance(predicate, dict) or set(predicate) != {"buildDefinition", "runDetails"}:
+              raise SystemExit("npm provenance predicate schema changed")
+          build = predicate.get("buildDefinition")
+          expected_ref = f"refs/tags/v{version}"
+          expected_workflow = {
+              "ref": expected_ref,
+              "repository": f"{server_url}/{repository}",
+              "path": ".github/workflows/stasis-publish-npm.yml",
+          }
+          if not isinstance(build, dict):
+              raise SystemExit("npm provenance build definition is missing")
+          if build.get("buildType") != "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1":
+              raise SystemExit("npm provenance build type changed")
+          if build.get("externalParameters") != {"workflow": expected_workflow}:
+              raise SystemExit("npm provenance workflow identity changed")
+          expected_dependencies = [{
+              "uri": f"git+{server_url}/{repository}@{expected_ref}",
+              "digest": {"gitCommit": revision},
+          }]
+          if build.get("resolvedDependencies") != expected_dependencies:
+              raise SystemExit("npm provenance source commit changed")
+          internal = build.get("internalParameters")
+          if not isinstance(internal, dict) or internal.get("github", {}).get("event_name") != "release":
+              raise SystemExit("npm provenance did not originate from the release event")
+
+          run_details = predicate.get("runDetails")
+          if not isinstance(run_details, dict):
+              raise SystemExit("npm provenance run details are missing")
+          if run_details.get("builder") != {"id": "https://github.com/actions/runner/github-hosted"}:
+              raise SystemExit("npm provenance was not produced by a GitHub-hosted runner")
+          metadata = run_details.get("metadata")
+          if not isinstance(metadata, dict) or set(metadata) != {"invocationId"}:
+              raise SystemExit("npm provenance invocation metadata changed")
+          prefix = f"{server_url}/{repository}/actions/runs/{run_id}/attempts/"
+          match = re.fullmatch(re.escape(prefix) + r"([1-9][0-9]*)", metadata["invocationId"])
+          if match is None:
+              raise SystemExit("npm provenance invocation is not the selected publication run")
+          provenance_attempt = int(match.group(1))
+          if provenance_attempt > expected_attempt:
+              raise SystemExit("npm provenance claims a future workflow attempt")
+          print(
+              f"verified exact npm publish attestation and provenance for {repository}@{revision} "
+              f"run {run_id} attempt {provenance_attempt}"
+          )
+          PY
 
   recover_published:
     name: Recover verification of the exact published SDK
@@ -1533,6 +2182,8 @@ jobs:
       attestations: read
       contents: read
     env:
+      ATTEST_RUN_ATTEMPT: ${{ needs.verify.outputs.attest_run_attempt }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       GH_TOKEN: ${{ github.token }}
       LINUX_RUN_ATTEMPT: ${{ needs.verify.outputs.linux_run_attempt }}
       MACOS_RUN_ATTEMPT: ${{ needs.verify.outputs.macos_run_attempt }}
@@ -1598,7 +2249,8 @@ jobs:
             test "$(LC_ALL=C getconf GNU_LIBC_VERSION)" = 'glibc 2.35'
           fi
           for producer_attempt in \
-            "$MACOS_RUN_ATTEMPT" "$LINUX_RUN_ATTEMPT" "$SDK_RUN_ATTEMPT"; do
+            "$MACOS_RUN_ATTEMPT" "$LINUX_RUN_ATTEMPT" "$SDK_RUN_ATTEMPT" \
+            "$ATTEST_RUN_ATTEMPT"; do
             if [[ ! "$producer_attempt" =~ ^[1-9][0-9]*$ ]]; then
               echo 'public verification received an invalid package producer attempt' >&2
               exit 1
@@ -1607,6 +2259,12 @@ jobs:
           if [[ "$MACOS_RUN_ATTEMPT" -gt "$SDK_RUN_ATTEMPT" \
             || "$LINUX_RUN_ATTEMPT" -gt "$SDK_RUN_ATTEMPT" ]]; then
             echo 'public verification received an SDK attempt older than a native attempt' >&2
+            exit 1
+          fi
+          if [[ "$SDK_RUN_ATTEMPT" -gt "$ATTEST_RUN_ATTEMPT" \
+            || "$MACOS_RUN_ATTEMPT" -gt "$ATTEST_RUN_ATTEMPT" \
+            || "$LINUX_RUN_ATTEMPT" -gt "$ATTEST_RUN_ATTEMPT" ]]; then
+            echo 'public verification received an attestation older than a selected producer' >&2
             exit 1
           fi
           if [[ "$STASIS_PLATFORM" == 'macos-aarch64' ]]; then
@@ -1619,7 +2277,7 @@ jobs:
           archive="${bundle}.tar.gz"
           binary_sidecar="${bundle}.binary.sha256"
           proof="${bundle}-act-settle-inspect.json"
-          mkdir release-assets gate-proof runtime-manifest
+          mkdir release-assets gate-proof runtime-manifest provenance-subjects
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release-assets \
             --pattern "$archive" \
             --pattern "$archive.sha256" \
@@ -1628,6 +2286,15 @@ jobs:
             --pattern "$proof"
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir runtime-manifest \
             --pattern "stasis-${STASIS_VERSION}-runtime-manifest.json"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir provenance-subjects \
+            --pattern "stasis-${STASIS_VERSION}-*"
+          shopt -s nullglob
+          provenance_release_subjects=(provenance-subjects/*)
+          test "${#provenance_release_subjects[@]}" -eq 9
+          for provenance_release_subject in "${provenance_release_subjects[@]}"; do
+            test -f "$provenance_release_subject"
+            test ! -L "$provenance_release_subject"
+          done
           python3 etc/ci/stasis/release_archive.py verify \
             --asset-directory release-assets \
             --version "$STASIS_VERSION" \
@@ -1671,13 +2338,6 @@ jobs:
           assert.equal(artifact.executableSha256, executableSha256);
           assert.equal(new URL(artifact.archiveUrl).pathname.split("/").at(-1), archiveName);
           JS
-          for release_asset in release-assets/* gate-proof/* runtime-manifest/*; do
-            gh attestation verify "$release_asset" \
-              --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
-              --source-digest "$STASIS_REVISION" \
-              --deny-self-hosted-runners
-          done
           echo "STASIS_BUNDLE=$bundle" >> "$GITHUB_ENV"
 
       - name: Download the exact pre-gated SDK
@@ -1704,13 +2364,34 @@ jobs:
             --native-binary-sha256 "$STASIS_NATIVE_BINARY_SHA256" \
             --run-id "$PACKAGE_RUN_ID" \
             --run-attempt "$SDK_RUN_ATTEMPT"
-          for sdk_asset in verified-sdk/*; do
-            gh attestation verify "$sdk_asset" \
-              --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
-              --source-digest "$STASIS_REVISION" \
-              --deny-self-hosted-runners
+          shopt -s nullglob
+          provenance_subjects=(provenance-subjects/* verified-sdk/*)
+          test "${#provenance_subjects[@]}" -eq 11
+          provenance_json="$RUNNER_TEMP/stasis-public-package-provenance.json"
+          gh attestation verify "${provenance_subjects[0]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
+            --source-digest "$STASIS_REVISION" \
+            --source-ref "refs/heads/$DEFAULT_BRANCH" \
+            --deny-self-hosted-runners \
+            --limit 100 \
+            --format json > "$provenance_json"
+          provenance_verifier=(
+            python3 etc/ci/stasis/verify_build_provenance.py verify
+            --verification-json "$provenance_json"
+            --repository "$GITHUB_REPOSITORY"
+            --workflow .github/workflows/stasis-package.yml
+            --revision "$STASIS_REVISION"
+            --source-ref "refs/heads/$DEFAULT_BRANCH"
+            --server-url "$GITHUB_SERVER_URL"
+            --run-id "$PACKAGE_RUN_ID"
+            --run-attempt "$ATTEST_RUN_ATTEMPT"
+            --expected-subject-count 11
+          )
+          for provenance_subject in "${provenance_subjects[@]}"; do
+            provenance_verifier+=(--subject "$provenance_subject")
           done
+          "${provenance_verifier[@]}"
           expected_tarball="$GITHUB_WORKSPACE/verified-sdk/oxhq-stasis-${STASIS_VERSION}.tgz"
           expected_integrity=$(node -e '
             const crypto = require("node:crypto");
@@ -1754,7 +2435,11 @@ jobs:
           registry_packages=("$RUNNER_TEMP"/stasis-registry-verification/*.tgz)
           test ${#registry_packages[@]} -eq 1
           cmp "$expected_tarball" "${registry_packages[0]}"
-          jq -e --arg version "$STASIS_VERSION" --arg registry "$NPM_CONFIG_REGISTRY" '
+          jq -e \
+            --arg version "$STASIS_VERSION" \
+            --arg registry "$NPM_CONFIG_REGISTRY" \
+            --arg provenance_predicate "https://slsa.dev/provenance/v1" \
+            --arg publish_predicate "https://github.com/npm/attestation/tree/main/specs/publish/v0.1" '
             (keys | sort) == ["invalid", "missing", "verified"]
             and .invalid == []
             and .missing == []
@@ -1763,7 +2448,12 @@ jobs:
             and .verified[0].name == "@oxhq/stasis"
             and .verified[0].version == $version
             and .verified[0].registry == $registry
-            and .verified[0].attestations.provenance.predicateType == "https://slsa.dev/provenance/v1"
+            and .verified[0].attestations.provenance.predicateType == $provenance_predicate
+            and (.verified[0].attestationBundles | type) == "array"
+            and (.verified[0].attestationBundles | length) == 2
+            and (
+              [.verified[0].attestationBundles[].predicateType] | sort
+            ) == ([$provenance_predicate, $publish_predicate] | sort)
           ' "$audit_json" > /dev/null
           python3 - "$audit_json" "$expected_tarball" <<'PY'
           import base64
@@ -1821,6 +2511,8 @@ jobs:
           if not isinstance(verified, list) or len(verified) != 1:
               raise SystemExit("npm audit did not return exactly one verified package")
           entry = verified[0]
+          if not isinstance(entry, dict):
+              raise SystemExit("npm audit verified package entry is not an object")
           expected_attestation_url = (
               f"https://registry.npmjs.org/-/npm/v1/attestations/"
               f"@oxhq%2fstasis@{version}"
@@ -1828,28 +2520,6 @@ jobs:
           attestations = entry.get("attestations")
           if not isinstance(attestations, dict) or attestations.get("url") != expected_attestation_url:
               raise SystemExit("npm attestation URL is not the exact public registry identity")
-
-          bundles = entry.get("attestationBundles")
-          if not isinstance(bundles, list):
-              raise SystemExit("npm audit omitted verified attestation bundles")
-          provenance_bundles = [
-              item for item in bundles
-              if isinstance(item, dict)
-              and item.get("predicateType") == "https://slsa.dev/provenance/v1"
-          ]
-          if len(provenance_bundles) != 1:
-              raise SystemExit("npm audit did not verify exactly one SLSA v1 provenance bundle")
-          envelope = provenance_bundles[0].get("bundle", {}).get("dsseEnvelope")
-          if not isinstance(envelope, dict) or envelope.get("payloadType") != "application/vnd.in-toto+json":
-              raise SystemExit("npm provenance DSSE envelope type changed")
-          signatures = envelope.get("signatures")
-          if not isinstance(signatures, list) or not signatures:
-              raise SystemExit("npm provenance DSSE envelope has no verified signature")
-          try:
-              payload = base64.b64decode(envelope["payload"], validate=True)
-              statement = strict_json_loads(payload.decode("utf-8"), "npm provenance statement")
-          except (KeyError, ValueError, UnicodeDecodeError) as error:
-              raise SystemExit("npm provenance DSSE payload is invalid") from error
 
           expected_sha512_state = hashlib.sha512()
           with tarball.open("rb") as tarball_source:
@@ -1860,11 +2530,91 @@ jobs:
               "name": f"pkg:npm/%40oxhq/stasis@{version}",
               "digest": {"sha512": expected_sha512},
           }]
+
+          provenance_predicate_type = "https://slsa.dev/provenance/v1"
+          publish_predicate_type = (
+              "https://github.com/npm/attestation/tree/main/specs/publish/v0.1"
+          )
+          bundles = entry.get("attestationBundles")
+          if (
+              not isinstance(bundles, list)
+              or len(bundles) != 2
+              or any(not isinstance(item, dict) for item in bundles)
+          ):
+              raise SystemExit("npm audit did not return exactly two verified attestation bundles")
+          bundles_by_type = {}
+          for bundle in bundles:
+              predicate_type = bundle.get("predicateType")
+              if (
+                  predicate_type not in {provenance_predicate_type, publish_predicate_type}
+                  or predicate_type in bundles_by_type
+              ):
+                  raise SystemExit("npm audit attestation predicate inventory changed")
+              bundles_by_type[predicate_type] = bundle
+          if set(bundles_by_type) != {provenance_predicate_type, publish_predicate_type}:
+              raise SystemExit("npm audit omitted required provenance or publish attestation")
+
+          def decode_statement(bundle, context):
+              bundle_body = bundle.get("bundle")
+              if not isinstance(bundle_body, dict):
+                  raise SystemExit(f"{context} bundle body is missing")
+              envelope = bundle_body.get("dsseEnvelope")
+              if (
+                  not isinstance(envelope, dict)
+                  or envelope.get("payloadType") != "application/vnd.in-toto+json"
+              ):
+                  raise SystemExit(f"{context} DSSE envelope type changed")
+              signatures = envelope.get("signatures")
+              if (
+                  not isinstance(signatures, list)
+                  or not signatures
+                  or any(
+                      not isinstance(signature, dict)
+                      or not isinstance(signature.get("sig"), str)
+                      or not signature["sig"]
+                      for signature in signatures
+                  )
+              ):
+                  raise SystemExit(f"{context} DSSE envelope has no verified signature")
+              payload_value = envelope.get("payload")
+              if not isinstance(payload_value, str):
+                  raise SystemExit(f"{context} DSSE payload is missing")
+              try:
+                  payload = base64.b64decode(payload_value, validate=True)
+                  statement = strict_json_loads(payload.decode("utf-8"), f"{context} statement")
+              except (ValueError, UnicodeDecodeError) as error:
+                  raise SystemExit(f"{context} DSSE payload is invalid") from error
+              if not isinstance(statement, dict):
+                  raise SystemExit(f"{context} statement is not an object")
+              return statement
+
+          publish_statement = decode_statement(
+              bundles_by_type[publish_predicate_type], "npm publish attestation"
+          )
+          if set(publish_statement) != {"_type", "subject", "predicateType", "predicate"}:
+              raise SystemExit("npm publish attestation statement schema changed")
+          if publish_statement.get("_type") != "https://in-toto.io/Statement/v0.1":
+              raise SystemExit("npm publish attestation is not an in-toto v0.1 statement")
+          if publish_statement.get("predicateType") != publish_predicate_type:
+              raise SystemExit("npm publish attestation predicate type changed")
+          if publish_statement.get("subject") != expected_subject:
+              raise SystemExit("npm publish attestation does not bind the exact registry tarball")
+          expected_publish_predicate = {
+              "name": "@oxhq/stasis",
+              "version": version,
+              "registry": "https://registry.npmjs.org",
+          }
+          if publish_statement.get("predicate") != expected_publish_predicate:
+              raise SystemExit("npm publish attestation registry predicate changed")
+
+          statement = decode_statement(
+              bundles_by_type[provenance_predicate_type], "npm provenance"
+          )
           if set(statement) != {"_type", "subject", "predicateType", "predicate"}:
               raise SystemExit("npm provenance statement schema changed")
           if statement.get("_type") != "https://in-toto.io/Statement/v1":
               raise SystemExit("npm provenance is not an in-toto v1 statement")
-          if statement.get("predicateType") != "https://slsa.dev/provenance/v1":
+          if statement.get("predicateType") != provenance_predicate_type:
               raise SystemExit("npm provenance predicate type changed")
           if statement.get("subject") != expected_subject:
               raise SystemExit("npm provenance subject does not bind the exact registry tarball")
@@ -1919,7 +2669,7 @@ jobs:
           ):
               raise SystemExit("npm provenance invocation is not the selected publication attempt")
           print(
-              f"verified exact npm provenance for {repository}@{revision} "
+              f"verified exact npm publish attestation and provenance for {repository}@{revision} "
               f"run {run_id} attempt {provenance_attempt}"
           )
           PY
@@ -1937,11 +2687,39 @@ jobs:
           cp sdk/typescript/test/fixtures/public-package-north-star.mjs \
             "$consumer/public-package-north-star.mjs"
           cp sdk/typescript/test/fixtures/north-star.html "$consumer/north-star.html"
-          north_star_log="$RUNNER_TEMP/stasis-public-package-north-star.jsonl"
+          cp sdk/typescript/test/fixtures/public-package-session-north-star.mjs \
+            "$consumer/public-package-session-north-star.mjs"
+          cp -R sdk/typescript/test/fixtures/session-north-star \
+            "$consumer/session-north-star"
+          managed_runtime_cache="$RUNNER_TEMP/stasis-public-managed-runtime-cache"
+          mkdir "$managed_runtime_cache"
+          managed_archive_sha256=$(awk '{print $1}' \
+            "release-assets/$STASIS_BUNDLE.tar.gz.sha256")
+          managed_binary_sha256=$(awk '{print $1}' \
+            "release-assets/$STASIS_BUNDLE.binary.sha256")
+          v2_north_star_log="$RUNNER_TEMP/stasis-public-v2-session-north-star.jsonl"
           (
             cd "$consumer"
-            unset STASIS_NORTH_STAR_BINARY
+            unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_TOKEN \
+              STASIS_NORTH_STAR_BINARY STASIS_SESSION_NORTH_STAR_BINARY \
+              STASIS_SESSION_NORTH_STAR_RUNTIME_CACHE
+            export STASIS_SESSION_NORTH_STAR_RUNTIME_CACHE="$managed_runtime_cache"
+            export STASIS_SESSION_NORTH_STAR_EXPECTED_ARCHIVE_SHA256="$managed_archive_sha256"
+            export STASIS_SESSION_NORTH_STAR_EXPECTED_BINARY_SHA256="$managed_binary_sha256"
+            export STASIS_SESSION_NORTH_STAR_EXPECTED_REVISION="$STASIS_REVISION"
+            "${gate_runner[@]}" node ./public-package-session-north-star.mjs
+          ) 2>&1 | tee "$v2_north_star_log"
+          grep -F '"proof":"stasis-v0.2-session-north-star"' "$v2_north_star_log"
+          grep -F '"runs":3' "$v2_north_star_log"
+          grep -F '"sessions":6' "$v2_north_star_log"
+          grep -F '"runtimeAcquisition":"managed-empty-cache-installed"' \
+            "$v2_north_star_log"
+          v1_north_star_log="$RUNNER_TEMP/stasis-public-v1-north-star.jsonl"
+          (
+            cd "$consumer"
+            unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_TOKEN \
+              STASIS_NORTH_STAR_BINARY STASIS_SESSION_NORTH_STAR_BINARY
             "${gate_runner[@]}" node ./public-package-north-star.mjs
-          ) 2>&1 | tee "$north_star_log"
-          grep -F '"proof":"stasis-v0.1-north-star"' "$north_star_log"
-          grep -F '"runs":3' "$north_star_log"
+          ) 2>&1 | tee "$v1_north_star_log"
+          grep -F '"proof":"stasis-v0.1-north-star"' "$v1_north_star_log"
+          grep -F '"runs":3' "$v1_north_star_log"

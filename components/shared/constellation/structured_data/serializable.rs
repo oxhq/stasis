@@ -348,6 +348,11 @@ impl BlobImpl {
         self.type_string.clone()
     }
 
+    /// Return the type-string byte length without cloning page-controlled data.
+    pub fn type_string_len(&self) -> usize {
+        self.type_string.len()
+    }
+
     /// Get a mutable ref to the data
     pub fn blob_data(&self) -> &BlobData {
         &self.blob_data

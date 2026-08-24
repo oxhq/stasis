@@ -15,7 +15,7 @@ use js::rust::wrappers2::{JS_IsExceptionPending, JS_SetPendingException};
 use net_traits::blob_url_store::UrlWithBlobClaim;
 use net_traits::request::{
     CorsSettings, CredentialsMode, Destination, Referrer, Request as NetTraitsRequest,
-    RequestBuilder, RequestId, RequestMode, ServiceWorkersMode,
+    RequestBuilder, RequestId, RequestMode, RequestOriginatingApi, ServiceWorkersMode,
 };
 use net_traits::{
     CoreResourceMsg, CoreResourceThread, FetchChannels, FetchMetadata, FetchResponseMsg,
@@ -159,6 +159,7 @@ fn request_init_from_request(request: NetTraitsRequest, global: &GlobalScope) ->
     .unsafe_request(request.unsafe_request)
     .body(request.body)
     .destination(request.destination)
+    .originating_api(request.originating_api)
     .synchronous(request.synchronous)
     .mode(request.mode)
     .cache_mode(request.cache_mode)
@@ -192,8 +193,8 @@ fn abort_fetch_call(
     // Step 1. Reject promise with error.
     promise.reject(cx, abort_reason);
     // Step 2. If request’s body is non-null and is readable, then cancel request’s body with error.
-    if let Some(body) = request.body() &&
-        body.is_readable()
+    if let Some(body) = request.body()
+        && body.is_readable()
     {
         body.cancel(cx, global, abort_reason);
     }
@@ -203,8 +204,8 @@ fn abort_fetch_call(
         return;
     };
     // Step 5. If response’s body is non-null and is readable, then error response’s body with error.
-    if let Some(body) = response.body() &&
-        body.is_readable()
+    if let Some(body) = response.body()
+        && body.is_readable()
     {
         body.error(cx, abort_reason);
     }
@@ -261,7 +262,8 @@ pub(crate) fn Fetch(
     let keep_alive = request.keep_alive;
     // Step 5. Let globalObject be request’s client’s global object.
     // NOTE:   We already get the global object as an argument
-    let mut request_init = request_init_from_request(request, global);
+    let mut request_init =
+        request_init_from_request(request, global).originating_api(RequestOriginatingApi::Fetch);
 
     // Step 6. If globalObject is a ServiceWorkerGlobalScope object, then set request’s
     //         service-workers mode to "none".
@@ -639,8 +641,8 @@ impl FetchResponseListener for FetchContext {
         let response_object = self.response_object.root();
         let mut realm = enter_auto_realm(cx, &*response_object);
         let cx = &mut realm.current_realm();
-        if let Err(ref error) = response &&
-            *error == NetworkError::DecompressionError
+        if let Err(ref error) = response
+            && *error == NetworkError::DecompressionError
         {
             response_object.error_stream(cx, Error::Type(c"Network error occurred".to_owned()));
         }
@@ -776,8 +778,8 @@ pub(crate) fn load_whole_resource(
                 }
                 return Ok((metadata, buf, muted_errors));
             },
-            FetchResponseMsg::ProcessResponse(_, Err(e)) |
-            FetchResponseMsg::ProcessResponseEOF(_, Err(e), _) => return Err(e),
+            FetchResponseMsg::ProcessResponse(_, Err(e))
+            | FetchResponseMsg::ProcessResponseEOF(_, Err(e), _) => return Err(e),
             FetchResponseMsg::ProcessCspViolations(_, violations) => {
                 csp_violations_processor.process_csp_violations(cx, violations);
             },

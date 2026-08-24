@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Stasis bounded automation adversarial fixture</title>
+</head>
+<body>
+  <div id="huge-attribute">Huge attribute target</div>
+  <div id="document-node-count">0</div>
+
+  <select id="many-children" multiple required></select>
+
+  <select id="replace-options" multiple>
+    <option value="old-a" selected>Old A</option>
+    <option value="old-b">Old B</option>
+  </select>
+
+  <select id="grow-value">
+    <option value="small" selected>Small</option>
+    <option value="grow">Grow</option>
+  </select>
+
+  <form id="large-form">
+    <fieldset id="large-fieldset">
+      <select id="large-form-select" required>
+        <option value="">Choose</option>
+        <option value="large-selected">Large selected</option>
+      </select>
+      <div id="large-fieldset-load"></div>
+    </fieldset>
+  </form>
+
+  <form id="large-reset-form">
+    <button id="large-reset" type="reset">Reset large form</button>
+    <div id="large-form-controls"></div>
+  </form>
+  <div id="reset-preflight-status">untouched</div>
+  <div id="submit-work-preflight-status">untouched</div>
+  <div id="invalid-work-preflight-status">untouched</div>
+
+  <input id="huge-old-fill" form="large-form" aria-label="huge old fill value">
+  <div id="fill-preflight-status">untouched</div>
+
+  <div id="large-radio-group">
+    <input id="large-radio" type="radio" name="large-radio-group">
+  </div>
+  <div id="radio-preflight-status">untouched</div>
+
+  <input id="large-focus" aria-label="large focus target">
+  <div id="focus-preflight-status">untouched</div>
+
+  <button id="large-activate" type="button">Activate</button>
+  <div id="activate-preflight-status">untouched</div>
+
+  <a id="large-link" href="#large-link-destination">Link</a>
+  <div id="link-preflight-status">untouched</div>
+
+  <div id="submit-preflight-status">untouched</div>
+
+  <script>
+    document.querySelector("#huge-attribute").setAttribute(
+      "data-huge",
+      `${"x".repeat(2 * 1024 * 1024)}needle`,
+    );
+    document.querySelector("#huge-attribute").setAttribute("data-small", "short");
+
+    const manyChildren = document.querySelector("#many-children");
+    for (let index = 0; index < 5632; index += 1) {
+      manyChildren.append(document.createComment(`non-option-${index}`));
+    }
+    for (let index = 0; index < 256; index += 1) {
+      const option = document.createElement("option");
+      option.value = index === 255 ? "chosen" : `value-${index}`;
+      manyChildren.append(option);
+    }
+
+    const fieldsetLoad = document.querySelector("#large-fieldset-load");
+    for (let index = 0; index < 4096; index += 1) {
+      fieldsetLoad.append(document.createElement("span"));
+    }
+    const formControls = document.querySelector("#large-form-controls");
+    for (let index = 0; index < 1024; index += 1) {
+      const input = document.createElement("input");
+      if (index === 0) input.required = true;
+      formControls.append(input);
+    }
+
+    const radioGroup = document.querySelector("#large-radio-group");
+    for (let index = 1; index < 64; index += 1) {
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "large-radio-group";
+      radioGroup.append(radio);
+    }
+
+    const hugeOldFill = document.querySelector("#huge-old-fill");
+    hugeOldFill.value = "f".repeat(8 * 1024 * 1024 + 1);
+    hugeOldFill.addEventListener("input", () => {
+      document.querySelector("#fill-preflight-status").textContent = "mutated";
+    });
+
+    document.querySelector("#large-radio").addEventListener("input", () => {
+      document.querySelector("#radio-preflight-status").textContent = "mutated";
+    });
+    document.querySelector("#large-focus").addEventListener("focus", () => {
+      document.querySelector("#focus-preflight-status").textContent = "mutated";
+    });
+    document.querySelector("#large-activate").addEventListener("click", () => {
+      document.querySelector("#activate-preflight-status").textContent = "mutated";
+    });
+    document.querySelector("#large-link").addEventListener("click", (event) => {
+      event.preventDefault();
+      document.querySelector("#link-preflight-status").textContent = "mutated";
+    });
+    document.querySelector("#large-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      document.querySelector("#submit-preflight-status").textContent = "mutated";
+    });
+    document.querySelector("#large-reset-form").addEventListener("reset", () => {
+      document.querySelector("#reset-preflight-status").textContent = "mutated";
+    });
+    document.querySelector("#large-reset-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      document.querySelector("#submit-work-preflight-status").textContent = "mutated";
+    });
+    document.querySelector("#large-reset-form").addEventListener("invalid", () => {
+      document.querySelector("#invalid-work-preflight-status").textContent = "mutated";
+    }, true);
+
+    document.querySelector("#replace-options").addEventListener("change", (event) => {
+      event.currentTarget.innerHTML =
+        '<option value="replacement" selected>Replacement</option>';
+    });
+
+    document.querySelector("#grow-value").addEventListener("change", (event) => {
+      event.currentTarget.selectedOptions[0].value = "g".repeat(8 * 1024 * 1024 + 1);
+    });
+
+    const allNodes = document.createTreeWalker(document, NodeFilter.SHOW_ALL);
+    let documentNodeCount = 0;
+    while (allNodes.nextNode()) documentNodeCount += 1;
+    document.querySelector("#document-node-count").textContent = String(documentNodeCount);
+  </script>
+</body>
+</html>

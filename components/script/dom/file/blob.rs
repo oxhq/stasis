@@ -86,6 +86,11 @@ impl Blob {
         self.global().get_blob_type_string(&self.blob_id)
     }
 
+    /// Return the type-string byte length without cloning page-controlled data.
+    pub(crate) fn automation_type_bytes(&self) -> u64 {
+        u64::try_from(self.global().get_blob_type_string_len(&self.blob_id)).unwrap_or(u64::MAX)
+    }
+
     /// Get a FileID representing the Blob content,
     /// used by URL.createObjectURL
     pub(crate) fn get_blob_url_id(&self) -> Uuid {

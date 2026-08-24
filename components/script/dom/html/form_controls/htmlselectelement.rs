@@ -73,16 +73,14 @@ const SELECT_BOX_STYLE: &str = "
 const TEXT_CONTAINER_STYLE: &str = "flex: 1;";
 
 const CHEVRON_CONTAINER_STYLE: &str = "
-    background-image: url('data:image/svg+xml,<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"180\" height=\"180\" viewBox=\"0 0 180 180\"> <path d=\"M10 50h160L90 130z\" style=\"fill:currentcolor\"/> </svg>');
-    background-size: 100%;
-    background-repeat: no-repeat;
-    background-position: center;
-
     vertical-align: middle;
     line-height: 1;
     display: inline-block;
-    width: 0.75em;
-    height: 0.75em;
+    width: 0;
+    height: 0;
+    border-left: 0.375em solid transparent;
+    border-right: 0.375em solid transparent;
+    border-top: 0.5em solid currentcolor;
 ";
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -147,6 +145,13 @@ struct ShadowTree {
 }
 
 impl HTMLSelectElement {
+    pub(crate) fn automation_custom_validity_bytes(&self) -> u64 {
+        self.validity_state
+            .get()
+            .map(|state| state.custom_error_message().len() as u64)
+            .unwrap_or(0)
+    }
+
     fn new_inherited(
         local_name: LocalName,
         prefix: Option<Prefix>,
@@ -256,8 +261,8 @@ impl HTMLSelectElement {
 
         if let Some(last_selected) = last_selected {
             last_selected.set_selectedness(no_gc, true);
-        } else if self.display_size() == 1 &&
-            let Some(first_enabled) = first_enabled
+        } else if self.display_size() == 1
+            && let Some(first_enabled) = first_enabled
         {
             first_enabled.set_selectedness(no_gc, true);
         }
@@ -400,6 +405,19 @@ impl HTMLSelectElement {
             .SetData(cx, displayed_text.trim().into());
     }
 
+    /// Finish one native automation bulk selection after the caller has atomically established the
+    /// exact selectedness set. The caller supplies the already-bounded display text and precharges
+    /// the validity algorithm's option-list scans, avoiding the repeated per-option setter work.
+    pub(crate) fn finish_automation_selection(&self, cx: &mut JSContext, displayed_text: &str) {
+        let shadow_tree = self.shadow_tree(cx);
+        shadow_tree
+            .selected_option
+            .upcast::<CharacterData>()
+            .SetData(cx, displayed_text.trim().into());
+        self.validity_state(cx)
+            .perform_validation_and_update(cx, ValidationFlags::all());
+    }
+
     pub(crate) fn selected_option<'b>(
         &self,
         no_gc: &'b NoGC,
@@ -526,8 +544,8 @@ impl HTMLSelectElement {
 
             if let Some(first_selected) = first_selected {
                 first_selected.set_selectedness(cx.no_gc(), true);
-            } else if self.display_size() == 1 &&
-                let Some(first_enabled) = first_enabled
+            } else if self.display_size() == 1
+                && let Some(first_enabled) = first_enabled
             {
                 first_enabled.set_selectedness(cx.no_gc(), true);
             }
@@ -918,8 +936,8 @@ impl VirtualMethods for HTMLSelectElement {
 
     fn handle_event(&self, cx: &mut js::context::JSContext, event: &Event) {
         self.super_type().unwrap().handle_event(cx, event);
-        if let Some(event) = event.downcast::<FocusEvent>() &&
-            *event.upcast::<Event>().type_() != *"blur"
+        if let Some(event) = event.downcast::<FocusEvent>()
+            && *event.upcast::<Event>().type_() != *"blur"
         {
             self.owner_document()
                 .embedder_controls()
@@ -970,8 +988,8 @@ impl Validatable for HTMLSelectElement {
         if validate_flags.contains(ValidationFlags::VALUE_MISSING) && self.Required() {
             let placeholder = self.get_placeholder_label_option(cx.no_gc());
             let is_value_missing = !self.list_of_options(cx.no_gc()).any(|e| {
-                e.Selected() &&
-                    placeholder
+                e.Selected()
+                    && placeholder
                         .as_ref()
                         .map(|placeholder| **placeholder != **e)
                         .unwrap_or(true)

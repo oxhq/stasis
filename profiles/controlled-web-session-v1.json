@@ -1,0 +1,1058 @@
+{
+  "schemaVersion": 1,
+  "id": "controlled-web-session-v1",
+  "releaseStatus": "stable_contract",
+  "targetRelease": "0.2.0",
+  "clockMode": "controlled",
+  "compatibility": {
+    "protocolEnvelopeVersion": 1,
+    "predecessor": "controlled-webapp-v1",
+    "predecessorContractUnchanged": true,
+    "legacyOpenDefault": "controlled-webapp-v1",
+    "maximumOpaqueTokenBytes": 256,
+    "selection": "explicit"
+  },
+  "sessionScope": {
+    "processesPerSession": 1,
+    "sessionsPerProcess": 1,
+    "webViews": 1,
+    "activeTopLevelDocuments": 1,
+    "controlledScriptEventLoops": 1,
+    "childBrowsingContexts": "unsupported",
+    "auxiliaryWebViews": "unsupported",
+    "persistentDomHandles": false
+  },
+  "lifecycle": {
+    "openMethod": "session.open",
+    "closeMethod": "session.close",
+    "closeEffect": "terminal_response_then_process_exit",
+    "processReuse": false,
+    "runtimeCloseContract": false,
+    "sessionId": "one_process_local_id",
+    "requestsAfterClose": "transport_eof",
+    "abortedOrIndeterminateSession": "fail_stop_process"
+  },
+  "documentAuthority": {
+    "kind": "opaque_state_token",
+    "requestField": "expectedStateToken",
+    "resultField": "stateToken",
+    "scope": "current_active_top_level_document",
+    "sessionLocal": true,
+    "persistent": false,
+    "wireSyntax": "document:<32_lowercase_hex_namespace>:<canonical_nonzero_u128_decimal_alias>",
+    "maximumBytes": 81,
+    "namespaceBits": 128,
+    "namespaceSource": "operating_system_csprng_fail_closed",
+    "entropyFailure": {
+      "code": "runtime_error",
+      "fatal": true,
+      "processEffect": "fail_stop"
+    },
+    "crossSessionToken": "well_formed_but_stale",
+    "debugRepresentation": "redacted",
+    "maximumRetainedBindings": 1,
+    "boundFacts": [
+      "web_view",
+      "script_event_loop",
+      "active_top_level_document",
+      "document_epoch",
+      "navigation_id",
+      "history_revision",
+      "navigation_revision",
+      "pipeline_membership_revision",
+      "runtime_state_generation"
+    ],
+    "rotatesOn": [
+      "navigation_start",
+      "document_activation",
+      "same_document_history_change",
+      "target_authority_change",
+      "runtime_state_generation_change"
+    ],
+    "stableAcrossEquivalentObservation": true,
+    "recoveryMethod": "runtime.pending",
+    "staleError": {
+      "code": "stale_state_token",
+      "fatal": false,
+      "stateEffect": "none"
+    },
+    "legacyExpectedGenerationAccepted": false
+  },
+  "sessionStateAuthority": {
+    "kind": "opaque_session_state_token",
+    "requestField": "expectedSessionStateToken",
+    "resultField": "sessionStateToken",
+    "separateFromDocumentAuthority": true,
+    "sessionLocal": true,
+    "persistent": false,
+    "wireSyntax": "session:<32_lowercase_hex_namespace>:<canonical_nonzero_u64_decimal_alias>",
+    "maximumBytes": 61,
+    "namespaceBits": 128,
+    "namespaceSource": "independent_operating_system_csprng_fail_closed",
+    "entropyFailure": {
+      "code": "session_state_token_entropy_unavailable",
+      "fatal": true,
+      "liveMutationStateEffect": "indeterminate",
+      "processEffect": "fail_stop"
+    },
+    "crossSessionToken": "well_formed_but_stale",
+    "debugRepresentation": "redacted",
+    "boundFacts": [
+      "cookie_revision",
+      "web_storage_revision"
+    ],
+    "backendRevisions": "combined_and_hidden_by_shell",
+    "mutationRevalidation": "all_bound_revisions_immediately_before_mutation",
+    "rotatesOn": [
+      "cookie_mutation",
+      "local_storage_mutation",
+      "session_storage_mutation",
+      "state_import"
+    ],
+    "readMethods": [
+      "session.cookies.get",
+      "session.storage.get",
+      "session.state.export"
+    ],
+    "successfulMutationMethods": [
+      "session.cookies.set",
+      "session.storage.set"
+    ],
+    "successfulMutationsRequireExpectedSessionStateToken": true,
+    "backendMutationAtomicity": "one_backend_method_at_a_time",
+    "initialToken": "established_in_unpublished_session_builder_before_optional_import",
+    "initialImport": {
+      "method": "session.open.state",
+      "onlySuccessfulEntryPoint": true,
+      "phase": "unpublished_pre_navigation_only",
+      "requiresCallerExpectedSessionStateToken": false,
+      "authorization": "unpublished_builder_hidden_current_token",
+      "validation": "complete_before_any_backend_mutation",
+      "effect": "atomic_construction_before_session_publication",
+      "boundary": "navigation_and_network_start_revision_zero",
+      "requiredSeam": "pre_navigation_session_builder"
+    },
+    "postPublicationImport": {
+      "method": "session.state.import",
+      "successfulMutation": false,
+      "requestPayloadInspected": false,
+      "closedPhaseError": {
+        "code": "session_state_import_phase_closed",
+        "fatal": false,
+        "stateEffect": "none"
+      }
+    },
+    "staleError": {
+      "code": "stale_session_state_token",
+      "fatal": false,
+      "stateEffect": "none"
+    }
+  },
+  "navigation": {
+    "initial": {
+      "schemes": [
+        "http",
+        "https"
+      ],
+      "fetchBacked": true,
+      "navigationId": "0",
+      "boundary": "controlled_ready"
+    },
+    "explicit": {
+      "method": "session.navigate",
+      "schemes": [
+        "http",
+        "https"
+      ],
+      "requiresExpectedStateToken": true,
+      "replacesTopLevelDocument": true,
+      "resultFields": [
+        "requestedUrl",
+        "url",
+        "stateGeneration",
+        "domEpoch",
+        "documentEpoch",
+        "navigationId",
+        "historyRevision",
+        "stateToken"
+      ],
+      "boundary": "controlled_ready"
+    },
+    "applicationTopLevel": {
+      "sameOriginHttpHttps": "supported_when_existing_controlled_event_loop_is_preserved",
+      "crossOriginHttpHttps": "supported_when_existing_controlled_event_loop_is_preserved",
+      "nonHttpHttps": "rejected_before_navigation_admission_pipeline_creation_or_network_start",
+      "crossEventLoop": "unsupported",
+      "formSubmission": "subject_to_same_top_level_rules"
+    },
+    "preAdmissionRejectionEffects": {
+      "appliesTo": [
+        "unsupported_navigation_scheme",
+        "document_transition_limit_exceeded",
+        "history_limit_exceeded"
+      ],
+      "explicit_pre_admission_or_observation_before_request_work": {
+        "fatal": false,
+        "stateEffect": "none",
+        "processEffect": "continue"
+      },
+      "application_initiated_observation_after_enclosing_request_work": {
+        "fatal": true,
+        "stateEffect": "partial",
+        "processEffect": "fail_stop"
+      }
+    },
+    "sameDocument": {
+      "hashNavigation": "supported",
+      "historyPushState": "supported",
+      "historyReplaceState": "supported",
+      "historyTraversal": "unsupported",
+      "historyTraversalBoundary": {
+        "profile": "controlled-web-session-v1_only",
+        "script": "throws_NotSupportedError_before_constellation_send_and_latches_history_traversal",
+        "alternateIngress": "constellation_latches_target_owned_history_traversal_before_ignore",
+        "settlementOutcome": "unsupported_work",
+        "timeSurface": "history_traversal",
+        "controlledWebappV1": "unchanged"
+      },
+      "historyRevision": "checked_u64_session_monotonic_initial_zero_increment_every_admitted_change_never_reset_on_replacement",
+      "replaceStatePreventsAbaByIncrementing": true,
+      "maximumRevisions": 10000,
+      "limitError": {
+        "code": "history_limit_exceeded",
+        "effectContract": "navigation.preAdmissionRejectionEffects",
+        "fields": [
+          "limit",
+          "observed",
+          "navigationId",
+          "historyRevision"
+        ]
+      }
+    },
+    "replacementDocuments": {
+      "documentEpoch": "checked_u64_initial_activation_one_increment_on_successful_replacement_activation",
+      "navigationId": "checked_u64_initial_navigation_zero_replacements_reserve_one_and_up_at_admission_never_reused",
+      "redirectsShareNavigationId": true,
+      "residentDocumentPolicy": "one_live_active_document_old_pipeline_converted_to_reloadable_history_and_closed_before_replacement_authority_completes",
+      "bfcache": "unsupported",
+      "pagehideUnloadFidelityOnReplacement": "unsupported_exit_lifecycle_is_prioritized_for_authority_reconciliation",
+      "turnAdmissionHandoff": {
+        "sourceTurnReplay": false,
+        "sourceTurnCount": "exactly_once",
+        "proof": "typed_in_process_drive_boundary_plus_passive_no_pump_exact_session_authority_transition",
+        "bootstrap": "sole_exact_owner_queued_http_https_top_level_spawn_pipeline_selected_ahead_only_of_retained_ordinary_backlog",
+        "settlementRearm": "each_independently_verified_activation_rebinds_authority_and_rearms_the_same_settle_for_another_replacement",
+        "transportLoss": "fatal_indeterminate",
+        "budgetContinuity": "original_virtual_time_control_turn_and_cumulative_wall_io_ledgers"
+      },
+      "maximumSuccessfulReplacements": 1000,
+      "initialActivationCountsAgainstLimit": false,
+      "limitError": {
+        "code": "document_transition_limit_exceeded",
+        "effectContract": "navigation.preAdmissionRejectionEffects",
+        "fields": [
+          "limit",
+          "observed",
+          "nextNavigationId"
+        ]
+      }
+    },
+    "redirects": {
+      "httpHttps": "subject_to_controlled_event_loop_rule",
+      "maximumFollowedHops": 20,
+      "overflow": {
+        "code": "redirect_limit_exceeded",
+        "fatal": true,
+        "stateEffect": "partial",
+        "processEffect": "fail_stop",
+        "fields": [
+          "limit",
+          "observed",
+          "navigationId"
+        ]
+      }
+    },
+    "counterOverflow": "runtime_error_and_fail_stop",
+    "reload": "use_explicit_navigate",
+    "downloads": "unsupported"
+  },
+  "selectors": {
+    "grammar": "practical_selector_v2",
+    "supportedComponents": [
+      "type",
+      "universal",
+      "id",
+      "class",
+      "attribute_presence",
+      "attribute_equality"
+    ],
+    "attributeSelectors": {
+      "namespace": "no_namespace_only",
+      "supportedOperators": [
+        "exists",
+        "equal"
+      ],
+      "unsupportedOperators": [
+        "includes",
+        "dash_match",
+        "prefix",
+        "substring",
+        "suffix"
+      ],
+      "attributeEntryScans": "precharged_for_candidate_and_structurally_considered_ancestors",
+      "attributeValueScans": "exact_equality_precharges_relevant_candidate_and_ancestor_serialized_value_byte_upper_bounds",
+      "lazyDeclarationEquality": "unsupported_before_match_unless_serialization_already_exists"
+    },
+    "commaSeparatedLists": true,
+    "supportedCombinators": [
+      "descendant",
+      "child"
+    ],
+    "unsupportedCombinators": [
+      "adjacent_sibling",
+      "general_sibling",
+      "column"
+    ],
+    "pseudoClasses": {
+      "supported": [],
+      "admissionRule": "explicitly_enumerated_only_after_bounded_work_audit",
+      "currentlyUnsupported": [
+        "has",
+        "lang",
+        "dynamic_state",
+        "all_other_pseudo_classes"
+      ]
+    },
+    "pseudoElements": false,
+    "namedNamespacePrefixes": false,
+    "candidateCost": "(local_units+attribute_entries*attribute_components+relevant_attribute_value_bytes*equality_components)*(child_combinators+1)*(ancestor_depth+1)^descendant_combinators",
+    "persistentHandles": false
+  },
+  "automation": {
+    "fill": {
+      "method": "action.fill",
+      "elements": [
+        "input:text",
+        "input:search",
+        "input:url",
+        "input:tel",
+        "input:email",
+        "input:password",
+        "textarea"
+      ],
+      "effect": "replace_value_then_one_input_event",
+      "inputType": "insertReplacementText",
+      "inputEventBubbles": true,
+      "inputEventComposed": true,
+      "inputEventCancelable": false,
+      "focus": false,
+      "keyboardEvents": false,
+      "changeEvent": false
+    },
+    "activate": {
+      "method": "action.activate",
+      "effect": "html_element_click",
+      "formSubmission": "supported_within_navigation_contract",
+      "layoutHitTesting": false,
+      "pointerEvents": false
+    },
+    "focus": {
+      "method": "action.focus",
+      "elements": "html_elements",
+      "effect": "focus_with_prevent_scroll_true",
+      "result": [
+        "focused"
+      ],
+      "focusedFalse": "successful_observation_for_non_focusable_html_element"
+    },
+    "check": {
+      "method": "action.check",
+      "elements": [
+        "mutable_checkbox",
+        "mutable_radio"
+      ],
+      "effect": "html_element_click_when_state_differs",
+      "result": [
+        "changed",
+        "checked"
+      ]
+    },
+    "uncheck": {
+      "method": "action.uncheck",
+      "elements": [
+        "mutable_checkbox"
+      ],
+      "effect": "html_element_click_when_state_differs",
+      "result": [
+        "changed",
+        "checked"
+      ]
+    },
+    "select": {
+      "method": "action.select",
+      "elements": [
+        "mutable_select"
+      ],
+      "validation": "unique_requested_values_prevalidated_atomically_against_enabled_options",
+      "singleSelectRequestedValues": 1,
+      "mutationImplementation": "bulk_selectedness_then_one_precharged_validity_refresh",
+      "optionTreeWork": "every_inspected_direct_select_child_optgroup_child_option_attribute_entry_and_option_text_node_charged",
+      "validityPropagationWork": "precharge_one_document_walk_plus_three_full_document_passes_for_form_controls_fieldset_ancestor_and_fieldset_subtree_before_mutation",
+      "uaShadowWork": "128_fixed_units_reserved_before_mutation_for_fixed_tree_creation_set_data_observer_and_version_walks",
+      "resultOrder": "current_post_event_dom_option_order",
+      "postEventObservationFailure": {
+        "code": "outcome_indeterminate",
+        "fatal": true,
+        "stateEffect": "indeterminate",
+        "processEffect": "fail_stop"
+      },
+      "eventsWhenChanged": [
+        "bubbling_composed_input",
+        "bubbling_change"
+      ],
+      "eventsWhenUnchanged": [],
+      "result": [
+        "changed",
+        "values"
+      ]
+    },
+    "submit": {
+      "method": "action.submit",
+      "elements": [
+        "form"
+      ],
+      "effect": "request_submit_null",
+      "result": [
+        "submitted"
+      ],
+      "submittedMeaning": "request_submit_invocation_succeeded_not_validation_or_navigation_guarantee",
+      "navigation": "subject_to_top_level_navigation_contract"
+    },
+    "documentMethodsRequireExpectedStateToken": [
+      "action.fill",
+      "action.activate",
+      "action.focus",
+      "action.check",
+      "action.uncheck",
+      "action.select",
+      "action.submit",
+      "dom.query",
+      "dom.text",
+      "dom.extract",
+      "runtime.settle",
+      "runtime.advance_to_next",
+      "session.navigate"
+    ],
+    "linearization": "script_owner_revalidates_document_identity_and_generation_before_execution",
+    "actionNavigationAuthority": {
+      "synchronousScriptEmission": "an_action_may_carry_only_top_level_or_same_document_authority_emitted_synchronously_during_its_controlled_turn",
+      "queuedNativeDefault": "link_and_form_default_navigation_queued_for_later_execution_is_observed_by_explicit_settle_not_claimed_by_the_action_result",
+      "laterAsyncWork": "timer_fetch_and_other_later_navigation_is_observed_by_explicit_settle",
+      "unprovenPostActionDrift": "fatal_partial_or_indeterminate_fail_stop_never_definitive_none"
+    },
+    "nativeHiddenWork": {
+      "scope": "target_specific_native_path_observed_before_mutation",
+      "fixedUnits": 256,
+      "eventPath": {
+        "P": "exact_composed_node_path_following_shadow_root_host_else_assigned_slot_else_parent",
+        "R": "sum_of_shadow_including_ancestor_depths_for_each_node_in_P",
+        "D": "target_shadow_including_ancestor_depth",
+        "H": "shadow_root_retarget_hops_in_P",
+        "eventUnits": "(1+H_related)*R_target+H_related*D_target+4*P_target+32"
+      },
+      "relevantValidity": {
+        "C": "owned_control_count_of_the_target_control_form_or_zero",
+        "A": "target_control_light_dom_ancestor_count",
+        "F": "node_count_of_the_nearest_fieldset_light_subtree_or_zero"
+      },
+      "radio": {
+        "Rroot": "node_count_of_the_actual_light_tree_root",
+        "G": "exact_same_owner_same_name_radio_group_members_in_Rroot",
+        "reservationUnits": "6*(Rroot+G*Rroot+sum_over_group(C_i+A_i+F_i))+3*event(target,null)+256"
+      },
+      "focus": {
+        "transitionUnits": "2*event(old,new)+2*event(new,old)+256",
+        "delegatedFocus": "8*(relevant_shadow_nodes+attribute_entries+ancestor_steps+ancestor_attribute_entries)",
+        "editingHost": "8*(relevant_shadow_including_subtree_nodes+attribute_entries)"
+      },
+      "forms": {
+        "scope": "only_controls_owned_by_the_actual_submit_or_reset_form",
+        "chargedWork": "control_snapshot_invalid_event_paths_datalist_ancestor_paths_option_and_version_paths_validity_form_fieldset_and_radio_passes",
+        "submitValidityUnits": "sum_over_owned_controls(C_i+A_i+F_i)+radio_root_group_reservations+2*sum_over_owned_selects(inspected_option_tree_nodes)",
+        "submitValidityOrder": "reserve_exact_C*C_owned_control_scan_before_entry_output_then_reserve_each_target_specific_ancestor_fieldset_radio_and_select_term_before_requestSubmit",
+        "submissionEntryBound": "E=2*C+sum(max(selected_file_entries_i-1,0))+sum(max(selected_option_entries_i-1,0))+sum(max(element_internals_entries_i-1,0))",
+        "submissionCardinalityOrder": "reserve_2*C_before_control_content_then_each_O1_or_bounded_counted_fanout_excess_before_iterating_its_entries",
+        "submissionEntryWorkUnits": "E",
+        "submissionEntryRawScratchBytes": "E_plus_page_controlled_source_bytes_with_each_repeated_file_or_select_control_name_charged_per_entry",
+        "submissionEntryDerivedBytes": "135*E+53_plus_6*page_controlled_string_bytes_plus_file_body_bytes",
+        "submissionFixedEnvelope": "135_bytes_per_entry_covers_max_47_byte_boundary_and_file_header_trailer_with_text_plain_fallback;53_bytes_covers_final_closing_boundary",
+        "submissionFileStrings": "control_name_per_entry_filename_and_blob_type",
+        "submissionElementInternalsStrings": "each_FormData_datum_name_value_or_filename_and_blob_type",
+        "submissionStrings": "only_actual_form_form_controls_selected_options_selected_files_and_form_associated_custom_element_data"
+      },
+      "select": {
+        "validityOptionTreeUnits": "2*inspected_option_tree_nodes_before_changed_selectedness_or_submit_validation",
+        "changedEventUnits": "2*event(target,null)_for_input_and_change",
+        "changedEventScratch": "exact_composed_path_attributes_share_the_cumulative_action_scratch_budget"
+      },
+      "activate": {
+        "classification": "first_activatable_element_on_exact_composed_click_path",
+        "label": "charge_only_actual_label_control_resolution_root_then_recursively_classify_resolved_control",
+        "simpleLinkButtonSummary": "event_path_and_target_default_action_only_without_unrelated_form_or_document_scan"
+      },
+      "unrelatedDomInvariant": "ordinary_shallow_link_plain_button_and_focus_do_not_scale_with_unrelated_document_nodes_or_forms",
+      "workLimit": "cumulative_automationLimits.maxDomNodesVisited_including_selector_preflight_and_reservation",
+      "stringScratchSources": "target_attributes_and_private_state_plus_only_action_relevant_form_controls_options_files_contenteditable_or_delegated_focus_subtrees_and_element_internals_form_data",
+      "stringScratchLimit": "automationLimits.maxOutputBytes",
+      "derivedStringExpansionMultiplier": 6,
+      "failureBoundary": "work_or_scratch_failure_is_nonfatal_stateEffect_none_before_event_or_mutation",
+      "synchronousHandlerBoundary": "page_handler_work_or_handler_created_dom_after_preflight_is_bounded_by_command_wall_time_and_any_unprovable_post_action_result_is_fatal_outcome_indeterminate"
+    }
+  },
+  "inspection": {
+    "tokenBound": true,
+    "operations": [
+      "query_count",
+      "text",
+      "extract_text",
+      "extract_html",
+      "extract_attribute",
+      "extract_resolved_url"
+    ],
+    "attributeExtraction": {
+      "rawRead": "attribute",
+      "urlRead": "resolved_url",
+      "source": "content_attribute",
+      "missing": null,
+      "unresolvableUrl": null,
+      "urlResolutionBase": "current_document_base_url_including_first_valid_base_href",
+      "attributeNameRequiredFor": [
+        "attribute",
+        "resolved_url"
+      ],
+      "attributeNameValidation": "nonempty_no_ascii_whitespace_or_control",
+      "attributeLookupWork": "every_element_attribute_entry_precharged_before_vector_lookup"
+    },
+    "fieldTarget": {
+      "nonemptySelector": "exact_one_descendant_match_relative_to_row_root",
+      "emptySelector": "row_root_itself",
+      "emptySelectorProfileScope": "controlled_web_session_v1_only",
+      "emptySelectorWorkAccounting": "one_explicit_row_root_visit_before_read"
+    },
+    "rootOrder": "document_order",
+    "fieldOrder": "request_order",
+    "persistentHandles": false
+  },
+  "forms": {
+    "supported": [
+      "semantic_text_fill",
+      "html_element_activation",
+      "semantic_focus",
+      "semantic_check",
+      "semantic_uncheck",
+      "semantic_select",
+      "semantic_request_submit",
+      "top_level_http_https_form_submission_when_controlled_event_loop_is_preserved"
+    ],
+    "deferred": [
+      "keyboard_input",
+      "file_upload",
+      "form_data_introspection"
+    ]
+  },
+  "execution": {
+    "tasks": true,
+    "microtasks": true,
+    "mutationObserver": true,
+    "oneShotTimers": "controlled",
+    "intervals": "persistent_work",
+    "finiteRendering": true,
+    "animationFrame": true,
+    "date": true,
+    "performance": true
+  },
+  "executionLimits": {
+    "ordinaryTasks": 100000,
+    "microtasks": 1000000,
+    "renderingOpportunities": 10000,
+    "mutations": 1000000
+  },
+  "settlementOutcomes": [
+    "quiescent",
+    "quiescent_with_persistent_work",
+    "blocked_on_external_io",
+    "blocked_on_open_ended_work",
+    "unsupported_work",
+    "virtual_time_limit_exceeded",
+    "task_limit_exceeded",
+    "microtask_limit_exceeded",
+    "rendering_limit_exceeded",
+    "mutation_limit_exceeded",
+    "control_turn_limit_exceeded",
+    "runtime_error"
+  ],
+  "network": {
+    "fetch": "asynchronous",
+    "xmlHttpRequest": "asynchronous",
+    "synchronousXmlHttpRequest": "rejected_before_start",
+    "externalIoTimeout": "typed_blocker",
+    "configurationField": "session.open.network",
+    "configurationLifetime": "immutable_before_first_request",
+    "modes": {
+      "fixtures_only": "deterministic_when_all_other_profile_inputs_are_controlled",
+      "mixed": "nondeterministic_no_cross_run_digest_claim",
+      "live": "nondeterministic_no_cross_run_digest_claim"
+    },
+    "routes": {
+      "order": "first_match_wins",
+      "consumption": "never",
+      "match": {
+        "method": "ascii_http_token_case_insensitive",
+        "urlKinds": [
+          "exact",
+          "prefix",
+          "glob"
+        ],
+        "globSemantics": "simple_star_only"
+      },
+      "actions": [
+        "fulfill",
+        "abort"
+      ],
+      "fulfill": {
+        "status": "integer_200_through_599",
+        "headers": "ordered_name_value_pairs",
+        "body": "bounded_utf8_or_canonical_base64"
+      },
+      "abortReasons": [
+        "blocked_by_fixture",
+        "connection_reset",
+        "network_error"
+      ],
+      "callbacks": false,
+      "regularExpressions": false,
+      "hostDelays": false
+    },
+    "fixturesOnlyMiss": {
+      "code": "network_fixture_miss",
+      "sticky": true,
+      "liveFallback": false
+    },
+    "reachableStickyFailures": {
+      "stateEffect": "partial_after_request_admission",
+      "initialOpen": {
+        "fatal": true,
+        "processEffect": "fail_stop"
+      },
+      "postOpen": {
+        "fatal": false,
+        "processEffect": "continue",
+        "sticky": true
+      },
+      "activeOperationLimit": {
+        "code": "controlled_network_active_operation_limit_exceeded",
+        "limit": 512,
+        "details": [
+          "limit",
+          "observed"
+        ]
+      },
+      "unknownRequestBodyLength": {
+        "code": "unsupported_network_request_body_length",
+        "boundary": "before_request_body_or_route_fallback"
+      },
+      "rejectedRequestMetadata": {
+        "code": "unsupported_network_request_metadata",
+        "boundary": "before_unbounded_or_unredactable_request_metadata_is_retained"
+      }
+    },
+    "fixtureValidation": {
+      "rejectUrlCredentials": true,
+      "rejectUrlFragments": true,
+      "rejectHeaderCrLf": true,
+      "rejectResponseHeaders": [
+        "hop_by_hop",
+        "content_length",
+        "authorization",
+        "cookie"
+      ]
+    },
+    "limits": {
+      "maximumRoutes": 256,
+      "maximumMethodBytes": 32,
+      "maximumUrlOrPatternBytes": 4096,
+      "maximumResponseHeaders": 64,
+      "maximumResponseHeaderBytes": 16384,
+      "maximumResponseBodyBytes": 262144,
+      "maximumAggregateFixtureBytes": 327680,
+      "maximumEncodedRouteTableBytes": 393216,
+      "requestFrameRelationship": "encoded_route_table_plus_optional_state_and_open_envelope_must_fit_the_frozen_1048576_byte_request_frame",
+      "maximumActiveOperations": 512
+    },
+    "webSocket": "unsupported",
+    "serverSentEvents": "unsupported",
+    "serviceWorker": "unsupported"
+  },
+  "requestRecords": {
+    "method": "session.requests",
+    "parameters": [
+      "afterSeq",
+      "limit"
+    ],
+    "source": "bounded_session_event_ledger",
+    "sharesSequenceAndRetentionWith": "session.evidence",
+    "records": "redacted_request_lifecycle_projection_without_header_values_or_bodies",
+    "urlProjection": [
+      "origin",
+      "path",
+      "sorted_query_keys"
+    ],
+    "cursorFields": [
+      "firstRetainedSeq",
+      "nextAfterSeq",
+      "latestSeq",
+      "complete",
+      "hasMore",
+      "droppedThroughSeq"
+    ],
+    "completeFalseOnlyWhenRequestedHistoryEvicted": true
+  },
+  "settlementEvidence": {
+    "schemaVersion": 2,
+    "completeness": "terminal_snapshot",
+    "maximumItems": 32,
+    "documentStateTokenBinding": "included",
+    "sessionStateToken": "excluded",
+    "redactedFields": [
+      "selectors",
+      "fill_values",
+      "urls",
+      "headers",
+      "bodies",
+      "cookies",
+      "web_storage"
+    ]
+  },
+  "sessionEvidence": {
+    "method": "session.evidence",
+    "schemaVersion": 2,
+    "authority": "diagnostic_only_never_settlement_authority",
+    "sequence": "checked_monotonic_session_local_shared_with_request_records",
+    "time": "exact_virtual_time_nanoseconds",
+    "causalIds": "explicit_request_redirect_and_navigation_ids_only_unknown_relationships_omitted",
+    "applicationNavigationGranularity": "terminal_observation_delta_coalesced_multiple_unobserved_same_document_changes_are_not_reconstructed",
+    "parameters": [
+      "afterSeq",
+      "limit"
+    ],
+    "cursorFields": [
+      "firstRetainedSeq",
+      "nextAfterSeq",
+      "latestSeq",
+      "complete",
+      "hasMore",
+      "droppedThroughSeq"
+    ],
+    "completeFalseOnlyWhenRequestedHistoryEvicted": true,
+    "eventTypes": [
+      "request_started",
+      "route_decided",
+      "response_headers",
+      "redirect",
+      "request_completed",
+      "request_failed",
+      "navigation_started",
+      "navigation_committed",
+      "navigation_failed",
+      "same_document_history_changed",
+      "settlement_terminal"
+    ],
+    "urlProjection": {
+      "owner": "session.requests",
+      "evidenceEvents": "cross_reference_request_id_only"
+    },
+    "navigationCorrelation": {
+      "sameDocumentHistoryChangedRequiresNavigationId": true,
+      "settlementTerminalRequiresNavigationId": true,
+      "historyRevisionMayAdvanceByMoreThanOnePerEvidenceRecord": true
+    },
+    "neverRetained": [
+      "url_credentials",
+      "url_fragments",
+      "query_values",
+      "header_values",
+      "request_bodies",
+      "response_bodies",
+      "cookie_values",
+      "authorization_values",
+      "session_state_token"
+    ],
+    "bounds": {
+      "defaultMaximumRecords": 1024,
+      "hardMaximumRecords": 4096,
+      "defaultMaximumMetadataBytes": 1048576,
+      "hardMaximumMetadataBytes": 8388608,
+      "defaultMaximumPageItems": 256,
+      "hardMaximumPageItems": 1024,
+      "maximumMethodBytes": 32,
+      "maximumOriginBytes": 512,
+      "maximumPathBytes": 2048,
+      "maximumQueryBytes": 16384,
+      "maximumNonEmptyRawQueryComponents": 64,
+      "maximumQueryKeys": 64,
+      "maximumQueryKeyBytes": 128,
+      "maximumRawHeaderNames": 64,
+      "maximumHeaderNames": 64,
+      "maximumHeaderNameBytes": 256
+    }
+  },
+  "sessionState": {
+    "cookies": {
+      "supported": true,
+      "persistence": "session_only",
+      "partitioning": "unpartitioned_only",
+      "domain": {
+        "form": "canonical_host",
+        "ipv6": "unbracketed",
+        "leadingDot": "invalid",
+        "trailingDot": "invalid",
+        "port": "invalid",
+        "credentials": "invalid",
+        "publicSuffixValidation": "native_authoritative",
+        "nonHostOnlyPublicSuffix": "invalid"
+      },
+      "namePrefixes": {
+        "secure": "case_insensitive_requires_secure",
+        "host": "case_insensitive_requires_secure_host_only_root_path"
+      },
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": {
+        "metadataRoundTrip": true,
+        "topLevelNavigationContext": "target_url",
+        "none": "requires_secure",
+        "strict": "schemeful_same_site_requests_only",
+        "lax": "schemeful_same_site_requests_only",
+        "crossSiteOrIndeterminate": {
+          "code": "unsupported_cookie_same_site_context",
+          "boundary": "before_network_start_and_state_mutation"
+        }
+      },
+      "unsupportedSetCookie": {
+        "expiresOrMaxAge": "unsupported_persistent_cookie",
+        "partitioned": "unsupported_partitioned_cookie",
+        "invalid": "invalid_controlled_cookie",
+        "boundary": "before_cookie_jar_mutation"
+      },
+      "invalidPortableState": {
+        "boundary": "before_operation_entry_and_cookie_jar_mutation",
+        "stateEffect": "none"
+      },
+      "pageApi": {
+        "documentCookie": {
+          "get": "supported_deterministic_controlled_order",
+          "set": "supported_atomic_controlled_policy"
+        },
+        "cookieStore": {
+          "set": {
+            "supported": true,
+            "policy": "supported_atomic_controlled_policy",
+            "persistentError": "unsupported_persistent_cookie",
+            "partitionedError": "unsupported_partitioned_cookie",
+            "invalidError": "invalid_controlled_cookie"
+          },
+          "get": {
+            "supported": false,
+            "code": "controlled_cookie_store_read_delete_unsupported"
+          },
+          "getAll": {
+            "supported": false,
+            "code": "controlled_cookie_store_read_delete_unsupported"
+          },
+          "delete": {
+            "supported": false,
+            "code": "controlled_cookie_store_read_delete_unsupported"
+          }
+        },
+        "ordinaryResourceThreadPaths": "forbidden"
+      }
+    },
+    "localStorage": "supported",
+    "sessionStorage": "supported",
+    "indexedDb": "unsupported",
+    "cacheStorage": "unsupported",
+    "serviceWorkerRegistrations": "unsupported",
+    "exportIsSensitive": true,
+    "excludedFromDiagnostics": true
+  },
+  "stateLimits": {
+    "maximumSerializedBytes": 524288,
+    "combinedArtifactEnforcement": "shell_and_backends_validate_static_encoded_partition_before_mutation",
+    "encodedBudgetPartition": {
+      "cookiesArrayBytes": 256000,
+      "originsArrayBytes": 256000,
+      "envelopeAndSlackBytes": 12288,
+      "fixedV1EnvelopeBytes": 147,
+      "remainingSlackBytes": 12141,
+      "fragmentsInclude": "array_brackets_commas_field_names_json_escaping_and_decimal_sequence_strings"
+    },
+    "successfulControlledPageMutationInvariant": "session_state_export_remains_within_public_bounds",
+    "controlledWebStorageLimitError": {
+      "domName": "QuotaExceededError",
+      "boundary": "before_web_storage_state_or_revision_mutation"
+    },
+    "maximumCookies": 512,
+    "maximumCookiesPerRegistrableHost": 150,
+    "registrableHostDefinition": "Servo_native_public_suffix_registrable_suffix_or_canonical_ip",
+    "perRegistrableHostCookieLimitError": {
+      "code": "too_many_session_cookies_per_registrable_host",
+      "boundary": "native_shell_validation_before_unpublished_backend_replacement_or_live_compare_replace",
+      "fatal": false,
+      "stateEffect": "none",
+      "processEffect": "continue"
+    },
+    "maximumCookieBytes": 4096,
+    "maximumTotalCookieBytes": 524288,
+    "cookieSequenceFields": {
+      "wireSyntax": "canonical_decimal_u64_string",
+      "maximum": "18446744073709551615",
+      "creationSequenceUniqueWithinCookies": true,
+      "lastAccessSequenceUniqueWithinCookies": true
+    },
+    "maximumRawControlledCookieBytes": 8192,
+    "maximumControlledCookieBatchValues": 512,
+    "maximumCookieArrayEncodedBytes": 256000,
+    "maximumOriginsArrayEncodedBytes": 256000,
+    "maximumOrigins": 64,
+    "maximumLocalStorageEntriesPerOrigin": 1024,
+    "maximumSessionStorageEntriesPerOrigin": 1024,
+    "maximumStorageKeyBytes": 4096,
+    "maximumStorageValueBytes": 131072,
+    "maximumTotalStorageBytesPerOrigin": 524288
+  },
+  "automationLimits": {
+    "maxSelectorBytes": 4096,
+    "maxFillValueBytes": 131072,
+    "maxFieldNameBytes": 256,
+    "maxAttributeNameBytes": 256,
+    "maxExtractionFields": 16,
+    "maxSelectValues": 16,
+    "maxSelectValueBytesTotal": 131072,
+    "maxMatches": 128,
+    "maxDomNodesVisited": 1000000,
+    "maxOutputBytes": 131072
+  },
+  "sdkProcessPool": {
+    "processOwnership": "owned_child_processes_only",
+    "leaseUnit": "one_process_per_active_session",
+    "maximumActiveSessionsPerProcess": 1,
+    "processReuse": false,
+    "scheduling": "fifo",
+    "processLimit": "required_positive_finite_integer",
+    "queueLimit": "required_non_negative_finite_integer",
+    "queueOverflow": "reject_before_enqueue",
+    "queuedCancellation": "remove_without_spawning_or_opening_session",
+    "healthyRelease": "terminal_session_close_then_discard_exited_process",
+    "poisonedRelease": "terminate_and_discard_process",
+    "nextLease": "spawn_fresh_process",
+    "automaticMutationRetries": false,
+    "retryAfterWrittenCommand": "never"
+  },
+  "referenceCrawler": {
+    "profile": "controlled-web-session-v1",
+    "originPolicyDefault": "same_origin",
+    "crossOriginPolicy": "explicit_http_https_allowlist_only",
+    "linkDiscovery": {
+      "operation": "dom.extract",
+      "read": "resolved_url",
+      "attribute": "href",
+      "resolutionBase": "current_document_base_url",
+      "acceptedSchemes": [
+        "http",
+        "https"
+      ]
+    },
+    "stateImport": "fresh_process_initialization_before_first_request",
+    "deduplication": "canonical_resolved_url_without_fragment",
+    "redirects": "final_url_rechecked_against_origin_policy",
+    "bounds": {
+      "maximumDepth": "required_non_negative_finite_integer",
+      "maximumPages": "required_positive_finite_integer",
+      "maximumConcurrency": "required_positive_finite_integer_not_exceeding_pool_process_limit",
+      "maximumQueuedUrls": "never_exceeds_maximum_pages"
+    },
+    "activePageLease": "one_fresh_pool_process_and_one_session",
+    "wallClockSleeps": false,
+    "automaticRetryAfterWrittenNavigation": false
+  },
+  "unsupportedRetention": "first_per_authority",
+  "unsupportedClasses": {
+    "iframe": [
+      "same_event_loop_iframe",
+      "cross_event_loop_iframe"
+    ],
+    "crossEventLoopNavigation": "cross_event_loop_navigation",
+    "worker": "worker",
+    "worklet": "worklet",
+    "auxiliaryWebView": "auxiliary_web_view",
+    "webSocketAndServerSentEvents": "external_subscription",
+    "externalChannels": "external_subscription",
+    "untrackedResourceIo": "resource_thread_io",
+    "media": "native_media",
+    "embedderControls": "embedder_control",
+    "hostTimestamp": "host_timestamp",
+    "historyTraversal": "history_traversal"
+  },
+  "supportedProductSurface": [
+    "one_terminal_session_per_owned_process",
+    "explicit_and_application_top_level_navigation",
+    "checked_document_navigation_and_history_authority",
+    "document_scoped_state_tokens",
+    "session_state_export_and_initialization_only_import",
+    "practical_selector_v2_descendant_and_child_combinators",
+    "semantic_fill_activate_focus_check_uncheck_select_and_submit",
+    "bounded_query_text_html_raw_attribute_and_resolved_url_extraction",
+    "immutable_declarative_network_routes",
+    "bounded_public_request_records",
+    "bounded_redacted_navigation_and_network_evidence",
+    "controlled_settlement",
+    "bounded_redacted_terminal_settlement_evidence",
+    "fresh_process_sdk_pool",
+    "bounded_reference_crawler_with_same_origin_default"
+  ],
+  "deferredProductSurface": [
+    "iframes",
+    "workers",
+    "multiple_tabs",
+    "dialogs",
+    "permissions",
+    "geolocation",
+    "downloads",
+    "file_upload",
+    "websocket_settlement",
+    "server_sent_event_settlement",
+    "service_workers",
+    "cross_event_loop_document_control",
+    "sibling_selector_combinators",
+    "selector_pseudo_classes",
+    "selector_pseudo_elements",
+    "history_traversal",
+    "bfcache",
+    "pagehide_unload_replacement_fidelity",
+    "layout_backed_click",
+    "hit_testing",
+    "screenshots",
+    "complete_causal_journal",
+    "replay",
+    "time_travel",
+    "persistent_daemon",
+    "distributed_crawling",
+    "stealth_or_anti_bot"
+  ],
+  "determinismExcludes": [
+    "mixed_network",
+    "live_network",
+    "uncontrolled_randomness",
+    "ambient_system_state"
+  ]
+}

@@ -10,7 +10,9 @@ use servo_base::generic_channel::{GenericSend, SendResult};
 use servo_base::id::WebViewId;
 use servo_constellation_traits::ScriptToConstellationMessage;
 use servo_url::{ImmutableOrigin, ServoUrl};
-use storage_traits::webstorage_thread::{WebStorageThreadMsg, WebStorageType};
+use storage_traits::webstorage_thread::{
+    WebStorageMutationError, WebStorageThreadMsg, WebStorageType,
+};
 
 use crate::dom::bindings::codegen::Bindings::StorageBinding::StorageMethods;
 use crate::dom::bindings::error::{Error, ErrorResult};
@@ -122,6 +124,7 @@ impl StorageMethods<crate::DomTypeHolder> for Storage {
         let msg = WebStorageThreadMsg::SetItem(
             sender,
             self.storage_type,
+            self.global().web_storage_mutation_policy(),
             self.webview_id(),
             self.get_immutable_origin(),
             name.clone(),
@@ -129,10 +132,16 @@ impl StorageMethods<crate::DomTypeHolder> for Storage {
         );
         self.send_storage_msg(msg).unwrap();
         match receiver.recv().unwrap() {
-            Err(_) => Err(Error::QuotaExceeded {
+            Err(
+                WebStorageMutationError::QuotaExceeded
+                | WebStorageMutationError::ControlledStateLimit,
+            ) => Err(Error::QuotaExceeded {
                 quota: None,
                 requested: None,
             }),
+            Err(WebStorageMutationError::RevisionExhausted) => Err(Error::NotSupported(Some(
+                "controlled Web Storage revision exhausted".into(),
+            ))),
             Ok((changed, old_value)) => {
                 if changed {
                     self.broadcast_change_notification(Some(name), old_value, Some(value));
@@ -151,6 +160,7 @@ impl StorageMethods<crate::DomTypeHolder> for Storage {
         let msg = WebStorageThreadMsg::RemoveItem(
             sender,
             self.storage_type,
+            self.global().web_storage_mutation_policy(),
             self.webview_id(),
             self.get_immutable_origin(),
             name.clone(),
@@ -169,6 +179,7 @@ impl StorageMethods<crate::DomTypeHolder> for Storage {
         self.send_storage_msg(WebStorageThreadMsg::Clear(
             sender,
             self.storage_type,
+            self.global().web_storage_mutation_policy(),
             self.webview_id(),
             self.get_immutable_origin(),
         ))

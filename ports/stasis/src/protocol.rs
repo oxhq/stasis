@@ -16,8 +16,12 @@ use crate::wake::ShellWaker;
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+pub const MAX_PROTOCOL_ERROR_DETAILS_BYTES: usize = 64 * 1024;
+pub const MAX_PROTOCOL_ERROR_DETAILS_DEPTH: usize = 16;
+pub const MAX_PROTOCOL_ERROR_DETAILS_VALUES: usize = 1024;
 pub const DEFAULT_ORDINARY_LANE_CAPACITY: usize = 8;
 const CONTROL_LANE_CAPACITY: usize = 8;
+const MAX_EXACT_JSON_INTEGER: i64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -107,6 +111,7 @@ pub struct ProtocolError {
     pub message: String,
     pub fatal: bool,
     pub state_effect: &'static str,
+    pub details: Option<Value>,
 }
 
 impl ProtocolError {
@@ -116,6 +121,7 @@ impl ProtocolError {
             message: message.into(),
             fatal: false,
             state_effect: "none",
+            details: None,
         }
     }
 
@@ -130,6 +136,7 @@ impl ProtocolError {
             message: message.into(),
             fatal: false,
             state_effect,
+            details: None,
         }
     }
 
@@ -139,8 +146,116 @@ impl ProtocolError {
             message: message.into(),
             fatal: true,
             state_effect: "none",
+            details: None,
         }
     }
+
+    /// Attach a bounded JSON object whose values can be decoded exactly by the TypeScript SDK.
+    pub fn with_details(mut self, details: Value) -> Result<Self, ProtocolErrorDetailsError> {
+        if !details.is_object() {
+            return Err(ProtocolErrorDetailsError::NotObject);
+        }
+        let mut values = 0usize;
+        validate_protocol_error_details(&details, 0, &mut values)?;
+        let bytes = serde_json::to_vec(&details)
+            .expect("a validated serde_json::Value must always serialize")
+            .len();
+        if bytes > MAX_PROTOCOL_ERROR_DETAILS_BYTES {
+            return Err(ProtocolErrorDetailsError::TooLarge {
+                actual: bytes,
+                limit: MAX_PROTOCOL_ERROR_DETAILS_BYTES,
+            });
+        }
+        self.details = Some(details);
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProtocolErrorDetailsError {
+    NotObject,
+    TooDeep { actual: usize, limit: usize },
+    TooManyValues { actual: usize, limit: usize },
+    IntegerNotExactlyRepresentable,
+    TooLarge { actual: usize, limit: usize },
+}
+
+impl fmt::Display for ProtocolErrorDetailsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotObject => formatter.write_str("protocol error details must be a JSON object"),
+            Self::TooDeep { actual, limit } => write!(
+                formatter,
+                "protocol error details depth {actual} exceeds {limit}",
+            ),
+            Self::TooManyValues { actual, limit } => write!(
+                formatter,
+                "protocol error details contain {actual} values, exceeding {limit}",
+            ),
+            Self::IntegerNotExactlyRepresentable => formatter.write_str(
+                "protocol error details contain an integer that TypeScript cannot decode exactly",
+            ),
+            Self::TooLarge { actual, limit } => write!(
+                formatter,
+                "protocol error details encode to {actual} bytes, exceeding {limit}",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProtocolErrorDetailsError {}
+
+fn validate_protocol_error_details(
+    value: &Value,
+    depth: usize,
+    values: &mut usize,
+) -> Result<(), ProtocolErrorDetailsError> {
+    if depth > MAX_PROTOCOL_ERROR_DETAILS_DEPTH {
+        return Err(ProtocolErrorDetailsError::TooDeep {
+            actual: depth,
+            limit: MAX_PROTOCOL_ERROR_DETAILS_DEPTH,
+        });
+    }
+    *values = values.saturating_add(1);
+    if *values > MAX_PROTOCOL_ERROR_DETAILS_VALUES {
+        return Err(ProtocolErrorDetailsError::TooManyValues {
+            actual: *values,
+            limit: MAX_PROTOCOL_ERROR_DETAILS_VALUES,
+        });
+    }
+
+    match value {
+        Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                if !(-MAX_EXACT_JSON_INTEGER..=MAX_EXACT_JSON_INTEGER).contains(&integer) {
+                    return Err(ProtocolErrorDetailsError::IntegerNotExactlyRepresentable);
+                }
+            } else if let Some(integer) = number.as_u64() {
+                if integer > MAX_EXACT_JSON_INTEGER as u64 {
+                    return Err(ProtocolErrorDetailsError::IntegerNotExactlyRepresentable);
+                }
+            } else if number.as_f64().is_none()
+                || !number
+                    .to_string()
+                    .chars()
+                    .any(|character| matches!(character, '.' | 'e' | 'E'))
+            {
+                return Err(ProtocolErrorDetailsError::IntegerNotExactlyRepresentable);
+            }
+        },
+        Value::Array(items) => {
+            for item in items {
+                validate_protocol_error_details(item, depth.saturating_add(1), values)?;
+            }
+        },
+        Value::Object(object) => {
+            for item in object.values() {
+                validate_protocol_error_details(item, depth.saturating_add(1), values)?;
+            }
+        },
+        Value::Null | Value::Bool(_) | Value::String(_) => {},
+    }
+    Ok(())
 }
 
 /// Sending half of the bounded protocol inbox.
@@ -557,9 +672,11 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
         let mut values = Map::with_capacity(object.size_hint().unwrap_or(0).min(1024));
         while let Some(name) = object.next_key::<String>()? {
             if !names.insert(name.clone()) {
-                return Err(de::Error::custom(format_args!(
-                    "duplicate JSON object member {name:?}"
-                )));
+                // This decoder runs before the method is known, so the member name can belong to
+                // a sensitive payload such as imported cookies or Web Storage. Keep the fatal
+                // diagnostic independent from all request bytes; serde may still append a safe
+                // line/column location.
+                return Err(de::Error::custom("duplicate JSON object member"));
             }
             let StrictJson(value) = object.next_value::<StrictJson>()?;
             values.insert(name, value);
@@ -641,6 +758,18 @@ impl<W: Write> ProtocolWriter<W> {
         error: &ProtocolError,
     ) -> io::Result<()> {
         let wire_seq = self.next_wire_seq()?;
+        let mut error_payload = json!({
+            "code": error.code,
+            "message": error.message,
+            "fatal": error.fatal,
+            "stateEffect": error.state_effect,
+        });
+        if let Some(details) = &error.details {
+            error_payload
+                .as_object_mut()
+                .expect("protocol error payload is an object")
+                .insert("details".to_owned(), details.clone());
+        }
         self.write(json!({
             "v": PROTOCOL_VERSION,
             "type": if request.is_some() { "response" } else { "event" },
@@ -648,12 +777,7 @@ impl<W: Write> ProtocolWriter<W> {
             "id": request.map(|request| request.id.as_str()),
             "sessionId": session_id,
             "event": if request.is_none() { Some("protocol.fatal") } else { None::<&str> },
-            "error": {
-                "code": error.code,
-                "message": error.message,
-                "fatal": error.fatal,
-                "stateEffect": error.state_effect,
-            },
+            "error": error_payload,
         }))
     }
 
@@ -902,7 +1026,8 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(top.code, "invalid_json");
-        assert!(top.message.contains("duplicate JSON object member \"id\""));
+        assert!(top.message.contains("duplicate JSON object member"));
+        assert!(!top.message.contains("\"id\""));
 
         let nested = parse(
             br#"{"v":1,"type":"request","id":"one","method":"x","params":{"a":1,"a":2}}
@@ -910,11 +1035,30 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(nested.code, "invalid_json");
-        assert!(
-            nested
-                .message
-                .contains("duplicate JSON object member \"a\"")
+        assert!(nested.message.contains("duplicate JSON object member"));
+        assert!(!nested.message.contains("\"a\""));
+    }
+
+    #[test]
+    fn sensitive_duplicate_member_never_enters_fatal_diagnostics() {
+        const SENTINEL: &str = "SECRET-SESSION-STATE-CANARY";
+        let frame = format!(
+            "{{\"v\":1,\"type\":\"request\",\"id\":\"one\",\"method\":\"session.open\",\"params\":{{\"state\":{{\"{SENTINEL}\":1,\"{SENTINEL}\":2}}}}}}\n"
         );
+        let error = parse(frame.as_bytes()).unwrap_err();
+        assert_eq!(error.code, "invalid_json");
+
+        // Shell::handle_reader_message returns this message to main, which writes this exact
+        // diagnostic shape to stderr.
+        let stderr = format!("stasis shell fatal error: {}", error.message);
+        assert!(!stderr.contains(SENTINEL));
+
+        let mut output = Vec::new();
+        ProtocolWriter::new(&mut output)
+            .error(None, None, &error)
+            .unwrap();
+        let fatal = String::from_utf8(output).unwrap();
+        assert!(!fatal.contains(SENTINEL));
     }
 
     #[test]
@@ -1196,5 +1340,60 @@ mod tests {
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["error"]["code"], "wall_time_limit_exceeded");
         assert_eq!(value["error"]["stateEffect"], "indeterminate");
+    }
+
+    #[test]
+    fn legacy_error_envelope_is_byte_for_byte_unchanged_without_details() {
+        let request = request("one");
+        let error = ProtocolError::operation("evaluation_failed", "failure", "none");
+        let mut bytes = Vec::new();
+        ProtocolWriter::new(&mut bytes)
+            .error(Some(&request), Some("s-1"), &error)
+            .unwrap();
+
+        assert_eq!(
+            bytes,
+            br#"{"v":1,"type":"response","wireSeq":"1","id":"one","sessionId":"s-1","event":null,"error":{"code":"evaluation_failed","message":"failure","fatal":false,"stateEffect":"none"}}
+"#,
+        );
+    }
+
+    #[test]
+    fn structured_error_details_are_validated_bounded_and_emitted() {
+        let request = request("one");
+        let error = ProtocolError::operation("navigation_limit", "limit", "none")
+            .with_details(json!({
+                "actual": "21",
+                "limit": 20,
+                "reasons": ["replacement", null],
+            }))
+            .unwrap();
+        let mut bytes = Vec::new();
+        ProtocolWriter::new(&mut bytes)
+            .error(Some(&request), Some("s-1"), &error)
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(value["error"]["details"]["actual"], "21");
+        assert_eq!(value["error"]["details"]["limit"], 20);
+        assert_eq!(value["error"]["details"]["reasons"][1], Value::Null);
+        assert_eq!(
+            ProtocolError::invalid_request("invalid")
+                .with_details(json!(["not", "an", "object"]))
+                .unwrap_err(),
+            ProtocolErrorDetailsError::NotObject,
+        );
+        assert_eq!(
+            ProtocolError::invalid_request("inexact")
+                .with_details(json!({ "counter": 9_007_199_254_740_992u64 }))
+                .unwrap_err(),
+            ProtocolErrorDetailsError::IntegerNotExactlyRepresentable,
+        );
+
+        let oversized = "x".repeat(MAX_PROTOCOL_ERROR_DETAILS_BYTES);
+        assert!(matches!(
+            ProtocolError::invalid_request("large").with_details(json!({ "value": oversized })),
+            Err(ProtocolErrorDetailsError::TooLarge { .. }),
+        ));
     }
 }

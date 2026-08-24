@@ -1,0 +1,12 @@
+<!doctype html>
+<html>
+  <body>
+    <p id="cross-origin-status">pending</p>
+    <script>
+      document.cookie = "stasis-origin-source=source-cookie; Path=/; SameSite=Lax";
+      localStorage.setItem("stasis-origin-marker", "source-local");
+      sessionStorage.setItem("stasis-origin-marker", "source-session");
+      document.querySelector("#cross-origin-status").textContent = "source-ready";
+    </script>
+  </body>
+</html>

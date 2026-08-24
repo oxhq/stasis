@@ -8,11 +8,16 @@ import {
   StasisProtocolError,
   StasisStateError,
   StasisTransportError,
+  type ProtocolErrorDetailValue,
+  type ProtocolErrorDetails,
   type ProtocolStateEffect,
 } from "./errors.js";
 
 const PROTOCOL_VERSION = 1;
 const MAX_REQUEST_FRAME_BYTES = 1024 * 1024;
+const MAX_PROTOCOL_ERROR_DETAILS_BYTES = 64 * 1024;
+const MAX_PROTOCOL_ERROR_DETAILS_DEPTH = 16;
+const MAX_PROTOCOL_ERROR_DETAILS_VALUES = 1024;
 const MAX_U128 = (1n << 128n) - 1n;
 const ABRUPT_SIGTERM_GRACE_MS = 250;
 const MIN_ABRUPT_TERMINATION_TIMEOUT_MS = 1_000;
@@ -52,6 +57,7 @@ interface ProtocolErrorPayload {
   message: string;
   fatal: boolean;
   stateEffect: ProtocolStateEffect;
+  details?: ProtocolErrorDetails;
 }
 
 class WireViolation extends Error {
@@ -170,10 +176,10 @@ class NdjsonDecoder {
     let text: string;
     try {
       text = new TextDecoder("utf-8", { fatal: true }).decode(frame);
-    } catch (error) {
-      throw new WireViolation("invalid_utf8", "Stasis stdout emitted invalid UTF-8", {
-        cause: error,
-      });
+    } catch {
+      // Decoder diagnostics are intentionally discarded. Native stdout can contain sensitive
+      // session state, and platform parser errors are not guaranteed to omit nearby bytes.
+      throw new WireViolation("invalid_utf8", "Stasis stdout emitted invalid UTF-8");
     }
 
     let value: unknown;
@@ -182,9 +188,9 @@ class NdjsonDecoder {
       assertNoDuplicateObjectKeys(text);
     } catch (error) {
       if (error instanceof WireViolation) throw error;
-      throw new WireViolation("invalid_json", "Stasis stdout emitted invalid JSON", {
-        cause: error,
-      });
+      // JSON.parse errors in supported Node versions can quote the malformed source around the
+      // failure. Never retain that platform error in the public recursive cause chain.
+      throw new WireViolation("invalid_json", "Stasis stdout emitted invalid JSON");
     }
     this.#onFrame(value);
   }
@@ -235,7 +241,7 @@ function assertNoDuplicateObjectKeys(text: string): void {
         if (names.has(name)) {
           throw new WireViolation(
             "duplicate_member",
-            `Stasis stdout JSON contains duplicate object member ${JSON.stringify(name)}`,
+            "Stasis stdout JSON contains a duplicate object member",
           );
         }
         names.add(name);
@@ -765,7 +771,13 @@ export class ProtocolClient {
 
   #protocolError(payload: unknown, requestId: string | null, sessionIdValue: unknown): StasisProtocolError {
     const error = asRecord(payload, "protocol error");
-    assertExactKeys(error, ["code", "fatal", "message", "stateEffect"]);
+    const hasDetails = Object.hasOwn(error, "details");
+    assertExactKeys(
+      error,
+      hasDetails
+        ? ["code", "details", "fatal", "message", "stateEffect"]
+        : ["code", "fatal", "message", "stateEffect"],
+    );
     if (typeof error.code !== "string" || error.code.length === 0) {
       throw new WireViolation("invalid_envelope", "Protocol error code must be a non-empty string");
     }
@@ -775,6 +787,7 @@ export class ProtocolClient {
     if (!isStateEffect(error.stateEffect)) {
       throw new WireViolation("invalid_envelope", "Protocol error has an invalid stateEffect");
     }
+    const details = hasDetails ? decodeProtocolErrorDetails(error.details) : undefined;
     return new StasisProtocolError({
       code: error.code,
       message: error.message,
@@ -783,6 +796,7 @@ export class ProtocolClient {
       requestId,
       sessionId: parseNullableString(sessionIdValue, "sessionId"),
       stderrTail: this.stderrTail,
+      details,
     });
   }
 
@@ -941,13 +955,78 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function decodeProtocolErrorDetails(value: unknown): ProtocolErrorDetails {
+  const root = asRecord(value, "Protocol error details");
+  const budget = { values: 0 };
+  const decoded = decodeProtocolErrorDetailValue(root, 0, budget);
+  if (Array.isArray(decoded) || decoded === null || typeof decoded !== "object") {
+    throw new WireViolation("invalid_envelope", "Protocol error details must be an object");
+  }
+  const encodedBytes = Buffer.byteLength(JSON.stringify(decoded), "utf8");
+  if (encodedBytes > MAX_PROTOCOL_ERROR_DETAILS_BYTES) {
+    throw new WireViolation(
+      "invalid_envelope",
+      `Protocol error details exceed ${MAX_PROTOCOL_ERROR_DETAILS_BYTES} encoded bytes`,
+    );
+  }
+  return decoded as ProtocolErrorDetails;
+}
+
+function decodeProtocolErrorDetailValue(
+  value: unknown,
+  depth: number,
+  budget: { values: number },
+): ProtocolErrorDetailValue {
+  if (depth > MAX_PROTOCOL_ERROR_DETAILS_DEPTH) {
+    throw new WireViolation(
+      "invalid_envelope",
+      `Protocol error details exceed depth ${MAX_PROTOCOL_ERROR_DETAILS_DEPTH}`,
+    );
+  }
+  budget.values += 1;
+  if (budget.values > MAX_PROTOCOL_ERROR_DETAILS_VALUES) {
+    throw new WireViolation(
+      "invalid_envelope",
+      `Protocol error details exceed ${MAX_PROTOCOL_ERROR_DETAILS_VALUES} values`,
+    );
+  }
+
+  if (value === null || typeof value === "boolean" || typeof value === "string") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value))) {
+      throw new WireViolation(
+        "invalid_envelope",
+        "Protocol error details contain a number that cannot be decoded exactly",
+      );
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return Object.freeze(
+      value.map((item) => decodeProtocolErrorDetailValue(item, depth + 1, budget)),
+    );
+  }
+  if (typeof value === "object") {
+    const object = asRecord(value, "Protocol error detail value");
+    return Object.freeze(
+      Object.fromEntries(
+        Object.entries(object).map(([key, item]) => [
+          key,
+          decodeProtocolErrorDetailValue(item, depth + 1, budget),
+        ]),
+      ),
+    );
+  }
+  throw new WireViolation("invalid_envelope", "Protocol error details are not JSON-safe");
+}
+
 function assertExactKeys(value: Record<string, unknown>, expected: readonly string[]): void {
   const actual = Object.keys(value).sort();
   const wanted = [...expected].sort();
   if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
     throw new WireViolation(
       "invalid_envelope",
-      `Unexpected response members: ${actual.join(", ")}`,
+      "Stasis response contains unexpected or missing members",
     );
   }
 }

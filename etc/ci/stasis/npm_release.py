@@ -661,7 +661,7 @@ def verify_proof(
 
 
 def self_test() -> None:
-    version = "0.1.0"
+    version = "0.2.0"
     revision = "2" * 40
     binary_digest = "3" * 64
 
@@ -807,8 +807,8 @@ def self_test() -> None:
         assert publish_tag(alpha_version) == "alpha"
         assert publish_tag(version) == "latest"
 
-        expect_error("beta prerelease", lambda: tarball_name("0.1.0-beta.1"))
-        expect_error("leading-zero version", lambda: tarball_name("00.1.0"))
+        expect_error("beta prerelease", lambda: tarball_name("0.2.0-beta.1"))
+        expect_error("leading-zero version", lambda: tarball_name("00.2.0"))
 
         top_level_tag_package = root / "top-level-tag" / tarball_name(version)
         write_package(

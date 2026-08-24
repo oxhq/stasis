@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Stasis post-handler growth fixture</title>
+</head>
+<body>
+  <select id="grow-value">
+    <option value="small" selected>Small</option>
+    <option value="grow">Grow</option>
+  </select>
+  <script>
+    document.querySelector("#grow-value").addEventListener("change", (event) => {
+      event.currentTarget.selectedOptions[0].value = "g".repeat(8 * 1024 * 1024 + 1);
+    });
+  </script>
+</body>
+</html>

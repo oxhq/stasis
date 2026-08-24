@@ -180,11 +180,27 @@ pub enum DocumentAutomationLimitKind {
     OutputBytes,
 }
 
+/// The explicitly selected, bounded selector grammar for one same-build automation request.
+///
+/// The legacy constructor always selects [`Self::LocalCompoundV1`]. New public profiles must opt
+/// into a broader grammar explicitly so a native capability addition cannot silently widen a
+/// frozen profile.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum DocumentSelectorGrammar {
+    LocalCompoundV1,
+    PracticalV2,
+}
+
 /// How a strict extraction field reads its one matched element.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DocumentExtractionRead {
     TextContent,
     InnerHtml,
+    /// Raw, nullable value of one no-namespace attribute.
+    Attribute,
+    /// Raw attribute resolved against the document's effective base URL, or `None` when the
+    /// attribute is absent or is not a valid relative/absolute URL.
+    ResolvedUrl,
 }
 
 /// One named, exact-one field in an extraction plan.
@@ -193,6 +209,7 @@ pub struct DocumentExtractionField {
     name: String,
     selector: String,
     read: DocumentExtractionRead,
+    attribute: Option<String>,
 }
 
 impl DocumentExtractionField {
@@ -203,6 +220,24 @@ impl DocumentExtractionField {
             name,
             selector,
             read,
+            attribute: None,
+        }
+    }
+
+    /// Construct a nullable raw or resolved-URL attribute field for a trusted same-build caller.
+    /// The enclosing request validates the attribute name and read kind.
+    #[doc(hidden)]
+    pub fn new_attribute_internal(
+        name: String,
+        selector: String,
+        read: DocumentExtractionRead,
+        attribute: String,
+    ) -> Self {
+        Self {
+            name,
+            selector,
+            read,
+            attribute: Some(attribute),
         }
     }
 
@@ -216,6 +251,10 @@ impl DocumentExtractionField {
 
     pub const fn read(&self) -> DocumentExtractionRead {
         self.read
+    }
+
+    pub fn attribute(&self) -> Option<&str> {
+        self.attribute.as_deref()
     }
 }
 
@@ -249,17 +288,44 @@ impl DocumentExtractionPlan {
 
 /// A native operation against one document. CSS selectors never produce reusable handles.
 ///
-/// The 0.1 executor accepts local compound selectors (type, universal, id, class, namespace, and
-/// attributes). It rejects combinators and pseudo-classes whose matching can perform hidden tree
-/// traversal outside the bounded selector visitor.
+/// The executor accepts a conservative selector subset whose local and structural matching work
+/// is explicitly charged. It rejects selector features whose hidden traversal is not covered by
+/// that budget.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DocumentAutomationOperation {
-    QueryCount { selector: String },
-    TextContent { selector: String },
-    InnerHtml { selector: String },
+    QueryCount {
+        selector: String,
+    },
+    TextContent {
+        selector: String,
+    },
+    InnerHtml {
+        selector: String,
+    },
     Extract(DocumentExtractionPlan),
-    Fill { selector: String, value: String },
-    Activate { selector: String },
+    Fill {
+        selector: String,
+        value: String,
+    },
+    Activate {
+        selector: String,
+    },
+    Check {
+        selector: String,
+    },
+    Uncheck {
+        selector: String,
+    },
+    Select {
+        selector: String,
+        values: Vec<String>,
+    },
+    Focus {
+        selector: String,
+    },
+    Submit {
+        selector: String,
+    },
 }
 
 impl DocumentAutomationOperation {
@@ -268,7 +334,16 @@ impl DocumentAutomationOperation {
     /// Callers must conservatively classify a lost response for these operations as
     /// indeterminate: the Script owner may already have crossed the native mutation boundary.
     pub const fn may_mutate_document(&self) -> bool {
-        matches!(self, Self::Fill { .. } | Self::Activate { .. })
+        matches!(
+            self,
+            Self::Fill { .. }
+                | Self::Activate { .. }
+                | Self::Check { .. }
+                | Self::Uncheck { .. }
+                | Self::Select { .. }
+                | Self::Focus { .. }
+                | Self::Submit { .. }
+        )
     }
 
     /// Validate all bounded request data without parsing engine-specific CSS syntax.
@@ -279,10 +354,14 @@ impl DocumentAutomationOperation {
     ) -> Result<(), DocumentAutomationRequestError> {
         limits.validate()?;
         match self {
-            Self::QueryCount { selector } |
-            Self::TextContent { selector } |
-            Self::InnerHtml { selector } |
-            Self::Activate { selector } => validate_selector(selector, limits),
+            Self::QueryCount { selector }
+            | Self::TextContent { selector }
+            | Self::InnerHtml { selector }
+            | Self::Activate { selector }
+            | Self::Check { selector }
+            | Self::Uncheck { selector }
+            | Self::Focus { selector }
+            | Self::Submit { selector } => validate_selector(selector, limits),
             Self::Fill { selector, value } => {
                 validate_selector(selector, limits)?;
                 validate_length(
@@ -332,11 +411,91 @@ impl DocumentAutomationOperation {
                         );
                     }
                     validate_selector(field.selector(), limits)?;
+                    match (field.read(), field.attribute()) {
+                        (
+                            DocumentExtractionRead::Attribute | DocumentExtractionRead::ResolvedUrl,
+                            Some(attribute),
+                        ) => validate_attribute_name(index as u32, attribute, limits)?,
+                        (
+                            DocumentExtractionRead::TextContent | DocumentExtractionRead::InnerHtml,
+                            None,
+                        ) => {},
+                        _ => {
+                            return Err(
+                                DocumentAutomationRequestError::InvalidExtractionFieldRead {
+                                    index: index as u32,
+                                },
+                            );
+                        },
+                    }
+                }
+                Ok(())
+            },
+            Self::Select { selector, values } => {
+                validate_selector(selector, limits)?;
+                let actual = values.len() as u64;
+                if actual > u64::from(limits.max_extraction_fields) {
+                    return Err(DocumentAutomationRequestError::TooManySelectValues {
+                        actual,
+                        limit: limits.max_extraction_fields,
+                    });
+                }
+                let mut unique = HashSet::with_capacity(values.len());
+                let mut bytes = 0u64;
+                for value in values {
+                    if !unique.insert(value) {
+                        return Err(DocumentAutomationRequestError::DuplicateSelectValue {
+                            value: value.to_owned(),
+                        });
+                    }
+                    bytes = bytes.checked_add(value.len() as u64).ok_or(
+                        DocumentAutomationRequestError::SelectValuesTooLong {
+                            actual: u64::MAX,
+                            limit: u64::from(limits.max_fill_value_bytes),
+                        },
+                    )?;
+                }
+                if bytes > u64::from(limits.max_fill_value_bytes) {
+                    return Err(DocumentAutomationRequestError::SelectValuesTooLong {
+                        actual: bytes,
+                        limit: u64::from(limits.max_fill_value_bytes),
+                    });
                 }
                 Ok(())
             },
         }
     }
+}
+
+fn validate_attribute_name(
+    index: u32,
+    attribute: &str,
+    limits: DocumentAutomationLimits,
+) -> Result<(), DocumentAutomationRequestError> {
+    let actual = attribute.len() as u64;
+    let limit = u64::from(limits.max_field_name_bytes);
+    if actual == 0 || actual > limit {
+        return Err(
+            DocumentAutomationRequestError::InvalidExtractionAttributeName {
+                index,
+                actual,
+                limit,
+            },
+        );
+    }
+    if attribute
+        .chars()
+        .any(|character| character.is_ascii_control() || character.is_ascii_whitespace())
+    {
+        return Err(
+            DocumentAutomationRequestError::InvalidExtractionAttributeName {
+                index,
+                actual,
+                limit,
+            },
+        );
+    }
+    Ok(())
 }
 
 fn validate_selector(
@@ -369,6 +528,7 @@ pub struct DocumentAutomationRequest {
     expected_generation: RuntimeStateGeneration,
     operation: DocumentAutomationOperation,
     limits: DocumentAutomationLimits,
+    selector_grammar: DocumentSelectorGrammar,
 }
 
 impl DocumentAutomationRequest {
@@ -380,6 +540,25 @@ impl DocumentAutomationRequest {
         operation: DocumentAutomationOperation,
         limits: DocumentAutomationLimits,
     ) -> Result<Self, DocumentAutomationRequestError> {
+        Self::new_with_selector_grammar_internal(
+            target,
+            expected_generation,
+            operation,
+            limits,
+            DocumentSelectorGrammar::LocalCompoundV1,
+        )
+    }
+
+    /// Construct a request with an explicit selector grammar for a trusted same-build caller.
+    /// Public callers must choose this only after selecting a profile which advertises it.
+    #[doc(hidden)]
+    pub fn new_with_selector_grammar_internal(
+        target: PendingTargetObservation,
+        expected_generation: RuntimeStateGeneration,
+        operation: DocumentAutomationOperation,
+        limits: DocumentAutomationLimits,
+        selector_grammar: DocumentSelectorGrammar,
+    ) -> Result<Self, DocumentAutomationRequestError> {
         target
             .validate()
             .map_err(DocumentAutomationRequestError::InvalidTarget)?;
@@ -389,6 +568,7 @@ impl DocumentAutomationRequest {
             expected_generation,
             operation,
             limits,
+            selector_grammar,
         })
     }
 
@@ -408,6 +588,10 @@ impl DocumentAutomationRequest {
 
     pub const fn limits(&self) -> DocumentAutomationLimits {
         self.limits
+    }
+
+    pub const fn selector_grammar(&self) -> DocumentSelectorGrammar {
+        self.selector_grammar
     }
 
     /// Revalidate bounded data after deserialization. Target freshness is an owner responsibility.
@@ -478,6 +662,25 @@ pub enum DocumentAutomationRequestError {
     DuplicateExtractionFieldName {
         name: String,
     },
+    InvalidExtractionFieldRead {
+        index: u32,
+    },
+    InvalidExtractionAttributeName {
+        index: u32,
+        actual: u64,
+        limit: u64,
+    },
+    TooManySelectValues {
+        actual: u64,
+        limit: u32,
+    },
+    SelectValuesTooLong {
+        actual: u64,
+        limit: u64,
+    },
+    DuplicateSelectValue {
+        value: String,
+    },
 }
 
 /// Stable operation names used in checked DOM-failure results.
@@ -485,6 +688,9 @@ pub enum DocumentAutomationRequestError {
 pub enum DocumentAutomationOperationKind {
     InnerHtml,
     Fill,
+    Select,
+    Focus,
+    Submit,
 }
 
 /// A typed rejection from authority validation or native DOM execution.
@@ -547,6 +753,43 @@ pub enum DocumentAutomationError {
     DisabledActivationElement {
         selector: String,
     },
+    UnsupportedCheckElement {
+        selector: String,
+    },
+    ImmutableCheckElement {
+        selector: String,
+    },
+    UnsupportedUncheckElement {
+        selector: String,
+    },
+    ImmutableUncheckElement {
+        selector: String,
+    },
+    UnsupportedSelectElement {
+        selector: String,
+    },
+    ImmutableSelectElement {
+        selector: String,
+    },
+    InvalidSelectMultiplicity {
+        selector: String,
+        multiple: bool,
+        requested: u32,
+    },
+    SelectValueNotFound {
+        selector: String,
+        value: String,
+    },
+    SelectValueDisabled {
+        selector: String,
+        value: String,
+    },
+    UnsupportedFocusElement {
+        selector: String,
+    },
+    UnsupportedSubmitElement {
+        selector: String,
+    },
     UnsupportedLazyAttributeSerialization {
         attribute: String,
     },
@@ -563,7 +806,7 @@ pub enum DocumentAutomationError {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DocumentExtractionValue {
     pub name: String,
-    pub value: String,
+    pub value: Option<String>,
 }
 
 /// One root match and all of its strict exact-one field values.
@@ -581,6 +824,10 @@ pub enum DocumentAutomationResult {
     Extract { rows: Vec<DocumentExtractionRow> },
     Filled,
     Activated,
+    Checked { changed: bool, checked: bool },
+    Selected { changed: bool, values: Vec<String> },
+    Focused { focused: bool },
+    Submitted,
 }
 
 #[cfg(test)]
@@ -635,12 +882,34 @@ mod tests {
 
         assert_eq!(decoded, request);
         assert_eq!(decoded.expected_generation().get(), 19);
+        assert_eq!(
+            decoded.selector_grammar(),
+            DocumentSelectorGrammar::LocalCompoundV1,
+        );
         assert!(decoded.target().contains_pipeline(TEST_PIPELINE_ID));
         let DocumentAutomationOperation::Extract(plan) = decoded.operation() else {
             panic!("expected extraction plan");
         };
         assert_eq!(plan.fields()[0].name(), "case");
         assert_eq!(plan.fields()[1].name(), "court");
+
+        let practical = DocumentAutomationRequest::new_with_selector_grammar_internal(
+            target(),
+            RuntimeStateGeneration::new(20),
+            DocumentAutomationOperation::QueryCount {
+                selector: ".row > .case".to_owned(),
+            },
+            DocumentAutomationLimits::MVP,
+            DocumentSelectorGrammar::PracticalV2,
+        )
+        .unwrap();
+        let decoded: DocumentAutomationRequest =
+            from_bytes(&to_stdvec(&practical).unwrap()).unwrap();
+        assert_eq!(decoded, practical);
+        assert_eq!(
+            decoded.selector_grammar(),
+            DocumentSelectorGrammar::PracticalV2,
+        );
     }
 
     #[test]
@@ -799,6 +1068,82 @@ mod tests {
     }
 
     #[test]
+    fn attribute_extraction_requires_a_bounded_valid_attribute_name() {
+        let limits = DocumentAutomationLimits::new_internal(32, 32, 8, 2, 2, 32, 64).unwrap();
+        let valid = DocumentAutomationOperation::Extract(DocumentExtractionPlan::new_internal(
+            ".row".to_owned(),
+            vec![DocumentExtractionField::new_attribute_internal(
+                "href".to_owned(),
+                "a".to_owned(),
+                DocumentExtractionRead::ResolvedUrl,
+                "href".to_owned(),
+            )],
+        ));
+        assert_eq!(valid.validate(limits), Ok(()));
+
+        let missing_attribute =
+            DocumentAutomationOperation::Extract(DocumentExtractionPlan::new_internal(
+                ".row".to_owned(),
+                vec![DocumentExtractionField::new_internal(
+                    "href".to_owned(),
+                    "a".to_owned(),
+                    DocumentExtractionRead::Attribute,
+                )],
+            ));
+        assert_eq!(
+            missing_attribute.validate(limits),
+            Err(DocumentAutomationRequestError::InvalidExtractionFieldRead { index: 0 }),
+        );
+
+        let whitespace =
+            DocumentAutomationOperation::Extract(DocumentExtractionPlan::new_internal(
+                ".row".to_owned(),
+                vec![DocumentExtractionField::new_attribute_internal(
+                    "href".to_owned(),
+                    "a".to_owned(),
+                    DocumentExtractionRead::Attribute,
+                    "bad name".to_owned(),
+                )],
+            ));
+        assert_eq!(
+            whitespace.validate(limits),
+            Err(
+                DocumentAutomationRequestError::InvalidExtractionAttributeName {
+                    index: 0,
+                    actual: 8,
+                    limit: 8,
+                },
+            ),
+        );
+    }
+
+    #[test]
+    fn select_values_are_unique_and_cumulatively_bounded() {
+        let limits = DocumentAutomationLimits::new_internal(32, 5, 8, 2, 2, 32, 64).unwrap();
+        assert_eq!(
+            DocumentAutomationOperation::Select {
+                selector: "select".to_owned(),
+                values: vec!["a".to_owned(), "a".to_owned()],
+            }
+            .validate(limits),
+            Err(DocumentAutomationRequestError::DuplicateSelectValue {
+                value: "a".to_owned(),
+            }),
+        );
+        assert_eq!(
+            DocumentAutomationOperation::Select {
+                selector: "select".to_owned(),
+                values: vec!["abc".to_owned(), "def".to_owned()],
+            }
+            .validate(limits),
+            Err(DocumentAutomationRequestError::SelectValuesTooLong {
+                actual: 6,
+                limit: 5,
+            }),
+        );
+    }
+
+    #[test]
     fn selector_and_fill_value_are_bounded_before_execution() {
         let limits = DocumentAutomationLimits::new_internal(3, 4, 4, 1, 1, 8, 8).unwrap();
         assert_eq!(
@@ -839,6 +1184,26 @@ mod tests {
             }
             .may_mutate_document()
         );
+        for operation in [
+            DocumentAutomationOperation::Check {
+                selector: "#check".to_owned(),
+            },
+            DocumentAutomationOperation::Uncheck {
+                selector: "#check".to_owned(),
+            },
+            DocumentAutomationOperation::Select {
+                selector: "select".to_owned(),
+                values: vec!["one".to_owned()],
+            },
+            DocumentAutomationOperation::Focus {
+                selector: "#field".to_owned(),
+            },
+            DocumentAutomationOperation::Submit {
+                selector: "form".to_owned(),
+            },
+        ] {
+            assert!(operation.may_mutate_document());
+        }
         assert!(
             !DocumentAutomationOperation::TextContent {
                 selector: "#result".to_owned(),

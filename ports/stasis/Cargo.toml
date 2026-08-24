@@ -1,6 +1,6 @@
 [package]
 name = "stasis-shell"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["OxHQ"]
 license = "MPL-2.0"
 edition.workspace = true
@@ -16,10 +16,13 @@ path = "src/main.rs"
 [dependencies]
 dpi = { workspace = true }
 embedder_traits = { workspace = true }
+net_traits = { workspace = true }
+rand = { workspace = true }
 rustls = { workspace = true, features = ["aws-lc-rs"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 servo = { workspace = true, default-features = false, features = ["baked-in-resources", "bundled_freetype", "js_jit"] }
 servo-base = { workspace = true }
+storage_traits = { workspace = true }
 timers = { workspace = true }
 url = { workspace = true }

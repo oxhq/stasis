@@ -1806,6 +1806,7 @@ fn test_dont_prompt_credentials_when_unauthorized_response_contains_no_www_authe
                     );
                 },
                 net::embedder::NetToEmbedderMsg::WebResourceRequested(..) => {},
+                net::embedder::NetToEmbedderMsg::WebResourceFinished(..) => {},
                 _ => unreachable!(),
             }
         }

@@ -402,9 +402,29 @@ impl ServoInner {
                         response_sender,
                         self.servo_errors.sender(),
                     );
-                    webview
-                        .delegate()
-                        .load_web_resource(webview, web_resource_load);
+                    if matches!(web_resource_load.request().url.scheme(), "http" | "https")
+                        && let Some(session) = webview.controlled_network_session()
+                    {
+                        // A main-frame navigation establishes its target as the new cookie
+                        // context. Subresources and fetches remain bound to the active document's
+                        // top-level URL. This distinction is part of controlled-web-session-v1:
+                        // without it, a supported cross-origin document replacement cannot send
+                        // cookies belonging to its target origin.
+                        let top_level_url = controlled_cookie_context_url(
+                            &web_resource_load.request().url,
+                            web_resource_load.request().is_for_main_frame,
+                            webview.controlled_cookie_top_level_url(),
+                        );
+                        crate::controlled_network::handle_request(
+                            &session,
+                            web_resource_load,
+                            top_level_url,
+                        );
+                    } else {
+                        webview
+                            .delegate()
+                            .load_web_resource(webview, web_resource_load);
+                    }
                 } else {
                     let web_resource_load = WebResourceLoad::new(
                         web_resource_request,
@@ -413,6 +433,17 @@ impl ServoInner {
                     );
                     self.delegate.borrow().load_web_resource(web_resource_load);
                 }
+            },
+            NetToEmbedderMsg::WebResourceFinished(webview_id, load_id, terminal) => {
+                let Some(webview) =
+                    webview_id.and_then(|webview_id| self.get_webview_handle(webview_id))
+                else {
+                    return;
+                };
+                let Some(session) = webview.controlled_network_session() else {
+                    return;
+                };
+                crate::controlled_network::handle_terminal(&session, load_id, terminal);
             },
             NetToEmbedderMsg::RequestAuthentication(
                 webview_id,
@@ -849,6 +880,52 @@ impl ServoInner {
                 }
             },
         }
+    }
+}
+
+fn controlled_cookie_context_url(
+    request_url: &url::Url,
+    is_for_main_frame: bool,
+    active_top_level_url: Option<url::Url>,
+) -> url::Url {
+    if is_for_main_frame {
+        request_url.clone()
+    } else {
+        active_top_level_url.unwrap_or_else(|| request_url.clone())
+    }
+}
+
+#[cfg(test)]
+mod controlled_cookie_context_tests {
+    use super::controlled_cookie_context_url;
+
+    #[test]
+    fn main_frame_cross_origin_navigation_uses_the_target_context() {
+        let active = url::Url::parse("https://source.example/account").unwrap();
+        let target = url::Url::parse("https://target.example/dashboard").unwrap();
+
+        assert_eq!(
+            controlled_cookie_context_url(&target, true, Some(active)),
+            target,
+        );
+    }
+
+    #[test]
+    fn subresource_uses_the_active_top_level_context() {
+        let active = url::Url::parse("https://source.example/account").unwrap();
+        let target = url::Url::parse("https://cdn.example/app.js").unwrap();
+
+        assert_eq!(
+            controlled_cookie_context_url(&target, false, Some(active.clone())),
+            active,
+        );
+    }
+
+    #[test]
+    fn first_subresource_falls_back_to_its_request_context() {
+        let target = url::Url::parse("https://source.example/app.js").unwrap();
+
+        assert_eq!(controlled_cookie_context_url(&target, false, None), target,);
     }
 }
 

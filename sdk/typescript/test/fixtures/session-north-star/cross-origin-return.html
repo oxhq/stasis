@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+  <body>
+    <p id="cross-origin-status">pending</p>
+    <script>
+      const targetCookieVisible = document.cookie.includes("stasis-origin-target=");
+      const sourceCookieVisible = document.cookie.includes("stasis-origin-source=source-cookie");
+      const localValue = localStorage.getItem("stasis-origin-marker");
+      const sessionValue = sessionStorage.getItem("stasis-origin-marker");
+      fetch("/cross-origin-source-probe")
+        .then((response) => response.text())
+        .then((probe) => {
+          document.querySelector("#cross-origin-status").textContent =
+            `source-return|source-cookie=${sourceCookieVisible}|target-cookie=${targetCookieVisible}|local=${localValue}|session=${sessionValue}|probe=${probe}`;
+        })
+        .catch(() => {
+          document.querySelector("#cross-origin-status").textContent = "source-probe-failed";
+        });
+    </script>
+  </body>
+</html>

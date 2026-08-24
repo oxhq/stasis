@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+  <body>
+    <p id="network-abort-status">pending</p>
+    <script>
+      const fetchAbort = fetch("/fixture-abort-must-not-reach-live?transport=fetch")
+        .then(() => "unexpected-fetch-success")
+        .catch(() => "caught-fetch");
+      const xhrAbort = new Promise((resolve) => {
+        const request = new XMLHttpRequest();
+        request.open("GET", "/fixture-abort-must-not-reach-live?transport=xhr");
+        request.onload = () => resolve("unexpected-xhr-success");
+        request.onerror = () => resolve("caught-xhr");
+        request.onabort = () => resolve("caught-xhr");
+        request.send();
+      });
+      Promise.all([fetchAbort, xhrAbort]).then((results) => {
+        document.querySelector("#network-abort-status").textContent = results.join("|");
+      });
+    </script>
+  </body>
+</html>

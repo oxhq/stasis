@@ -265,6 +265,17 @@ impl WebResourceLoad {
         &self.request
     }
 
+    /// Install the controlled-session cookie context before choosing fixture or live handling.
+    #[doc(hidden)]
+    pub(crate) fn mark_controlled_session(&mut self, top_level_url: Url) {
+        if let Err(error) = self
+            .responder
+            .send(WebResourceResponseMsg::ControlledSession { top_level_url })
+        {
+            self.error_sender.raise_response_send_error(error);
+        }
+    }
+
     /// Intercept this [`WebResourceLoad`] and control the response via the returned
     /// [`InterceptedWebResourceLoad`].
     pub fn intercept(mut self, response: WebResourceResponse) -> InterceptedWebResourceLoad {
@@ -276,6 +287,14 @@ impl WebResourceLoad {
             response_sender: self.responder,
             finished: false,
             error_sender: self.error_sender,
+        }
+    }
+
+    /// Cancel this resource before any live-network fallback can begin.
+    #[doc(hidden)]
+    pub fn cancel(mut self) {
+        if let Err(error) = self.responder.send(WebResourceResponseMsg::CancelLoad) {
+            self.error_sender.raise_response_send_error(error);
         }
     }
 }
@@ -327,8 +346,8 @@ impl InterceptedWebResourceLoad {
 
 impl Drop for InterceptedWebResourceLoad {
     fn drop(&mut self) {
-        if !self.finished &&
-            let Err(error) = self
+        if !self.finished
+            && let Err(error) = self
                 .response_sender
                 .send(WebResourceResponseMsg::FinishLoad)
         {
@@ -904,6 +923,7 @@ pub struct CreateNewWebViewRequest {
     pub(crate) servo: Servo,
     pub(crate) responder: IpcResponder<Option<NewWebViewDetails>>,
     pub(crate) document_clock: ValidatedDocumentClockConfiguration,
+    pub(crate) document_control_profile: embedder_traits::DocumentControlProfile,
 }
 
 impl CreateNewWebViewRequest {
@@ -914,6 +934,7 @@ impl CreateNewWebViewRequest {
             rendering_context,
             self.responder,
             self.document_clock,
+            self.document_control_profile,
         )
     }
 }
@@ -1103,6 +1124,7 @@ impl WebViewDelegate for DefaultWebViewDelegate {}
 #[cfg(test)]
 mod test {
     use super::*;
+    use embedder_traits::{WebResourceKind, WebResourceLoadId};
 
     #[test]
     fn test_allow_deny_request() {
@@ -1231,6 +1253,9 @@ mod test {
             referrer_url: None,
             is_for_main_frame: false,
             is_redirect: false,
+            controlled_load_id: WebResourceLoadId::new([0; 16], 0),
+            controlled_body_bytes: Some(0),
+            controlled_resource_kind: WebResourceKind::Navigation,
         };
         let web_resource_response = || {
             WebResourceResponse::new(

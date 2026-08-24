@@ -6,17 +6,26 @@
 //! <http://tools.ietf.org/html/rfc6265>
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Write};
 use std::net::IpAddr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use cookie::Cookie;
+use cookie::{Cookie, SameSite};
 use itertools::Itertools;
-use log::info;
 use malloc_size_of_derive::MallocSizeOf;
-use net_traits::pub_domains::reg_suffix;
-use net_traits::{CookieSource, SiteDescriptor};
+use net_traits::pub_domains::{is_same_site, reg_suffix};
+use net_traits::{
+    CONTROLLED_COOKIE_MAX_BATCH_VALUES_V1, CONTROLLED_COOKIE_MAX_RAW_VALUE_BYTES_V1,
+    COOKIE_STATE_MAX_COOKIE_BYTES_V1, COOKIE_STATE_MAX_COOKIES_V1,
+    COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1, COOKIE_STATE_MAX_TOTAL_BYTES_V1,
+    COOKIE_STATE_SCHEMA_VERSION_V1, ControlledCookiePolicyError, CookieSource, CookieStateError,
+    CookieStateRecordV1, CookieStateSameSite, CookieStateSnapshotV1, SiteDescriptor,
+    has_valid_cookie_state_prefix, is_canonical_cookie_state_domain,
+    is_valid_cookie_state_name_and_value,
+};
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use servo_url::ServoUrl;
 
@@ -27,6 +36,20 @@ pub struct CookieStorage {
     version: u32,
     cookies_map: HashMap<String, Vec<ServoCookie>>,
     max_per_host: usize,
+    #[serde(default)]
+    revision: u64,
+    #[serde(default)]
+    revision_exhausted: bool,
+    /// Next controller-owned ordering stamps. These are separate from the ordinary Servo cookie
+    /// wall-clock fields and are used only by the controlled-session paths below.
+    #[serde(default)]
+    controlled_creation_sequence_next: u64,
+    #[serde(default)]
+    controlled_creation_sequence_exhausted: bool,
+    #[serde(default)]
+    controlled_access_sequence_next: u64,
+    #[serde(default)]
+    controlled_access_sequence_exhausted: bool,
 }
 
 #[derive(Debug)]
@@ -41,6 +64,19 @@ impl CookieStorage {
             version: 1,
             cookies_map: HashMap::new(),
             max_per_host: max_cookies,
+            revision: 0,
+            revision_exhausted: false,
+            controlled_creation_sequence_next: 0,
+            controlled_creation_sequence_exhausted: false,
+            controlled_access_sequence_next: 0,
+            controlled_access_sequence_exhausted: false,
+        }
+    }
+
+    fn bump_revision(&mut self) {
+        match self.revision.checked_add(1) {
+            Some(revision) => self.revision = revision,
+            None => self.revision_exhausted = true,
         }
     }
 
@@ -63,11 +99,11 @@ impl CookieStorage {
                 let existing_domain = c.cookie.domain().as_ref().unwrap().to_owned();
                 let existing_path = c.cookie.path().as_ref().unwrap().to_owned();
 
-                c.cookie.name() == cookie.cookie.name() &&
-                    c.cookie.secure().unwrap_or(false) &&
-                    (ServoCookie::domain_match(new_domain, existing_domain) ||
-                        ServoCookie::domain_match(existing_domain, new_domain)) &&
-                    ServoCookie::path_match(new_path, existing_path)
+                c.cookie.name() == cookie.cookie.name()
+                    && c.cookie.secure().unwrap_or(false)
+                    && (ServoCookie::domain_match(new_domain, existing_domain)
+                        || ServoCookie::domain_match(existing_domain, new_domain))
+                    && ServoCookie::path_match(new_path, existing_path)
             });
 
             if any_overlapping {
@@ -77,9 +113,9 @@ impl CookieStorage {
 
         // Step 11.1
         let position = cookies.iter().position(|c| {
-            c.cookie.domain() == cookie.cookie.domain() &&
-                c.cookie.path() == cookie.cookie.path() &&
-                c.cookie.name() == cookie.cookie.name()
+            c.cookie.domain() == cookie.cookie.domain()
+                && c.cookie.path() == cookie.cookie.path()
+                && c.cookie.name() == cookie.cookie.name()
         });
 
         if let Some(ind) = position {
@@ -92,6 +128,7 @@ impl CookieStorage {
                 cookies.push(c);
                 Err(RemoveCookieError::NonHTTP)
             } else {
+                self.bump_revision();
                 Ok(Some(c))
             }
         } else {
@@ -104,6 +141,7 @@ impl CookieStorage {
         // entries in the cookies map. If this assumption stops holding in
         // practice, this implementation can be revised to use `retain`
         // together with a temporary `HashSet` of sites.
+        let mut changed = false;
         for site in sites {
             // TODO: We currently mark cookies as expired instead of removing
             // them immediately (same behavior as in the functions below).
@@ -113,40 +151,63 @@ impl CookieStorage {
             if let Some(cookies) = self.cookies_map.get_mut(site) {
                 for cookie in cookies.iter_mut() {
                     cookie.set_expiry_time_in_past();
+                    changed = true;
                 }
             }
+        }
+        if changed {
+            self.bump_revision();
         }
     }
 
     pub fn clear_session_cookies(&mut self) {
-        self.cookies_map
+        let mut changed = false;
+        for cookie in self
+            .cookies_map
             .values_mut()
             .flat_map(|cookies| cookies.iter_mut())
             .filter(|cookie| !cookie.persistent)
-            .for_each(|cookie| cookie.set_expiry_time_in_past());
+        {
+            cookie.set_expiry_time_in_past();
+            changed = true;
+        }
+        if changed {
+            self.bump_revision();
+        }
     }
 
     pub fn clear_storage(&mut self, url: Option<&ServoUrl>) {
+        let mut changed = false;
         if let Some(url) = url {
             let domain = reg_host(url.host_str().unwrap_or(""));
             if let Some(cookies) = self.cookies_map.get_mut(&domain) {
                 for cookie in cookies.iter_mut() {
                     cookie.set_expiry_time_in_past();
+                    changed = true;
                 }
             }
         } else {
+            changed = !self.cookies_map.is_empty();
             self.cookies_map.clear();
+        }
+        if changed {
+            self.bump_revision();
         }
     }
 
     pub fn delete_cookie_with_name(&mut self, url: &ServoUrl, name: String) {
+        let mut changed = false;
         let domain = reg_host(url.host_str().unwrap_or(""));
         if let Some(cookies) = self.cookies_map.get_mut(&domain) {
             for cookie in cookies.iter_mut() {
                 if cookie.cookie.name() == name {
                     cookie.set_expiry_time_in_past();
+                    changed = true;
                 }
             }
+        }
+        if changed {
+            self.bump_revision();
         }
     }
 
@@ -167,6 +228,12 @@ impl CookieStorage {
         if let Some(old_cookie) = old_cookie.unwrap() {
             // Step 11.3
             cookie.creation_time = old_cookie.creation_time;
+            // A replacement retains the controller-owned creation order just as it retains the
+            // ordinary RFC creation time. Ordinary cookies carry `None`, so their behavior is
+            // unchanged.
+            cookie.controlled_creation_sequence = old_cookie
+                .controlled_creation_sequence
+                .or(cookie.controlled_creation_sequence);
         }
 
         // Step 12
@@ -179,13 +246,14 @@ impl CookieStorage {
             let new_len = cookies.len();
 
             // https://www.ietf.org/id/draft-ietf-httpbis-cookie-alone-01.txt
-            if new_len == old_len &&
-                !evict_one_cookie(cookie.cookie.secure().unwrap_or(false), cookies)
+            if new_len == old_len
+                && !evict_one_cookie(cookie.cookie.secure().unwrap_or(false), cookies)
             {
                 return;
             }
         }
         cookies.push(cookie);
+        self.bump_revision();
     }
 
     pub fn cookie_comparator(a: &ServoCookie, b: &ServoCookie) -> Ordering {
@@ -201,20 +269,31 @@ impl CookieStorage {
 
     pub fn remove_expired_cookies_for_url(&mut self, url: &ServoUrl) {
         let domain = reg_host(url.host_str().unwrap_or(""));
+        let mut changed = false;
         if let Entry::Occupied(mut entry) = self.cookies_map.entry(domain) {
             let cookies = entry.get_mut();
+            let old_len = cookies.len();
             cookies.retain(|c| !is_cookie_expired(c));
+            changed = cookies.len() != old_len;
             if cookies.is_empty() {
                 entry.remove_entry();
             }
         }
+        if changed {
+            self.bump_revision();
+        }
     }
 
     pub fn remove_all_expired_cookies(&mut self) {
+        let old_len: usize = self.cookies_map.values().map(Vec::len).sum();
         self.cookies_map.retain(|_, cookies| {
             cookies.retain(|c| !is_cookie_expired(c));
             !cookies.is_empty()
         });
+        let new_len: usize = self.cookies_map.values().map(Vec::len).sum();
+        if new_len != old_len {
+            self.bump_revision();
+        }
     }
 
     // http://tools.ietf.org/html/rfc6265#section-5.4
@@ -232,19 +311,176 @@ impl CookieStorage {
             (match acc.len() {
                 0 => acc,
                 _ => acc + "; ",
-            }) + cookie.name() +
-                "=" +
-                cookie.value()
+            }) + cookie.name()
+                + "="
+                + cookie.value()
         };
 
         // Serialize the cookie-list into a cookie-string by processing each cookie in the cookie-list in order
         let result = cookie_list.fold("".to_owned(), reducer);
 
-        info!(" === COOKIES SENT: {}", result);
         match result.len() {
             0 => None,
             _ => Some(result),
         }
+    }
+
+    /// Return the HTTP Cookie header for a deterministic controlled session.
+    ///
+    /// The current Servo jar does not carry a request-site argument into ordinary cookie
+    /// selection. Controlled sessions therefore admit only a schemefully same-site context. Once
+    /// that proof holds, Strict, Lax, unspecified, and None cookies all pass the SameSite boundary;
+    /// the existing domain/path/Secure/HttpOnly checks remain authoritative.
+    pub fn controlled_session_cookies_for_url(
+        &mut self,
+        url: &ServoUrl,
+        top_level_url: &ServoUrl,
+        source: CookieSource,
+    ) -> Result<Option<String>, ControlledCookiePolicyError> {
+        ensure_controlled_same_site(url, top_level_url)?;
+        self.ensure_controlled_ordering()
+            .map_err(|()| ControlledCookiePolicyError::InvalidCookie)?;
+
+        let domain = reg_host(url.host_str().unwrap_or(""));
+        let matching_count = self
+            .cookies_map
+            .entry(domain.clone())
+            .or_default()
+            .iter()
+            .filter(|cookie| cookie.appropriate_for_url(url, source))
+            .count();
+        let access_sequences = self
+            .reserve_controlled_access_sequences(matching_count)
+            .map_err(|()| ControlledCookiePolicyError::InvalidCookie)?;
+        let cookies = self.cookies_map.entry(domain).or_default();
+        let mut matching: Vec<_> = cookies
+            .iter_mut()
+            .filter(|cookie| cookie.appropriate_for_url(url, source))
+            .collect();
+        matching.sort_by(|a, b| controlled_cookie_comparator(a, b));
+
+        let mut result = String::new();
+        for (cookie, access_sequence) in matching.into_iter().zip(access_sequences) {
+            cookie.controlled_last_access_sequence = Some(access_sequence);
+            if !result.is_empty() {
+                result.push_str("; ");
+            }
+            result.push_str(cookie.cookie.name());
+            result.push('=');
+            result.push_str(cookie.cookie.value());
+        }
+        if result.is_empty() {
+            Ok(None)
+        } else {
+            self.bump_revision();
+            Ok(Some(result))
+        }
+    }
+
+    /// Parse and store one controlled-session Set-Cookie value without wall-clock or partition
+    /// ambiguity. Rejection happens before `push`, so the jar and its revision remain unchanged.
+    pub fn set_controlled_session_cookie_from_header(
+        &mut self,
+        request_url: &ServoUrl,
+        top_level_url: &ServoUrl,
+        cookie_value: &str,
+    ) -> Result<(), ControlledCookiePolicyError> {
+        self.set_controlled_session_cookies_from_headers(
+            request_url,
+            top_level_url,
+            &[cookie_value],
+        )
+    }
+
+    /// Parse and store one cookie authored by a page API under controlled-session policy. This
+    /// deliberately accepts the original cookie string so attribute *presence* (including an
+    /// invalid `Max-Age`) is rejected before parsing can erase that evidence.
+    pub fn set_controlled_session_cookie_from_non_http(
+        &mut self,
+        request_url: &ServoUrl,
+        top_level_url: &ServoUrl,
+        cookie_value: &str,
+    ) -> Result<(), ControlledCookiePolicyError> {
+        self.set_controlled_session_cookie_values(
+            request_url,
+            top_level_url,
+            &[cookie_value],
+            CookieSource::NonHTTP,
+        )
+    }
+
+    /// Validate a complete response's Set-Cookie list before mutating the jar. This preserves the
+    /// response-level fail-closed boundary when a later header contains an unsupported attribute.
+    pub fn set_controlled_session_cookies_from_headers(
+        &mut self,
+        request_url: &ServoUrl,
+        top_level_url: &ServoUrl,
+        cookie_values: &[&str],
+    ) -> Result<(), ControlledCookiePolicyError> {
+        self.set_controlled_session_cookie_values(
+            request_url,
+            top_level_url,
+            cookie_values,
+            CookieSource::HTTP,
+        )
+    }
+
+    fn set_controlled_session_cookie_values(
+        &mut self,
+        request_url: &ServoUrl,
+        top_level_url: &ServoUrl,
+        cookie_values: &[&str],
+        source: CookieSource,
+    ) -> Result<(), ControlledCookiePolicyError> {
+        ensure_controlled_same_site(request_url, top_level_url)?;
+        if cookie_values.len() > CONTROLLED_COOKIE_MAX_BATCH_VALUES_V1 {
+            return Err(ControlledCookiePolicyError::InvalidCookie);
+        }
+        let mut cookies = Vec::with_capacity(cookie_values.len());
+        for cookie_value in cookie_values {
+            if cookie_value.len() > CONTROLLED_COOKIE_MAX_RAW_VALUE_BYTES_V1 {
+                return Err(ControlledCookiePolicyError::InvalidCookie);
+            }
+            if has_cookie_attribute(cookie_value, "expires")
+                || has_cookie_attribute(cookie_value, "max-age")
+            {
+                return Err(ControlledCookiePolicyError::PersistentCookieUnsupported);
+            }
+            if has_cookie_attribute(cookie_value, "partitioned") {
+                return Err(ControlledCookiePolicyError::PartitionedCookieUnsupported);
+            }
+            let cookie = ServoCookie::from_cookie_string(cookie_value, request_url, source)
+                .ok_or(ControlledCookiePolicyError::InvalidCookie)?;
+            if !is_valid_cookie_state_name_and_value(cookie.cookie.name(), cookie.cookie.value())
+                || (cookie.cookie.same_site() == Some(SameSite::None)
+                    && cookie.cookie.secure() != Some(true))
+            {
+                return Err(ControlledCookiePolicyError::InvalidCookie);
+            }
+            cookies.push(cookie);
+        }
+        // Apply the whole response/page mutation to a private jar. Ordinary `push` intentionally
+        // reports no result and can ignore a cookie (for example, a non-HTTP overwrite of an
+        // HttpOnly cookie). A controlled caller must never observe that as success or consume
+        // controller ordering stamps. Requiring a revision change per candidate detects those
+        // silent no-ops, while the staged export proves the final global count and byte bounds.
+        let mut staged = self.clone();
+        let initial_revision = staged.revision;
+        for cookie in cookies {
+            let previous_revision = staged.revision;
+            staged.push_controlled(cookie, request_url, source)?;
+            if staged.revision == previous_revision {
+                return Err(ControlledCookiePolicyError::InvalidCookie);
+            }
+        }
+        if staged.revision == initial_revision {
+            return Ok(());
+        }
+        staged
+            .export_state()
+            .map_err(|_| ControlledCookiePolicyError::InvalidCookie)?;
+        *self = staged;
+        Ok(())
     }
 
     /// <https://cookiestore.spec.whatwg.org/#query-cookies>
@@ -268,15 +504,14 @@ impl CookieStorage {
         // Return list
     }
 
-    pub fn cookies_data_for_url<'a>(
-        &'a mut self,
-        url: &'a ServoUrl,
+    pub fn cookies_data_for_url(
+        &mut self,
+        url: &ServoUrl,
         source: CookieSource,
-    ) -> impl Iterator<Item = cookie::Cookie<'static>> + 'a {
+    ) -> impl Iterator<Item = cookie::Cookie<'static>> {
         let domain = reg_host(url.host_str().unwrap_or(""));
         let cookies = self.cookies_map.entry(domain).or_default();
-
-        cookies
+        let result: Vec<_> = cookies
             .iter_mut()
             .filter(move |c| c.appropriate_for_url(url, source))
             .sorted_by(|a: &&mut ServoCookie, b: &&mut ServoCookie| {
@@ -288,6 +523,311 @@ impl CookieStorage {
                 c.touch();
                 c.cookie.clone()
             })
+            .collect();
+        if !result.is_empty() {
+            self.bump_revision();
+        }
+        result.into_iter()
+    }
+
+    /// Return a bounded canonical snapshot suitable for privileged controlled-session transfer.
+    ///
+    /// Persistent cookies are rejected. Creation and last-access ordering use checked,
+    /// controller-owned stamps rather than Servo's ordinary wall-clock timestamps. Partitioned
+    /// cookies are rejected because the current jar has no partition key.
+    pub fn export_state(&mut self) -> Result<CookieStateSnapshotV1, CookieStateError> {
+        self.remove_all_expired_cookies();
+        if self.revision_exhausted {
+            return Err(CookieStateError::RevisionExhausted);
+        }
+
+        let cookies: Vec<&ServoCookie> = self.cookies_map.values().flatten().collect();
+        if cookies.len() > COOKIE_STATE_MAX_COOKIES_V1 {
+            return Err(CookieStateError::TooManyCookies);
+        }
+        if cookies.iter().any(|cookie| cookie.persistent) {
+            return Err(CookieStateError::PersistentCookieUnsupported);
+        }
+        if cookies
+            .iter()
+            .any(|cookie| cookie.cookie.partitioned() == Some(true))
+        {
+            return Err(CookieStateError::PartitionedCookieUnsupported);
+        }
+
+        self.ensure_controlled_ordering()
+            .map_err(|()| CookieStateError::RevisionExhausted)?;
+        let cookies: Vec<&ServoCookie> = self.cookies_map.values().flatten().collect();
+
+        let mut creation_order = cookies.clone();
+        creation_order.sort_by(|a, b| {
+            a.controlled_creation_sequence
+                .cmp(&b.controlled_creation_sequence)
+                .then_with(|| cookie_identity(a).cmp(&cookie_identity(b)))
+        });
+        let creation_sequences: HashMap<_, _> = creation_order
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, cookie)| (cookie_identity(cookie), sequence as u64))
+            .collect();
+
+        let mut access_order = cookies.clone();
+        access_order.sort_by(|a, b| {
+            a.controlled_last_access_sequence
+                .cmp(&b.controlled_last_access_sequence)
+                .then_with(|| cookie_identity(a).cmp(&cookie_identity(b)))
+        });
+        let access_sequences: HashMap<_, _> = access_order
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, cookie)| (cookie_identity(cookie), sequence as u64))
+            .collect();
+
+        let mut total_bytes = 0usize;
+        let mut records = Vec::with_capacity(cookies.len());
+        for cookie in cookies {
+            let identity = cookie_identity(cookie);
+            let public_domain = public_cookie_state_domain(&identity.0);
+            let record_bytes = cookie.cookie.name().len()
+                + cookie.cookie.value().len()
+                + public_domain.len()
+                + identity.1.len();
+            if record_bytes > COOKIE_STATE_MAX_COOKIE_BYTES_V1 {
+                return Err(CookieStateError::CookieTooLarge);
+            }
+            total_bytes = total_bytes
+                .checked_add(record_bytes)
+                .ok_or(CookieStateError::SnapshotTooLarge)?;
+            if total_bytes > COOKIE_STATE_MAX_TOTAL_BYTES_V1 {
+                return Err(CookieStateError::SnapshotTooLarge);
+            }
+            records.push(CookieStateRecordV1 {
+                name: cookie.cookie.name().to_owned(),
+                value: cookie.cookie.value().to_owned(),
+                domain: public_domain.to_owned(),
+                path: identity.1.clone(),
+                host_only: cookie.host_only,
+                secure: cookie.cookie.secure().unwrap_or(false),
+                http_only: cookie.cookie.http_only().unwrap_or(false),
+                same_site: project_same_site(cookie.cookie.same_site()),
+                expires_unix_time_ns: None,
+                partitioned: false,
+                creation_sequence: creation_sequences[&identity],
+                last_access_sequence: access_sequences[&identity],
+            });
+        }
+        records.sort_by(|a, b| cookie_record_identity(a).cmp(&cookie_record_identity(b)));
+        validate_cookie_state_encoded_array(&records)?;
+
+        Ok(CookieStateSnapshotV1 {
+            schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+            revision: self.revision,
+            cookies: records,
+        })
+    }
+
+    /// Atomically replace this jar from a fully validated session-cookie snapshot.
+    pub fn replace_state(
+        &mut self,
+        expected_revision: u64,
+        snapshot: CookieStateSnapshotV1,
+    ) -> Result<u64, CookieStateError> {
+        if self.revision_exhausted {
+            return Err(CookieStateError::RevisionExhausted);
+        }
+        if expected_revision != self.revision {
+            return Err(CookieStateError::StaleRevision);
+        }
+        let next_revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(CookieStateError::RevisionExhausted)?;
+        if snapshot.schema_version != COOKIE_STATE_SCHEMA_VERSION_V1 {
+            return Err(CookieStateError::UnsupportedSchemaVersion);
+        }
+        if snapshot.cookies.len() > COOKIE_STATE_MAX_COOKIES_V1 {
+            return Err(CookieStateError::TooManyCookies);
+        }
+        validate_cookie_state_encoded_array(&snapshot.cookies)?;
+
+        let mut identities = HashSet::new();
+        let mut creation_sequences = HashSet::new();
+        let mut access_sequences = HashSet::new();
+        let mut total_bytes = 0usize;
+        let mut replacement: HashMap<String, Vec<ServoCookie>> = HashMap::new();
+        let mut maximum_creation_sequence = None;
+        let mut maximum_access_sequence = None;
+        for record in snapshot.cookies {
+            if record.partitioned {
+                return Err(CookieStateError::PartitionedCookieUnsupported);
+            }
+            if record.expires_unix_time_ns.is_some() {
+                return Err(CookieStateError::PersistentCookieUnsupported);
+            }
+            let identity = cookie_record_identity(&record);
+            if !identities.insert(identity) {
+                return Err(CookieStateError::DuplicateCookieIdentity);
+            }
+            if !creation_sequences.insert(record.creation_sequence) {
+                return Err(CookieStateError::DuplicateCreationSequence);
+            }
+            if !access_sequences.insert(record.last_access_sequence) {
+                return Err(CookieStateError::DuplicateLastAccessSequence);
+            }
+            maximum_creation_sequence = Some(
+                maximum_creation_sequence.map_or(record.creation_sequence, |maximum: u64| {
+                    maximum.max(record.creation_sequence)
+                }),
+            );
+            maximum_access_sequence = Some(
+                maximum_access_sequence.map_or(record.last_access_sequence, |maximum: u64| {
+                    maximum.max(record.last_access_sequence)
+                }),
+            );
+            let record_bytes =
+                record.name.len() + record.value.len() + record.domain.len() + record.path.len();
+            if record_bytes > COOKIE_STATE_MAX_COOKIE_BYTES_V1 {
+                return Err(CookieStateError::CookieTooLarge);
+            }
+            total_bytes = total_bytes
+                .checked_add(record_bytes)
+                .ok_or(CookieStateError::SnapshotTooLarge)?;
+            if total_bytes > COOKIE_STATE_MAX_TOTAL_BYTES_V1 {
+                return Err(CookieStateError::SnapshotTooLarge);
+            }
+
+            let cookie = cookie_from_state_record(record)?;
+            let host = reg_host(cookie.cookie.domain().as_deref().unwrap_or(""));
+            let host_cookies = replacement.entry(host).or_default();
+            if host_cookies.len() == self.max_per_host {
+                return Err(CookieStateError::TooManyCookies);
+            }
+            host_cookies.push(cookie);
+        }
+
+        self.cookies_map = replacement;
+        self.revision = next_revision;
+        (
+            self.controlled_creation_sequence_next,
+            self.controlled_creation_sequence_exhausted,
+        ) = next_controlled_sequence(maximum_creation_sequence);
+        (
+            self.controlled_access_sequence_next,
+            self.controlled_access_sequence_exhausted,
+        ) = next_controlled_sequence(maximum_access_sequence);
+        Ok(self.revision)
+    }
+
+    fn push_controlled(
+        &mut self,
+        mut cookie: ServoCookie,
+        url: &ServoUrl,
+        source: CookieSource,
+    ) -> Result<(), ControlledCookiePolicyError> {
+        self.ensure_controlled_ordering()
+            .map_err(|()| ControlledCookiePolicyError::InvalidCookie)?;
+        cookie.controlled_creation_sequence = Some(
+            self.reserve_controlled_creation_sequence()
+                .map_err(|()| ControlledCookiePolicyError::InvalidCookie)?,
+        );
+        cookie.controlled_last_access_sequence = Some(
+            self.reserve_controlled_access_sequences(1)
+                .map_err(|()| ControlledCookiePolicyError::InvalidCookie)?
+                .into_iter()
+                .next()
+                .ok_or(ControlledCookiePolicyError::InvalidCookie)?,
+        );
+        self.push(cookie, url, source);
+        Ok(())
+    }
+
+    fn ensure_controlled_ordering(&mut self) -> Result<(), ()> {
+        if self
+            .cookies_map
+            .values()
+            .flatten()
+            .any(|cookie| cookie.controlled_creation_sequence.is_none())
+        {
+            self.compact_controlled_creation_sequences()?;
+        }
+        if self
+            .cookies_map
+            .values()
+            .flatten()
+            .any(|cookie| cookie.controlled_last_access_sequence.is_none())
+        {
+            self.compact_controlled_access_sequences()?;
+        }
+        Ok(())
+    }
+
+    fn reserve_controlled_creation_sequence(&mut self) -> Result<u64, ()> {
+        if self.controlled_creation_sequence_exhausted {
+            self.compact_controlled_creation_sequences()?;
+        }
+        let sequence = self.controlled_creation_sequence_next;
+        match sequence.checked_add(1) {
+            Some(next) => self.controlled_creation_sequence_next = next,
+            None => self.controlled_creation_sequence_exhausted = true,
+        }
+        Ok(sequence)
+    }
+
+    fn reserve_controlled_access_sequences(&mut self, count: usize) -> Result<Vec<u64>, ()> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let count = u64::try_from(count).map_err(|_| ())?;
+        let last_offset = count.checked_sub(1).ok_or(())?;
+        if self.controlled_access_sequence_exhausted
+            || self
+                .controlled_access_sequence_next
+                .checked_add(last_offset)
+                .is_none()
+        {
+            self.compact_controlled_access_sequences()?;
+        }
+        let first = self.controlled_access_sequence_next;
+        let last = first.checked_add(last_offset).ok_or(())?;
+        match last.checked_add(1) {
+            Some(next) => self.controlled_access_sequence_next = next,
+            None => self.controlled_access_sequence_exhausted = true,
+        }
+        Ok((first..=last).collect())
+    }
+
+    fn compact_controlled_creation_sequences(&mut self) -> Result<(), ()> {
+        let mut cookies: Vec<_> = self.cookies_map.values_mut().flatten().collect();
+        cookies.sort_by(|a, b| {
+            optional_controlled_sequence_comparator(
+                a.controlled_creation_sequence,
+                b.controlled_creation_sequence,
+            )
+            .then_with(|| cookie_identity(a).cmp(&cookie_identity(b)))
+        });
+        for (sequence, cookie) in cookies.iter_mut().enumerate() {
+            cookie.controlled_creation_sequence = Some(u64::try_from(sequence).map_err(|_| ())?);
+        }
+        self.controlled_creation_sequence_next = u64::try_from(cookies.len()).map_err(|_| ())?;
+        self.controlled_creation_sequence_exhausted = false;
+        Ok(())
+    }
+
+    fn compact_controlled_access_sequences(&mut self) -> Result<(), ()> {
+        let mut cookies: Vec<_> = self.cookies_map.values_mut().flatten().collect();
+        cookies.sort_by(|a, b| {
+            optional_controlled_sequence_comparator(
+                a.controlled_last_access_sequence,
+                b.controlled_last_access_sequence,
+            )
+            .then_with(|| cookie_identity(a).cmp(&cookie_identity(b)))
+        });
+        for (sequence, cookie) in cookies.iter_mut().enumerate() {
+            cookie.controlled_last_access_sequence = Some(u64::try_from(sequence).map_err(|_| ())?);
+        }
+        self.controlled_access_sequence_next = u64::try_from(cookies.len()).map_err(|_| ())?;
+        self.controlled_access_sequence_exhausted = false;
+        Ok(())
     }
 
     pub fn cookie_site_descriptors(&self) -> Vec<SiteDescriptor> {
@@ -297,6 +837,273 @@ impl CookieStorage {
             .map(SiteDescriptor::new)
             .collect()
     }
+}
+
+/// Bound the exact compact public cookie-array projection used by the shell and SDK.
+///
+/// The lower backend record uses snake_case fields and numeric sequence values on its private
+/// channel, while the public v1 projection uses camelCase and canonical decimal strings. Measuring
+/// the private representation would reject valid public fragments near the frozen boundary, so
+/// this serializer deliberately mirrors the public representation byte-for-byte.
+fn validate_cookie_state_encoded_array(
+    records: &[CookieStateRecordV1],
+) -> Result<(), CookieStateError> {
+    let mut counter =
+        CookieStateEncodedSizeCounter::new(COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1);
+    serde_json::to_writer(&mut counter, &PublicCookieStateArray(records))
+        .map_err(|_| CookieStateError::SnapshotTooLarge)
+}
+
+struct PublicCookieStateArray<'a>(&'a [CookieStateRecordV1]);
+
+impl Serialize for PublicCookieStateArray<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for cookie in self.0 {
+            sequence.serialize_element(&PublicCookieStateRecord::from(cookie))?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicCookieStateRecord<'a> {
+    name: &'a str,
+    value: &'a str,
+    domain: &'a str,
+    path: &'a str,
+    host_only: bool,
+    secure: bool,
+    http_only: bool,
+    same_site: CookieStateSameSite,
+    expires_unix_time_ns: Option<PublicWireU64>,
+    partitioned: bool,
+    creation_sequence: PublicWireU64,
+    last_access_sequence: PublicWireU64,
+}
+
+impl<'a> From<&'a CookieStateRecordV1> for PublicCookieStateRecord<'a> {
+    fn from(cookie: &'a CookieStateRecordV1) -> Self {
+        Self {
+            name: &cookie.name,
+            value: &cookie.value,
+            domain: &cookie.domain,
+            path: &cookie.path,
+            host_only: cookie.host_only,
+            secure: cookie.secure,
+            http_only: cookie.http_only,
+            same_site: cookie.same_site,
+            expires_unix_time_ns: cookie.expires_unix_time_ns.map(PublicWireU64),
+            partitioned: cookie.partitioned,
+            creation_sequence: PublicWireU64(cookie.creation_sequence),
+            last_access_sequence: PublicWireU64(cookie.last_access_sequence),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PublicWireU64(u64);
+
+impl Serialize for PublicWireU64 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+struct CookieStateEncodedSizeCounter {
+    bytes: usize,
+    maximum: usize,
+}
+
+impl CookieStateEncodedSizeCounter {
+    const fn new(maximum: usize) -> Self {
+        Self { bytes: 0, maximum }
+    }
+}
+
+impl Write for CookieStateEncodedSizeCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("cookie state exceeds encoded fragment limit"))?;
+        if self.bytes > self.maximum {
+            return Err(io::Error::other(
+                "cookie state exceeds encoded fragment limit",
+            ));
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn cookie_identity(cookie: &ServoCookie) -> (String, String, String) {
+    (
+        cookie.cookie.domain().unwrap_or_default().to_owned(),
+        cookie.cookie.path().unwrap_or("/").to_owned(),
+        cookie.cookie.name().to_owned(),
+    )
+}
+
+fn controlled_cookie_comparator(a: &ServoCookie, b: &ServoCookie) -> Ordering {
+    let a_path_len = a.cookie.path().as_ref().map_or(0, |path| path.len());
+    let b_path_len = b.cookie.path().as_ref().map_or(0, |path| path.len());
+    match a_path_len.cmp(&b_path_len) {
+        Ordering::Equal => a
+            .controlled_creation_sequence
+            .cmp(&b.controlled_creation_sequence)
+            .then_with(|| cookie_identity(a).cmp(&cookie_identity(b))),
+        Ordering::Greater => Ordering::Less,
+        Ordering::Less => Ordering::Greater,
+    }
+}
+
+fn optional_controlled_sequence_comparator(a: Option<u64>, b: Option<u64>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn next_controlled_sequence(maximum: Option<u64>) -> (u64, bool) {
+    match maximum {
+        None => (0, false),
+        Some(maximum) => match maximum.checked_add(1) {
+            Some(next) => (next, false),
+            None => (0, true),
+        },
+    }
+}
+
+fn cookie_record_identity(record: &CookieStateRecordV1) -> (String, String, String) {
+    (
+        record.domain.clone(),
+        record.path.clone(),
+        record.name.clone(),
+    )
+}
+
+fn ensure_controlled_same_site(
+    request_url: &ServoUrl,
+    top_level_url: &ServoUrl,
+) -> Result<(), ControlledCookiePolicyError> {
+    if !matches!(request_url.scheme(), "http" | "https")
+        || !matches!(top_level_url.scheme(), "http" | "https")
+        || !is_same_site(&request_url.origin(), &top_level_url.origin())
+    {
+        return Err(ControlledCookiePolicyError::SameSiteContextUnsupported);
+    }
+    Ok(())
+}
+
+fn has_cookie_attribute(cookie_value: &str, expected: &str) -> bool {
+    cookie_value.split(';').skip(1).any(|attribute| {
+        attribute
+            .trim()
+            .split_once('=')
+            .map_or(attribute.trim(), |(name, _)| name.trim())
+            .eq_ignore_ascii_case(expected)
+    })
+}
+
+fn project_same_site(same_site: Option<SameSite>) -> CookieStateSameSite {
+    match same_site {
+        None => CookieStateSameSite::Unspecified,
+        Some(SameSite::Strict) => CookieStateSameSite::Strict,
+        Some(SameSite::Lax) => CookieStateSameSite::Lax,
+        Some(SameSite::None) => CookieStateSameSite::None,
+    }
+}
+
+fn cookie_from_state_record(record: CookieStateRecordV1) -> Result<ServoCookie, CookieStateError> {
+    if !is_canonical_cookie_state_domain(&record.domain)
+        || !record.path.starts_with('/')
+        || !is_valid_cookie_state_name_and_value(&record.name, &record.value)
+        || !has_valid_cookie_state_prefix(
+            &record.name,
+            record.secure,
+            record.host_only,
+            &record.path,
+        )
+    {
+        return Err(CookieStateError::InvalidCookie);
+    }
+    if record.same_site == CookieStateSameSite::None && !record.secure {
+        return Err(CookieStateError::InvalidCookie);
+    }
+
+    let creation_sequence = record.creation_sequence;
+    let last_access_sequence = record.last_access_sequence;
+    let mut cookie = Cookie::new(record.name.clone(), record.value.clone());
+    if !record.host_only {
+        cookie.set_domain(internal_cookie_state_domain(&record.domain));
+    }
+    cookie.set_path(record.path.clone());
+    cookie.set_secure(record.secure);
+    cookie.set_http_only(record.http_only);
+    cookie.set_same_site(match record.same_site {
+        CookieStateSameSite::Unspecified => None,
+        CookieStateSameSite::Strict => Some(SameSite::Strict),
+        CookieStateSameSite::Lax => Some(SameSite::Lax),
+        CookieStateSameSite::None => Some(SameSite::None),
+    });
+
+    let authority = internal_cookie_state_domain(&record.domain);
+    let scheme = if record.secure { "https" } else { "http" };
+    let request = ServoUrl::parse(&format!("{scheme}://{authority}{}", record.path))
+        .map_err(|_| CookieStateError::InvalidCookie)?;
+    let mut wrapped = ServoCookie::new_wrapped(cookie, &request, CookieSource::HTTP)
+        .ok_or(CookieStateError::InvalidCookie)?;
+    // Servo's public-suffix helper treats every dotless string as a suffix, including its
+    // bracketed internal IPv6 host spelling, and therefore converts an IPv6 Domain attribute to
+    // host-only. Portable state keeps the caller's explicit flag. Restoring `false` here is safe:
+    // the internal bracketed address can only domain-match that exact IP literal.
+    if record.domain.contains(':') && !record.host_only && wrapped.host_only {
+        wrapped.host_only = false;
+    }
+    if wrapped.host_only != record.host_only
+        || wrapped.cookie.domain().map(public_cookie_state_domain) != Some(record.domain.as_str())
+    {
+        return Err(CookieStateError::InvalidCookie);
+    }
+    wrapped.creation_time = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_nanos(record.creation_sequence))
+        .ok_or(CookieStateError::InvalidCookie)?;
+    wrapped.last_access = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_nanos(last_access_sequence))
+        .ok_or(CookieStateError::InvalidCookie)?;
+    wrapped.controlled_creation_sequence = Some(creation_sequence);
+    wrapped.controlled_last_access_sequence = Some(last_access_sequence);
+    wrapped.persistent = false;
+    wrapped.expiry_time = None;
+    Ok(wrapped)
+}
+
+fn internal_cookie_state_domain(domain: &str) -> String {
+    if domain.contains(':') {
+        format!("[{domain}]")
+    } else {
+        domain.to_owned()
+    }
+}
+
+fn public_cookie_state_domain(domain: &str) -> &str {
+    domain
+        .strip_prefix('[')
+        .and_then(|domain| domain.strip_suffix(']'))
+        .unwrap_or(domain)
 }
 
 fn reg_host(url: &str) -> String {
@@ -340,8 +1147,8 @@ fn get_oldest_accessed(
 ) -> Option<(usize, SystemTime)> {
     let mut oldest_accessed = None;
     for (i, c) in cookies.iter().enumerate() {
-        if (c.cookie.secure().unwrap_or(false) == is_secure_cookie) &&
-            oldest_accessed
+        if (c.cookie.secure().unwrap_or(false) == is_secure_cookie)
+            && oldest_accessed
                 .as_ref()
                 .is_none_or(|(_, current_oldest_time)| c.last_access < *current_oldest_time)
         {

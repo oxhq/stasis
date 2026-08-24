@@ -51,6 +51,19 @@ pub enum Initiator {
     Link,
 }
 
+/// Servo-internal provenance for requests whose Fetch destination is empty.
+///
+/// The Fetch destination alone cannot distinguish requests created by the `fetch()` API from
+/// XMLHttpRequest or other producers. Keep that distinction out of the spec-defined
+/// [`Initiator`] field and carry it only as far as bounded controlled-network evidence needs it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub enum RequestOriginatingApi {
+    #[default]
+    Unclassified,
+    Fetch,
+    XmlHttpRequest,
+}
+
 /// A request [destination](https://fetch.spec.whatwg.org/#concept-request-destination)
 pub use csp::Destination;
 
@@ -467,6 +480,8 @@ pub struct RequestBuilder {
     pub client: Option<RequestClient>,
     /// <https://fetch.spec.whatwg.org/#concept-request-destination>
     pub destination: Destination,
+    /// Servo-internal provenance for otherwise ambiguous empty-destination requests.
+    pub originating_api: RequestOriginatingApi,
     pub synchronous: bool,
     pub mode: RequestMode,
 
@@ -539,6 +554,7 @@ impl RequestBuilder {
             history_navigation: false,
             service_workers_mode: ServiceWorkersMode::All,
             destination: Destination::None,
+            originating_api: RequestOriginatingApi::Unclassified,
             synchronous: false,
             mode: RequestMode::NoCors,
             cache_mode: CacheMode::Default,
@@ -603,6 +619,11 @@ impl RequestBuilder {
     /// <https://fetch.spec.whatwg.org/#concept-request-destination>
     pub fn destination(mut self, destination: Destination) -> RequestBuilder {
         self.destination = destination;
+        self
+    }
+
+    pub fn originating_api(mut self, originating_api: RequestOriginatingApi) -> RequestBuilder {
+        self.originating_api = originating_api;
         self
     }
 
@@ -747,6 +768,7 @@ impl RequestBuilder {
         request.history_navigation = self.history_navigation;
         request.service_workers_mode = self.service_workers_mode;
         request.destination = self.destination;
+        request.originating_api = self.originating_api;
         request.synchronous = self.synchronous;
         request.mode = self.mode;
         request.use_cors_preflight = self.use_cors_preflight;
@@ -822,6 +844,8 @@ pub struct Request {
     pub initiator: Initiator,
     /// <https://fetch.spec.whatwg.org/#concept-request-destination>
     pub destination: Destination,
+    /// Servo-internal provenance for otherwise ambiguous empty-destination requests.
+    pub originating_api: RequestOriginatingApi,
     // TODO: priority object
     /// <https://fetch.spec.whatwg.org/#concept-request-origin>
     pub origin: Origin,
@@ -889,6 +913,7 @@ impl Request {
             service_workers_mode: ServiceWorkersMode::All,
             initiator: Initiator::None,
             destination: Destination::None,
+            originating_api: RequestOriginatingApi::Unclassified,
             origin: origin.unwrap_or(Origin::Client),
             referrer,
             referrer_policy: ReferrerPolicy::EmptyString,
@@ -951,11 +976,11 @@ impl Request {
     pub fn is_navigation_request(&self) -> bool {
         matches!(
             self.destination,
-            Destination::Document |
-                Destination::Embed |
-                Destination::Frame |
-                Destination::IFrame |
-                Destination::Object
+            Destination::Document
+                | Destination::Embed
+                | Destination::Frame
+                | Destination::IFrame
+                | Destination::Object
         )
     }
 
@@ -963,16 +988,16 @@ impl Request {
     pub fn is_subresource_request(&self) -> bool {
         matches!(
             self.destination,
-            Destination::Audio |
-                Destination::Font |
-                Destination::Image |
-                Destination::Manifest |
-                Destination::Script |
-                Destination::Style |
-                Destination::Track |
-                Destination::Video |
-                Destination::Xslt |
-                Destination::None
+            Destination::Audio
+                | Destination::Font
+                | Destination::Image
+                | Destination::Manifest
+                | Destination::Script
+                | Destination::Style
+                | Destination::Track
+                | Destination::Video
+                | Destination::Xslt
+                | Destination::None
         )
     }
 
@@ -1072,8 +1097,8 @@ impl Request {
 
             // Step 4.2. If url’s origin is not same site with lastURL’s origin and
             // request’s origin is not same site with lastURL’s origin, then return "cross-site".
-            if !is_same_site(&url.origin(), &last_url.origin()) &&
-                !is_same_site(request_origin, &last_url.origin())
+            if !is_same_site(&url.origin(), &last_url.origin())
+                && !is_same_site(request_origin, &last_url.origin())
             {
                 return RedirectTaint::CrossSite;
             }
@@ -1169,9 +1194,9 @@ pub fn is_cors_safelisted_request_content_type(value: &[u8]) -> bool {
     match value_mime_result {
         Err(_) => false, // step 3
         Ok(value_mime) => match (value_mime.type_(), value_mime.subtype()) {
-            (mime::APPLICATION, mime::WWW_FORM_URLENCODED) |
-            (mime::MULTIPART, mime::FORM_DATA) |
-            (mime::TEXT, mime::PLAIN) => true,
+            (mime::APPLICATION, mime::WWW_FORM_URLENCODED)
+            | (mime::MULTIPART, mime::FORM_DATA)
+            | (mime::TEXT, mime::PLAIN) => true,
             _ => false, // step 4
         },
     }
@@ -1216,8 +1241,8 @@ fn validate_range_header(value: &str) -> bool {
         let start = parts.next();
         let end = parts.next();
 
-        if let Some(start) = start &&
-            let Ok(start_num) = start.parse::<u64>()
+        if let Some(start) = start
+            && let Ok(start_num) = start.parse::<u64>()
         {
             return match end {
                 Some(e) if !e.is_empty() => {

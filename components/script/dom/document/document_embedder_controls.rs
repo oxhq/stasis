@@ -74,8 +74,32 @@ pub(crate) struct DocumentEmbedderControls {
     /// embedder show. This is used to track user interface elements in the API.
     #[no_trace]
     user_interface_element_index: Cell<Epoch>,
+    /// Native semantic focus owns the DOM focus transition synchronously and never waits for an
+    /// embedder IME response. Keep that narrow path distinct from real user-driven controls so a
+    /// controlled session does not acquire a false unsupported time surface.
+    semantic_automation_focus_active: Cell<bool>,
     /// A map of visible user interface elements.
     visible_elements: DomRefCell<FxHashMap<NoTrace<Epoch>, ControlElement>>,
+}
+
+pub(crate) struct SemanticAutomationFocusGuard<'a> {
+    active: &'a Cell<bool>,
+    previous: bool,
+}
+
+impl Drop for SemanticAutomationFocusGuard<'_> {
+    fn drop(&mut self) {
+        self.active.set(self.previous);
+    }
+}
+
+fn begin_semantic_automation_focus(active: &Cell<bool>) -> SemanticAutomationFocusGuard<'_> {
+    let previous = active.replace(true);
+    SemanticAutomationFocusGuard { active, previous }
+}
+
+fn suppress_for_semantic_automation_focus(active: bool, request: &EmbedderControlRequest) -> bool {
+    active && matches!(request, EmbedderControlRequest::InputMethod(_))
 }
 
 impl DocumentEmbedderControls {
@@ -83,8 +107,13 @@ impl DocumentEmbedderControls {
         Self {
             window: Dom::from_ref(window),
             user_interface_element_index: Default::default(),
+            semantic_automation_focus_active: Default::default(),
             visible_elements: Default::default(),
         }
+    }
+
+    pub(crate) fn begin_semantic_automation_focus(&self) -> SemanticAutomationFocusGuard<'_> {
+        begin_semantic_automation_focus(&self.semantic_automation_focus_active)
     }
 
     /// Generate the next unused [`EmbedderControlId`]. This method is only needed for some older
@@ -106,8 +135,17 @@ impl DocumentEmbedderControls {
         request: EmbedderControlRequest,
         point: Option<DevicePoint>,
     ) -> Option<EmbedderControlId> {
-        if !matches!(&request, EmbedderControlRequest::FilePicker(_)) &&
-            self.window
+        if suppress_for_semantic_automation_focus(
+            self.semantic_automation_focus_active.get(),
+            &request,
+        ) {
+            // A semantic focus command needs DOM focus/event behavior but does not expose or wait
+            // on a native IME. Do not touch the controlled clock or publish a visible owner.
+            return None;
+        }
+        if !matches!(&request, EmbedderControlRequest::FilePicker(_))
+            && self
+                .window
                 .as_global_scope()
                 .require_embedder_control()
                 .is_err()
@@ -115,8 +153,9 @@ impl DocumentEmbedderControls {
             // Leave a sticky terminal without publishing an owner or sending an embedder request.
             return None;
         }
-        if matches!(&request, EmbedderControlRequest::FilePicker(_)) &&
-            self.window
+        if matches!(&request, EmbedderControlRequest::FilePicker(_))
+            && self
+                .window
                 .as_global_scope()
                 .require_resource_thread_io()
                 .is_err()
@@ -160,10 +199,10 @@ impl DocumentEmbedderControls {
         rect: DeviceIntRect,
     ) {
         match request {
-            EmbedderControlRequest::SelectElement(..) |
-            EmbedderControlRequest::ColorPicker(..) |
-            EmbedderControlRequest::InputMethod(..) |
-            EmbedderControlRequest::ContextMenu(..) => self
+            EmbedderControlRequest::SelectElement(..)
+            | EmbedderControlRequest::ColorPicker(..)
+            | EmbedderControlRequest::InputMethod(..)
+            | EmbedderControlRequest::ContextMenu(..) => self
                 .window
                 .send_to_embedder(EmbedderMsg::ShowEmbedderControl(id, rect, request)),
             EmbedderControlRequest::FilePicker(file_picker_request) => {
@@ -292,21 +331,21 @@ impl DocumentEmbedderControls {
             .node
             .inclusive_ancestors(ShadowIncluding::Yes)
         {
-            if anchor_element.is_none() &&
-                let Some(candidate_anchor_element) = node.downcast::<HTMLAnchorElement>() &&
-                candidate_anchor_element.is_instance_activatable()
+            if anchor_element.is_none()
+                && let Some(candidate_anchor_element) = node.downcast::<HTMLAnchorElement>()
+                && candidate_anchor_element.is_instance_activatable()
             {
                 anchor_element = Some(DomRoot::from_ref(candidate_anchor_element));
             }
 
-            if image_element.is_none() &&
-                let Some(candidate_image_element) = node.downcast::<HTMLImageElement>()
+            if image_element.is_none()
+                && let Some(candidate_image_element) = node.downcast::<HTMLImageElement>()
             {
                 image_element = Some(DomRoot::from_ref(candidate_image_element))
             }
 
-            if text_input_element.is_none() &&
-                let Some(candidate_text_input_element) = node.as_text_input()
+            if text_input_element.is_none()
+                && let Some(candidate_text_input_element) = node.as_text_input()
             {
                 text_input_element = Some(candidate_text_input_element);
             }
@@ -422,6 +461,57 @@ impl DocumentEmbedderControls {
             }),
             Some(hit_test_result.point_in_frame.cast_unit()),
         );
+    }
+}
+
+#[cfg(test)]
+mod semantic_automation_focus_tests {
+    use std::cell::Cell;
+
+    use embedder_traits::{
+        EmbedderControlRequest, InputMethodRequest, InputMethodType, SelectElementRequest,
+    };
+
+    use super::{begin_semantic_automation_focus, suppress_for_semantic_automation_focus};
+
+    #[test]
+    fn scope_restores_and_only_suppresses_input_method_controls() {
+        let active = Cell::new(false);
+        let input_method = EmbedderControlRequest::InputMethod(InputMethodRequest {
+            input_method_type: InputMethodType::Text,
+            text: String::new(),
+            insertion_point: None,
+            multiline: false,
+            allow_virtual_keyboard: false,
+        });
+        let select = EmbedderControlRequest::SelectElement(SelectElementRequest {
+            options: Vec::new(),
+            selected_options: Vec::new(),
+            allow_select_multiple: false,
+        });
+
+        assert!(!suppress_for_semantic_automation_focus(
+            false,
+            &input_method
+        ));
+        {
+            let _outer = begin_semantic_automation_focus(&active);
+            assert!(active.get());
+            assert!(suppress_for_semantic_automation_focus(
+                active.get(),
+                &input_method
+            ));
+            assert!(!suppress_for_semantic_automation_focus(
+                active.get(),
+                &select
+            ));
+            {
+                let _inner = begin_semantic_automation_focus(&active);
+                assert!(active.get());
+            }
+            assert!(active.get());
+        }
+        assert!(!active.get());
     }
 }
 

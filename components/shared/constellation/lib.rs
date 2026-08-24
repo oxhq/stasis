@@ -14,11 +14,12 @@ mod structured_data;
 use std::collections::VecDeque;
 use std::fmt;
 
-use embedder_traits::user_contents::{
-    UserContentManagerId, UserScript, UserScriptId, UserStyleSheet, UserStyleSheetId,
-};
 use embedder_traits::document_control::{
     DocumentControlCancellationId, DocumentControlCommand, DocumentControlOutcome,
+};
+use embedder_traits::document_session::{SessionNavigationAuthority, SessionNavigationError};
+use embedder_traits::user_contents::{
+    UserContentManagerId, UserScript, UserScriptId, UserStyleSheet, UserStyleSheetId,
 };
 use embedder_traits::{
     EmbedderControlId, EmbedderControlResponse, InputEventAndId, JavaScriptEvaluationId,
@@ -136,6 +137,20 @@ pub enum EmbedderToConstellationMessage {
         webview_id: WebViewId,
         /// Exact nonce; stale values must not consume a successor.
         cancellation_id: DocumentControlCancellationId,
+    },
+    /// Capture engine-owned controlled-session navigation identity without mutating the page.
+    #[doc(hidden)]
+    ObserveSessionNavigation {
+        webview_id: WebViewId,
+        response: GenericCallback<Result<SessionNavigationAuthority, SessionNavigationError>>,
+    },
+    /// Admit an explicit replacement against exact engine-owned session authority.
+    #[doc(hidden)]
+    NavigateControlledSession {
+        webview_id: WebViewId,
+        expected: Box<SessionNavigationAuthority>,
+        url: ServoUrl,
+        response: GenericCallback<Result<SessionNavigationAuthority, SessionNavigationError>>,
     },
 }
 

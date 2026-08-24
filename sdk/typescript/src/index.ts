@@ -1,4 +1,9 @@
-export { App, Runtime, launch } from "./api.js";
+export { App, Runtime, Session, launch } from "./api.js";
+export {
+  CrawlerOriginPolicyError,
+  canonicalHttpUrl,
+  crawlWithStasis,
+} from "./crawler.js";
 export {
   StasisAbortError,
   StasisCommandTimeoutError,
@@ -10,19 +15,63 @@ export {
 } from "./errors.js";
 export { RuntimeResolutionError } from "./runtime-resolver.js";
 export {
+  FreshSessionPool,
+  SessionPoolClosedError,
+  SessionPoolQueueFullError,
+  createStasisSessionPool,
+} from "./session-pool.js";
+export {
   SETTLEMENT_EVIDENCE_MAX_ITEMS,
   settlementEvidence,
 } from "./evidence.js";
-export { CONTROLLED_WEBAPP_V1_PROFILE } from "./profile.js";
-export type { ProtocolStateEffect, StasisErrorOptions } from "./errors.js";
-export type { SettlementEvidenceReason, SettlementEvidenceV1 } from "./evidence.js";
-export type { SupportProfile } from "./profile.js";
+export {
+  CONTROLLED_WEBAPP_V1_PROFILE,
+  CONTROLLED_WEB_SESSION_V1_PROFILE,
+} from "./profile.js";
+export type {
+  ProtocolErrorDetails,
+  ProtocolErrorDetailValue,
+  ProtocolStateEffect,
+  StasisErrorOptions,
+} from "./errors.js";
+export type {
+  SettlementEvidenceReason,
+  SettlementEvidenceV1,
+  SettlementEvidenceV2,
+} from "./evidence.js";
+export type {
+  CrawlPageResult,
+  CrawlPageStatus,
+  ReferenceCrawlResult,
+  ReferenceCrawlerOptions,
+  ReferenceCrawlerPool,
+  ReferenceCrawlerSession,
+} from "./crawler.js";
+export type {
+  AnySupportProfile,
+  LegacySupportProfile,
+  SessionSupportProfile,
+  SupportProfile,
+} from "./profile.js";
+export type {
+  FreshSessionPoolOptions,
+  OwnedSessionProcess,
+  SessionAcquireOptions,
+  SessionLease,
+  SessionProcessFactory,
+  SessionProcessFactoryContext,
+  StasisSessionPoolOptions,
+  StasisSessionRequest,
+} from "./session-pool.js";
 export type {
   AdvanceToNextResult,
   AutomationMutationResult,
   ClockMode,
   ClockOptions,
   CommandOptions,
+  ControlledClockOptions,
+  CookieSameSite,
+  DocumentStateToken,
   EffectiveSettlePolicy,
   ExternalIoOwner,
   ExternalIoPhase,
@@ -35,7 +84,14 @@ export type {
   ExtractValue,
   LaunchOptions,
   LoadBlocking,
+  NetworkAbortReason,
   NetworkKind,
+  NetworkBody,
+  NetworkFulfillment,
+  NetworkMode,
+  NetworkRoute,
+  NetworkRouteMatch,
+  NetworkUrlMatcher,
   OpenEndedDescription,
   OpenEndedReason,
   OpenOptions,
@@ -48,6 +104,43 @@ export type {
   QueryResult,
   RuntimeFailureComponent,
   RuntimeInfo,
+  SessionAdvanceToNextResult,
+  SessionAuditBounds,
+  SessionAuditOptions,
+  SessionAutomationMutationResult,
+  SessionCookie,
+  SessionCookiesResult,
+  SessionEvidenceEvent,
+  SessionEvidenceFailureReason,
+  SessionEvidenceRecord,
+  SessionEvidenceResult,
+  SessionExtractField,
+  SessionExtractPlan,
+  SessionExtractRead,
+  SessionExtractRow,
+  SessionExtractResult,
+  SessionExtractValue,
+  SessionFocusResult,
+  SessionCheckResult,
+  SessionNavigateResult,
+  SessionNetworkOptions,
+  SessionOpenOptions,
+  SessionOriginState,
+  SessionPendingSnapshot,
+  SessionQueryResult,
+  SessionRequestRecord,
+  SessionRequestsResult,
+  SessionSafeUrl,
+  SessionSelectResult,
+  SessionSettleResult,
+  SessionState,
+  SessionStateExportResult,
+  SessionStateMutationResult,
+  SessionStateToken,
+  SessionStorageEntry,
+  SessionStorageResult,
+  SessionSubmitResult,
+  SessionTextResult,
   SettleFailureCode,
   SettleLimit,
   SettleLimitKind,

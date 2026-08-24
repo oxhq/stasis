@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Stasis controlled session login</title>
+</head>
+<body>
+  <main>
+    <form id="login-form" action="/authenticate" method="post">
+      <label>Email <input id="email" name="email" type="email" required></label>
+      <label>Password <input id="password" name="password" type="password" required></label>
+      <label>
+        Terms
+        <input id="terms" name="terms" type="checkbox">
+      </label>
+      <fieldset>
+        <legend>Plan</legend>
+        <label>
+          Basic
+          <input id="plan-basic" name="plan" type="radio" value="basic" checked>
+        </label>
+        <label>
+          Pro
+          <input id="plan-pro" name="plan" type="radio" value="pro">
+        </label>
+      </fieldset>
+      <label>
+        Primary region
+        <select id="primary-region" name="primary-region">
+          <option value="east" selected>East</option>
+          <option value="central">Central</option>
+          <option value="west">West</option>
+        </select>
+      </label>
+      <label>
+        Regions
+        <select id="region" name="region" multiple>
+          <option value="north">North</option>
+          <option value="south">South</option>
+          <option value="west">West</option>
+        </select>
+      </label>
+      <div id="nonfocusable">Non-focusable automation target</div>
+      <button id="storage-overflow" type="button">Prove controlled storage limit</button>
+      <button id="storage-within-budget" type="button">Prove controlled storage success</button>
+      <button id="storage-cleanup" type="button">Clean controlled storage proof</button>
+      <button id="prepare" type="button">Prepare deterministic login</button>
+      <button id="submit" type="submit">Sign in</button>
+    </form>
+    <output id="input-events">email=0,password=0</output>
+    <output id="activation-events">activated=0</output>
+    <output id="focus-events">email=0</output>
+    <output id="check-events">input=0,change=0,checked=false</output>
+    <output id="radio-events">basic-input=0,basic-change=0,pro-input=0,pro-change=0,basic=true,pro=false</output>
+    <output id="single-select-events">input=0,change=0,value=east,selected=1</output>
+    <output id="select-events">input=0,change=0,values=</output>
+    <output id="storage-limit-result">not-run</output>
+    <output id="storage-success-result">not-run</output>
+    <output id="status">login-ready</output>
+  </main>
+  <script>
+    const email = document.querySelector("#email");
+    const password = document.querySelector("#password");
+    const terms = document.querySelector("#terms");
+    const planBasic = document.querySelector("#plan-basic");
+    const planPro = document.querySelector("#plan-pro");
+    const primaryRegion = document.querySelector("#primary-region");
+    const region = document.querySelector("#region");
+    const status = document.querySelector("#status");
+    const inputEvents = document.querySelector("#input-events");
+    const activationEvents = document.querySelector("#activation-events");
+    const focusEvents = document.querySelector("#focus-events");
+    const checkEvents = document.querySelector("#check-events");
+    const radioEvents = document.querySelector("#radio-events");
+    const singleSelectEvents = document.querySelector("#single-select-events");
+    const selectEvents = document.querySelector("#select-events");
+    const storageLimitResult = document.querySelector("#storage-limit-result");
+    const storageSuccessResult = document.querySelector("#storage-success-result");
+    let emailEvents = 0;
+    let passwordEvents = 0;
+    let activations = 0;
+    let emailFocusEvents = 0;
+    let checkInputEvents = 0;
+    let checkChangeEvents = 0;
+    const radioInputEvents = { basic: 0, pro: 0 };
+    const radioChangeEvents = { basic: 0, pro: 0 };
+    let singleSelectInputEvents = 0;
+    let singleSelectChangeEvents = 0;
+    let selectInputEvents = 0;
+    let selectChangeEvents = 0;
+
+    const renderInputEvents = () => {
+      inputEvents.textContent = `email=${emailEvents},password=${passwordEvents}`;
+    };
+    email.addEventListener("input", () => {
+      emailEvents += 1;
+      renderInputEvents();
+    });
+    password.addEventListener("input", () => {
+      passwordEvents += 1;
+      renderInputEvents();
+    });
+    document.querySelector("#prepare").addEventListener("click", () => {
+      activations += 1;
+      activationEvents.textContent = `activated=${activations}`;
+    });
+    email.addEventListener("focus", () => {
+      emailFocusEvents += 1;
+      focusEvents.textContent = `email=${emailFocusEvents}`;
+    });
+    const renderCheckEvents = () => {
+      checkEvents.textContent =
+        `input=${checkInputEvents},change=${checkChangeEvents},checked=${terms.checked}`;
+    };
+    terms.addEventListener("input", () => {
+      checkInputEvents += 1;
+      renderCheckEvents();
+    });
+    terms.addEventListener("change", () => {
+      checkChangeEvents += 1;
+      renderCheckEvents();
+    });
+    const renderRadioEvents = () => {
+      radioEvents.textContent =
+        `basic-input=${radioInputEvents.basic},basic-change=${radioChangeEvents.basic},` +
+        `pro-input=${radioInputEvents.pro},pro-change=${radioChangeEvents.pro},` +
+        `basic=${planBasic.checked},pro=${planPro.checked}`;
+    };
+    for (const [name, radio] of [["basic", planBasic], ["pro", planPro]]) {
+      radio.addEventListener("input", () => {
+        radioInputEvents[name] += 1;
+        renderRadioEvents();
+      });
+      radio.addEventListener("change", () => {
+        radioChangeEvents[name] += 1;
+        renderRadioEvents();
+      });
+    }
+    const renderSingleSelectEvents = () => {
+      singleSelectEvents.textContent =
+        `input=${singleSelectInputEvents},change=${singleSelectChangeEvents},` +
+        `value=${primaryRegion.value},selected=${primaryRegion.selectedOptions.length}`;
+    };
+    primaryRegion.addEventListener("input", () => {
+      singleSelectInputEvents += 1;
+      renderSingleSelectEvents();
+    });
+    primaryRegion.addEventListener("change", () => {
+      singleSelectChangeEvents += 1;
+      renderSingleSelectEvents();
+    });
+    const selectedRegions = () =>
+      Array.from(region.selectedOptions, (option) => option.value);
+    const renderSelectEvents = () => {
+      selectEvents.textContent =
+        `input=${selectInputEvents},change=${selectChangeEvents},values=${selectedRegions().join("|")}`;
+    };
+    region.addEventListener("input", () => {
+      selectInputEvents += 1;
+      renderSelectEvents();
+    });
+    region.addEventListener("change", () => {
+      selectChangeEvents += 1;
+      renderSelectEvents();
+    });
+    document.querySelector("#storage-overflow").addEventListener("click", () => {
+      try {
+        localStorage.setItem("stasis-overflow-proof", "\0".repeat(131072));
+        storageLimitResult.textContent = "unexpected-success";
+      } catch (error) {
+        storageLimitResult.textContent = error instanceof DOMException
+          ? error.name
+          : "non-dom-error";
+      }
+    });
+    document.querySelector("#storage-within-budget").addEventListener("click", () => {
+      localStorage.setItem("stasis-budget-proof", "bounded-value");
+      storageSuccessResult.textContent = "stored";
+    });
+    document.querySelector("#storage-cleanup").addEventListener("click", () => {
+      localStorage.removeItem("stasis-budget-proof");
+      storageSuccessResult.textContent = "removed";
+    });
+
+    document.querySelector("#login-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      status.textContent = "authenticating";
+      localStorage.setItem("stasis-email", email.value);
+      sessionStorage.setItem("stasis-flow", "login");
+      fetch("/authenticate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          email: email.value,
+          password: password.value,
+          terms: terms.checked,
+          regions: selectedRegions(),
+        }),
+      })
+        .then((response) => {
+          if (!response.ok) throw new Error(`authentication failed: ${response.status}`);
+          return response.json();
+        })
+        .then((profile) => {
+          localStorage.setItem("stasis-role", profile.role);
+          location.assign("/handoff?ticket=fixture-secret-ticket");
+        });
+    });
+  </script>
+</body>
+</html>

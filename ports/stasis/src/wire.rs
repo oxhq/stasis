@@ -17,6 +17,7 @@ use embedder_traits::document_automation::{
     DocumentAutomationLimits, DocumentAutomationOperation, DocumentAutomationRequest,
     DocumentAutomationRequestError, DocumentAutomationResult as EngineDocumentAutomationResult,
     DocumentExtractionField, DocumentExtractionPlan, DocumentExtractionRead,
+    DocumentSelectorGrammar,
 };
 use embedder_traits::document_pending::{
     PendingClockMode, PendingExternalIoLoadBlocking, PendingExternalIoObservation,
@@ -27,6 +28,7 @@ use embedder_traits::document_pending::{
     PendingSourceObservation, PendingTargetObservation, PendingUnsupportedSourceReason,
     RawPendingSnapshot, RuntimeStateGeneration,
 };
+use embedder_traits::document_session::SessionNavigationAuthority;
 use serde::de::value::MapAccessDeserializer;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -37,6 +39,11 @@ use crate::settle::{
     PersistentWork as SettlePersistentWork, SettleCompletion, SettlePolicy as EngineSettlePolicy,
     SettleRuntimeFailure,
 };
+use crate::token_namespace::{
+    OpaqueTokenNamespace, format_namespaced_token, split_namespaced_token,
+};
+
+const DOCUMENT_STATE_TOKEN_MAX_BYTES: usize = 81;
 
 /// The public automation request/result envelope must fit the protocol's one-MiB frame limit even
 /// when every user string takes serde_json's six-byte `\u00xx` escape form. These product limits
@@ -154,6 +161,11 @@ impl<'de> Deserialize<'de> for DecimalU128 {
 pub enum PublicAutomationKind {
     Activate,
     Fill,
+    Focus,
+    Check,
+    Uncheck,
+    Select,
+    Submit,
     Query,
     Text,
     Extract,
@@ -218,6 +230,73 @@ impl ResolvedAutomationParams {
 pub enum AutomationParamsError {
     ExpectedGenerationOutOfRange,
     InvalidOperation(DocumentAutomationRequestError),
+}
+
+/// A strict, bounded controlled-session automation request before owner authorization.
+///
+/// Unlike the frozen v0.1 request, this retains only an opaque product token. The engine
+/// generation and complete private target are taken from the fresh Observe which authorizes the
+/// token, immediately before constructing the same-build request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedSessionAutomationParams {
+    kind: PublicAutomationKind,
+    expected_state_token: DocumentStateToken,
+    operation: DocumentAutomationOperation,
+    limits: DocumentAutomationLimits,
+}
+
+impl ResolvedSessionAutomationParams {
+    fn new(
+        kind: PublicAutomationKind,
+        expected_state_token: DocumentStateToken,
+        operation: DocumentAutomationOperation,
+    ) -> Result<Self, AutomationParamsError> {
+        let limits = public_automation_limits();
+        operation
+            .validate(limits)
+            .map_err(AutomationParamsError::InvalidOperation)?;
+        Ok(Self {
+            kind,
+            expected_state_token,
+            operation,
+            limits,
+        })
+    }
+
+    pub const fn kind(&self) -> PublicAutomationKind {
+        self.kind
+    }
+
+    /// Authorize the opaque product token against a fresh owner observation, then bind all
+    /// private authority and the exact observed generation into the existing Servo request.
+    pub fn authorize_and_bind(
+        self,
+        observed: &RawPendingSnapshot,
+        navigation: &SessionNavigationAuthority,
+        context: &mut WireProjectionContext,
+    ) -> Result<DocumentAutomationRequest, SessionAutomationBindError> {
+        let authorized = context
+            .authorizes_document_state(observed, navigation, &self.expected_state_token)
+            .map_err(SessionAutomationBindError::Authority)?;
+        if !authorized {
+            return Err(SessionAutomationBindError::StaleStateToken);
+        }
+        DocumentAutomationRequest::new_with_selector_grammar_internal(
+            observed.target.clone(),
+            observed.state_generation,
+            self.operation,
+            self.limits,
+            DocumentSelectorGrammar::PracticalV2,
+        )
+        .map_err(SessionAutomationBindError::InvalidRequest)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionAutomationBindError {
+    StaleStateToken,
+    Authority(DocumentStateAuthorityError),
+    InvalidRequest(DocumentAutomationRequestError),
 }
 
 /// Strict parameters for `action.activate`.
@@ -353,9 +432,255 @@ impl DomExtractParams {
     }
 }
 
+/// Token-authorized controlled-session parameters for `action.activate`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SessionActionActivateParams {
+    selector: String,
+    expected_state_token: DocumentStateToken,
+}
+
+impl SessionActionActivateParams {
+    pub fn resolve(self) -> Result<ResolvedSessionAutomationParams, AutomationParamsError> {
+        ResolvedSessionAutomationParams::new(
+            PublicAutomationKind::Activate,
+            self.expected_state_token,
+            DocumentAutomationOperation::Activate {
+                selector: self.selector,
+            },
+        )
+    }
+}
+
+/// Token-authorized controlled-session parameters for `action.fill`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SessionActionFillParams {
+    selector: String,
+    value: String,
+    expected_state_token: DocumentStateToken,
+}
+
+macro_rules! session_selector_action {
+    ($params:ident, $kind:ident, $operation:ident) => {
+        #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        pub struct $params {
+            selector: String,
+            expected_state_token: DocumentStateToken,
+        }
+
+        impl $params {
+            pub fn resolve(self) -> Result<ResolvedSessionAutomationParams, AutomationParamsError> {
+                ResolvedSessionAutomationParams::new(
+                    PublicAutomationKind::$kind,
+                    self.expected_state_token,
+                    DocumentAutomationOperation::$operation {
+                        selector: self.selector,
+                    },
+                )
+            }
+        }
+    };
+}
+
+session_selector_action!(SessionActionFocusParams, Focus, Focus);
+session_selector_action!(SessionActionCheckParams, Check, Check);
+session_selector_action!(SessionActionUncheckParams, Uncheck, Uncheck);
+session_selector_action!(SessionActionSubmitParams, Submit, Submit);
+
+/// Token-authorized controlled-session parameters for semantic select replacement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SessionActionSelectParams {
+    selector: String,
+    values: Vec<String>,
+    expected_state_token: DocumentStateToken,
+}
+
+impl SessionActionSelectParams {
+    pub fn resolve(self) -> Result<ResolvedSessionAutomationParams, AutomationParamsError> {
+        ResolvedSessionAutomationParams::new(
+            PublicAutomationKind::Select,
+            self.expected_state_token,
+            DocumentAutomationOperation::Select {
+                selector: self.selector,
+                values: self.values,
+            },
+        )
+    }
+}
+
+impl SessionActionFillParams {
+    pub fn resolve(self) -> Result<ResolvedSessionAutomationParams, AutomationParamsError> {
+        ResolvedSessionAutomationParams::new(
+            PublicAutomationKind::Fill,
+            self.expected_state_token,
+            DocumentAutomationOperation::Fill {
+                selector: self.selector,
+                value: self.value,
+            },
+        )
+    }
+}
+
+/// Token-authorized controlled-session parameters for `dom.query`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SessionDomQueryParams {
+    selector: String,
+    expected_state_token: DocumentStateToken,
+}
+
+impl SessionDomQueryParams {
+    pub fn resolve(self) -> Result<ResolvedSessionAutomationParams, AutomationParamsError> {
+        ResolvedSessionAutomationParams::new(
+            PublicAutomationKind::Query,
+            self.expected_state_token,
+            DocumentAutomationOperation::QueryCount {
+                selector: self.selector,
+            },
+        )
+    }
+}
+
+/// Token-authorized controlled-session parameters for `dom.text`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SessionDomTextParams {
+    selector: String,
+    expected_state_token: DocumentStateToken,
+}
+
+impl SessionDomTextParams {
+    pub fn resolve(self) -> Result<ResolvedSessionAutomationParams, AutomationParamsError> {
+        ResolvedSessionAutomationParams::new(
+            PublicAutomationKind::Text,
+            self.expected_state_token,
+            DocumentAutomationOperation::TextContent {
+                selector: self.selector,
+            },
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionDomExtractRead {
+    Text,
+    Html,
+    Attribute,
+    ResolvedUrl,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionDomExtractFieldParams {
+    name: String,
+    selector: String,
+    read: SessionDomExtractRead,
+    attribute: Option<String>,
+}
+
+/// Token-authorized controlled-session parameters for text, HTML, nullable raw-attribute, and
+/// nullable document-base-resolved URL extraction. The frozen v0.1 decoder remains separate.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SessionDomExtractParams {
+    root_selector: String,
+    fields: Vec<SessionDomExtractFieldParams>,
+    expected_state_token: DocumentStateToken,
+}
+
+impl SessionDomExtractParams {
+    pub fn resolve(self) -> Result<ResolvedSessionAutomationParams, AutomationParamsError> {
+        let fields = self
+            .fields
+            .into_iter()
+            .map(|field| match (field.read, field.attribute) {
+                (SessionDomExtractRead::Text, None) => DocumentExtractionField::new_internal(
+                    field.name,
+                    field.selector,
+                    DocumentExtractionRead::TextContent,
+                ),
+                (SessionDomExtractRead::Html, None) => DocumentExtractionField::new_internal(
+                    field.name,
+                    field.selector,
+                    DocumentExtractionRead::InnerHtml,
+                ),
+                (SessionDomExtractRead::Attribute, Some(attribute)) => {
+                    DocumentExtractionField::new_attribute_internal(
+                        field.name,
+                        field.selector,
+                        DocumentExtractionRead::Attribute,
+                        attribute,
+                    )
+                },
+                (SessionDomExtractRead::ResolvedUrl, Some(attribute)) => {
+                    DocumentExtractionField::new_attribute_internal(
+                        field.name,
+                        field.selector,
+                        DocumentExtractionRead::ResolvedUrl,
+                        attribute,
+                    )
+                },
+                (read, attribute) => DocumentExtractionField::new_attribute_internal(
+                    field.name,
+                    field.selector,
+                    match read {
+                        SessionDomExtractRead::Text => DocumentExtractionRead::TextContent,
+                        SessionDomExtractRead::Html => DocumentExtractionRead::InnerHtml,
+                        SessionDomExtractRead::Attribute => DocumentExtractionRead::Attribute,
+                        SessionDomExtractRead::ResolvedUrl => DocumentExtractionRead::ResolvedUrl,
+                    },
+                    attribute.unwrap_or_default(),
+                ),
+            })
+            .collect();
+        ResolvedSessionAutomationParams::new(
+            PublicAutomationKind::Extract,
+            self.expected_state_token,
+            DocumentAutomationOperation::Extract(DocumentExtractionPlan::new_internal(
+                self.root_selector,
+                fields,
+            )),
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionMutationResult {
+    state_generation: DecimalU128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionCheckedResult {
+    changed: bool,
+    checked: bool,
+    state_generation: DecimalU128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionSelectedResult {
+    changed: bool,
+    values: Vec<String>,
+    state_generation: DecimalU128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionFocusedResult {
+    focused: bool,
+    state_generation: DecimalU128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionSubmittedResult {
+    submitted: bool,
     state_generation: DecimalU128,
 }
 
@@ -376,7 +701,7 @@ pub struct DomTextResult {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DomExtractValue {
     name: String,
-    value: String,
+    value: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -397,6 +722,11 @@ pub struct DomExtractResult {
 pub enum PublicAutomationResult {
     Activate(ActionMutationResult),
     Fill(ActionMutationResult),
+    Focus(ActionFocusedResult),
+    Check(ActionCheckedResult),
+    Uncheck(ActionCheckedResult),
+    Select(ActionSelectedResult),
+    Submit(ActionSubmittedResult),
     Query(DomQueryResult),
     Text(DomTextResult),
     Extract(DomExtractResult),
@@ -422,6 +752,42 @@ impl PublicAutomationResult {
             },
             (PublicAutomationKind::Fill, EngineDocumentAutomationResult::Filled) => {
                 Ok(Self::Fill(ActionMutationResult { state_generation }))
+            },
+            (PublicAutomationKind::Focus, EngineDocumentAutomationResult::Focused { focused }) => {
+                Ok(Self::Focus(ActionFocusedResult {
+                    focused,
+                    state_generation,
+                }))
+            },
+            (
+                PublicAutomationKind::Check,
+                EngineDocumentAutomationResult::Checked { changed, checked },
+            ) => Ok(Self::Check(ActionCheckedResult {
+                changed,
+                checked,
+                state_generation,
+            })),
+            (
+                PublicAutomationKind::Uncheck,
+                EngineDocumentAutomationResult::Checked { changed, checked },
+            ) => Ok(Self::Uncheck(ActionCheckedResult {
+                changed,
+                checked,
+                state_generation,
+            })),
+            (
+                PublicAutomationKind::Select,
+                EngineDocumentAutomationResult::Selected { changed, values },
+            ) => Ok(Self::Select(ActionSelectedResult {
+                changed,
+                values,
+                state_generation,
+            })),
+            (PublicAutomationKind::Submit, EngineDocumentAutomationResult::Submitted) => {
+                Ok(Self::Submit(ActionSubmittedResult {
+                    submitted: true,
+                    state_generation,
+                }))
             },
             (PublicAutomationKind::Query, EngineDocumentAutomationResult::QueryCount { count }) => {
                 Ok(Self::Query(DomQueryResult {
@@ -472,6 +838,73 @@ impl OpaqueSourceId {
     }
 }
 
+/// Opaque authorization for one exact controlled-session document state.
+///
+/// The prefixed value is a product-owned alias, not an engine generation, pipeline, epoch, or
+/// allocator identity. A token is meaningful only inside the shell session which issued it.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DocumentStateToken(String);
+
+impl DocumentStateToken {
+    fn from_alias(namespace: &OpaqueTokenNamespace, value: u128) -> Self {
+        debug_assert_ne!(value, 0);
+        Self(format_namespaced_token("document:", namespace, value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for DocumentStateToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DocumentStateToken(<redacted>)")
+    }
+}
+
+impl Serialize for DocumentStateToken {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for DocumentStateToken {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let token = String::deserialize(deserializer)?;
+        if token.len() > DOCUMENT_STATE_TOKEN_MAX_BYTES {
+            return Err(de::Error::custom("canonical document token required"));
+        }
+        let (_, alias) = split_namespaced_token(&token, "document:")
+            .map_err(|_| de::Error::custom("canonical document token required"))?;
+        alias
+            .parse::<u128>()
+            .map_err(|_| de::Error::custom("document token alias exceeds u128"))?;
+        Ok(Self(token))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DocumentStateAuthority {
+    target: PendingTargetObservation,
+    state_generation: RuntimeStateGeneration,
+    document_epoch: u64,
+    navigation_id: u64,
+    history_revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DocumentStateAuthorityError {
+    NavigationTargetDoesNotMatchPending,
+    TokenEntropyUnavailable,
+    TokenSpaceExhausted,
+}
+
 /// Session-owned product projection of engine source identities.
 ///
 /// The raw allocator value is same-build control evidence. Compact canonical-decimal aliases are
@@ -482,6 +915,10 @@ pub struct WireProjectionContext {
     event_loop_id: Option<ScriptEventLoopId>,
     source_ids: BTreeMap<u64, OpaqueSourceId>,
     next_source_alias: u128,
+    document_state_authority: Option<DocumentStateAuthority>,
+    document_state_token: Option<DocumentStateToken>,
+    document_token_namespace: Option<OpaqueTokenNamespace>,
+    next_document_state_alias: Option<u128>,
 }
 
 impl Default for WireProjectionContext {
@@ -490,6 +927,10 @@ impl Default for WireProjectionContext {
             event_loop_id: None,
             source_ids: BTreeMap::new(),
             next_source_alias: 1,
+            document_state_authority: None,
+            document_state_token: None,
+            document_token_namespace: None,
+            next_document_state_alias: Some(1),
         }
     }
 }
@@ -497,6 +938,18 @@ impl Default for WireProjectionContext {
 impl WireProjectionContext {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a projection context with an owner-supplied token namespace.
+    ///
+    /// This is an internal seam for deterministic same-build tests. Production contexts must use
+    /// [`Self::new`] so their namespace comes from the operating system CSPRNG on first use.
+    #[doc(hidden)]
+    pub fn new_with_namespace_internal(namespace: OpaqueTokenNamespace) -> Self {
+        Self {
+            document_token_namespace: Some(namespace),
+            ..Self::default()
+        }
     }
 
     fn observe_pending(&mut self, raw: &RawPendingSnapshot) {
@@ -525,6 +978,88 @@ impl WireProjectionContext {
         self.source_ids.insert(engine_id, alias.clone());
         alias
     }
+
+    /// Return a stable session-local token for this exact target and complete-state generation.
+    ///
+    /// Only the current binding is retained. Any target transition or state-generation change
+    /// rotates the token, so an earlier document can never become authorized again through an
+    /// ABA transition.
+    pub fn document_state_token(
+        &mut self,
+        raw: &RawPendingSnapshot,
+        navigation: &SessionNavigationAuthority,
+    ) -> Result<DocumentStateToken, DocumentStateAuthorityError> {
+        if navigation.target() != &raw.target {
+            return Err(DocumentStateAuthorityError::NavigationTargetDoesNotMatchPending);
+        }
+        let authority = DocumentStateAuthority {
+            target: raw.target.clone(),
+            state_generation: raw.state_generation,
+            document_epoch: navigation.document_epoch().get(),
+            navigation_id: navigation.navigation_id().get(),
+            history_revision: navigation.history_revision().get(),
+        };
+        if self.document_state_authority.as_ref() == Some(&authority) {
+            return Ok(self
+                .document_state_token
+                .clone()
+                .expect("an observed document-state authority always has a token"));
+        }
+
+        let alias = self
+            .next_document_state_alias
+            .ok_or(DocumentStateAuthorityError::TokenSpaceExhausted)?;
+        let namespace = match self.document_token_namespace.as_ref() {
+            Some(namespace) => namespace,
+            None => {
+                let namespace = OpaqueTokenNamespace::generate()
+                    .map_err(|_| DocumentStateAuthorityError::TokenEntropyUnavailable)?;
+                self.document_token_namespace.insert(namespace)
+            },
+        };
+        let token = DocumentStateToken::from_alias(namespace, alias);
+        // Entropy acquisition must fail before consuming public token authority. The shell fails
+        // closed on that error, but keeping allocation transactional also preserves the invariant
+        // for direct library users and deterministic fault-injection tests.
+        self.next_document_state_alias = alias.checked_add(1);
+        self.document_state_authority = Some(authority);
+        self.document_state_token = Some(token.clone());
+        Ok(token)
+    }
+
+    /// Check supplied document authorization against a freshly observed owner snapshot.
+    pub fn authorizes_document_state(
+        &mut self,
+        raw: &RawPendingSnapshot,
+        navigation: &SessionNavigationAuthority,
+        supplied: &DocumentStateToken,
+    ) -> Result<bool, DocumentStateAuthorityError> {
+        Ok(self.document_state_token(raw, navigation)? == *supplied)
+    }
+}
+
+/// Additive controlled-session result envelope. The flattened legacy projection stays byte-for-
+/// byte unchanged for `controlled-webapp-v1`; only the new profile uses this wrapper.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDocumentResult<T> {
+    #[serde(flatten)]
+    result: T,
+    state_token: DocumentStateToken,
+}
+
+impl<T> SessionDocumentResult<T> {
+    pub fn new(
+        result: T,
+        raw: &RawPendingSnapshot,
+        navigation: &SessionNavigationAuthority,
+        context: &mut WireProjectionContext,
+    ) -> Result<Self, DocumentStateAuthorityError> {
+        Ok(Self {
+            result,
+            state_token: context.document_state_token(raw, navigation)?,
+        })
+    }
 }
 
 /// Strict parameters for `runtime.pending`.
@@ -534,6 +1069,64 @@ pub struct RuntimePendingParams {}
 /// Strict parameters for `runtime.advance_to_next`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeAdvanceToNextParams {}
+
+/// Strict token-authorized parameters for controlled-session advancement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SessionRuntimeAdvanceToNextParams {
+    pub expected_state_token: DocumentStateToken,
+}
+
+/// Strict parameters for an explicit controlled-session top-level navigation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SessionNavigateParams {
+    pub url: String,
+    pub expected_state_token: DocumentStateToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionNavigateBoundary {
+    ControlledReady,
+}
+
+/// Authoritative result after the admitted replacement has reached a controlled terminal
+/// settlement observation and the final navigation/document authority has been re-observed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionNavigateResult {
+    pub requested_url: String,
+    pub url: String,
+    pub boundary: SessionNavigateBoundary,
+    pub state_generation: DecimalU128,
+    pub dom_epoch: DecimalU128,
+    pub document_epoch: DecimalU128,
+    pub navigation_id: DecimalU128,
+    pub history_revision: DecimalU128,
+    pub state_token: DocumentStateToken,
+}
+
+impl SessionNavigateResult {
+    pub fn project(
+        requested_url: String,
+        pending: &RawPendingSnapshot,
+        navigation: &SessionNavigationAuthority,
+        context: &mut WireProjectionContext,
+    ) -> Result<Self, DocumentStateAuthorityError> {
+        Ok(Self {
+            requested_url,
+            url: navigation.url().to_string(),
+            boundary: SessionNavigateBoundary::ControlledReady,
+            state_generation: pending.state_generation.get().into(),
+            dom_epoch: pending.dom_epoch.get().into(),
+            document_epoch: navigation.document_epoch().get().into(),
+            navigation_id: navigation.navigation_id().get().into(),
+            history_revision: navigation.history_revision().get().into(),
+            state_token: context.document_state_token(pending, navigation)?,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -567,6 +1160,37 @@ struct RuntimeSettleParamsInput {
     max_control_turns: Option<DecimalU128>,
     #[serde(default, deserialize_with = "deserialize_optional_decimal")]
     wall_io_timeout_ns: Option<DecimalU128>,
+}
+
+/// Strict token-authorized parameters for controlled-session settlement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SessionRuntimeSettleParams {
+    pub expected_state_token: DocumentStateToken,
+    #[serde(default)]
+    persistent_work: PersistentWorkPolicy,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    max_virtual_time_ns: Option<DecimalU128>,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    max_control_turns: Option<DecimalU128>,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    wall_io_timeout_ns: Option<DecimalU128>,
+}
+
+impl SessionRuntimeSettleParams {
+    pub fn resolve(
+        self,
+        defaults: EngineSettlePolicy,
+    ) -> Result<(DocumentStateToken, ResolvedSettlePolicy), SettleParamsError> {
+        let policy = RuntimeSettleParams {
+            persistent_work: self.persistent_work,
+            max_virtual_time_ns: self.max_virtual_time_ns,
+            max_control_turns: self.max_control_turns,
+            wall_io_timeout_ns: self.wall_io_timeout_ns,
+        }
+        .resolve(defaults)?;
+        Ok((self.expected_state_token, policy))
+    }
 }
 
 impl<'de> Deserialize<'de> for RuntimePendingParams {
@@ -713,6 +1337,7 @@ pub enum TimeSurface {
     ExternalSubscription,
     NativeMedia,
     EmbedderControl,
+    HistoryTraversal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1274,6 +1899,51 @@ pub struct SettleFailureSnapshot {
     pub code: SettleFailureCode,
 }
 
+/// Bounded settlement diagnostics used when a navigation cannot cross the
+/// `controlled_ready` boundary. This deliberately reuses the public settle failure/source
+/// projection while omitting opaque source identities and the raw engine failure payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[doc(hidden)]
+pub struct ControlledReadyFailureDetails {
+    pub failure: SettleFailureSnapshot,
+    pub unsupported_work: Vec<ControlledReadyUnsupportedWork>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[doc(hidden)]
+pub struct ControlledReadyUnsupportedWork {
+    pub kind: SourceKind,
+    pub count: DecimalU128,
+    #[serde(flatten)]
+    pub description: UnsupportedDescription,
+}
+
+#[doc(hidden)]
+pub fn project_controlled_ready_failure_details(
+    failure: &SettleRuntimeFailure,
+    pending: &RawPendingSnapshot,
+) -> (SettleOutcome, ControlledReadyFailureDetails) {
+    let mut context = WireProjectionContext::new();
+    let projected = project_settle_failure(failure, pending, &mut context);
+    let details = ControlledReadyFailureDetails {
+        failure: SettleFailureSnapshot {
+            code: projected.code,
+        },
+        unsupported_work: projected
+            .unsupported_work
+            .into_iter()
+            .map(|work| ControlledReadyUnsupportedWork {
+                kind: work.kind,
+                count: work.count,
+                description: work.description,
+            })
+            .collect(),
+    };
+    (projected.outcome, details)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSettleResult {
@@ -1663,6 +2333,7 @@ fn project_time_surface(surface: DocumentTimeSurface) -> TimeSurface {
         DocumentTimeSurface::ExternalSubscription => TimeSurface::ExternalSubscription,
         DocumentTimeSurface::NativeMedia => TimeSurface::NativeMedia,
         DocumentTimeSurface::EmbedderControl => TimeSurface::EmbedderControl,
+        DocumentTimeSurface::HistoryTraversal => TimeSurface::HistoryTraversal,
     }
 }
 
@@ -2435,7 +3106,11 @@ mod tests {
         PendingSourceObservation, PendingSourceSnapshot, PendingTargetObservation,
         PendingTaskObservation, RawPendingSnapshot, RuntimeStateGeneration,
     };
+    use embedder_traits::document_session::{
+        DocumentEpoch, HistoryRevision, SessionNavigationAuthority, SessionNavigationId,
+    };
     use serde_json::{Value, json};
+    use servo::ServoUrl;
     use servo_base::id::{
         BrowsingContextId, BrowsingContextIndex, Index, PipelineId, PipelineIndex,
         PipelineNamespaceId, ScriptEventLoopId, WebViewId,
@@ -2451,6 +3126,17 @@ mod tests {
 
     const ABOVE_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_993;
     const LARGE_VIRTUAL_TIME: u128 = (u64::MAX as u128) + 9_007_199_254_740_993;
+    const TEST_DOCUMENT_NAMESPACE_HEX: &str = "61616161616161616161616161616161";
+
+    fn test_projection_context() -> WireProjectionContext {
+        WireProjectionContext::new_with_namespace_internal(OpaqueTokenNamespace::new_internal(
+            [0x61; 16],
+        ))
+    }
+
+    fn test_document_token(alias: u128) -> String {
+        format!("document:{TEST_DOCUMENT_NAMESPACE_HEX}:{alias}")
+    }
 
     fn pending_fixture() -> RawPendingSnapshot {
         let event_loop_id = ScriptEventLoopId::new();
@@ -2548,6 +3234,18 @@ mod tests {
         snapshot
     }
 
+    fn navigation_fixture(pending: &RawPendingSnapshot) -> SessionNavigationAuthority {
+        SessionNavigationAuthority::new_internal(
+            Box::new(pending.target.clone()),
+            DocumentEpoch::new(1),
+            SessionNavigationId::new(0),
+            HistoryRevision::new(0),
+            0,
+            ServoUrl::parse("https://example.test/").unwrap(),
+            None,
+        )
+    }
+
     #[test]
     fn automation_params_are_strict_bounded_and_generation_checked() {
         let maximum_generation = u64::MAX.to_string();
@@ -2628,6 +3326,140 @@ mod tests {
                 DocumentAutomationRequestError::FillValueTooLong { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn session_automation_uses_only_the_current_opaque_document_token() {
+        let pending = pending_fixture();
+        let navigation = navigation_fixture(&pending);
+        let mut context = test_projection_context();
+        let current = context.document_state_token(&pending, &navigation).unwrap();
+        assert_eq!(current.as_str(), test_document_token(1));
+
+        let params: SessionActionActivateParams = serde_json::from_value(json!({
+            "selector": "#start",
+            "expectedStateToken": test_document_token(1),
+        }))
+        .unwrap();
+        let request = params
+            .resolve()
+            .unwrap()
+            .authorize_and_bind(&pending, &navigation, &mut context)
+            .unwrap();
+        assert_eq!(request.expected_generation(), pending.state_generation);
+        assert_eq!(request.target(), &pending.target);
+        assert_eq!(
+            request.selector_grammar(),
+            DocumentSelectorGrammar::PracticalV2
+        );
+
+        let mut changed = pending.clone();
+        changed.state_generation = RuntimeStateGeneration::new(ABOVE_JS_SAFE_INTEGER + 1);
+        let stale: SessionActionActivateParams = serde_json::from_value(json!({
+            "selector": "#start",
+            "expectedStateToken": test_document_token(1),
+        }))
+        .unwrap();
+        assert_eq!(
+            stale
+                .resolve()
+                .unwrap()
+                .authorize_and_bind(&changed, &navigation, &mut context),
+            Err(SessionAutomationBindError::StaleStateToken)
+        );
+
+        for invalid in [
+            json!({"selector": "#start", "expectedStateToken": 1}),
+            json!({"selector": "#start", "expectedStateToken": format!("document:{TEST_DOCUMENT_NAMESPACE_HEX}:01")}),
+            json!({"selector": "#start", "expectedStateToken": test_document_token(1), "extra": true}),
+        ] {
+            assert!(serde_json::from_value::<SessionActionActivateParams>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn session_forms_and_extraction_are_strict_and_v2_only() {
+        let pending = pending_fixture();
+        let navigation = navigation_fixture(&pending);
+        let mut context = test_projection_context();
+        let token = context.document_state_token(&pending, &navigation).unwrap();
+
+        let select: SessionActionSelectParams = serde_json::from_value(json!({
+            "selector": "form > select[name=kind]",
+            "values": ["primary", "secondary"],
+            "expectedStateToken": token,
+        }))
+        .unwrap();
+        let select = select
+            .resolve()
+            .unwrap()
+            .authorize_and_bind(&pending, &navigation, &mut context)
+            .unwrap();
+        assert!(matches!(
+            select.operation(),
+            DocumentAutomationOperation::Select { selector, values }
+                if selector == "form > select[name=kind]" &&
+                    values == &["primary".to_owned(), "secondary".to_owned()]
+        ));
+
+        let extract: SessionDomExtractParams = serde_json::from_value(json!({
+            "rootSelector": ".card",
+            "fields": [
+                {"name": "raw", "selector": "a", "read": "attribute", "attribute": "href"},
+                {"name": "url", "selector": "a", "read": "resolved_url", "attribute": "href"}
+            ],
+            "expectedStateToken": context.document_state_token(&pending, &navigation).unwrap(),
+        }))
+        .unwrap();
+        let extract = extract
+            .resolve()
+            .unwrap()
+            .authorize_and_bind(&pending, &navigation, &mut context)
+            .unwrap();
+        let DocumentAutomationOperation::Extract(plan) = extract.operation() else {
+            panic!("expected session extraction")
+        };
+        assert_eq!(plan.fields()[0].read(), DocumentExtractionRead::Attribute);
+        assert_eq!(plan.fields()[0].attribute(), Some("href"));
+        assert_eq!(plan.fields()[1].read(), DocumentExtractionRead::ResolvedUrl);
+
+        for invalid in [
+            json!({
+                "rootSelector": ".card",
+                "fields": [{"name": "x", "selector": "a", "read": "attribute"}],
+                "expectedStateToken": context.document_state_token(&pending, &navigation).unwrap(),
+            }),
+            json!({
+                "rootSelector": ".card",
+                "fields": [{"name": "x", "selector": "a", "read": "text", "attribute": "href"}],
+                "expectedStateToken": context.document_state_token(&pending, &navigation).unwrap(),
+            }),
+        ] {
+            let invalid: SessionDomExtractParams = serde_json::from_value(invalid).unwrap();
+            assert!(matches!(
+                invalid.resolve(),
+                Err(AutomationParamsError::InvalidOperation(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn session_document_result_adds_token_without_changing_legacy_projection() {
+        let pending = pending_fixture();
+        let navigation = navigation_fixture(&pending);
+        let mut context = test_projection_context();
+        let legacy = PendingWorkSnapshot::project(&pending, &mut context);
+        let legacy_value = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_value.get("stateToken").is_none());
+
+        let session =
+            SessionDocumentResult::new(legacy, &pending, &navigation, &mut context).unwrap();
+        let session_value = serde_json::to_value(session).unwrap();
+        assert_eq!(session_value["stateToken"], test_document_token(1));
+        assert_eq!(
+            session_value["stateGeneration"],
+            ABOVE_JS_SAFE_INTEGER.to_string()
+        );
     }
 
     #[test]
@@ -2766,6 +3598,42 @@ mod tests {
             json!({"stateGeneration": ABOVE_JS_SAFE_INTEGER.to_string()})
         );
 
+        let checked = PublicAutomationResult::project(
+            PublicAutomationKind::Check,
+            EngineDocumentAutomationResult::Checked {
+                changed: true,
+                checked: true,
+            },
+            &raw,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(checked).unwrap(),
+            json!({
+                "changed": true,
+                "checked": true,
+                "stateGeneration": ABOVE_JS_SAFE_INTEGER.to_string(),
+            })
+        );
+
+        let selected = PublicAutomationResult::project(
+            PublicAutomationKind::Select,
+            EngineDocumentAutomationResult::Selected {
+                changed: false,
+                values: vec!["primary".to_owned()],
+            },
+            &raw,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(selected).unwrap(),
+            json!({
+                "changed": false,
+                "values": ["primary"],
+                "stateGeneration": ABOVE_JS_SAFE_INTEGER.to_string(),
+            })
+        );
+
         let queried = PublicAutomationResult::project(
             PublicAutomationKind::Query,
             EngineDocumentAutomationResult::QueryCount { count: 7 },
@@ -2800,11 +3668,11 @@ mod tests {
                     fields: vec![
                         EngineDocumentExtractionValue {
                             name: "second".to_owned(),
-                            value: "2".to_owned(),
+                            value: Some("2".to_owned()),
                         },
                         EngineDocumentExtractionValue {
                             name: "first".to_owned(),
-                            value: "1".to_owned(),
+                            value: Some("1".to_owned()),
                         },
                     ],
                 }],
@@ -2906,7 +3774,7 @@ mod tests {
                     .iter()
                     .map(|name| EngineDocumentExtractionValue {
                         name: name.clone(),
-                        value: "\0".repeat(55),
+                        value: Some("\0".repeat(55)),
                     })
                     .collect(),
             })
@@ -2914,14 +3782,18 @@ mod tests {
         let logical_output_bytes: usize = rows
             .iter()
             .flat_map(|row| row.fields.iter())
-            .map(|field| field.name.len() + field.value.len())
+            .map(|field| field.name.len() + field.value.as_ref().map_or(0, String::len))
             .sum();
         let remaining = limits.max_output_bytes() as usize - logical_output_bytes;
-        rows[0].fields[0].value.push_str(&"\0".repeat(remaining));
+        rows[0].fields[0]
+            .value
+            .as_mut()
+            .unwrap()
+            .push_str(&"\0".repeat(remaining));
         let logical_output_bytes: usize = rows
             .iter()
             .flat_map(|row| row.fields.iter())
-            .map(|field| field.name.len() + field.value.len())
+            .map(|field| field.name.len() + field.value.as_ref().map_or(0, String::len))
             .sum();
         assert_eq!(logical_output_bytes, limits.max_output_bytes() as usize);
         let result = PublicAutomationResult::project(
@@ -2953,7 +3825,7 @@ mod tests {
 
     #[test]
     fn exact_values_above_javascript_safe_integer_are_decimal_strings() {
-        let mut context = WireProjectionContext::new();
+        let mut context = test_projection_context();
         let result = RuntimePendingResult::project(&pending_fixture(), &mut context);
         let value = serde_json::to_value(result).unwrap();
 
@@ -2973,6 +3845,171 @@ mod tests {
             value["sources"][0]["openEnded"]["requestedPeriodNs"],
             "5000000000"
         );
+    }
+
+    #[test]
+    fn document_state_tokens_are_stable_for_exact_authority_and_never_aba() {
+        let first = pending_fixture();
+        let navigation = navigation_fixture(&first);
+        let mut context = test_projection_context();
+
+        let first_token = context.document_state_token(&first, &navigation).unwrap();
+        assert_eq!(first_token.as_str(), test_document_token(1));
+        assert_eq!(
+            context.document_state_token(&first, &navigation).unwrap(),
+            first_token
+        );
+        assert!(
+            context
+                .authorizes_document_state(&first, &navigation, &first_token)
+                .unwrap()
+        );
+
+        let mut changed = first.clone();
+        changed.state_generation = RuntimeStateGeneration::new(ABOVE_JS_SAFE_INTEGER + 1);
+        let changed_token = context.document_state_token(&changed, &navigation).unwrap();
+        assert_eq!(changed_token.as_str(), test_document_token(2));
+        assert_ne!(changed_token, first_token);
+        assert!(
+            !context
+                .authorizes_document_state(&changed, &navigation, &first_token)
+                .unwrap()
+        );
+
+        // Returning to byte-identical engine authority still receives a new alias. Only the
+        // current binding is retained, so a stale token cannot regain authority through ABA.
+        let returned_token = context.document_state_token(&first, &navigation).unwrap();
+        assert_eq!(returned_token.as_str(), test_document_token(3));
+        assert_ne!(returned_token, first_token);
+        assert!(
+            !context
+                .authorizes_document_state(&first, &navigation, &first_token)
+                .unwrap()
+        );
+        assert!(
+            context
+                .authorizes_document_state(&first, &navigation, &returned_token)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn document_state_tokens_are_domain_separated_and_strict() {
+        let wire = test_document_token(7);
+        let token: DocumentStateToken = serde_json::from_value(json!(wire)).unwrap();
+        assert_eq!(token.as_str(), test_document_token(7));
+        assert_eq!(
+            serde_json::to_value(&token).unwrap(),
+            json!(test_document_token(7))
+        );
+        assert_eq!(format!("{token:?}"), "DocumentStateToken(<redacted>)");
+
+        let maximum = test_document_token(u128::MAX);
+        assert_eq!(maximum.len(), DOCUMENT_STATE_TOKEN_MAX_BYTES);
+        let maximum_token: DocumentStateToken =
+            serde_json::from_value(json!(maximum.clone())).unwrap();
+        assert_eq!(maximum_token.as_str(), maximum);
+
+        for rejected in [
+            "session:61616161616161616161616161616161:7",
+            "7",
+            "document:6161616161616161616161616161616:7",
+            "document:616161616161616161616161616161611:7",
+            "document:6161616161616161616161616161616g:7",
+            "document:6161616161616161616161616161616A:7",
+            "document:61616161616161616161616161616161:0",
+            "document:61616161616161616161616161616161:07",
+            "document:61616161616161616161616161616161:+7",
+            "document:61616161616161616161616161616161:-7",
+            "document:61616161616161616161616161616161: 7",
+            "document:61616161616161616161616161616161:340282366920938463463374607431768211456",
+        ] {
+            assert!(
+                serde_json::from_value::<DocumentStateToken>(json!(rejected)).is_err(),
+                "accepted invalid document token {rejected:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn document_state_token_space_exhaustion_is_checked() {
+        let pending = pending_fixture();
+        let navigation = navigation_fixture(&pending);
+        let mut context = test_projection_context();
+        context.next_document_state_alias = Some(u128::MAX);
+        let first = context.document_state_token(&pending, &navigation).unwrap();
+        assert_eq!(first.as_str(), test_document_token(u128::MAX));
+
+        let mut changed = pending.clone();
+        changed.state_generation = RuntimeStateGeneration::new(2);
+        assert_eq!(
+            context.document_state_token(&changed, &navigation),
+            Err(DocumentStateAuthorityError::TokenSpaceExhausted),
+        );
+    }
+
+    #[test]
+    fn document_state_authority_rejects_a_token_from_another_fresh_session() {
+        let pending = pending_fixture();
+        let navigation = navigation_fixture(&pending);
+        let mut first = test_projection_context();
+        let mut second = WireProjectionContext::new_with_namespace_internal(
+            OpaqueTokenNamespace::new_internal([0x62; 16]),
+        );
+        let foreign = first.document_state_token(&pending, &navigation).unwrap();
+        let local = second.document_state_token(&pending, &navigation).unwrap();
+
+        assert_ne!(foreign, local);
+        assert!(
+            !second
+                .authorizes_document_state(&pending, &navigation, &foreign)
+                .unwrap()
+        );
+        assert!(!format!("{foreign:?}").contains(TEST_DOCUMENT_NAMESPACE_HEX));
+    }
+
+    #[test]
+    fn session_navigation_authority_rotates_tokens_and_projects_controlled_ready() {
+        let pending = pending_fixture();
+        let initial = navigation_fixture(&pending);
+        let changed_history = SessionNavigationAuthority::new_internal(
+            Box::new(pending.target.clone()),
+            DocumentEpoch::new(2),
+            SessionNavigationId::new(7),
+            HistoryRevision::new(9),
+            1,
+            ServoUrl::parse("https://example.test/final").unwrap(),
+            None,
+        );
+        let mut context = test_projection_context();
+        let initial_token = context.document_state_token(&pending, &initial).unwrap();
+        let changed_token = context
+            .document_state_token(&pending, &changed_history)
+            .unwrap();
+        assert_ne!(initial_token, changed_token);
+        assert!(
+            !context
+                .authorizes_document_state(&pending, &changed_history, &initial_token)
+                .unwrap()
+        );
+
+        let value = serde_json::to_value(
+            SessionNavigateResult::project(
+                "https://example.test/requested".into(),
+                &pending,
+                &changed_history,
+                &mut context,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["requestedUrl"], "https://example.test/requested");
+        assert_eq!(value["url"], "https://example.test/final");
+        assert_eq!(value["boundary"], "controlled_ready");
+        assert_eq!(value["documentEpoch"], "2");
+        assert_eq!(value["navigationId"], "7");
+        assert_eq!(value["historyRevision"], "9");
+        assert_eq!(value["stateToken"], changed_token.as_str());
     }
 
     #[test]
@@ -3034,7 +4071,7 @@ mod tests {
     #[test]
     fn opaque_source_ids_are_stable_without_exposing_allocator_values() {
         let raw = pending_fixture();
-        let mut context = WireProjectionContext::new();
+        let mut context = test_projection_context();
         let before =
             serde_json::to_value(RuntimePendingResult::project(&raw, &mut context)).unwrap();
         let surviving_id = before["sources"][1]["sourceId"]
@@ -3209,6 +4246,7 @@ mod tests {
             ),
             (DocumentTimeSurface::NativeMedia, "native_media"),
             (DocumentTimeSurface::EmbedderControl, "embedder_control"),
+            (DocumentTimeSurface::HistoryTraversal, "history_traversal"),
         ] {
             assert_eq!(
                 serde_json::to_value(project_time_surface(surface)).unwrap(),
@@ -3220,7 +4258,7 @@ mod tests {
     #[test]
     fn settle_and_advance_results_have_the_mvp_shape() {
         let raw = pending_fixture();
-        let mut context = WireProjectionContext::new();
+        let mut context = test_projection_context();
         let interval = raw.sources.sources()[0];
         let policy = RuntimeSettleParams::default()
             .resolve(EngineSettlePolicy::default())
@@ -3288,6 +4326,34 @@ mod tests {
         assert_eq!(unsupported["outcome"], "unsupported_work");
         assert_eq!(unsupported["failure"]["code"], "unsupported_source");
         assert_eq!(unsupported["unsupportedWork"][0]["reason"], "time_surface");
+
+        let (outcome, controlled_ready_details) = project_controlled_ready_failure_details(
+            &SettleRuntimeFailure::UnsupportedSource(raw.sources.sources()[1]),
+            &raw,
+        );
+        assert_eq!(outcome, SettleOutcome::UnsupportedWork);
+        let controlled_ready_details = serde_json::to_value(controlled_ready_details).unwrap();
+        assert_eq!(
+            controlled_ready_details["failure"]["code"],
+            "unsupported_source"
+        );
+        assert_eq!(
+            controlled_ready_details["unsupportedWork"][0]["kind"],
+            "other"
+        );
+        assert_eq!(
+            controlled_ready_details["unsupportedWork"][0]["reason"],
+            "time_surface"
+        );
+        assert_eq!(
+            controlled_ready_details["unsupportedWork"][0]["timeSurface"],
+            "worker"
+        );
+        assert!(
+            controlled_ready_details["unsupportedWork"][0]
+                .get("sourceId")
+                .is_none()
+        );
 
         let retained_tasks = RuntimeSettleResult::project(
             SettleCompletion::RuntimeError {
@@ -3449,7 +4515,7 @@ mod tests {
             });
             raw.validate().unwrap();
 
-            let mut context = WireProjectionContext::new();
+            let mut context = test_projection_context();
             let projected = RuntimeSettleResult::project(
                 SettleCompletion::ExecutionLimitExceeded {
                     pending: Box::new(raw),
@@ -3481,7 +4547,7 @@ mod tests {
     #[test]
     fn golden_projection_never_exposes_engine_authority_or_urls() {
         let raw = pending_fixture();
-        let mut context = WireProjectionContext::new();
+        let mut context = test_projection_context();
         let projected = RuntimeAdvanceToNextResult::project(
             RuntimeAdvanceToNextFacts::Advanced {
                 from_virtual_time_ns: LARGE_VIRTUAL_TIME - 1,
@@ -3565,6 +4631,289 @@ mod tests {
         for result in [&pending, &settled, &value] {
             audit(result);
         }
+    }
+
+    #[test]
+    fn controlled_web_session_profile_matches_public_numeric_contracts() {
+        use crate::session_state::{
+            MAX_SESSION_COOKIE_ARRAY_ENCODED_BYTES, MAX_SESSION_COOKIE_BYTES, MAX_SESSION_COOKIES,
+            MAX_SESSION_COOKIES_PER_REGISTRABLE_HOST, MAX_SESSION_STATE_BYTES,
+            MAX_SESSION_STORAGE_ARRAY_ENCODED_BYTES, MAX_SESSION_STORAGE_BYTES_PER_ORIGIN,
+            MAX_SESSION_STORAGE_ENTRIES_PER_AREA, MAX_SESSION_STORAGE_KEY_BYTES,
+            MAX_SESSION_STORAGE_ORIGINS, MAX_SESSION_STORAGE_VALUE_BYTES,
+            SESSION_STATE_SCHEMA_VERSION_V1, SessionStateToken, WireU64,
+        };
+        use net_traits::{
+            CONTROLLED_COOKIE_MAX_BATCH_VALUES_V1, CONTROLLED_COOKIE_MAX_RAW_VALUE_BYTES_V1,
+            COOKIE_STATE_MAX_COOKIE_BYTES_V1, COOKIE_STATE_MAX_COOKIES_PER_REGISTRABLE_HOST_V1,
+            COOKIE_STATE_MAX_COOKIES_V1, COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1,
+            COOKIE_STATE_MAX_TOTAL_BYTES_V1, network_evidence::MAX_EVIDENCE_METHOD_BYTES,
+        };
+        use storage_traits::webstorage_thread::{
+            WEB_STORAGE_STATE_MAX_ENTRIES_PER_AREA_V1, WEB_STORAGE_STATE_MAX_KEY_BYTES_V1,
+            WEB_STORAGE_STATE_MAX_ORIGIN_BYTES_V1, WEB_STORAGE_STATE_MAX_ORIGINS_V1,
+            WEB_STORAGE_STATE_MAX_PUBLIC_JSON_BYTES_V1, WEB_STORAGE_STATE_MAX_VALUE_BYTES_V1,
+        };
+
+        let profile: Value = serde_json::from_str(include_str!(
+            "../../../profiles/controlled-web-session-v1.json"
+        ))
+        .expect("the frozen controlled-web-session-v1 profile must be valid JSON");
+        assert_eq!(profile["schemaVersion"], 1);
+        assert_eq!(SESSION_STATE_SCHEMA_VERSION_V1, 1);
+        assert_eq!(profile["id"], "controlled-web-session-v1");
+        assert_eq!(profile["releaseStatus"], "stable_contract");
+        assert_eq!(profile["targetRelease"], "0.2.0");
+        assert_eq!(profile["compatibility"]["maximumOpaqueTokenBytes"], 256);
+        assert_eq!(profile["documentAuthority"]["namespaceBits"], 128);
+        assert_eq!(profile["sessionStateAuthority"]["namespaceBits"], 128);
+        assert_eq!(
+            profile["sessionStateAuthority"]["successfulMutationMethods"],
+            json!(["session.cookies.set", "session.storage.set"])
+        );
+        assert_eq!(
+            profile["sessionStateAuthority"]["successfulMutationsRequireExpectedSessionStateToken"],
+            true
+        );
+        assert_eq!(
+            profile["sessionStateAuthority"]["initialImport"]["method"],
+            "session.open.state"
+        );
+        assert_eq!(
+            profile["sessionStateAuthority"]["initialImport"]["onlySuccessfulEntryPoint"],
+            true
+        );
+        assert_eq!(
+            profile["sessionStateAuthority"]["initialImport"]["requiresCallerExpectedSessionStateToken"],
+            false
+        );
+        assert_eq!(
+            profile["sessionStateAuthority"]["initialImport"]["authorization"],
+            "unpublished_builder_hidden_current_token"
+        );
+        assert_eq!(
+            profile["sessionStateAuthority"]["postPublicationImport"]["method"],
+            "session.state.import"
+        );
+        assert_eq!(
+            profile["sessionStateAuthority"]["postPublicationImport"]["successfulMutation"],
+            false
+        );
+        assert_eq!(
+            profile["sessionStateAuthority"]["postPublicationImport"]["requestPayloadInspected"],
+            false
+        );
+        assert_eq!(profile["automation"]["fill"]["inputEventBubbles"], true);
+        assert_eq!(profile["automation"]["fill"]["inputEventComposed"], true);
+        assert_eq!(profile["automation"]["fill"]["inputEventCancelable"], false);
+        assert!(
+            profile["deferredProductSurface"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|surface| surface == "geolocation")
+        );
+
+        let maximum_document_token = format!("document:{}:{}", "f".repeat(32), u128::MAX);
+        assert_eq!(maximum_document_token.len(), DOCUMENT_STATE_TOKEN_MAX_BYTES);
+        assert_eq!(
+            profile["documentAuthority"]["maximumBytes"],
+            maximum_document_token.len()
+        );
+        let _: DocumentStateToken = serde_json::from_value(json!(maximum_document_token)).unwrap();
+
+        let maximum_session_token = format!("session:{}:{}", "f".repeat(32), u64::MAX);
+        assert_eq!(
+            profile["sessionStateAuthority"]["maximumBytes"],
+            maximum_session_token.len()
+        );
+        let _: SessionStateToken = serde_json::from_value(json!(maximum_session_token)).unwrap();
+
+        let state = &profile["stateLimits"];
+        assert_eq!(state["maximumSerializedBytes"], MAX_SESSION_STATE_BYTES);
+        assert_eq!(state["maximumCookies"], MAX_SESSION_COOKIES);
+        assert_eq!(MAX_SESSION_COOKIES, COOKIE_STATE_MAX_COOKIES_V1);
+        assert_eq!(
+            state["maximumCookiesPerRegistrableHost"],
+            MAX_SESSION_COOKIES_PER_REGISTRABLE_HOST
+        );
+        assert_eq!(
+            MAX_SESSION_COOKIES_PER_REGISTRABLE_HOST,
+            COOKIE_STATE_MAX_COOKIES_PER_REGISTRABLE_HOST_V1
+        );
+        assert_eq!(
+            state["perRegistrableHostCookieLimitError"]["code"],
+            "too_many_session_cookies_per_registrable_host"
+        );
+        assert_eq!(state["maximumCookieBytes"], MAX_SESSION_COOKIE_BYTES);
+        assert_eq!(MAX_SESSION_COOKIE_BYTES, COOKIE_STATE_MAX_COOKIE_BYTES_V1);
+        assert_eq!(
+            state["maximumTotalCookieBytes"],
+            COOKIE_STATE_MAX_TOTAL_BYTES_V1
+        );
+        assert_eq!(
+            state["maximumRawControlledCookieBytes"],
+            CONTROLLED_COOKIE_MAX_RAW_VALUE_BYTES_V1
+        );
+        assert_eq!(
+            state["maximumControlledCookieBatchValues"],
+            CONTROLLED_COOKIE_MAX_BATCH_VALUES_V1
+        );
+        assert_eq!(
+            state["maximumCookieArrayEncodedBytes"],
+            MAX_SESSION_COOKIE_ARRAY_ENCODED_BYTES
+        );
+        assert_eq!(
+            MAX_SESSION_COOKIE_ARRAY_ENCODED_BYTES,
+            COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1
+        );
+        assert_eq!(
+            state["maximumOriginsArrayEncodedBytes"],
+            MAX_SESSION_STORAGE_ARRAY_ENCODED_BYTES
+        );
+        assert_eq!(
+            MAX_SESSION_STORAGE_ARRAY_ENCODED_BYTES,
+            WEB_STORAGE_STATE_MAX_PUBLIC_JSON_BYTES_V1
+        );
+        assert_eq!(state["maximumOrigins"], MAX_SESSION_STORAGE_ORIGINS);
+        assert_eq!(
+            MAX_SESSION_STORAGE_ORIGINS,
+            WEB_STORAGE_STATE_MAX_ORIGINS_V1
+        );
+        assert_eq!(
+            state["maximumLocalStorageEntriesPerOrigin"],
+            MAX_SESSION_STORAGE_ENTRIES_PER_AREA
+        );
+        assert_eq!(
+            state["maximumSessionStorageEntriesPerOrigin"],
+            MAX_SESSION_STORAGE_ENTRIES_PER_AREA
+        );
+        assert_eq!(
+            MAX_SESSION_STORAGE_ENTRIES_PER_AREA,
+            WEB_STORAGE_STATE_MAX_ENTRIES_PER_AREA_V1
+        );
+        assert_eq!(
+            state["maximumStorageKeyBytes"],
+            MAX_SESSION_STORAGE_KEY_BYTES
+        );
+        assert_eq!(
+            MAX_SESSION_STORAGE_KEY_BYTES,
+            WEB_STORAGE_STATE_MAX_KEY_BYTES_V1
+        );
+        assert_eq!(
+            state["maximumStorageValueBytes"],
+            MAX_SESSION_STORAGE_VALUE_BYTES
+        );
+        assert_eq!(
+            MAX_SESSION_STORAGE_VALUE_BYTES,
+            WEB_STORAGE_STATE_MAX_VALUE_BYTES_V1
+        );
+        assert_eq!(
+            state["maximumTotalStorageBytesPerOrigin"],
+            MAX_SESSION_STORAGE_BYTES_PER_ORIGIN
+        );
+        assert_eq!(
+            MAX_SESSION_STORAGE_BYTES_PER_ORIGIN,
+            WEB_STORAGE_STATE_MAX_ORIGIN_BYTES_V1
+        );
+
+        let partition = &state["encodedBudgetPartition"];
+        assert_eq!(
+            partition["cookiesArrayBytes"],
+            MAX_SESSION_COOKIE_ARRAY_ENCODED_BYTES
+        );
+        assert_eq!(
+            partition["originsArrayBytes"],
+            MAX_SESSION_STORAGE_ARRAY_ENCODED_BYTES
+        );
+        assert_eq!(partition["envelopeAndSlackBytes"], 12_288);
+        assert_eq!(partition["fixedV1EnvelopeBytes"], 147);
+        assert_eq!(partition["remainingSlackBytes"], 12_141);
+        assert_eq!(
+            partition["cookiesArrayBytes"].as_u64().unwrap()
+                + partition["originsArrayBytes"].as_u64().unwrap()
+                + partition["envelopeAndSlackBytes"].as_u64().unwrap(),
+            MAX_SESSION_STATE_BYTES as u64
+        );
+        assert_eq!(
+            partition["fixedV1EnvelopeBytes"].as_u64().unwrap()
+                + partition["remainingSlackBytes"].as_u64().unwrap(),
+            partition["envelopeAndSlackBytes"].as_u64().unwrap()
+        );
+
+        let sequence = &state["cookieSequenceFields"];
+        assert_eq!(sequence["wireSyntax"], "canonical_decimal_u64_string");
+        assert_eq!(sequence["maximum"], u64::MAX.to_string());
+        assert_eq!(sequence["creationSequenceUniqueWithinCookies"], true);
+        assert_eq!(sequence["lastAccessSequenceUniqueWithinCookies"], true);
+        let maximum_sequence: WireU64 =
+            serde_json::from_value(json!(sequence["maximum"].as_str().unwrap())).unwrap();
+        assert_eq!(maximum_sequence.get(), u64::MAX);
+
+        assert_eq!(
+            profile["navigation"]["sameDocument"]["historyTraversalBoundary"]["timeSurface"],
+            "history_traversal"
+        );
+        assert_eq!(
+            profile["unsupportedClasses"]["historyTraversal"],
+            "history_traversal"
+        );
+        assert_eq!(
+            profile["network"]["reachableStickyFailures"]["activeOperationLimit"]["code"],
+            "controlled_network_active_operation_limit_exceeded"
+        );
+        assert_eq!(
+            profile["network"]["reachableStickyFailures"]["unknownRequestBodyLength"]["code"],
+            "unsupported_network_request_body_length"
+        );
+        assert_eq!(
+            profile["network"]["reachableStickyFailures"]["rejectedRequestMetadata"]["code"],
+            "unsupported_network_request_metadata"
+        );
+        assert_eq!(
+            profile["sessionEvidence"]["bounds"]["maximumMethodBytes"],
+            MAX_EVIDENCE_METHOD_BYTES
+        );
+
+        let automation = public_automation_limits();
+        let automation_profile = &profile["automationLimits"];
+        assert_eq!(
+            automation_profile["maxSelectorBytes"],
+            automation.max_selector_bytes()
+        );
+        assert_eq!(
+            automation_profile["maxFillValueBytes"],
+            automation.max_fill_value_bytes()
+        );
+        assert_eq!(
+            automation_profile["maxFieldNameBytes"],
+            automation.max_field_name_bytes()
+        );
+        assert_eq!(
+            automation_profile["maxAttributeNameBytes"],
+            automation.max_field_name_bytes()
+        );
+        assert_eq!(
+            automation_profile["maxExtractionFields"],
+            automation.max_extraction_fields()
+        );
+        assert_eq!(
+            automation_profile["maxSelectValues"],
+            automation.max_extraction_fields()
+        );
+        assert_eq!(
+            automation_profile["maxSelectValueBytesTotal"],
+            automation.max_fill_value_bytes()
+        );
+        assert_eq!(automation_profile["maxMatches"], automation.max_matches());
+        assert_eq!(
+            automation_profile["maxDomNodesVisited"],
+            automation.max_dom_nodes_visited()
+        );
+        assert_eq!(
+            automation_profile["maxOutputBytes"],
+            automation.max_output_bytes()
+        );
     }
 
     #[test]

@@ -36,6 +36,13 @@ pub use crate::hosts::replace_host_table;
 static ASYNC_RUNTIME: LazyLock<Arc<Mutex<Box<dyn AsyncRuntime>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(init_async_runtime())));
 
+/// Ensure that net tests share the single process-wide async runtime.
+pub fn ensure_async_runtime() {
+    if !async_runtime_initialized() {
+        let _ = &*ASYNC_RUNTIME;
+    }
+}
+
 pub fn create_embedder_proxy() -> EmbedderProxy {
     create_generic_embedder_proxy::<EmbedderMsg>()
 }

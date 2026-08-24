@@ -46,10 +46,13 @@ use crate::request::{Request, RequestBuilder};
 use crate::response::{Response, ResponseInit};
 
 pub mod blob_url_store;
+pub mod controlled_network;
 pub mod filemanager_thread;
 pub mod http_status;
 pub mod image_cache;
 pub mod mime_classifier;
+pub mod network_evidence;
+pub mod network_fixture;
 pub mod policy_container;
 pub mod pub_domains;
 pub mod quality;
@@ -297,12 +300,12 @@ impl std::fmt::Debug for DebugVec {
 impl FetchResponseMsg {
     pub fn request_id(&self) -> RequestId {
         match self {
-            FetchResponseMsg::ProcessRequestBody(id) |
-            FetchResponseMsg::ProcessResponse(id, ..) |
-            FetchResponseMsg::ProcessResponseChunk(id, ..) |
-            FetchResponseMsg::ProcessResponseEOF(id, ..) |
-            FetchResponseMsg::ProcessCspViolations(id, ..) |
-            FetchResponseMsg::ProcessContentLength(id, _) => *id,
+            FetchResponseMsg::ProcessRequestBody(id)
+            | FetchResponseMsg::ProcessResponse(id, ..)
+            | FetchResponseMsg::ProcessResponseChunk(id, ..)
+            | FetchResponseMsg::ProcessResponseEOF(id, ..)
+            | FetchResponseMsg::ProcessCspViolations(id, ..)
+            | FetchResponseMsg::ProcessContentLength(id, _) => *id,
         }
     }
 }
@@ -585,6 +588,30 @@ impl ResourceThreads {
             .collect()
     }
 
+    /// Return a bounded canonical snapshot of the public cookie jar.
+    pub fn cookie_state(&self) -> Result<CookieStateSnapshotV1, CookieStateError> {
+        let (sender, receiver) = generic_channel::channel().unwrap();
+        let _ = self
+            .core_thread
+            .send(CoreResourceMsg::ExportCookieState(sender));
+        receiver.recv().unwrap()
+    }
+
+    /// Replace the public cookie jar if the caller still owns its observed revision.
+    pub fn replace_cookie_state(
+        &self,
+        expected_revision: u64,
+        snapshot: CookieStateSnapshotV1,
+    ) -> Result<u64, CookieStateError> {
+        let (sender, receiver) = generic_channel::channel().unwrap();
+        let _ = self.core_thread.send(CoreResourceMsg::ReplaceCookieState(
+            expected_revision,
+            snapshot,
+            sender,
+        ));
+        receiver.recv().unwrap()
+    }
+
     pub fn clear_session_cookies(&self) {
         let (sender, receiver) = generic_channel::channel().unwrap();
         let _ = self
@@ -732,6 +759,15 @@ pub enum CoreResourceMsg {
     ),
     /// Store a set of cookies for a given originating URL
     SetCookiesForUrl(ServoUrl, Vec<Serde<Cookie<'static>>>, CookieSource),
+    /// Validate and store one page-authored cookie at the deterministic controlled-session
+    /// boundary. The resource thread returns the secret-safe policy result before the caller
+    /// resumes, so an unsupported attribute can never be committed speculatively.
+    SetControlledCookieForUrl(
+        ServoUrl,
+        ServoUrl,
+        String,
+        GenericSender<Result<(), ControlledCookiePolicyError>>,
+    ),
     SetCookieForUrlAsync(
         CookieStoreId,
         ServoUrl,
@@ -740,12 +776,28 @@ pub enum CoreResourceMsg {
     ),
     /// Retrieve the stored cookies as a header string for a given URL.
     GetCookieStringForUrl(ServoUrl, GenericSender<Option<String>>, CookieSource),
+    /// Retrieve a deterministic, schemefully same-site page cookie string and update only the
+    /// controller-owned access order.
+    GetControlledCookieStringForUrl(
+        ServoUrl,
+        ServoUrl,
+        GenericSender<Result<Option<String>, ControlledCookiePolicyError>>,
+    ),
     /// Retrieve the stored cookies as a vector for the given URL.
     /// The response is sent via the provided sender.
     GetCookiesForUrl(
         ServoUrl,
         GenericSender<Vec<Serde<Cookie<'static>>>>,
         CookieSource,
+    ),
+    /// Return a bounded, canonical, versioned snapshot of the complete public cookie jar.
+    ExportCookieState(GenericSender<Result<CookieStateSnapshotV1, CookieStateError>>),
+    /// Atomically replace the public cookie jar when its revision still matches the caller's
+    /// observation. This privileged path is intended for controlled session restoration.
+    ReplaceCookieState(
+        u64,
+        CookieStateSnapshotV1,
+        GenericSender<Result<u64, CookieStateError>>,
     ),
     /// Retrieve cookies for a URL for embedder. The response is
     /// sent via [`NetToEmbedderMsg::EmbedderGetCookiesForUrlResponse`].
@@ -1142,6 +1194,245 @@ impl Metadata {
     }
 }
 
+/// Schema version for the privileged, portable cookie-state projection.
+pub const COOKIE_STATE_SCHEMA_VERSION_V1: u16 = 1;
+
+/// Maximum number of cookies accepted by one portable snapshot.
+pub const COOKIE_STATE_MAX_COOKIES_V1: usize = 512;
+
+/// Maximum cookies retained for one registrable host by Servo's cookie jar.
+///
+/// The portable snapshot contract must expose this lower bucket limit as well as the aggregate
+/// snapshot limit; otherwise a shape accepted by the shell could still fail during atomic backend
+/// replacement.
+pub const COOKIE_STATE_MAX_COOKIES_PER_REGISTRABLE_HOST_V1: usize = 150;
+
+/// Maximum combined UTF-8 bytes in the string fields of one cookie record.
+pub const COOKIE_STATE_MAX_COOKIE_BYTES_V1: usize = 4096;
+
+/// Maximum combined UTF-8 bytes in all cookie string fields in one snapshot.
+pub const COOKIE_STATE_MAX_TOTAL_BYTES_V1: usize = 512 * 1024;
+
+/// Maximum compact JSON bytes reserved for the public v1 cookie array, including `[]`.
+///
+/// The controlled-session state budget reserves a separate 250 KiB array fragment for Web
+/// Storage. Together those fragments consume 512,000 bytes of the 512 KiB state limit, leaving
+/// 12,288 bytes for the fixed envelope and future-compatible slack.
+pub const COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1: usize = 250 * 1024;
+
+/// Maximum bytes accepted for one raw controlled Set-Cookie/page-cookie string before parsing.
+///
+/// This accommodates a maximum 4 KiB projected record plus bounded attributes while preventing
+/// ignored or duplicate attribute text from becoming an unbounded parser input.
+pub const CONTROLLED_COOKIE_MAX_RAW_VALUE_BYTES_V1: usize = 8 * 1024;
+
+/// Maximum cookie values admitted in one atomic controlled response batch before allocation.
+pub const CONTROLLED_COOKIE_MAX_BATCH_VALUES_V1: usize = COOKIE_STATE_MAX_COOKIES_V1;
+
+/// Return whether a portable cookie name/value pair has the exact RFC 6265 request-wire shape.
+///
+/// Names use the HTTP token grammar. Values are either unquoted cookie-octets or one quoted
+/// cookie-octet sequence. The shared state bound is included so callers cannot accidentally use
+/// this syntax check as an unbounded allocation admission predicate.
+pub fn is_valid_cookie_state_name_and_value(name: &str, value: &str) -> bool {
+    fn is_token_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+    }
+
+    fn is_cookie_octet(byte: u8) -> bool {
+        matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e)
+    }
+
+    if name.is_empty()
+        || !name.bytes().all(is_token_byte)
+        || name
+            .len()
+            .checked_add(value.len())
+            .is_none_or(|bytes| bytes > COOKIE_STATE_MAX_COOKIE_BYTES_V1)
+    {
+        return false;
+    }
+
+    let value = value.as_bytes();
+    if value.first() == Some(&b'"') || value.last() == Some(&b'"') {
+        value.len() >= 2
+            && value.first() == Some(&b'"')
+            && value.last() == Some(&b'"')
+            && value[1..value.len() - 1]
+                .iter()
+                .copied()
+                .all(is_cookie_octet)
+    } else {
+        value.iter().copied().all(is_cookie_octet)
+    }
+}
+
+/// Return whether a portable cookie domain is the canonical public host spelling.
+///
+/// Public state uses unbracketed IPv6 addresses even though URL authorities and Servo's internal
+/// cookie jar use brackets. Parsing and comparing the normalized host also rejects userinfo,
+/// ports, leading dots, non-canonical IP spellings, Unicode aliases, and other URL ambiguity.
+pub fn is_canonical_cookie_state_domain(domain: &str) -> bool {
+    if domain.is_empty()
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || domain.starts_with('[')
+    {
+        return false;
+    }
+    let authority = if domain.contains(':') {
+        format!("[{domain}]")
+    } else {
+        domain.to_owned()
+    };
+    let Ok(url) = ServoUrl::parse(&format!("http://{authority}/")) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let public_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    public_host == domain
+}
+
+/// Return whether cookie-name prefix invariants hold for portable state metadata.
+pub fn has_valid_cookie_state_prefix(
+    name: &str,
+    secure: bool,
+    host_only: bool,
+    path: &str,
+) -> bool {
+    let has_prefix = |prefix: &str| {
+        name.get(..prefix.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+    };
+    (!has_prefix("__Secure-") || secure)
+        && (!has_prefix("__Host-") || (secure && host_only && path == "/"))
+}
+
+/// SameSite metadata retained by the portable cookie projection.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CookieStateSameSite {
+    Unspecified,
+    Strict,
+    Lax,
+    None,
+}
+
+/// One cookie in a canonical, privileged session-state snapshot.
+///
+/// v1 intentionally restores session cookies only. A non-null expiry is retained in the schema so
+/// a later version can add controlled cookie time without changing the record shape.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CookieStateRecordV1 {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub host_only: bool,
+    pub secure: bool,
+    pub http_only: bool,
+    pub same_site: CookieStateSameSite,
+    pub expires_unix_time_ns: Option<u64>,
+    pub partitioned: bool,
+    pub creation_sequence: u64,
+    pub last_access_sequence: u64,
+}
+
+impl Debug for CookieStateRecordV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CookieStateRecordV1")
+            .field(
+                "string_bytes",
+                &(self.name.len() + self.value.len() + self.domain.len() + self.path.len()),
+            )
+            .field("host_only", &self.host_only)
+            .field("secure", &self.secure)
+            .field("http_only", &self.http_only)
+            .field("same_site", &self.same_site)
+            .field("persistent", &self.expires_unix_time_ns.is_some())
+            .field("partitioned", &self.partitioned)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Complete cookie state for one isolated public resource-thread group.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CookieStateSnapshotV1 {
+    pub schema_version: u16,
+    /// Revision of the source jar. Import authorization uses a separate expected target revision.
+    pub revision: u64,
+    /// Records are sorted by canonical cookie identity, not hash-map iteration order.
+    pub cookies: Vec<CookieStateRecordV1>,
+}
+
+impl Debug for CookieStateSnapshotV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CookieStateSnapshotV1")
+            .field("schema_version", &self.schema_version)
+            .field("revision", &self.revision)
+            .field("cookie_count", &self.cookies.len())
+            .finish()
+    }
+}
+
+/// Definitive failures from privileged cookie snapshot/import operations.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CookieStateError {
+    UnsupportedSchemaVersion,
+    StaleRevision,
+    RevisionExhausted,
+    TooManyCookies,
+    CookieTooLarge,
+    SnapshotTooLarge,
+    DuplicateCookieIdentity,
+    DuplicateCreationSequence,
+    DuplicateLastAccessSequence,
+    InvalidCookie,
+    PartitionedCookieUnsupported,
+    PersistentCookieUnsupported,
+}
+
+/// Secret-safe rejection reasons for the deterministic controlled-session cookie boundary.
+///
+/// Ordinary Servo requests do not use this policy. Controlled sessions accept cookie traffic only
+/// when the request is proven schemefully same-site with the top-level document and reject cookie
+/// attributes whose meaning depends on uncontrolled wall time or an unsupported partition key.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlledCookiePolicyError {
+    SameSiteContextUnsupported,
+    PersistentCookieUnsupported,
+    PartitionedCookieUnsupported,
+    InvalidCookie,
+}
+
 /// The creator of a given cookie
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub enum CookieSource {
@@ -1264,20 +1555,20 @@ impl NetworkError {
     pub fn is_permanent_failure(&self) -> bool {
         matches!(
             self,
-            NetworkError::ContentSecurityPolicy |
-                NetworkError::MixedContent |
-                NetworkError::SubresourceIntegrity |
-                NetworkError::Nosniff |
-                NetworkError::InvalidPort |
-                NetworkError::CorsGeneral |
-                NetworkError::CrossOriginResponse |
-                NetworkError::CorsCredentials |
-                NetworkError::CorsAllowMethods |
-                NetworkError::CorsAllowHeaders |
-                NetworkError::CorsMethod |
-                NetworkError::CorsAuthorization |
-                NetworkError::CorsHeaders |
-                NetworkError::UnsupportedScheme
+            NetworkError::ContentSecurityPolicy
+                | NetworkError::MixedContent
+                | NetworkError::SubresourceIntegrity
+                | NetworkError::Nosniff
+                | NetworkError::InvalidPort
+                | NetworkError::CorsGeneral
+                | NetworkError::CrossOriginResponse
+                | NetworkError::CorsCredentials
+                | NetworkError::CorsAllowMethods
+                | NetworkError::CorsAllowHeaders
+                | NetworkError::CorsMethod
+                | NetworkError::CorsAuthorization
+                | NetworkError::CorsHeaders
+                | NetworkError::UnsupportedScheme
         )
     }
 

@@ -425,8 +425,8 @@ impl<T: ClipboardProvider> TextInput<T> {
     ///
     /// If there is no selection, returns an empty range at the edit point.
     pub(crate) fn sorted_selection_character_offsets_range(&self) -> Range<usize> {
-        self.rope.index_to_character_offset(self.selection_start())..
-            self.rope.index_to_character_offset(self.selection_end())
+        self.rope.index_to_character_offset(self.selection_start())
+            ..self.rope.index_to_character_offset(self.selection_end())
     }
 
     /// The state of the current selection. Can be used to compare whether selection state has changed.
@@ -988,6 +988,14 @@ impl<T: ClipboardProvider> TextInput<T> {
     /// The total number of code units required to encode the content in utf16.
     pub(crate) fn len_utf16(&self) -> Utf16CodeUnits {
         self.rope.len_utf16()
+    }
+
+    /// The exact UTF-8 byte length without joining the rope into a new `String`.
+    ///
+    /// Native document automation uses this to prove its scratch-allocation ceiling before a
+    /// semantic action calls an IDL getter which materializes the current value.
+    pub(crate) fn len_utf8(&self) -> Utf8CodeUnits {
+        self.rope.index_to_utf8_offset(self.rope.last_index())
     }
 
     /// Get the current contents of the text input. Multiple lines are joined by \n.

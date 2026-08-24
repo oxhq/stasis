@@ -9,7 +9,14 @@ use servo_base::id::TEST_WEBVIEW_ID;
 use servo_default_resources as _;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use storage_traits::StorageThreads;
-use storage_traits::webstorage_thread::{WebStorageThreadMsg, WebStorageType};
+use storage_traits::webstorage_thread::{
+    WEB_STORAGE_STATE_MAX_ENTRIES_PER_AREA_V1, WEB_STORAGE_STATE_MAX_KEY_BYTES_V1,
+    WEB_STORAGE_STATE_MAX_ORIGINS_V1, WEB_STORAGE_STATE_MAX_PUBLIC_JSON_BYTES_V1,
+    WEB_STORAGE_STATE_MAX_VALUE_BYTES_V1, WEB_STORAGE_STATE_SCHEMA_VERSION_V1,
+    WebStorageMutationError, WebStorageMutationPolicy, WebStorageOriginStateV1,
+    WebStorageStateEntryV1, WebStorageStateError, WebStorageStateSnapshotV1, WebStorageThreadMsg,
+    WebStorageType,
+};
 use tempfile::TempDir;
 
 pub(crate) struct WebStorageTest {
@@ -130,12 +137,30 @@ impl WebStorageTest {
         origin: &ImmutableOrigin,
         key: &str,
         value: &str,
-    ) -> Result<(bool, Option<String>), ()> {
+    ) -> Result<(bool, Option<String>), WebStorageMutationError> {
+        self.set_item_with_policy(
+            storage_type,
+            WebStorageMutationPolicy::Ordinary,
+            origin,
+            key,
+            value,
+        )
+    }
+
+    pub(crate) fn set_item_with_policy(
+        &self,
+        storage_type: WebStorageType,
+        mutation_policy: WebStorageMutationPolicy,
+        origin: &ImmutableOrigin,
+        key: &str,
+        value: &str,
+    ) -> Result<(bool, Option<String>), WebStorageMutationError> {
         let (sender, receiver) = base_channel::channel().unwrap();
         self.threads
             .send(WebStorageThreadMsg::SetItem(
                 sender,
                 storage_type,
+                mutation_policy,
                 TEST_WEBVIEW_ID,
                 origin.clone(),
                 key.into(),
@@ -151,11 +176,27 @@ impl WebStorageTest {
         origin: &ImmutableOrigin,
         key: &str,
     ) -> Option<String> {
+        self.remove_item_with_policy(
+            storage_type,
+            WebStorageMutationPolicy::Ordinary,
+            origin,
+            key,
+        )
+    }
+
+    pub(crate) fn remove_item_with_policy(
+        &self,
+        storage_type: WebStorageType,
+        mutation_policy: WebStorageMutationPolicy,
+        origin: &ImmutableOrigin,
+        key: &str,
+    ) -> Option<String> {
         let (sender, receiver) = base_channel::channel().unwrap();
         self.threads
             .send(WebStorageThreadMsg::RemoveItem(
                 sender,
                 storage_type,
+                mutation_policy,
                 TEST_WEBVIEW_ID,
                 origin.clone(),
                 key.into(),
@@ -165,16 +206,39 @@ impl WebStorageTest {
     }
 
     pub(crate) fn clear(&self, storage_type: WebStorageType, origin: &ImmutableOrigin) -> bool {
+        self.clear_with_policy(storage_type, WebStorageMutationPolicy::Ordinary, origin)
+    }
+
+    pub(crate) fn clear_with_policy(
+        &self,
+        storage_type: WebStorageType,
+        mutation_policy: WebStorageMutationPolicy,
+        origin: &ImmutableOrigin,
+    ) -> bool {
         let (sender, receiver) = base_channel::channel().unwrap();
         self.threads
             .send(WebStorageThreadMsg::Clear(
                 sender,
                 storage_type,
+                mutation_policy,
                 TEST_WEBVIEW_ID,
                 origin.clone(),
             ))
             .unwrap();
         receiver.recv().unwrap()
+    }
+
+    pub(crate) fn state(&self) -> Result<WebStorageStateSnapshotV1, WebStorageStateError> {
+        self.threads.webstorage_state(TEST_WEBVIEW_ID)
+    }
+
+    pub(crate) fn replace_state(
+        &self,
+        expected_revision: u64,
+        snapshot: WebStorageStateSnapshotV1,
+    ) -> Result<u64, WebStorageStateError> {
+        self.threads
+            .replace_webstorage_state(TEST_WEBVIEW_ID, expected_revision, snapshot)
     }
 
     /// Gracefully shut down the webstorage thread to avoid dangling threads in tests.
@@ -220,6 +284,396 @@ fn set_and_get_item_in_memory() {
     // Retrieve the value.
     let result = test.get_item(WebStorageType::Local, &url.origin(), "foo");
     assert_eq!(result, Some("bar".into()));
+}
+
+fn state_entry(key: &str, value: &str) -> WebStorageStateEntryV1 {
+    WebStorageStateEntryV1 {
+        key: key.into(),
+        value: value.into(),
+    }
+}
+
+#[test]
+fn state_replace_round_trips_local_and_webview_scoped_session_storage() {
+    let test = WebStorageTest::new_in_memory();
+    let snapshot = WebStorageStateSnapshotV1 {
+        schema_version: WEB_STORAGE_STATE_SCHEMA_VERSION_V1,
+        revision: 99,
+        origins: vec![WebStorageOriginStateV1 {
+            origin: "https://example.com".into(),
+            local_storage: vec![state_entry("z", "last"), state_entry("a", "first")],
+            session_storage: vec![state_entry("auth", "scoped")],
+        }],
+    };
+
+    assert_eq!(test.replace_state(0, snapshot), Ok(1));
+    let origin = ServoUrl::parse("https://example.com").unwrap().origin();
+    assert_eq!(
+        test.get_item(WebStorageType::Local, &origin, "a"),
+        Some("first".into())
+    );
+    assert_eq!(
+        test.get_item(WebStorageType::Session, &origin, "auth"),
+        Some("scoped".into())
+    );
+
+    let exported = test.state().unwrap();
+    assert_eq!(exported.revision, 1);
+    assert_eq!(exported.origins.len(), 1);
+    assert_eq!(exported.origins[0].local_storage[0].key, "a");
+    assert_eq!(exported.origins[0].local_storage[1].key, "z");
+    let public_fragment = serde_json::to_value(&exported.origins).unwrap();
+    assert!(public_fragment[0].get("localStorage").is_some());
+    assert!(public_fragment[0].get("sessionStorage").is_some());
+    assert!(public_fragment[0].get("local_storage").is_none());
+    assert!(!format!("{exported:?}").contains("example.com"));
+    assert!(!format!("{:?}", exported.origins[0]).contains("first"));
+    let sensitive_entry = state_entry("private-key", "private-value");
+    let debug_entry = format!("{sensitive_entry:?}");
+    assert!(!debug_entry.contains("private-key"));
+    assert!(!debug_entry.contains("private-value"));
+
+    assert_eq!(
+        test.set_item(WebStorageType::Session, &origin, "auth", "rotated"),
+        Ok((true, Some("scoped".into())))
+    );
+    assert_eq!(test.state().unwrap().revision, 2);
+}
+
+#[test]
+fn state_replace_rejects_stale_and_invalid_snapshots_atomically() {
+    let test = WebStorageTest::new_in_memory();
+    let initial = WebStorageStateSnapshotV1 {
+        schema_version: WEB_STORAGE_STATE_SCHEMA_VERSION_V1,
+        revision: 0,
+        origins: vec![WebStorageOriginStateV1 {
+            origin: "https://example.com".into(),
+            local_storage: vec![state_entry("key", "value")],
+            session_storage: vec![],
+        }],
+    };
+    assert_eq!(test.replace_state(0, initial), Ok(1));
+    let before = test.state().unwrap();
+
+    assert_eq!(
+        test.replace_state(0, before.clone()),
+        Err(WebStorageStateError::StaleRevision)
+    );
+    assert_eq!(test.state().unwrap(), before);
+
+    let duplicate = WebStorageStateSnapshotV1 {
+        schema_version: WEB_STORAGE_STATE_SCHEMA_VERSION_V1,
+        revision: 0,
+        origins: vec![WebStorageOriginStateV1 {
+            origin: "https://example.com".into(),
+            local_storage: vec![state_entry("key", "one"), state_entry("key", "two")],
+            session_storage: vec![],
+        }],
+    };
+    assert_eq!(
+        test.replace_state(1, duplicate),
+        Err(WebStorageStateError::DuplicateKey)
+    );
+    assert_eq!(test.state().unwrap(), before);
+
+    let invalid_origin = WebStorageStateSnapshotV1 {
+        schema_version: WEB_STORAGE_STATE_SCHEMA_VERSION_V1,
+        revision: 0,
+        origins: vec![WebStorageOriginStateV1 {
+            origin: "data:text/plain,opaque".into(),
+            local_storage: vec![state_entry("key", "other")],
+            session_storage: vec![],
+        }],
+    };
+    assert_eq!(
+        test.replace_state(1, invalid_origin),
+        Err(WebStorageStateError::InvalidOrigin)
+    );
+    assert_eq!(test.state().unwrap(), before);
+}
+
+#[test]
+fn state_transfer_rejects_persistent_webstorage_backend() {
+    let test = WebStorageTest::new();
+    assert_eq!(
+        test.state(),
+        Err(WebStorageStateError::PersistentBackendUnsupported)
+    );
+    assert_eq!(
+        test.replace_state(
+            0,
+            WebStorageStateSnapshotV1 {
+                schema_version: WEB_STORAGE_STATE_SCHEMA_VERSION_V1,
+                revision: 0,
+                origins: vec![],
+            },
+        ),
+        Err(WebStorageStateError::PersistentBackendUnsupported)
+    );
+}
+
+fn controlled_set(
+    test: &WebStorageTest,
+    storage_type: WebStorageType,
+    origin: &ImmutableOrigin,
+    key: &str,
+    value: &str,
+) -> Result<(bool, Option<String>), WebStorageMutationError> {
+    test.set_item_with_policy(
+        storage_type,
+        WebStorageMutationPolicy::ControlledSessionV1,
+        origin,
+        key,
+        value,
+    )
+}
+
+fn public_origins_json_bytes(origins: &[WebStorageOriginStateV1]) -> usize {
+    serde_json::to_vec(origins).unwrap().len()
+}
+
+#[test]
+fn controlled_page_set_preserves_exact_public_json_budget_atomically() {
+    let origin = ServoUrl::parse("https://example.com").unwrap().origin();
+    let candidate = |value_bytes: usize| {
+        vec![WebStorageOriginStateV1 {
+            origin: "https://example.com".into(),
+            local_storage: vec![state_entry("escaped", &"\0".repeat(value_bytes))],
+            session_storage: Vec::new(),
+        }]
+    };
+    let mut accepted = 0;
+    let mut rejected = WEB_STORAGE_STATE_MAX_VALUE_BYTES_V1 + 1;
+    while accepted + 1 < rejected {
+        let middle = accepted + (rejected - accepted) / 2;
+        if public_origins_json_bytes(&candidate(middle))
+            <= WEB_STORAGE_STATE_MAX_PUBLIC_JSON_BYTES_V1
+        {
+            accepted = middle;
+        } else {
+            rejected = middle;
+        }
+    }
+    assert!(accepted < WEB_STORAGE_STATE_MAX_VALUE_BYTES_V1);
+    assert_eq!(rejected, accepted + 1);
+    assert!(
+        public_origins_json_bytes(&candidate(accepted))
+            <= WEB_STORAGE_STATE_MAX_PUBLIC_JSON_BYTES_V1
+    );
+    assert!(
+        public_origins_json_bytes(&candidate(rejected))
+            > WEB_STORAGE_STATE_MAX_PUBLIC_JSON_BYTES_V1
+    );
+
+    let test = WebStorageTest::new_in_memory();
+    assert_eq!(
+        controlled_set(
+            &test,
+            WebStorageType::Local,
+            &origin,
+            "escaped",
+            &"\0".repeat(accepted),
+        ),
+        Ok((true, None))
+    );
+    let before_rejection = test.state().unwrap();
+    assert!(
+        public_origins_json_bytes(&before_rejection.origins)
+            <= WEB_STORAGE_STATE_MAX_PUBLIC_JSON_BYTES_V1
+    );
+    assert_eq!(
+        controlled_set(
+            &test,
+            WebStorageType::Local,
+            &origin,
+            "escaped",
+            &"\0".repeat(rejected),
+        ),
+        Err(WebStorageMutationError::ControlledStateLimit)
+    );
+    assert_eq!(test.state().unwrap(), before_rejection);
+    assert_eq!(
+        test.get_item(WebStorageType::Local, &origin, "escaped"),
+        Some("\0".repeat(accepted))
+    );
+    assert_eq!(
+        controlled_set(&test, WebStorageType::Session, &origin, "second-area", "x",),
+        Err(WebStorageMutationError::ControlledStateLimit)
+    );
+    assert_eq!(test.state().unwrap(), before_rejection);
+
+    // Ordinary Servo retains its existing area quota and is deliberately not narrowed by the
+    // controlled-session state-transfer budget.
+    let ordinary = WebStorageTest::new_in_memory();
+    assert_eq!(
+        ordinary.set_item(
+            WebStorageType::Local,
+            &origin,
+            "escaped",
+            &"\0".repeat(rejected),
+        ),
+        Ok((true, None))
+    );
+    assert_eq!(
+        ordinary.state(),
+        Err(WebStorageStateError::SnapshotTooLarge)
+    );
+}
+
+#[test]
+fn controlled_page_set_rejects_entry_and_origin_overflow_without_revision_change() {
+    let field_test = WebStorageTest::new_in_memory();
+    let field_origin = ServoUrl::parse("https://fields.example.com")
+        .unwrap()
+        .origin();
+    let empty = field_test.state().unwrap();
+    assert_eq!(
+        controlled_set(
+            &field_test,
+            WebStorageType::Local,
+            &field_origin,
+            &"k".repeat(WEB_STORAGE_STATE_MAX_KEY_BYTES_V1 + 1),
+            "value",
+        ),
+        Err(WebStorageMutationError::ControlledStateLimit)
+    );
+    assert_eq!(field_test.state().unwrap(), empty);
+    assert_eq!(
+        controlled_set(
+            &field_test,
+            WebStorageType::Session,
+            &field_origin,
+            "key",
+            &"v".repeat(WEB_STORAGE_STATE_MAX_VALUE_BYTES_V1 + 1),
+        ),
+        Err(WebStorageMutationError::ControlledStateLimit)
+    );
+    assert_eq!(field_test.state().unwrap(), empty);
+
+    let test = WebStorageTest::new_in_memory();
+    let origin = ServoUrl::parse("https://example.com").unwrap().origin();
+    let entries = (0..WEB_STORAGE_STATE_MAX_ENTRIES_PER_AREA_V1)
+        .map(|index| state_entry(&format!("key-{index:04}"), "x"))
+        .collect();
+    assert_eq!(
+        test.replace_state(
+            0,
+            WebStorageStateSnapshotV1 {
+                schema_version: WEB_STORAGE_STATE_SCHEMA_VERSION_V1,
+                revision: 0,
+                origins: vec![WebStorageOriginStateV1 {
+                    origin: "https://example.com".into(),
+                    local_storage: entries,
+                    session_storage: Vec::new(),
+                }],
+            },
+        ),
+        Ok(1)
+    );
+    let before_entry_overflow = test.state().unwrap();
+    assert_eq!(
+        controlled_set(&test, WebStorageType::Local, &origin, "one-too-many", "x",),
+        Err(WebStorageMutationError::ControlledStateLimit)
+    );
+    assert_eq!(test.state().unwrap(), before_entry_overflow);
+
+    let origins = (0..WEB_STORAGE_STATE_MAX_ORIGINS_V1)
+        .map(|index| WebStorageOriginStateV1 {
+            origin: format!("https://{index}.example.com"),
+            local_storage: vec![state_entry("key", "value")],
+            session_storage: Vec::new(),
+        })
+        .collect();
+    assert_eq!(
+        test.replace_state(
+            before_entry_overflow.revision,
+            WebStorageStateSnapshotV1 {
+                schema_version: WEB_STORAGE_STATE_SCHEMA_VERSION_V1,
+                revision: 0,
+                origins,
+            },
+        ),
+        Ok(before_entry_overflow.revision + 1)
+    );
+    let before_origin_overflow = test.state().unwrap();
+    let extra_origin = ServoUrl::parse("https://extra.example.com")
+        .unwrap()
+        .origin();
+    assert_eq!(
+        controlled_set(
+            &test,
+            WebStorageType::Session,
+            &extra_origin,
+            "key",
+            "value",
+        ),
+        Err(WebStorageMutationError::ControlledStateLimit)
+    );
+    assert_eq!(test.state().unwrap(), before_origin_overflow);
+}
+
+#[test]
+fn controlled_remove_and_clear_rotate_revision_and_remain_exportable() {
+    let test = WebStorageTest::new_in_memory();
+    let origin = ServoUrl::parse("https://example.com").unwrap().origin();
+    let empty = test.state().unwrap();
+    controlled_set(&test, WebStorageType::Local, &origin, "a", "one").unwrap();
+    let after_local_set = test.state().unwrap();
+    assert_eq!(after_local_set.revision, empty.revision + 1);
+    controlled_set(&test, WebStorageType::Session, &origin, "b", "two").unwrap();
+    let after_sets = test.state().unwrap();
+    assert_eq!(after_sets.revision, after_local_set.revision + 1);
+
+    assert_eq!(
+        controlled_set(&test, WebStorageType::Local, &origin, "a", "one"),
+        Ok((false, None))
+    );
+    assert_eq!(test.state().unwrap(), after_sets);
+    assert_eq!(
+        test.remove_item_with_policy(
+            WebStorageType::Local,
+            WebStorageMutationPolicy::ControlledSessionV1,
+            &origin,
+            "missing",
+        ),
+        None
+    );
+    assert_eq!(test.state().unwrap(), after_sets);
+
+    assert_eq!(
+        test.remove_item_with_policy(
+            WebStorageType::Local,
+            WebStorageMutationPolicy::ControlledSessionV1,
+            &origin,
+            "a",
+        ),
+        Some("one".into())
+    );
+    let after_remove = test.state().unwrap();
+    assert_eq!(after_remove.revision, after_sets.revision + 1);
+    assert!(
+        public_origins_json_bytes(&after_remove.origins)
+            <= WEB_STORAGE_STATE_MAX_PUBLIC_JSON_BYTES_V1
+    );
+
+    assert!(test.clear_with_policy(
+        WebStorageType::Session,
+        WebStorageMutationPolicy::ControlledSessionV1,
+        &origin,
+    ));
+    let after_clear = test.state().unwrap();
+    assert_eq!(after_clear.revision, after_remove.revision + 1);
+    assert!(after_clear.origins.is_empty());
+    assert!(
+        public_origins_json_bytes(&after_clear.origins)
+            <= WEB_STORAGE_STATE_MAX_PUBLIC_JSON_BYTES_V1
+    );
+    assert!(!test.clear_with_policy(
+        WebStorageType::Session,
+        WebStorageMutationPolicy::ControlledSessionV1,
+        &origin,
+    ));
+    assert_eq!(test.state().unwrap(), after_clear);
 }
 
 #[test]

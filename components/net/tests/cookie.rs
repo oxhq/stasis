@@ -6,7 +6,14 @@ use std::time::{Duration, SystemTime};
 
 use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
-use net_traits::CookieSource;
+use net_traits::{
+    CONTROLLED_COOKIE_MAX_BATCH_VALUES_V1, CONTROLLED_COOKIE_MAX_RAW_VALUE_BYTES_V1,
+    COOKIE_STATE_MAX_COOKIE_BYTES_V1, COOKIE_STATE_MAX_COOKIES_PER_REGISTRABLE_HOST_V1,
+    COOKIE_STATE_MAX_COOKIES_V1, COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1,
+    COOKIE_STATE_SCHEMA_VERSION_V1, ControlledCookiePolicyError, CookieSource, CookieStateError,
+    CookieStateRecordV1, CookieStateSameSite, CookieStateSnapshotV1,
+};
+use serde_json::json;
 use servo_url::ServoUrl;
 use time::macros::datetime;
 
@@ -220,6 +227,278 @@ fn add_cookie_to_storage(storage: &mut CookieStorage, url: &ServoUrl, cookie_str
     let cookie = cookie::Cookie::parse(cookie_str.to_owned()).unwrap();
     let cookie = ServoCookie::new_wrapped(cookie, url, source).unwrap();
     storage.push(cookie, url, source);
+}
+
+fn state_cookie(
+    name: &str,
+    domain: &str,
+    path: &str,
+    creation_sequence: u64,
+) -> CookieStateRecordV1 {
+    CookieStateRecordV1 {
+        name: name.into(),
+        value: format!("{name}-secret"),
+        domain: domain.into(),
+        path: path.into(),
+        host_only: true,
+        secure: true,
+        http_only: true,
+        same_site: CookieStateSameSite::Lax,
+        expires_unix_time_ns: None,
+        partitioned: false,
+        creation_sequence,
+        last_access_sequence: creation_sequence + 10,
+    }
+}
+
+fn cookie_backend_encoded_array_bytes(cookies: &[CookieStateRecordV1]) -> usize {
+    serde_json::to_vec(cookies).unwrap().len()
+}
+
+fn cookie_public_encoded_array_bytes(cookies: &[CookieStateRecordV1]) -> usize {
+    let projected: Vec<_> = cookies
+        .iter()
+        .map(|cookie| {
+            json!({
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "path": cookie.path,
+                "hostOnly": cookie.host_only,
+                "secure": cookie.secure,
+                "httpOnly": cookie.http_only,
+                "sameSite": cookie.same_site,
+                "expiresUnixTimeNs": cookie.expires_unix_time_ns.map(|value| value.to_string()),
+                "partitioned": cookie.partitioned,
+                "creationSequence": cookie.creation_sequence.to_string(),
+                "lastAccessSequence": cookie.last_access_sequence.to_string(),
+            })
+        })
+        .collect();
+    serde_json::to_vec(&projected).unwrap().len()
+}
+
+fn maximum_admitted_cookie_fragment() -> Vec<CookieStateRecordV1> {
+    let mut cookies = Vec::new();
+    while cookies.len() < COOKIE_STATE_MAX_COOKIES_V1 {
+        let index = cookies.len();
+        let name = format!("budget-{index:03}");
+        let mut cookie = state_cookie(&name, "example.com", "/", index as u64);
+        cookie.http_only = false;
+        cookie.last_access_sequence = index as u64;
+        let fixed_bytes = cookie.name.len() + cookie.domain.len() + cookie.path.len();
+        cookie.value = "x".repeat(COOKIE_STATE_MAX_COOKIE_BYTES_V1 - fixed_bytes);
+        cookies.push(cookie);
+        if cookie_public_encoded_array_bytes(&cookies)
+            <= COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1
+        {
+            continue;
+        }
+
+        let mut cookie = cookies.pop().unwrap();
+        cookie.value.clear();
+        cookies.push(cookie);
+        let minimum_bytes = cookie_public_encoded_array_bytes(&cookies);
+        if minimum_bytes > COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1 {
+            cookies.pop();
+            break;
+        }
+        let fill_bytes = (COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1 - minimum_bytes)
+            .min(COOKIE_STATE_MAX_COOKIE_BYTES_V1 - fixed_bytes);
+        cookies.last_mut().unwrap().value = "x".repeat(fill_bytes);
+        break;
+    }
+    cookies
+}
+
+#[test]
+fn cookie_state_replace_is_canonical_and_preserves_metadata() {
+    let mut storage = CookieStorage::new(150);
+    let snapshot = CookieStateSnapshotV1 {
+        schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+        revision: 75,
+        cookies: vec![
+            state_cookie("second", "example.com", "/account", 2),
+            state_cookie("first", "example.com", "/", 1),
+        ],
+    };
+
+    assert_eq!(storage.replace_state(0, snapshot), Ok(1));
+    let exported = storage.export_state().unwrap();
+    assert_eq!(exported.revision, 1);
+    assert_eq!(exported.cookies[0].name, "first");
+    assert_eq!(exported.cookies[1].name, "second");
+    assert!(exported.cookies.iter().all(|cookie| {
+        cookie.host_only
+            && cookie.secure
+            && cookie.http_only
+            && cookie.same_site == CookieStateSameSite::Lax
+            && cookie.expires_unix_time_ns.is_none()
+            && !cookie.partitioned
+    }));
+    assert_eq!(exported.cookies[0].creation_sequence, 0);
+    assert_eq!(exported.cookies[1].creation_sequence, 1);
+    assert_eq!(exported.cookies[0].last_access_sequence, 0);
+    assert_eq!(exported.cookies[1].last_access_sequence, 1);
+    assert!(!format!("{exported:?}").contains("secret"));
+    assert!(!format!("{:?}", exported.cookies[0]).contains("first"));
+}
+
+#[test]
+fn cookie_state_rejects_stale_persistent_and_partitioned_atomically() {
+    let mut storage = CookieStorage::new(150);
+    let initial = CookieStateSnapshotV1 {
+        schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+        revision: 0,
+        cookies: vec![state_cookie("session", "example.com", "/", 1)],
+    };
+    assert_eq!(storage.replace_state(0, initial), Ok(1));
+    let before = storage.export_state().unwrap();
+
+    assert_eq!(
+        storage.replace_state(0, before.clone()),
+        Err(CookieStateError::StaleRevision)
+    );
+    assert_eq!(storage.export_state().unwrap(), before);
+
+    let mut persistent = before.clone();
+    persistent.cookies[0].expires_unix_time_ns = Some(1);
+    assert_eq!(
+        storage.replace_state(1, persistent),
+        Err(CookieStateError::PersistentCookieUnsupported)
+    );
+    assert_eq!(storage.export_state().unwrap(), before);
+
+    let mut partitioned = before.clone();
+    partitioned.cookies[0].partitioned = true;
+    assert_eq!(
+        storage.replace_state(1, partitioned),
+        Err(CookieStateError::PartitionedCookieUnsupported)
+    );
+    assert_eq!(storage.export_state().unwrap(), before);
+}
+
+#[test]
+fn cookie_state_rejects_invalid_request_wire_pairs_atomically() {
+    let mut storage = CookieStorage::new(150);
+    let initial = CookieStateSnapshotV1 {
+        schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+        revision: 0,
+        cookies: vec![state_cookie("session", "example.com", "/", 1)],
+    };
+    assert_eq!(storage.replace_state(0, initial), Ok(1));
+    let before = storage.export_state().unwrap();
+
+    for (name, value) in [
+        ("bad name", "value"),
+        ("bad=name", "value"),
+        ("bad;name", "value"),
+        ("bad\r\nname", "value"),
+        ("valid", "bad;value"),
+        ("valid", "bad,value"),
+        ("valid", "bad\\value"),
+        ("valid", "bad\r\nvalue"),
+    ] {
+        let mut invalid = before.clone();
+        invalid.cookies[0].name = name.into();
+        invalid.cookies[0].value = value.into();
+        assert_eq!(
+            storage.replace_state(1, invalid),
+            Err(CookieStateError::InvalidCookie),
+            "accepted invalid cookie pair {name:?}={value:?}"
+        );
+        assert_eq!(storage.export_state().unwrap(), before);
+    }
+}
+
+#[test]
+fn cookie_state_ipv6_domain_projection_is_canonical_and_round_trips() {
+    assert!(net_traits::is_canonical_cookie_state_domain("2001:db8::1"));
+    let mut storage = CookieStorage::new(150);
+    let mut host_only = state_cookie("host-only", "2001:db8::1", "/", 0);
+    host_only.http_only = false;
+    let mut domain_cookie = state_cookie("domain", "2001:db8::1", "/", 1);
+    domain_cookie.host_only = false;
+    domain_cookie.http_only = false;
+    domain_cookie.last_access_sequence = 11;
+
+    assert_eq!(
+        storage.replace_state(
+            0,
+            CookieStateSnapshotV1 {
+                schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+                revision: 0,
+                cookies: vec![host_only, domain_cookie],
+            },
+        ),
+        Ok(1),
+    );
+    let request = ServoUrl::parse("https://[2001:db8::1]/").unwrap();
+    let header = storage
+        .cookies_for_url(&request, CookieSource::NonHTTP)
+        .unwrap();
+    assert!(header.contains("host-only=host-only-secret"));
+    assert!(header.contains("domain=domain-secret"));
+    let exported = storage.export_state().unwrap();
+    assert!(
+        exported
+            .cookies
+            .iter()
+            .all(|cookie| cookie.domain == "2001:db8::1")
+    );
+
+    let mut bracketed = exported.clone();
+    bracketed.cookies[0].domain = "[2001:db8::1]".into();
+    assert_eq!(
+        storage.replace_state(exported.revision, bracketed),
+        Err(CookieStateError::InvalidCookie),
+    );
+    assert_eq!(storage.export_state().unwrap(), exported);
+}
+
+#[test]
+fn controlled_cookie_reads_preserve_the_exact_public_fragment_budget() {
+    let cookies = maximum_admitted_cookie_fragment();
+    assert_eq!(
+        cookie_public_encoded_array_bytes(&cookies),
+        COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1,
+    );
+    let mut storage = CookieStorage::new(150);
+    storage
+        .replace_state(
+            0,
+            CookieStateSnapshotV1 {
+                schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+                revision: 0,
+                cookies,
+            },
+        )
+        .unwrap();
+    let request = ServoUrl::parse("https://example.com/").unwrap();
+
+    assert!(
+        storage
+            .controlled_session_cookies_for_url(&request, &request, CookieSource::HTTP)
+            .unwrap()
+            .is_some(),
+    );
+    let after_request = storage.export_state().unwrap();
+    assert_eq!(
+        cookie_public_encoded_array_bytes(&after_request.cookies),
+        COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1,
+    );
+
+    assert!(
+        storage
+            .controlled_session_cookies_for_url(&request, &request, CookieSource::NonHTTP)
+            .unwrap()
+            .is_some(),
+    );
+    let after_document_cookie = storage.export_state().unwrap();
+    assert_eq!(
+        cookie_public_encoded_array_bytes(&after_document_cookie.cookies),
+        COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1,
+    );
 }
 
 fn assert_ip_cookie_bucket_collision_eviction(ip_a: &str, ip_b: &str) {
@@ -610,4 +889,643 @@ fn test_delete_cookie_with_name_does_not_affect_other_domains() {
         storage.cookies_for_url(&other_url, source).as_deref(),
         Some("foo=bar")
     );
+}
+
+#[test]
+fn controlled_session_cookie_policy_is_schemeful_and_same_site() {
+    let mut storage = CookieStorage::new(5);
+    let request = ServoUrl::parse("https://api.example.com/account").unwrap();
+    let same_site = ServoUrl::parse("https://www.example.com/").unwrap();
+    let cross_scheme = ServoUrl::parse("http://www.example.com/").unwrap();
+    let cross_site = ServoUrl::parse("https://example.org/").unwrap();
+
+    storage
+        .set_controlled_session_cookie_from_header(
+            &request,
+            &same_site,
+            "strict=value; Secure; SameSite=Strict",
+        )
+        .unwrap();
+    assert_eq!(
+        storage
+            .controlled_session_cookies_for_url(&request, &same_site, CookieSource::HTTP)
+            .unwrap()
+            .as_deref(),
+        Some("strict=value")
+    );
+    assert_eq!(
+        storage.controlled_session_cookies_for_url(&request, &cross_scheme, CookieSource::HTTP,),
+        Err(ControlledCookiePolicyError::SameSiteContextUnsupported)
+    );
+    assert_eq!(
+        storage.set_controlled_session_cookie_from_header(
+            &request,
+            &cross_site,
+            "never=stored; Secure",
+        ),
+        Err(ControlledCookiePolicyError::SameSiteContextUnsupported)
+    );
+}
+
+#[test]
+fn controlled_session_rejects_uncontrolled_attributes_before_jar_mutation() {
+    let mut storage = CookieStorage::new(5);
+    let request = ServoUrl::parse("https://example.com/").unwrap();
+    let initial_revision = storage.export_state().unwrap().revision;
+
+    assert_eq!(
+        storage.set_controlled_session_cookies_from_headers(
+            &request,
+            &request,
+            &[
+                "would-have-been-stored=value; Secure",
+                "persistent=value; Max-Age=60",
+            ],
+        ),
+        Err(ControlledCookiePolicyError::PersistentCookieUnsupported)
+    );
+
+    for cookie in [
+        "persistent=value; Expires=Wed, 21 Oct 2037 07:28:00 GMT",
+        "persistent=value; mAx-AgE=60",
+    ] {
+        assert_eq!(
+            storage.set_controlled_session_cookie_from_header(&request, &request, cookie),
+            Err(ControlledCookiePolicyError::PersistentCookieUnsupported)
+        );
+    }
+    assert_eq!(
+        storage.set_controlled_session_cookie_from_header(
+            &request,
+            &request,
+            "partitioned=value; Secure; PARTITIONED",
+        ),
+        Err(ControlledCookiePolicyError::PartitionedCookieUnsupported)
+    );
+    let final_state = storage.export_state().unwrap();
+    assert_eq!(final_state.revision, initial_revision);
+    assert!(final_state.cookies.is_empty());
+}
+
+#[test]
+fn controlled_non_http_cookie_writes_cannot_poison_session_export() {
+    let mut storage = CookieStorage::new(5);
+    let document_url = ServoUrl::parse("https://example.com/account").unwrap();
+
+    storage
+        .set_controlled_session_cookie_from_non_http(
+            &document_url,
+            &document_url,
+            "page-session=valid; Path=/; Secure; SameSite=Lax",
+        )
+        .unwrap();
+    assert_eq!(
+        storage
+            .controlled_session_cookies_for_url(
+                &document_url,
+                &document_url,
+                CookieSource::NonHTTP,
+            )
+            .unwrap()
+            .as_deref(),
+        Some("page-session=valid")
+    );
+    storage
+        .set_controlled_session_cookie_from_non_http(
+            &document_url,
+            &document_url,
+            "page-session=updated; Path=/; Secure; SameSite=Lax",
+        )
+        .unwrap();
+    assert_eq!(
+        storage
+            .controlled_session_cookies_for_url(
+                &document_url,
+                &document_url,
+                CookieSource::NonHTTP,
+            )
+            .unwrap()
+            .as_deref(),
+        Some("page-session=updated")
+    );
+    let valid_state = storage.export_state().unwrap();
+    assert_eq!(valid_state.cookies.len(), 1);
+    assert_eq!(valid_state.cookies[0].name, "page-session");
+    assert_eq!(valid_state.cookies[0].value, "updated");
+
+    assert_eq!(
+        storage.set_controlled_session_cookie_from_non_http(
+            &document_url,
+            &document_url,
+            "persistent=blocked; Max-Age=60; Secure",
+        ),
+        Err(ControlledCookiePolicyError::PersistentCookieUnsupported)
+    );
+    assert_eq!(storage.export_state().unwrap(), valid_state);
+
+    assert_eq!(
+        storage.set_controlled_session_cookie_from_non_http(
+            &document_url,
+            &document_url,
+            "partitioned=blocked; Partitioned; Secure; SameSite=None",
+        ),
+        Err(ControlledCookiePolicyError::PartitionedCookieUnsupported)
+    );
+    assert_eq!(storage.export_state().unwrap(), valid_state);
+
+    let oversized_path = format!(
+        "oversized=blocked; Path=/{}; Secure",
+        "x".repeat(COOKIE_STATE_MAX_COOKIE_BYTES_V1),
+    );
+    assert_eq!(
+        storage.set_controlled_session_cookie_from_non_http(
+            &document_url,
+            &document_url,
+            &oversized_path,
+        ),
+        Err(ControlledCookiePolicyError::InvalidCookie)
+    );
+    assert_eq!(storage.export_state().unwrap(), valid_state);
+}
+
+#[test]
+fn controlled_cookie_mutations_enforce_global_snapshot_bounds_atomically() {
+    let document_url = ServoUrl::parse("https://example.com/account").unwrap();
+
+    let mut count_limited = CookieStorage::new(COOKIE_STATE_MAX_COOKIES_V1 + 1);
+    let mut count_records: Vec<_> = (0..COOKIE_STATE_MAX_COOKIES_V1)
+        .map(|index| state_cookie(&format!("count-{index}"), "example.com", "/", index as u64))
+        .collect();
+    count_records[0].http_only = false;
+    let count_snapshot = CookieStateSnapshotV1 {
+        schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+        revision: 0,
+        cookies: count_records,
+    };
+    count_limited.replace_state(0, count_snapshot).unwrap();
+    count_limited
+        .set_controlled_session_cookie_from_non_http(
+            &document_url,
+            &document_url,
+            "count-0=replaced-at-limit; Path=/; Secure",
+        )
+        .unwrap();
+    let count_baseline = count_limited.export_state().unwrap();
+    assert_eq!(count_baseline.cookies.len(), COOKIE_STATE_MAX_COOKIES_V1);
+    assert_eq!(count_baseline.cookies[0].value, "replaced-at-limit");
+    assert_eq!(
+        count_limited.set_controlled_session_cookie_from_non_http(
+            &document_url,
+            &document_url,
+            "one-too-many=blocked; Path=/; Secure",
+        ),
+        Err(ControlledCookiePolicyError::InvalidCookie)
+    );
+    assert_eq!(count_limited.export_state().unwrap(), count_baseline);
+
+    let mut byte_limited = CookieStorage::new(150);
+    let byte_records = maximum_admitted_cookie_fragment();
+    assert!(
+        cookie_public_encoded_array_bytes(&byte_records)
+            <= COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1
+    );
+    let mut over_budget_records = byte_records.clone();
+    let next_index = over_budget_records.len();
+    over_budget_records.push(state_cookie(
+        &format!("budget-{next_index:03}"),
+        "example.com",
+        "/",
+        next_index as u64,
+    ));
+    assert!(
+        cookie_public_encoded_array_bytes(&over_budget_records)
+            > COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1
+    );
+    let mut rejected_import = CookieStorage::new(150);
+    assert_eq!(
+        rejected_import.replace_state(
+            0,
+            CookieStateSnapshotV1 {
+                schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+                revision: 0,
+                cookies: over_budget_records,
+            },
+        ),
+        Err(CookieStateError::SnapshotTooLarge)
+    );
+    assert!(rejected_import.export_state().unwrap().cookies.is_empty());
+
+    let first_byte_value = byte_records[0].value.clone();
+    let byte_snapshot = CookieStateSnapshotV1 {
+        schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+        revision: 0,
+        cookies: byte_records,
+    };
+    byte_limited.replace_state(0, byte_snapshot).unwrap();
+    let byte_baseline = byte_limited.export_state().unwrap();
+    assert_eq!(
+        cookie_public_encoded_array_bytes(&byte_baseline.cookies),
+        COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1,
+    );
+    let last_cookie = byte_baseline.cookies.last().unwrap();
+    assert_eq!(
+        byte_limited.set_controlled_session_cookie_from_non_http(
+            &document_url,
+            &document_url,
+            &format!(
+                "{}={}x; Path=/; Secure; SameSite=Lax",
+                last_cookie.name, last_cookie.value,
+            ),
+        ),
+        Err(ControlledCookiePolicyError::InvalidCookie),
+    );
+    assert_eq!(byte_limited.export_state().unwrap(), byte_baseline);
+
+    byte_limited
+        .set_controlled_session_cookie_from_non_http(
+            &document_url,
+            &document_url,
+            &format!("budget-000={first_byte_value}; Path=/; Secure; SameSite=Lax"),
+        )
+        .unwrap();
+    let byte_baseline = byte_limited.export_state().unwrap();
+    let overflow_name = "one-encoded-record-too-many";
+    let overflow_fixed_bytes = overflow_name.len() + "example.com".len() + "/".len();
+    let overflow_value = "y".repeat(COOKIE_STATE_MAX_COOKIE_BYTES_V1 - overflow_fixed_bytes);
+    assert_eq!(
+        byte_limited.set_controlled_session_cookie_from_non_http(
+            &document_url,
+            &document_url,
+            &format!("{overflow_name}={overflow_value}; Path=/; Secure"),
+        ),
+        Err(ControlledCookiePolicyError::InvalidCookie)
+    );
+    assert_eq!(byte_limited.export_state().unwrap(), byte_baseline);
+
+    let mut protected = CookieStorage::new(5);
+    protected
+        .replace_state(
+            0,
+            CookieStateSnapshotV1 {
+                schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+                revision: 0,
+                cookies: vec![state_cookie("guarded", "example.com", "/", 0)],
+            },
+        )
+        .unwrap();
+    let protected_baseline = protected.export_state().unwrap();
+    assert_eq!(
+        protected.set_controlled_session_cookie_from_non_http(
+            &document_url,
+            &document_url,
+            "guarded=not-overwritten; Path=/; Secure",
+        ),
+        Err(ControlledCookiePolicyError::InvalidCookie)
+    );
+    assert_eq!(protected.export_state().unwrap(), protected_baseline);
+}
+
+#[test]
+fn production_registrable_host_cookie_limit_is_exact_and_atomic() {
+    let records = |count: usize| {
+        (0..count)
+            .map(|index| {
+                state_cookie(
+                    &format!("bucket-{index:03}"),
+                    &format!("shard-{}.example.com", index % 3),
+                    "/",
+                    index as u64,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut storage = CookieStorage::new(COOKIE_STATE_MAX_COOKIES_PER_REGISTRABLE_HOST_V1);
+    assert_eq!(
+        storage.replace_state(
+            0,
+            CookieStateSnapshotV1 {
+                schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+                revision: 0,
+                cookies: records(COOKIE_STATE_MAX_COOKIES_PER_REGISTRABLE_HOST_V1),
+            },
+        ),
+        Ok(1),
+    );
+    let baseline = storage.export_state().unwrap();
+    assert_eq!(
+        baseline.cookies.len(),
+        COOKIE_STATE_MAX_COOKIES_PER_REGISTRABLE_HOST_V1
+    );
+
+    assert_eq!(
+        storage.replace_state(
+            baseline.revision,
+            CookieStateSnapshotV1 {
+                schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+                revision: baseline.revision,
+                cookies: records(COOKIE_STATE_MAX_COOKIES_PER_REGISTRABLE_HOST_V1 + 1),
+            },
+        ),
+        Err(CookieStateError::TooManyCookies),
+    );
+    assert_eq!(storage.export_state().unwrap(), baseline);
+}
+
+#[test]
+fn controlled_cookie_backend_measures_the_exact_public_projection() {
+    let cookies = vec![
+        state_cookie("escaped", "example.com", "/quote", 9),
+        CookieStateRecordV1 {
+            name: "second".into(),
+            value: "quoted-\"value\\tail".into(),
+            domain: "sub.example.com".into(),
+            path: "/two".into(),
+            host_only: false,
+            secure: true,
+            http_only: false,
+            same_site: CookieStateSameSite::None,
+            expires_unix_time_ns: None,
+            partitioned: false,
+            creation_sequence: u64::MAX,
+            last_access_sequence: u64::MAX - 1,
+        },
+    ];
+    let backend = cookie_backend_encoded_array_bytes(&cookies);
+    let public = cookie_public_encoded_array_bytes(&cookies);
+    assert_eq!(backend, public + 5 * cookies.len());
+
+    let boundary = maximum_admitted_cookie_fragment();
+    assert_eq!(
+        cookie_public_encoded_array_bytes(&boundary),
+        COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1,
+    );
+    assert!(
+        cookie_backend_encoded_array_bytes(&boundary)
+            > COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1,
+        "the regression requires a public-valid fragment rejected by the private JSON shape",
+    );
+    let mut over_boundary = boundary.clone();
+    over_boundary.last_mut().unwrap().value.push('x');
+    assert_eq!(
+        cookie_public_encoded_array_bytes(&over_boundary),
+        COOKIE_STATE_MAX_ENCODED_PUBLIC_ARRAY_BYTES_V1 + 1,
+    );
+    let mut rejected = CookieStorage::new(COOKIE_STATE_MAX_COOKIES_V1);
+    assert_eq!(
+        rejected.replace_state(
+            0,
+            CookieStateSnapshotV1 {
+                schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+                revision: 0,
+                cookies: over_boundary,
+            },
+        ),
+        Err(CookieStateError::SnapshotTooLarge),
+    );
+    assert!(rejected.export_state().unwrap().cookies.is_empty());
+
+    let mut storage = CookieStorage::new(COOKIE_STATE_MAX_COOKIES_V1);
+    assert_eq!(
+        storage.replace_state(
+            0,
+            CookieStateSnapshotV1 {
+                schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+                revision: 0,
+                cookies: boundary,
+            },
+        ),
+        Ok(1),
+    );
+}
+
+#[test]
+fn controlled_cookie_raw_and_batch_inputs_are_bounded_before_mutation() {
+    let mut storage = CookieStorage::new(COOKIE_STATE_MAX_COOKIES_V1 + 1);
+    let request = ServoUrl::parse("https://example.com/").unwrap();
+    let baseline = storage.export_state().unwrap();
+
+    let huge_raw = format!(
+        "huge={}",
+        "x".repeat(CONTROLLED_COOKIE_MAX_RAW_VALUE_BYTES_V1)
+    );
+    assert!(huge_raw.len() > CONTROLLED_COOKIE_MAX_RAW_VALUE_BYTES_V1);
+    assert_eq!(
+        storage.set_controlled_session_cookie_from_non_http(&request, &request, &huge_raw),
+        Err(ControlledCookiePolicyError::InvalidCookie)
+    );
+    assert_eq!(storage.export_state().unwrap(), baseline);
+
+    let batch = vec!["same=value; Secure"; CONTROLLED_COOKIE_MAX_BATCH_VALUES_V1 + 1];
+    assert_eq!(
+        storage.set_controlled_session_cookies_from_headers(&request, &request, &batch),
+        Err(ControlledCookiePolicyError::InvalidCookie)
+    );
+    assert_eq!(storage.export_state().unwrap(), baseline);
+}
+
+#[test]
+fn controlled_session_rejects_insecure_same_site_none_atomically() {
+    let mut storage = CookieStorage::new(5);
+    let request = ServoUrl::parse("https://example.com/").unwrap();
+    let initial_revision = storage.export_state().unwrap().revision;
+
+    assert_eq!(
+        storage.set_controlled_session_cookies_from_headers(
+            &request,
+            &request,
+            &[
+                "would-have-been-stored=value; Secure",
+                "insecure-none=value; SameSite=None",
+            ],
+        ),
+        Err(ControlledCookiePolicyError::InvalidCookie)
+    );
+
+    let final_state = storage.export_state().unwrap();
+    assert_eq!(final_state.revision, initial_revision);
+    assert!(final_state.cookies.is_empty());
+}
+
+#[test]
+fn controlled_session_rejects_invalid_cookie_wire_shape_atomically() {
+    let mut storage = CookieStorage::new(5);
+    let request = ServoUrl::parse("https://example.com/").unwrap();
+    let initial_revision = storage.export_state().unwrap().revision;
+
+    assert_eq!(
+        storage.set_controlled_session_cookies_from_headers(
+            &request,
+            &request,
+            &[
+                "would-have-been-stored=value; Secure",
+                "ambiguous=bad,value; Secure",
+            ],
+        ),
+        Err(ControlledCookiePolicyError::InvalidCookie)
+    );
+
+    let final_state = storage.export_state().unwrap();
+    assert_eq!(final_state.revision, initial_revision);
+    assert!(final_state.cookies.is_empty());
+}
+
+#[test]
+fn secure_same_site_none_cookie_export_import_round_trips() {
+    let mut source = CookieStorage::new(5);
+    let request = ServoUrl::parse("https://example.com/").unwrap();
+    source
+        .set_controlled_session_cookie_from_header(
+            &request,
+            &request,
+            "session=secret; Secure; SameSite=None",
+        )
+        .unwrap();
+    let exported = source.export_state().unwrap();
+
+    let mut target = CookieStorage::new(5);
+    target.replace_state(0, exported.clone()).unwrap();
+    assert_eq!(target.export_state().unwrap(), exported);
+    assert_eq!(
+        target
+            .controlled_session_cookies_for_url(&request, &request, CookieSource::HTTP)
+            .unwrap()
+            .as_deref(),
+        Some("session=secret")
+    );
+}
+
+#[test]
+fn controlled_cookie_ordering_never_uses_servo_wall_time() {
+    let mut storage = CookieStorage::new(5);
+    let request = ServoUrl::parse("https://example.com/account").unwrap();
+    // Deliberately reverse both ordinary Servo timestamps before the controlled boundary adopts
+    // these otherwise ordinary cookies. Controlled ordering must use canonical controller stamps,
+    // never the wall-clock fields.
+    for (value, seconds) in [("first=one; Secure", 20), ("second=two; Secure", 10)] {
+        let mut cookie = ServoCookie::from_cookie_string(value, &request, CookieSource::HTTP)
+            .expect("test cookie parses");
+        cookie.creation_time = SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+        cookie.last_access = SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+        storage.push(cookie, &request, CookieSource::HTTP);
+    }
+
+    assert_eq!(
+        storage
+            .cookies_for_url(&request, CookieSource::HTTP)
+            .as_deref(),
+        Some("second=two; first=one")
+    );
+    assert_eq!(
+        storage
+            .controlled_session_cookies_for_url(&request, &request, CookieSource::HTTP)
+            .unwrap()
+            .as_deref(),
+        Some("first=one; second=two")
+    );
+    assert_eq!(
+        storage
+            .controlled_session_cookies_for_url(&request, &request, CookieSource::NonHTTP)
+            .unwrap()
+            .as_deref(),
+        Some("first=one; second=two")
+    );
+    let state = storage.export_state().unwrap();
+    let first = state
+        .cookies
+        .iter()
+        .find(|cookie| cookie.name == "first")
+        .unwrap();
+    let second = state
+        .cookies
+        .iter()
+        .find(|cookie| cookie.name == "second")
+        .unwrap();
+    assert_eq!(first.creation_sequence, 0);
+    assert_eq!(second.creation_sequence, 1);
+    assert_eq!(first.last_access_sequence, 0);
+    assert_eq!(second.last_access_sequence, 1);
+}
+
+#[test]
+fn controlled_cookie_access_order_is_monotonic_and_canonical() {
+    let mut storage = CookieStorage::new(5);
+    let root = ServoUrl::parse("https://example.com/").unwrap();
+    storage
+        .set_controlled_session_cookies_from_headers(
+            &root,
+            &root,
+            &[
+                "root=value; Secure; Path=/",
+                "account=value; Secure; Path=/account",
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(
+        storage
+            .controlled_session_cookies_for_url(&root, &root, CookieSource::HTTP)
+            .unwrap()
+            .as_deref(),
+        Some("root=value")
+    );
+    let state = storage.export_state().unwrap();
+    let root_cookie = state
+        .cookies
+        .iter()
+        .find(|cookie| cookie.name == "root")
+        .unwrap();
+    let account_cookie = state
+        .cookies
+        .iter()
+        .find(|cookie| cookie.name == "account")
+        .unwrap();
+    assert_eq!(account_cookie.last_access_sequence, 0);
+    assert_eq!(root_cookie.last_access_sequence, 1);
+}
+
+#[test]
+fn controlled_cookie_sequence_exhaustion_compacts_without_wrapping() {
+    let mut storage = CookieStorage::new(5);
+    let request = ServoUrl::parse("https://example.com/").unwrap();
+    let mut record = state_cookie("first", "example.com", "/", 0);
+    record.creation_sequence = u64::MAX;
+    record.last_access_sequence = u64::MAX;
+    storage
+        .replace_state(
+            0,
+            CookieStateSnapshotV1 {
+                schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+                revision: 0,
+                cookies: vec![record],
+            },
+        )
+        .unwrap();
+
+    storage
+        .set_controlled_session_cookie_from_header(&request, &request, "second=value; Secure")
+        .unwrap();
+    assert_eq!(
+        storage
+            .controlled_session_cookies_for_url(&request, &request, CookieSource::HTTP)
+            .unwrap()
+            .as_deref(),
+        Some("first=first-secret; second=value")
+    );
+
+    let state = storage.export_state().unwrap();
+    let first = state
+        .cookies
+        .iter()
+        .find(|cookie| cookie.name == "first")
+        .unwrap();
+    let second = state
+        .cookies
+        .iter()
+        .find(|cookie| cookie.name == "second")
+        .unwrap();
+    assert_eq!(first.creation_sequence, 0);
+    assert_eq!(second.creation_sequence, 1);
+    assert_eq!(first.last_access_sequence, 0);
+    assert_eq!(second.last_access_sequence, 1);
 }

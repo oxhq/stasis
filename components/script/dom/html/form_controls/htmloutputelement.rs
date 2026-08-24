@@ -33,6 +33,15 @@ pub(crate) struct HTMLOutputElement {
 }
 
 impl HTMLOutputElement {
+    /// Return the already-materialized default-value override size, if one exists. Automation
+    /// uses `None` to decide that it must instead preflight descendant text before reset.
+    pub(crate) fn automation_default_value_override_bytes(&self) -> Option<u64> {
+        self.default_value_override
+            .borrow()
+            .as_ref()
+            .map(|value| value.len() as u64)
+    }
+
     fn new_inherited(
         local_name: LocalName,
         prefix: Option<Prefix>,

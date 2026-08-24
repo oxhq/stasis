@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { inspect } from "node:util";
 
 import {
   CONTROLLED_WEBAPP_V1_PROFILE,
@@ -37,6 +38,7 @@ const allTimeSurfaceSet = {
   external_subscription: true,
   native_media: true,
   embedder_control: true,
+  history_traversal: true,
 } as const satisfies Record<TimeSurface, true>;
 const allTimeSurfaces = Object.keys(allTimeSurfaceSet) as TimeSurface[];
 
@@ -65,6 +67,19 @@ async function openFake(
   return { runtime, app };
 }
 
+function recursiveErrorDiagnostics(error: unknown, seen = new Set<unknown>()): string {
+  if (seen.has(error)) return "<cycle>";
+  seen.add(error);
+  const diagnostics = [String(error), inspect(error, { depth: 10 })];
+  if (error instanceof Error) {
+    diagnostics.push(error.message, error.stack ?? "");
+    if (error.cause !== undefined) {
+      diagnostics.push(recursiveErrorDiagnostics(error.cause, seen));
+    }
+  }
+  return diagnostics.join("\n");
+}
+
 test("launch, open, native DOM operations, runtime control, and close use the linear API", async (context) => {
   const { runtime, app } = await openFake(context);
   assert.equal(runtime.info.protocolVersion, 1);
@@ -79,7 +94,7 @@ test("launch, open, native DOM operations, runtime control, and close use the li
   };
   assert.deepEqual(initializeParams.client, {
     name: "@oxhq/stasis",
-    version: "0.1.0",
+    version: "0.2.0",
   });
 
   const openParams = (await app.evaluate("__openParams")) as {
@@ -452,6 +467,7 @@ test("a mutating command timeout is fatal with indeterminate state effect", asyn
 
 for (const [scenario, code] of [
   ["malformed", "invalid_json"],
+  ["invalid-utf8", "invalid_utf8"],
   ["duplicate", "duplicate_member"],
   ["unmatched", "unmatched_response"],
   ["bad-sequence", "wire_sequence_mismatch"],
@@ -461,6 +477,15 @@ for (const [scenario, code] of [
     await assert.rejects(app.pending(), (error) => {
       assert.ok(error instanceof StasisTransportError);
       assert.equal(error.code, code);
+      if (scenario === "malformed") {
+        assert.equal(recursiveErrorDiagnostics(error).includes("sensitive-invalid-json-canary"), false);
+      }
+      if (scenario === "invalid-utf8") {
+        assert.equal(recursiveErrorDiagnostics(error).includes("sensitive-invalid-utf8-canary"), false);
+      }
+      if (scenario === "duplicate") {
+        assert.equal(error.message.includes("sensitive-duplicate-canary"), false);
+      }
       return true;
     });
   });
@@ -563,11 +588,39 @@ test("nonfatal protocol errors stay typed and do not poison the FIFO", async (co
     assert.equal(error.code, "evaluation_failed");
     assert.equal(error.stateEffect, "none");
     assert.equal(error.fatal, false);
+    assert.equal(error.details, undefined);
     return true;
   });
   const alive = (await app.evaluate("alive")) as { expression: string };
   assert.equal(alive.expression, "alive");
   await app.close();
+});
+
+test("structured protocol error details are decoded exactly and exposed read-only", async (context) => {
+  const { app } = await openFake(context);
+  await assert.rejects(app.evaluate("protocol-error-details"), (error) => {
+    assert.ok(error instanceof StasisProtocolError);
+    assert.deepEqual(error.details, {
+      actual: "21",
+      limit: 20,
+      reasons: ["replacement", null],
+      retryable: false,
+    });
+    assert.equal(Object.isFrozen(error.details), true);
+    assert.equal(Object.isFrozen(error.details?.reasons), true);
+    return true;
+  });
+  await app.close();
+});
+
+test("a non-object protocol error details member is a fatal wire violation", async (context) => {
+  const { app } = await openFake(context);
+  await assert.rejects(app.evaluate("protocol-error-invalid-details"), (error) => {
+    assert.ok(error instanceof StasisTransportError);
+    assert.equal(error.code, "invalid_envelope");
+    assert.match(error.message, /details must be an object/iu);
+    return true;
+  });
 });
 
 test("an indeterminate protocol outcome fail-stops even when the server marks it nonfatal", async (context) => {

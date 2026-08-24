@@ -1,9 +1,17 @@
 import { readFileSync } from "node:fs";
 
-import { StasisAbortError, StasisProcessError, StasisStateError } from "./errors.js";
+import {
+  StasisAbortError,
+  StasisProcessError,
+  StasisStateError,
+} from "./errors.js";
 import { ProtocolClient } from "./protocol.js";
 import { assertManagedRuntimeIdentity, resolveRuntimeExecutable } from "./runtime-resolver.js";
-import { CONTROLLED_WEBAPP_V1_PROFILE, type SupportProfile } from "./profile.js";
+import {
+  CONTROLLED_WEBAPP_V1_PROFILE,
+  CONTROLLED_WEB_SESSION_V1_PROFILE,
+  type LegacySupportProfile,
+} from "./profile.js";
 import {
   METHOD,
   decodeActivation,
@@ -17,13 +25,47 @@ import {
   decodeQuery,
   decodeRuntimeInfo,
   decodeSettle,
+  decodeSessionActivation,
+  decodeSessionAdvanceToNext,
+  decodeSessionCookies,
+  decodeSessionEvidence,
+  decodeSessionExtract,
+  decodeSessionFill,
+  decodeSessionFocus,
+  decodeSessionCheck,
+  decodeSessionSelect,
+  decodeSessionSubmit,
+  decodeSessionUncheck,
+  decodeSessionNavigate,
+  decodeSessionOpenResult,
+  decodeSessionPending,
+  decodeSessionQuery,
+  decodeSessionRequests,
+  decodeSessionSettle,
+  decodeSessionStateExport,
+  decodeSessionStateMutation,
+  decodeSessionStorage,
+  decodeSessionText,
   decodeText,
+  decodeUnexpectedSessionStateImportSuccess,
   encodeDocumentTargetParams,
   encodeExtractParams,
   encodeFillParams,
   encodeOpenParams,
   encodeSettleParams,
+  encodeExpectedStateTokenParams,
+  encodeSessionAuditParams,
+  encodeSessionCookiesSetParams,
+  encodeSessionDocumentTargetParams,
+  encodeSessionExtractParams,
+  encodeSessionFillParams,
+  encodeSessionNavigateParams,
+  encodeSessionOpenParams,
+  encodeSessionSelectParams,
+  encodeSessionSettleParams,
+  encodeSessionStorageSetParams,
   type OpenResult,
+  type SessionOpenResult,
 } from "./wire.js";
 import type {
   AdvanceToNextResult,
@@ -36,6 +78,32 @@ import type {
   PendingSnapshot,
   QueryResult,
   RuntimeInfo,
+  SessionAdvanceToNextResult,
+  SessionAuditOptions,
+  SessionAutomationMutationResult,
+  SessionCookie,
+  SessionCookiesResult,
+  SessionEvidenceResult,
+  SessionFocusResult,
+  SessionCheckResult,
+  SessionExtractPlan,
+  SessionExtractResult,
+  SessionNavigateResult,
+  SessionOpenOptions,
+  SessionOriginState,
+  SessionPendingSnapshot,
+  SessionQueryResult,
+  SessionRequestsResult,
+  SessionSelectResult,
+  SessionSettleResult,
+  SessionState,
+  SessionStateExportResult,
+  SessionStateMutationResult,
+  SessionStateToken,
+  SessionStorageResult,
+  SessionSubmitResult,
+  SessionTextResult,
+  DocumentStateToken,
   SettlePolicy,
   SettleResult,
 } from "./types.js";
@@ -191,7 +259,48 @@ export class Runtime {
     }
   }
 
-  /** Abruptly terminates the owned process. Use App.close() for a graceful session close. */
+  /** Open the additive controlled-web-session-v1 surface without changing legacy open(). */
+  async openSession(
+    url: string | URL,
+    options: SessionOpenOptions = {},
+  ): Promise<Session> {
+    if (this.#state !== "ready") {
+      throw new StasisStateError(
+        "Runtime.openSession() may be called exactly once",
+        this.stderrTail,
+      );
+    }
+    this.#state = "opening";
+    try {
+      if (!this.info.capabilities.profiles.includes(CONTROLLED_WEB_SESSION_V1_PROFILE)) {
+        throw new StasisStateError(
+          `The Stasis runtime did not advertise profile ${CONTROLLED_WEB_SESSION_V1_PROFILE}`,
+          this.stderrTail,
+        );
+      }
+      const response = await this.#client.request(
+        METHOD.open,
+        encodeSessionOpenParams(url, options),
+        {
+          sessionId: null,
+          expectedResponseSessionId: "<open>",
+          timeoutStateEffect: "indeterminate",
+          ...(options.timeoutMs === undefined
+            ? {}
+            : { timeoutMs: boundedTimeoutMs(options.timeoutMs, "timeoutMs") }),
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        },
+        decodeSessionOpenResult,
+      );
+      this.#state = "open";
+      return Session.create(this, this.#client, response.result);
+    } catch (error) {
+      this.#state = this.#client.isUsable ? "ready" : "closed";
+      throw error;
+    }
+  }
+
+  /** Abruptly terminates the owned process. Use App.close()/Session.close() for graceful close. */
   async close(): Promise<void> {
     this.#state = "closed";
     await this.#client.terminate();
@@ -213,7 +322,7 @@ export class App {
   readonly url: string;
   readonly boundary: "load_complete" | "controlled_ready";
   readonly clockMode: "real" | "controlled";
-  readonly profile: SupportProfile | null;
+  readonly profile: LegacySupportProfile | null;
 
   private constructor(runtime: Runtime, client: ProtocolClient, open: OpenResult) {
     this.#runtime = runtime;
@@ -398,6 +507,452 @@ export class App {
   #assertOpen(): void {
     if (this.#closePromise !== null) {
       throw new StasisStateError("The Stasis app is closing or closed", this.stderrTail);
+    }
+  }
+
+  #assertMethod(method: string): void {
+    if (!this.#runtime.info.capabilities.methods.includes(method)) {
+      throw new StasisStateError(
+        `The Stasis runtime did not advertise ${method}`,
+        this.stderrTail,
+      );
+    }
+  }
+
+  #requestOptions(
+    options: CommandOptions,
+    timeoutStateEffect: "none" | "indeterminate",
+  ): {
+    sessionId: string;
+    expectedResponseSessionId: string;
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    timeoutStateEffect: "none" | "indeterminate";
+  } {
+    return {
+      sessionId: this.#sessionId,
+      expectedResponseSessionId: this.#sessionId,
+      timeoutStateEffect,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...(options.timeoutMs === undefined
+        ? {}
+        : { timeoutMs: boundedTimeoutMs(options.timeoutMs, "timeoutMs") }),
+    };
+  }
+}
+
+/**
+ * Additive controlled-web-session-v1 API. Document and session-state authorities are opaque and
+ * intentionally cannot be substituted for legacy generations or for each other.
+ */
+export class Session {
+  readonly #runtime: Runtime;
+  readonly #client: ProtocolClient;
+  readonly #sessionId: string;
+  #closePromise: Promise<void> | null = null;
+
+  readonly requestedUrl: string;
+  readonly url: string;
+  readonly boundary: "controlled_ready";
+  readonly clockMode: "controlled";
+  readonly profile: typeof CONTROLLED_WEB_SESSION_V1_PROFILE;
+  /** Initial document authority returned by session.open. Later operations return replacements. */
+  readonly stateToken: DocumentStateToken;
+  /** Initial state authority returned by session.open. State operations return replacements. */
+  readonly sessionStateToken: SessionStateToken;
+
+  private constructor(runtime: Runtime, client: ProtocolClient, open: SessionOpenResult) {
+    this.#runtime = runtime;
+    this.#client = client;
+    this.#sessionId = open.sessionId;
+    this.requestedUrl = open.requestedUrl;
+    this.url = open.url;
+    this.boundary = open.boundary;
+    this.clockMode = open.clockMode;
+    this.profile = open.profile;
+    this.stateToken = open.stateToken;
+    this.sessionStateToken = open.sessionStateToken;
+  }
+
+  /** @internal */
+  static create(runtime: Runtime, client: ProtocolClient, open: SessionOpenResult): Session {
+    return new Session(runtime, client, open);
+  }
+
+  get stderrTail(): string {
+    return this.#client.stderrTail;
+  }
+
+  async activate(
+    selector: string,
+    expectedStateToken: DocumentStateToken,
+    options: CommandOptions = {},
+  ): Promise<SessionAutomationMutationResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.activate);
+    const { result } = await this.#client.request(
+      METHOD.activate,
+      encodeSessionDocumentTargetParams(selector, expectedStateToken),
+      this.#requestOptions(options, "indeterminate"),
+      decodeSessionActivation,
+    );
+    return result;
+  }
+
+  async fill(
+    selector: string,
+    value: string,
+    expectedStateToken: DocumentStateToken,
+    options: CommandOptions = {},
+  ): Promise<SessionAutomationMutationResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.fill);
+    const { result } = await this.#client.request(
+      METHOD.fill,
+      encodeSessionFillParams(selector, value, expectedStateToken),
+      this.#requestOptions(options, "indeterminate"),
+      decodeSessionFill,
+    );
+    return result;
+  }
+
+  async focus(
+    selector: string,
+    expectedStateToken: DocumentStateToken,
+    options: CommandOptions = {},
+  ): Promise<SessionFocusResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.focus);
+    const { result } = await this.#client.request(
+      METHOD.focus,
+      encodeSessionDocumentTargetParams(selector, expectedStateToken),
+      this.#requestOptions(options, "indeterminate"),
+      decodeSessionFocus,
+    );
+    return result;
+  }
+
+  async check(
+    selector: string,
+    expectedStateToken: DocumentStateToken,
+    options: CommandOptions = {},
+  ): Promise<SessionCheckResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.check);
+    const { result } = await this.#client.request(
+      METHOD.check,
+      encodeSessionDocumentTargetParams(selector, expectedStateToken),
+      this.#requestOptions(options, "indeterminate"),
+      decodeSessionCheck,
+    );
+    return result;
+  }
+
+  async uncheck(
+    selector: string,
+    expectedStateToken: DocumentStateToken,
+    options: CommandOptions = {},
+  ): Promise<SessionCheckResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.uncheck);
+    const { result } = await this.#client.request(
+      METHOD.uncheck,
+      encodeSessionDocumentTargetParams(selector, expectedStateToken),
+      this.#requestOptions(options, "indeterminate"),
+      decodeSessionUncheck,
+    );
+    return result;
+  }
+
+  async select(
+    selector: string,
+    values: readonly string[],
+    expectedStateToken: DocumentStateToken,
+    options: CommandOptions = {},
+  ): Promise<SessionSelectResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.select);
+    const { result } = await this.#client.request(
+      METHOD.select,
+      encodeSessionSelectParams(selector, values, expectedStateToken),
+      this.#requestOptions(options, "indeterminate"),
+      decodeSessionSelect,
+    );
+    return result;
+  }
+
+  async submit(
+    selector: string,
+    expectedStateToken: DocumentStateToken,
+    options: CommandOptions = {},
+  ): Promise<SessionSubmitResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.submit);
+    const { result } = await this.#client.request(
+      METHOD.submit,
+      encodeSessionDocumentTargetParams(selector, expectedStateToken),
+      this.#requestOptions(options, "indeterminate"),
+      decodeSessionSubmit,
+    );
+    return result;
+  }
+
+  async query(
+    selector: string,
+    expectedStateToken: DocumentStateToken,
+    options: CommandOptions = {},
+  ): Promise<SessionQueryResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.query);
+    const { result } = await this.#client.request(
+      METHOD.query,
+      encodeSessionDocumentTargetParams(selector, expectedStateToken),
+      this.#requestOptions(options, "none"),
+      decodeSessionQuery,
+    );
+    return result;
+  }
+
+  async text(
+    selector: string,
+    expectedStateToken: DocumentStateToken,
+    options: CommandOptions = {},
+  ): Promise<SessionTextResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.text);
+    const { result } = await this.#client.request(
+      METHOD.text,
+      encodeSessionDocumentTargetParams(selector, expectedStateToken),
+      this.#requestOptions(options, "none"),
+      decodeSessionText,
+    );
+    return result;
+  }
+
+  async extract(
+    plan: SessionExtractPlan,
+    expectedStateToken: DocumentStateToken,
+    options: CommandOptions = {},
+  ): Promise<SessionExtractResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.extract);
+    const { result } = await this.#client.request(
+      METHOD.extract,
+      encodeSessionExtractParams(plan, expectedStateToken),
+      this.#requestOptions(options, "none"),
+      decodeSessionExtract,
+    );
+    return result;
+  }
+
+  /** Read-only recovery operation; no expected document token is required. */
+  async pending(options: CommandOptions = {}): Promise<SessionPendingSnapshot> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.pending);
+    const { result } = await this.#client.request(
+      METHOD.pending,
+      {},
+      this.#requestOptions(options, "none"),
+      decodeSessionPending,
+    );
+    return result;
+  }
+
+  async settle(
+    expectedStateToken: DocumentStateToken,
+    policy: SettlePolicy = {},
+    options: CommandOptions = {},
+  ): Promise<SessionSettleResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.settle);
+    const { result } = await this.#client.request(
+      METHOD.settle,
+      encodeSessionSettleParams(expectedStateToken, policy),
+      this.#requestOptions(options, "indeterminate"),
+      decodeSessionSettle,
+    );
+    return result;
+  }
+
+  async advanceToNext(
+    expectedStateToken: DocumentStateToken,
+    options: CommandOptions = {},
+  ): Promise<SessionAdvanceToNextResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.advanceToNext);
+    const { result } = await this.#client.request(
+      METHOD.advanceToNext,
+      encodeExpectedStateTokenParams(expectedStateToken),
+      this.#requestOptions(options, "indeterminate"),
+      decodeSessionAdvanceToNext,
+    );
+    return result;
+  }
+
+  async navigate(
+    url: string | URL,
+    expectedStateToken: DocumentStateToken,
+    options: CommandOptions = {},
+  ): Promise<SessionNavigateResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.navigate);
+    const { result } = await this.#client.request(
+      METHOD.navigate,
+      encodeSessionNavigateParams(url, expectedStateToken),
+      this.#requestOptions(options, "indeterminate"),
+      decodeSessionNavigate,
+    );
+    return result;
+  }
+
+  async getCookies(options: CommandOptions = {}): Promise<SessionCookiesResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.getCookies);
+    const { result } = await this.#client.request(
+      METHOD.getCookies,
+      {},
+      this.#requestOptions(options, "none"),
+      decodeSessionCookies,
+    );
+    return result;
+  }
+
+  async setCookies(
+    cookies: readonly SessionCookie[],
+    expectedSessionStateToken: SessionStateToken,
+    options: CommandOptions = {},
+  ): Promise<SessionStateMutationResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.setCookies);
+    const { result } = await this.#client.request(
+      METHOD.setCookies,
+      encodeSessionCookiesSetParams(cookies, expectedSessionStateToken),
+      this.#requestOptions(options, "indeterminate"),
+      (value) => decodeSessionStateMutation(value, "session.cookies.set result"),
+    );
+    return result;
+  }
+
+  async getStorage(options: CommandOptions = {}): Promise<SessionStorageResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.getStorage);
+    const { result } = await this.#client.request(
+      METHOD.getStorage,
+      {},
+      this.#requestOptions(options, "none"),
+      decodeSessionStorage,
+    );
+    return result;
+  }
+
+  async setStorage(
+    origins: readonly SessionOriginState[],
+    expectedSessionStateToken: SessionStateToken,
+    options: CommandOptions = {},
+  ): Promise<SessionStateMutationResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.setStorage);
+    const { result } = await this.#client.request(
+      METHOD.setStorage,
+      encodeSessionStorageSetParams(origins, expectedSessionStateToken),
+      this.#requestOptions(options, "indeterminate"),
+      (value) => decodeSessionStateMutation(value, "session.storage.set result"),
+    );
+    return result;
+  }
+
+  async exportState(options: CommandOptions = {}): Promise<SessionStateExportResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.exportState);
+    const { result } = await this.#client.request(
+      METHOD.exportState,
+      {},
+      this.#requestOptions(options, "none"),
+      decodeSessionStateExport,
+    );
+    return result;
+  }
+
+  /**
+   * Retained as the wire-level post-publication import endpoint. A published session can no
+   * longer import state, so this always rejects with `session_state_import_phase_closed`.
+   * Supply initial state through `Runtime.openSession(..., { state })` instead. The SDK
+   * intentionally does not serialize either argument because the closed-phase response is
+   * unconditional and session state is sensitive.
+   */
+  async importState(
+    state: SessionState,
+    expectedSessionStateToken: SessionStateToken,
+    options: CommandOptions = {},
+  ): Promise<never> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.importState);
+    void state;
+    void expectedSessionStateToken;
+    const { result } = await this.#client.request(
+      METHOD.importState,
+      {},
+      this.#requestOptions(options, "none"),
+      decodeUnexpectedSessionStateImportSuccess,
+    );
+    return result;
+  }
+
+  async requests(options: SessionAuditOptions = {}): Promise<SessionRequestsResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.requests);
+    const { result } = await this.#client.request(
+      METHOD.requests,
+      encodeSessionAuditParams(options),
+      this.#requestOptions(options, "none"),
+      decodeSessionRequests,
+    );
+    return result;
+  }
+
+  async evidence(options: SessionAuditOptions = {}): Promise<SessionEvidenceResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.evidence);
+    const { result } = await this.#client.request(
+      METHOD.evidence,
+      encodeSessionAuditParams(options),
+      this.#requestOptions(options, "none"),
+      decodeSessionEvidence,
+    );
+    return result;
+  }
+
+  close(options: CommandOptions = {}): Promise<void> {
+    if (this.#closePromise !== null) return this.#closePromise;
+    this.#closePromise = this.#close(options);
+    return this.#closePromise;
+  }
+
+  async #close(options: CommandOptions): Promise<void> {
+    try {
+      const { result } = await this.#client.request(
+        METHOD.close,
+        {},
+        {
+          ...this.#requestOptions(options, "indeterminate"),
+          terminatesProcess: true,
+        },
+        (value) => {
+          decodeClose(value);
+        },
+      );
+      void result;
+      await this.#client.waitForCleanExit(options.signal);
+      this.#runtime.appDidClose();
+    } catch (error) {
+      this.#closePromise = null;
+      throw error;
+    }
+  }
+
+  #assertOpen(): void {
+    if (this.#closePromise !== null) {
+      throw new StasisStateError("The Stasis session is closing or closed", this.stderrTail);
     }
   }
 

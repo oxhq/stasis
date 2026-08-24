@@ -91,8 +91,8 @@ pub struct WebGLPaint {
 impl WebGLPaint {
     fn shutdown(&self) {
         self.webgl_threads.exit();
-        if let Some(webgl_join_handle) = self.webgl_join_handle.take() &&
-            webgl_join_handle.join().is_err()
+        if let Some(webgl_join_handle) = self.webgl_join_handle.take()
+            && webgl_join_handle.join().is_err()
         {
             warn!("Could not join WebGLThread.");
         }
@@ -607,6 +607,15 @@ impl Paint {
         }
 
         self.remove_painter(painter_id);
+    }
+
+    /// Release a rendering-context registration when WebView construction is rejected before the
+    /// WebView renderer is installed. A shared painter remains alive for its published WebViews.
+    pub fn discard_unpublished_webview(&mut self, webview_id: WebViewId) {
+        let painter_id = webview_id.into();
+        if self.painter_mut(painter_id).is_empty() {
+            self.remove_painter(painter_id);
+        }
     }
 
     fn collect_memory_report(&self, sender: profile_traits::mem::ReportsChan) {

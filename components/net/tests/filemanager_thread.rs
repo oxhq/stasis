@@ -10,9 +10,9 @@ use embedder_traits::{
     EmbedderControlId, EmbedderControlResponse, FilePickerRequest, FilterPattern,
 };
 use ipc_channel::ipc;
-use net::async_runtime::init_async_runtime;
 use net::embedder::NetToEmbedderMsg;
 use net::filemanager_thread::FileManager;
+use net::test_util::ensure_async_runtime;
 use net_traits::blob_url_store::{BlobTokenCommunicator, BlobURLStoreError};
 use net_traits::filemanager_thread::{
     FileManagerThreadError, FileManagerThreadMsg, ReadFileProgress,
@@ -26,7 +26,7 @@ use crate::create_generic_embedder_proxy_and_receiver;
 
 #[test]
 fn test_filemanager() {
-    let _runtime = init_async_runtime();
+    ensure_async_runtime();
     let mut preferences = Preferences::default();
     preferences.dom_testing_html_input_element_select_files_enabled = true;
     servo_config::prefs::set(preferences);

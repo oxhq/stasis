@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       release_tag:
-        description: Exact stable Stasis release tag; v0.1.0 is the only accepted value
+        description: Exact stable Stasis release tag; v0.2.0 is the only accepted value
         required: false
         type: string
   push:
@@ -20,13 +20,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: stasis-release-${{ github.event_name }}-${{ github.ref }}-${{ inputs.release_tag || 'package' }}
-  cancel-in-progress: ${{ inputs.package_run_id == '' }}
+  group: stasis-package-run-${{ inputs.package_run_id || github.run_id }}
+  queue: max
 
 env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
-  STASIS_RELEASE_VERSION: 0.1.0
+  STASIS_FROZEN_V1_PROFILE_SHA256: 6e262edf0f8be11a1cece28f68f00d59fdac68b79b0a670ac891d36998720100
+  STASIS_FROZEN_V2_PROFILE_SHA256: 06ae92c6320b820bdf12bd5c8efb75f322db7bfec259fbc4b9fe1793ac296ea5
+  STASIS_RELEASE_VERSION: 0.2.0
 
 jobs:
   validate-invocation:
@@ -74,8 +76,17 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("ports/stasis/Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')
           test "$version" = "$STASIS_RELEASE_VERSION"
+          test "$(sha256sum profiles/controlled-webapp-v1.json | awk '{print $1}')" \
+            = "$STASIS_FROZEN_V1_PROFILE_SHA256"
+          test "$(sha256sum profiles/controlled-web-session-v1.json | awk '{print $1}')" \
+            = "$STASIS_FROZEN_V2_PROFILE_SHA256"
+          python3 etc/ci/stasis/release_archive.py verify-frozen-v1-profile \
+            --source-root .
+          python3 etc/ci/stasis/release_archive.py verify-frozen-v2-profile \
+            --source-root .
           python3 etc/ci/stasis/release_archive.py self-test
           python3 etc/ci/stasis/npm_release.py self-test
+          python3 etc/ci/stasis/verify_build_provenance.py self-test
           node --check etc/ci/stasis/verify_registry_sdk.mjs
 
   package-native:
@@ -210,6 +221,48 @@ jobs:
           PY
           fi
 
+      - name: Set up Node for the platform v0.2 gate
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Build the SDK harness for the platform v0.2 gate
+        shell: bash
+        working-directory: sdk/typescript
+        run: |
+          set -euo pipefail
+          corepack enable pnpm
+          corepack prepare pnpm@9.12.3 --activate
+          test "$(pnpm --version)" = '9.12.3'
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Gate the v0.2 controlled-session North Star on this native platform
+        shell: bash
+        working-directory: sdk/typescript
+        run: |
+          set -euo pipefail
+          binary="$GITHUB_WORKSPACE/target/production-stripped/stasis"
+          test -x "$binary"
+          gate_runner=(env)
+          if [[ "$STASIS_PLATFORM" == 'linux-x86_64' ]]; then
+            gate_runner=(xvfb-run -a env)
+          fi
+          explicit_runtime_cache="$RUNNER_TEMP/stasis-${STASIS_PLATFORM}-explicit-runtime-cache"
+          mkdir "$explicit_runtime_cache"
+          session_gate_log="$RUNNER_TEMP/stasis-${STASIS_PLATFORM}-session-north-star.jsonl"
+          "${gate_runner[@]}" \
+            STASIS_SESSION_NORTH_STAR_BINARY="$binary" \
+            STASIS_SESSION_NORTH_STAR_RUNTIME_CACHE="$explicit_runtime_cache" \
+            node test/fixtures/public-package-session-north-star.mjs \
+              2>&1 | tee "$session_gate_log"
+          grep -F '"proof":"stasis-v0.2-session-north-star"' "$session_gate_log"
+          grep -F '"runs":3' "$session_gate_log"
+          grep -F '"sessions":6' "$session_gate_log"
+          grep -F '"runtimeAcquisition":"explicit-executable-override-cache-bypassed"' \
+            "$session_gate_log"
+
       - name: Gate the automation and bounded-settlement fixture matrix
         shell: bash
         run: |
@@ -322,7 +375,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RUN_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      STASIS_VERSION: 0.1.0
+      STASIS_VERSION: 0.2.0
       STASIS_REVISION: ${{ github.sha }}
     steps:
       - name: Check out the exact event commit
@@ -344,14 +397,20 @@ jobs:
           gh api --paginate --slurp \
             "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
             > "$RUNNER_TEMP/native-artifact-pages.json"
-          gh api --paginate --slurp \
-            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100" \
-            > "$RUNNER_TEMP/native-job-pages.json"
+          native_job_attempts="$RUNNER_TEMP/native-job-attempt-pages"
+          mkdir "$native_job_attempts"
+          for ((attempt = 1; attempt <= GITHUB_RUN_ATTEMPT; attempt++)); do
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$attempt/jobs?per_page=100" \
+              > "$native_job_attempts/$attempt.json"
+          done
           read -r macos_run_attempt linux_run_attempt < <(
             RUN_ID="$GITHUB_RUN_ID" HEAD_SHA="$RUN_HEAD_SHA" \
+              JOB_ATTEMPT_DIR="$native_job_attempts" \
               OVERALL_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" python3 - <<'PY'
           import json
           import os
+          import pathlib
           import re
 
           run_id = int(os.environ["RUN_ID"])
@@ -385,10 +444,20 @@ jobs:
               os.path.join(os.environ["RUNNER_TEMP"], "native-artifact-pages.json"),
               "artifacts",
           )
-          jobs = flatten_pages(
-              os.path.join(os.environ["RUNNER_TEMP"], "native-job-pages.json"),
-              "jobs",
-          )
+          jobs_by_attempt = []
+          job_ids = set()
+          job_attempt_dir = pathlib.Path(os.environ["JOB_ATTEMPT_DIR"])
+          for attempt in range(1, overall_attempt + 1):
+              attempt_jobs = flatten_pages(job_attempt_dir / f"{attempt}.json", "jobs")
+              for job in attempt_jobs:
+                  job_id = job["id"]
+                  if job_id in job_ids:
+                      raise SystemExit("job history contains a duplicate job identity")
+                  job_ids.add(job_id)
+                  reported_attempt = job.get("run_attempt")
+                  if reported_attempt is not None and reported_attempt != attempt:
+                      raise SystemExit("attempt-specific job history claims another run attempt")
+                  jobs_by_attempt.append((attempt, job))
           prefixes = (
               "stasis-macos-aarch64",
               "stasis-macos-aarch64-act-settle-inspect-proof",
@@ -442,17 +511,13 @@ jobs:
           }
           producer_jobs = {name: {} for name in producer_names.values()}
           seen_jobs = set()
-          for job in jobs:
+          for attempt, job in jobs_by_attempt:
               name = job.get("name")
               if name not in producer_names.values():
                   continue
-              attempt = job.get("run_attempt")
               identity = (attempt, name)
               if (
-                  type(attempt) is not int
-                  or attempt < 1
-                  or attempt > overall_attempt
-                  or job.get("run_id") != run_id
+                  job.get("run_id") != run_id
                   or job.get("head_sha") != head_sha
                   or identity in seen_jobs
               ):
@@ -597,7 +662,7 @@ jobs:
               "linux-x86_64": os.environ["LINUX_RUN_ATTEMPT"],
           }
           repository = os.environ["GITHUB_REPOSITORY"]
-          if version != "0.1.0" or not re.fullmatch(r"[0-9a-f]{40}", revision):
+          if version != "0.2.0" or not re.fullmatch(r"[0-9a-f]{40}", revision):
               raise SystemExit("runtime manifest release identity is invalid")
           upstream = tomllib.loads(pathlib.Path("STASIS_UPSTREAM.toml").read_text(encoding="utf-8"))
           expected_upstream_keys = {
@@ -753,6 +818,23 @@ jobs:
           grep -F '"proof":"stasis-v0.1-north-star"' "$north_star_log"
           grep -F '"runs":3' "$north_star_log"
           cat "$north_star_log" >> "$sdk_gate_log"
+          cp sdk/typescript/test/fixtures/public-package-session-north-star.mjs \
+            "$consumer/public-package-session-north-star.mjs"
+          cp -R sdk/typescript/test/fixtures/session-north-star \
+            "$consumer/session-north-star"
+          explicit_runtime_cache="$RUNNER_TEMP/stasis-package-session-explicit-runtime-cache"
+          mkdir "$explicit_runtime_cache"
+          session_north_star_log="$RUNNER_TEMP/stasis-package-session-north-star.jsonl"
+          STASIS_SESSION_NORTH_STAR_BINARY="$binary" \
+            STASIS_SESSION_NORTH_STAR_RUNTIME_CACHE="$explicit_runtime_cache" \
+            node "$consumer/public-package-session-north-star.mjs" \
+              2>&1 | tee "$session_north_star_log"
+          grep -F '"proof":"stasis-v0.2-session-north-star"' "$session_north_star_log"
+          grep -F '"runs":3' "$session_north_star_log"
+          grep -F '"sessions":6' "$session_north_star_log"
+          grep -F '"runtimeAcquisition":"explicit-executable-override-cache-bypassed"' \
+            "$session_north_star_log"
+          cat "$session_north_star_log" >> "$sdk_gate_log"
           binary_sha256=$(awk '{print $1}' \
             "native-inputs/stasis-macos-aarch64-attempt-$MACOS_RUN_ATTEMPT/$bundle.binary.sha256")
           python3 etc/ci/stasis/npm_release.py create-proof \
@@ -870,7 +952,7 @@ jobs:
       - name: Recheck exact identities and digests without repository code
         shell: bash
         env:
-          STASIS_VERSION: 0.1.0
+          STASIS_VERSION: 0.2.0
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -1590,17 +1672,17 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: |
-            release-assets/macos-aarch64/stasis-0.1.0-macos-aarch64.tar.gz
-            release-assets/macos-aarch64/stasis-0.1.0-macos-aarch64.tar.gz.sha256
-            release-assets/macos-aarch64/stasis-0.1.0-macos-aarch64.binary.sha256
-            gate-proof/macos-aarch64/stasis-0.1.0-macos-aarch64-act-settle-inspect.json
-            release-assets/linux-x86_64/stasis-0.1.0-linux-x86_64.tar.gz
-            release-assets/linux-x86_64/stasis-0.1.0-linux-x86_64.tar.gz.sha256
-            release-assets/linux-x86_64/stasis-0.1.0-linux-x86_64.binary.sha256
-            gate-proof/linux-x86_64/stasis-0.1.0-linux-x86_64-act-settle-inspect.json
-            runtime-manifest/stasis-0.1.0-runtime-manifest.json
-            sdk-proof/oxhq-stasis-0.1.0.tgz
-            sdk-proof/stasis-0.1.0-typescript-act-settle-inspect.json
+            release-assets/macos-aarch64/stasis-0.2.0-macos-aarch64.tar.gz
+            release-assets/macos-aarch64/stasis-0.2.0-macos-aarch64.tar.gz.sha256
+            release-assets/macos-aarch64/stasis-0.2.0-macos-aarch64.binary.sha256
+            gate-proof/macos-aarch64/stasis-0.2.0-macos-aarch64-act-settle-inspect.json
+            release-assets/linux-x86_64/stasis-0.2.0-linux-x86_64.tar.gz
+            release-assets/linux-x86_64/stasis-0.2.0-linux-x86_64.tar.gz.sha256
+            release-assets/linux-x86_64/stasis-0.2.0-linux-x86_64.binary.sha256
+            gate-proof/linux-x86_64/stasis-0.2.0-linux-x86_64-act-settle-inspect.json
+            runtime-manifest/stasis-0.2.0-runtime-manifest.json
+            sdk-proof/oxhq-stasis-0.2.0.tgz
+            sdk-proof/stasis-0.2.0-typescript-act-settle-inspect.json
 
   verify-promotion:
     name: Verify immutable promotion inputs
@@ -1613,14 +1695,18 @@ jobs:
       contents: read
       attestations: read
     outputs:
+      attest_run_attempt: ${{ steps.selected-run.outputs.attest_run_attempt }}
       head_sha: ${{ steps.selected-run.outputs.head_sha }}
       head_branch: ${{ steps.selected-run.outputs.head_branch }}
       linux_run_attempt: ${{ steps.selected-run.outputs.linux_run_attempt }}
       macos_run_attempt: ${{ steps.selected-run.outputs.macos_run_attempt }}
+      overall_run_attempt: ${{ steps.selected-run.outputs.overall_run_attempt }}
       sdk_run_attempt: ${{ steps.selected-run.outputs.sdk_run_attempt }}
       staged_gate_artifact_name: ${{ steps.stage-names.outputs.gate_artifact_name }}
       staged_release_artifact_name: ${{ steps.stage-names.outputs.release_artifact_name }}
       version: ${{ steps.selected-run.outputs.version }}
+      workflow_ref: ${{ steps.selected-run.outputs.workflow_ref }}
+      workflow_sha: ${{ steps.selected-run.outputs.workflow_sha }}
     env:
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       GH_TOKEN: ${{ github.token }}
@@ -1634,6 +1720,12 @@ jobs:
           set -euo pipefail
           if [[ "$GITHUB_REPOSITORY" != 'oxhq/stasis' ]]; then
             echo 'promotion is restricted to oxhq/stasis' >&2
+            exit 1
+          fi
+          expected_workflow_ref="$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml@refs/heads/$DEFAULT_BRANCH"
+          if [[ ! "$GITHUB_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ \
+            || "$GITHUB_WORKFLOW_REF" != "$expected_workflow_ref" ]]; then
+            echo 'the executing promotion workflow identity is not the exact default-branch workflow' >&2
             exit 1
           fi
           if [[ "$GITHUB_REF_TYPE" != 'branch' || "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
@@ -1694,10 +1786,13 @@ jobs:
           }
           packaged_workflow_tree=$(workflow_tree_sha "$head_sha")
           current_workflow_tree=$(workflow_tree_sha "$current_default_sha")
+          executing_workflow_tree=$(workflow_tree_sha "$GITHUB_WORKFLOW_SHA")
           if [[ ! "$packaged_workflow_tree" =~ ^[0-9a-f]{40}$ \
             || ! "$current_workflow_tree" =~ ^[0-9a-f]{40}$ \
-            || "$packaged_workflow_tree" != "$current_workflow_tree" ]]; then
-            echo '.github/workflows changed after the selected package commit' >&2
+            || ! "$executing_workflow_tree" =~ ^[0-9a-f]{40}$ \
+            || "$packaged_workflow_tree" != "$current_workflow_tree" \
+            || "$packaged_workflow_tree" != "$executing_workflow_tree" ]]; then
+            echo '.github/workflows differs across the package, executing, or current default revision' >&2
             exit 1
           fi
 
@@ -1713,14 +1808,20 @@ jobs:
           gh api --paginate --slurp \
             "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
             > artifact-pages.json
-          gh api --paginate --slurp \
-            "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?filter=all&per_page=100" \
-            > job-pages.json
-          read -r macos_run_attempt linux_run_attempt sdk_run_attempt < <(
+          job_attempts="$RUNNER_TEMP/package-job-attempt-pages"
+          mkdir "$job_attempts"
+          for ((attempt = 1; attempt <= overall_run_attempt; attempt++)); do
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$attempt/jobs?per_page=100" \
+              > "$job_attempts/$attempt.json"
+          done
+          read -r macos_run_attempt linux_run_attempt sdk_run_attempt attest_run_attempt < <(
             RUN_ID="$RUN_ID" HEAD_SHA="$head_sha" HEAD_BRANCH="$head_branch" \
+              JOB_ATTEMPT_DIR="$job_attempts" \
               OVERALL_RUN_ATTEMPT="$overall_run_attempt" python3 - <<'PY'
           import json
           import os
+          import pathlib
           import re
 
           run_id = int(os.environ["RUN_ID"])
@@ -1752,7 +1853,20 @@ jobs:
               return entries
 
           artifacts = flatten_pages("artifact-pages.json", "artifacts")
-          jobs = flatten_pages("job-pages.json", "jobs")
+          jobs_by_attempt = []
+          job_ids = set()
+          job_attempt_dir = pathlib.Path(os.environ["JOB_ATTEMPT_DIR"])
+          for attempt in range(1, overall_attempt + 1):
+              attempt_jobs = flatten_pages(job_attempt_dir / f"{attempt}.json", "jobs")
+              for job in attempt_jobs:
+                  job_id = job["id"]
+                  if job_id in job_ids:
+                      raise SystemExit("job history contains a duplicate job identity")
+                  job_ids.add(job_id)
+                  reported_attempt = job.get("run_attempt")
+                  if reported_attempt is not None and reported_attempt != attempt:
+                      raise SystemExit("attempt-specific job history claims another run attempt")
+                  jobs_by_attempt.append((attempt, job))
 
           prefixes = (
               "stasis-macos-aarch64",
@@ -1806,20 +1920,17 @@ jobs:
               "macos-aarch64": "Package and gate macos-aarch64",
               "linux-x86_64": "Package and gate linux-x86_64",
               "sdk": "Bind both native runtimes and gate the TypeScript package",
+              "attest": "Attest exact credential-free package outputs",
           }
           producer_jobs = {name: {} for name in producer_names.values()}
           seen_jobs = set()
-          for job in jobs:
+          for attempt, job in jobs_by_attempt:
               name = job.get("name")
               if name not in producer_names.values():
                   continue
-              attempt = job.get("run_attempt")
               identity = (attempt, name)
               if (
-                  type(attempt) is not int
-                  or attempt < 1
-                  or attempt > overall_attempt
-                  or job.get("run_id") != run_id
+                  job.get("run_id") != run_id
                   or job.get("head_sha") != head_sha
                   or identity in seen_jobs
               ):
@@ -1859,16 +1970,28 @@ jobs:
               or selected["linux-x86_64"] > selected["sdk"]
           ):
               raise SystemExit("selected SDK producer predates a selected native producer")
+          attest_attempts = producer_jobs[producer_names["attest"]]
+          if not attest_attempts:
+              raise SystemExit("no package attestation producer job exists")
+          attest_attempt = max(attest_attempts)
+          if attest_attempts[attest_attempt] != ("completed", "success"):
+              raise SystemExit("latest package attestation producer job did not succeed")
+          if attest_attempt != overall_attempt:
+              raise SystemExit("successful package attestation is not from the overall run attempt")
+          if max(selected.values()) > attest_attempt:
+              raise SystemExit("selected package attestation predates a selected producer")
           print(
               selected["macos-aarch64"],
               selected["linux-x86_64"],
               selected["sdk"],
+              attest_attempt,
           )
           PY
           )
           if [[ ! "$macos_run_attempt" =~ ^[1-9][0-9]*$ \
             || ! "$linux_run_attempt" =~ ^[1-9][0-9]*$ \
-            || ! "$sdk_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
+            || ! "$sdk_run_attempt" =~ ^[1-9][0-9]*$ \
+            || ! "$attest_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
             echo 'package producer attempts are invalid' >&2
             exit 1
           fi
@@ -1879,6 +2002,8 @@ jobs:
             echo "MACOS_RUN_ATTEMPT=$macos_run_attempt"
             echo "LINUX_RUN_ATTEMPT=$linux_run_attempt"
             echo "SDK_RUN_ATTEMPT=$sdk_run_attempt"
+            echo "ATTEST_RUN_ATTEMPT=$attest_run_attempt"
+            echo "OVERALL_RUN_ATTEMPT=$overall_run_attempt"
             echo "STASIS_VERSION=$version"
           } >> "$GITHUB_ENV"
           {
@@ -1887,9 +2012,13 @@ jobs:
             echo "macos_run_attempt=$macos_run_attempt"
             echo "linux_run_attempt=$linux_run_attempt"
             echo "sdk_run_attempt=$sdk_run_attempt"
+            echo "attest_run_attempt=$attest_run_attempt"
+            echo "overall_run_attempt=$overall_run_attempt"
             echo "version=$version"
+            echo "workflow_ref=$GITHUB_WORKFLOW_REF"
+            echo "workflow_sha=$GITHUB_WORKFLOW_SHA"
           } >> "$GITHUB_OUTPUT"
-          echo "eligible package run: $RUN_ID native attempts $macos_run_attempt/$linux_run_attempt and SDK attempt $sdk_run_attempt (overall attempt $overall_run_attempt) at $head_sha"
+          echo "eligible package run: $RUN_ID native attempts $macos_run_attempt/$linux_run_attempt, SDK attempt $sdk_run_attempt, and attestation attempt $attest_run_attempt (overall attempt $overall_run_attempt) at $head_sha"
 
       - name: Check out the exact packaged source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -1897,6 +2026,16 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
           ref: ${{ steps.selected-run.outputs.head_sha }}
+
+      - name: Verify workflow-owned frozen profile identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          test "$(sha256sum profiles/controlled-webapp-v1.json | awk '{print $1}')" \
+            = "$STASIS_FROZEN_V1_PROFILE_SHA256"
+          test "$(sha256sum profiles/controlled-web-session-v1.json | awk '{print $1}')" \
+            = "$STASIS_FROZEN_V2_PROFILE_SHA256"
 
       - name: Download the exact package and gate proof
         shell: bash
@@ -2039,14 +2178,38 @@ jobs:
             --native-binary-sha256 "$binary_sha256" \
             --run-id "$RUN_ID" \
             --run-attempt "$SDK_RUN_ATTEMPT"
-          for release_asset in release-assets/*/* gate-proof/*/* runtime-manifest/* sdk-proof/*; do
-            gh attestation verify "$release_asset" \
-              --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
-              --source-digest "$HEAD_SHA" \
-              --source-ref "refs/heads/$HEAD_BRANCH" \
-              --deny-self-hosted-runners
+          provenance_subjects=(
+            release-assets/*/*
+            gate-proof/*/*
+            runtime-manifest/*
+            sdk-proof/*
+          )
+          test "${#provenance_subjects[@]}" -eq 11
+          provenance_json="$RUNNER_TEMP/stasis-package-provenance.json"
+          gh attestation verify "${provenance_subjects[0]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
+            --source-digest "$HEAD_SHA" \
+            --source-ref "refs/heads/$HEAD_BRANCH" \
+            --deny-self-hosted-runners \
+            --limit 100 \
+            --format json > "$provenance_json"
+          provenance_verifier=(
+            python3 etc/ci/stasis/verify_build_provenance.py verify
+            --verification-json "$provenance_json"
+            --repository "$GITHUB_REPOSITORY"
+            --workflow .github/workflows/stasis-package.yml
+            --revision "$HEAD_SHA"
+            --source-ref "refs/heads/$HEAD_BRANCH"
+            --server-url "$GITHUB_SERVER_URL"
+            --run-id "$RUN_ID"
+            --run-attempt "$ATTEST_RUN_ATTEMPT"
+            --expected-subject-count 11
+          )
+          for provenance_subject in "${provenance_subjects[@]}"; do
+            provenance_verifier+=(--subject "$provenance_subject")
           done
+          "${provenance_verifier[@]}"
           mkdir staged-release-assets staged-gate-proof
           cp release-assets/*/* staged-release-assets/
           cp "$manifest" staged-release-assets/
@@ -2097,20 +2260,32 @@ jobs:
       attestations: read
       contents: write
     env:
+      ATTEST_RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.attest_run_attempt }}
       GH_TOKEN: ${{ github.token }}
       HEAD_SHA: ${{ needs.verify-promotion.outputs.head_sha }}
       HEAD_BRANCH: ${{ needs.verify-promotion.outputs.head_branch }}
       LINUX_RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.linux_run_attempt }}
       MACOS_RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.macos_run_attempt }}
+      OVERALL_RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.overall_run_attempt }}
       SDK_RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.sdk_run_attempt }}
       RUN_ID: ${{ inputs.package_run_id }}
       STASIS_VERSION: ${{ needs.verify-promotion.outputs.version }}
       TAG: ${{ inputs.release_tag }}
+      VERIFIED_WORKFLOW_REF: ${{ needs.verify-promotion.outputs.workflow_ref }}
+      VERIFIED_WORKFLOW_SHA: ${{ needs.verify-promotion.outputs.workflow_sha }}
     steps:
       - name: Recheck selected commit is on the current default branch
         shell: bash
         run: |
           set -euo pipefail
+          expected_workflow_ref="$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml@refs/heads/$HEAD_BRANCH"
+          if [[ ! "$VERIFIED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ \
+            || "$GITHUB_WORKFLOW_SHA" != "$VERIFIED_WORKFLOW_SHA" \
+            || "$VERIFIED_WORKFLOW_REF" != "$expected_workflow_ref" \
+            || "$GITHUB_WORKFLOW_REF" != "$VERIFIED_WORKFLOW_REF" ]]; then
+            echo 'credentialed job is not executing the exact verified promotion workflow revision' >&2
+            exit 1
+          fi
           current_default_branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')
           if [[ -z "$current_default_branch" ]]; then
             echo 'repository has no current default branch' >&2
@@ -2147,10 +2322,13 @@ jobs:
           }
           packaged_workflow_tree=$(workflow_tree_sha "$HEAD_SHA")
           current_workflow_tree=$(workflow_tree_sha "$current_default_sha")
+          executing_workflow_tree=$(workflow_tree_sha "$GITHUB_WORKFLOW_SHA")
           if [[ ! "$packaged_workflow_tree" =~ ^[0-9a-f]{40}$ \
             || ! "$current_workflow_tree" =~ ^[0-9a-f]{40}$ \
-            || "$packaged_workflow_tree" != "$current_workflow_tree" ]]; then
-            echo '.github/workflows changed after the selected package commit' >&2
+            || ! "$executing_workflow_tree" =~ ^[0-9a-f]{40}$ \
+            || "$packaged_workflow_tree" != "$current_workflow_tree" \
+            || "$packaged_workflow_tree" != "$executing_workflow_tree" ]]; then
+            echo '.github/workflows differs across the package, executing, or current default revision' >&2
             exit 1
           fi
 
@@ -2171,7 +2349,8 @@ jobs:
         run: |
           set -euo pipefail
           for producer_attempt in \
-            "$MACOS_RUN_ATTEMPT" "$LINUX_RUN_ATTEMPT" "$SDK_RUN_ATTEMPT"; do
+            "$MACOS_RUN_ATTEMPT" "$LINUX_RUN_ATTEMPT" "$SDK_RUN_ATTEMPT" \
+            "$ATTEST_RUN_ATTEMPT"; do
             if [[ ! "$producer_attempt" =~ ^[1-9][0-9]*$ ]]; then
               echo 'staged producer attempt handoff is invalid' >&2
               exit 1
@@ -2180,6 +2359,12 @@ jobs:
           if [[ "$MACOS_RUN_ATTEMPT" -gt "$SDK_RUN_ATTEMPT" \
             || "$LINUX_RUN_ATTEMPT" -gt "$SDK_RUN_ATTEMPT" ]]; then
             echo 'staged SDK producer predates a native producer' >&2
+            exit 1
+          fi
+          if [[ "$SDK_RUN_ATTEMPT" -gt "$ATTEST_RUN_ATTEMPT" \
+            || "$MACOS_RUN_ATTEMPT" -gt "$ATTEST_RUN_ATTEMPT" \
+            || "$LINUX_RUN_ATTEMPT" -gt "$ATTEST_RUN_ATTEMPT" ]]; then
+            echo 'staged attestation predates a selected producer' >&2
             exit 1
           fi
           python3 - <<'PY'
@@ -2359,14 +2544,158 @@ jobs:
           if manifest != expected_manifest:
               raise SystemExit("staged runtime distribution manifest changed")
           PY
-          for release_asset in release-assets/* gate-proof/*; do
-            gh attestation verify "$release_asset" \
-              --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
-              --source-digest "$HEAD_SHA" \
-              --source-ref "refs/heads/$HEAD_BRANCH" \
-              --deny-self-hosted-runners
-          done
+          provenance_subjects=(release-assets/* gate-proof/*)
+          test "${#provenance_subjects[@]}" -eq 9
+          provenance_json="$RUNNER_TEMP/stasis-staged-release-provenance.json"
+          gh attestation verify "${provenance_subjects[0]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
+            --source-digest "$HEAD_SHA" \
+            --source-ref "refs/heads/$HEAD_BRANCH" \
+            --deny-self-hosted-runners \
+            --limit 100 \
+            --format json > "$provenance_json"
+          PROVENANCE_JSON="$provenance_json" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+
+          def strict_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate object key {key!r}")
+                  value[key] = item
+              return value
+
+          def nested(value, *keys):
+              for key in keys:
+                  if not isinstance(value, dict):
+                      return None
+                  value = value.get(key)
+              return value
+
+          def sha256(filename):
+              digest = hashlib.sha256()
+              with filename.open("rb") as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          try:
+              document = json.loads(
+                  pathlib.Path(os.environ["PROVENANCE_JSON"]).read_text(encoding="utf-8"),
+                  object_pairs_hook=strict_object,
+                  parse_constant=lambda value: (_ for _ in ()).throw(
+                      ValueError(f"non-finite number {value!r}")
+                  ),
+              )
+          except (OSError, UnicodeError, ValueError, RecursionError) as error:
+              raise SystemExit(f"cannot read strict staged provenance JSON: {error}") from error
+          if not isinstance(document, list) or not document:
+              raise SystemExit("staged provenance verification returned no statements")
+
+          version = os.environ["STASIS_VERSION"]
+          revision = os.environ["HEAD_SHA"]
+          source_ref = f"refs/heads/{os.environ['HEAD_BRANCH']}"
+          repository = os.environ["GITHUB_REPOSITORY"]
+          repository_uri = f"https://github.com/{repository}"
+          signer_uri = (
+              f"{repository_uri}/.github/workflows/stasis-package.yml@{source_ref}"
+          )
+          invocation_uri = (
+              f"{repository_uri}/actions/runs/{os.environ['RUN_ID']}/attempts/"
+              f"{os.environ['ATTEST_RUN_ATTEMPT']}"
+          )
+          candidates = []
+          for record in document:
+              certificate_invocation = nested(
+                  record, "verificationResult", "signature", "certificate", "runInvocationURI"
+              )
+              predicate_invocation = nested(
+                  record, "verificationResult", "statement", "predicate", "runDetails",
+                  "metadata", "invocationId",
+              )
+              if certificate_invocation == invocation_uri or predicate_invocation == invocation_uri:
+                  candidates.append(record)
+          if len(candidates) != 1:
+              raise SystemExit("staged release did not resolve to one exact package attestation")
+
+          result = nested(candidates[0], "verificationResult")
+          certificate = nested(result, "signature", "certificate")
+          if not isinstance(certificate, dict):
+              raise SystemExit("staged release verified certificate is missing")
+          expected_certificate = {
+              "subjectAlternativeName": signer_uri,
+              "githubWorkflowSHA": revision,
+              "githubWorkflowRepository": repository,
+              "githubWorkflowRef": source_ref,
+              "runnerEnvironment": "github-hosted",
+              "sourceRepositoryURI": repository_uri,
+              "sourceRepositoryDigest": revision,
+              "sourceRepositoryRef": source_ref,
+              "buildSignerURI": signer_uri,
+              "runInvocationURI": invocation_uri,
+          }
+          if any(certificate.get(key) != value for key, value in expected_certificate.items()):
+              raise SystemExit("staged release verified certificate identity changed")
+
+          statement = nested(result, "statement")
+          if (
+              not isinstance(statement, dict)
+              or statement.get("_type") != "https://in-toto.io/Statement/v1"
+              or statement.get("predicateType") != "https://slsa.dev/provenance/v1"
+          ):
+              raise SystemExit("staged release provenance statement type changed")
+          expected_names = {f"stasis-{version}-runtime-manifest.json"}
+          for platform in ("macos-aarch64", "linux-x86_64"):
+              bundle = f"stasis-{version}-{platform}"
+              archive = f"{bundle}.tar.gz"
+              expected_names.update({
+                  archive,
+                  f"{archive}.sha256",
+                  f"{bundle}.binary.sha256",
+                  f"{bundle}-act-settle-inspect.json",
+              })
+          sdk_names = {
+              f"oxhq-stasis-{version}.tgz",
+              f"stasis-{version}-typescript-act-settle-inspect.json",
+          }
+          expected_names.update(sdk_names)
+          actual_subjects = {}
+          for subject in statement.get("subject", []):
+              if not isinstance(subject, dict) or set(subject) != {"name", "digest"}:
+                  raise SystemExit("staged release provenance subject shape changed")
+              name = subject.get("name")
+              digest = subject.get("digest")
+              if (
+                  not isinstance(name, str)
+                  or name in actual_subjects
+                  or not isinstance(digest, dict)
+                  or set(digest) != {"sha256"}
+                  or re.fullmatch(r"[0-9a-f]{64}", digest.get("sha256", "")) is None
+              ):
+                  raise SystemExit("staged release provenance subject is malformed")
+              actual_subjects[name] = digest["sha256"]
+          if set(actual_subjects) != expected_names:
+              raise SystemExit("staged release provenance subject inventory changed")
+          local_subjects = {}
+          for filename in (*pathlib.Path("release-assets").iterdir(), *pathlib.Path("gate-proof").iterdir()):
+              if filename.is_symlink() or not filename.is_file() or filename.name in local_subjects:
+                  raise SystemExit("staged release provenance file identity is invalid")
+              local_subjects[filename.name] = sha256(filename)
+          if set(local_subjects) != expected_names - sdk_names or any(
+              actual_subjects[name] != digest for name, digest in local_subjects.items()
+          ):
+              raise SystemExit("staged release provenance digest binding changed")
+          predicate = statement.get("predicate")
+          if nested(predicate, "runDetails", "metadata") != {"invocationId": invocation_uri}:
+              raise SystemExit("staged release SLSA invocation identity changed")
+          if nested(predicate, "runDetails", "builder") != {"id": signer_uri}:
+              raise SystemExit("staged release SLSA builder identity changed")
+          PY
 
       - name: Verify immutable tag and resumable draft state
         shell: bash
@@ -2394,16 +2723,18 @@ jobs:
           cat > release-notes.md <<EOF
           # Stasis $TAG
 
-          First supported Stasis controlled-webapp release.
+          First supported Stasis controlled web-session release.
 
           - Exact source commit: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$HEAD_SHA
           - Package and gate run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID
+          - Producer attempts: macOS $MACOS_RUN_ATTEMPT, Linux $LINUX_RUN_ATTEMPT, SDK $SDK_RUN_ATTEMPT, provenance $ATTEST_RUN_ATTEMPT
           - Native platforms: macOS Apple Silicon and Linux x86_64
           - Linux compatibility floor: Ubuntu 22.04 / glibc 2.35
           - macOS signing: unsigned and not Apple-notarized
 
-          Stasis 0.1 controls time and explicit settlement within the versioned
-          controlled-webapp support profile. It fails closed on work outside that profile.
+          Stasis 0.2 preserves the frozen controlled-webapp-v1 contract and adds
+          controlled-web-session-v1 navigation, session state, network evidence, and
+          crawler-grade extraction. Both profiles fail closed outside their declared surface.
 
           This draft contains both native archives, archive and binary SHA-256 sidecars,
           artifact-bound native gate proofs, and the exact runtime distribution manifest
@@ -2559,6 +2890,106 @@ jobs:
           fi
           echo "CREATE_TAG=$create_tag" >> "$GITHUB_ENV"
 
+      - name: Reconfirm every release identity immediately before mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RUN_ID" =~ ^[1-9][0-9]*$ \
+            || ! "$OVERALL_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ \
+            || ! "$ATTEST_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ \
+            || "$OVERALL_RUN_ATTEMPT" != "$ATTEST_RUN_ATTEMPT" ]]; then
+            echo 'verified package run attempt handoff changed before release mutation' >&2
+            exit 1
+          fi
+          expected_workflow_ref="$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml@refs/heads/$HEAD_BRANCH"
+          if [[ ! "$VERIFIED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ \
+            || "$GITHUB_WORKFLOW_SHA" != "$VERIFIED_WORKFLOW_SHA" \
+            || "$VERIFIED_WORKFLOW_REF" != "$expected_workflow_ref" \
+            || "$GITHUB_WORKFLOW_REF" != "$VERIFIED_WORKFLOW_REF" ]]; then
+            echo 'the executing promotion workflow identity changed before release mutation' >&2
+            exit 1
+          fi
+
+          for profile_binding in \
+            "controlled-webapp-v1.json:$STASIS_FROZEN_V1_PROFILE_SHA256" \
+            "controlled-web-session-v1.json:$STASIS_FROZEN_V2_PROFILE_SHA256"; do
+            profile_name=${profile_binding%%:*}
+            expected_profile_sha256=${profile_binding#*:}
+            profile_file="$RUNNER_TEMP/stasis-$profile_name"
+            gh api -H 'Accept: application/vnd.github.raw+json' \
+              "repos/$GITHUB_REPOSITORY/contents/profiles/$profile_name?ref=$HEAD_SHA" \
+              > "$profile_file"
+            actual_profile_sha256=$(sha256sum "$profile_file" | awk '{print $1}')
+            if [[ "$actual_profile_sha256" != "$expected_profile_sha256" ]]; then
+              echo "frozen profile $profile_name changed before release mutation" >&2
+              exit 1
+            fi
+          done
+
+          package_run="$RUNNER_TEMP/stasis-package-run-before-mutation.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > "$package_run"
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg head_branch "$HEAD_BRANCH" \
+            --argjson run_id "$RUN_ID" \
+            --argjson run_attempt "$OVERALL_RUN_ATTEMPT" '
+              .id == $run_id
+              and .repository.full_name == $repository
+              and .head_repository.full_name == $repository
+              and .name == "Stasis package and promote"
+              and .path == ".github/workflows/stasis-package.yml"
+              and .event == "push"
+              and .head_sha == $head_sha
+              and .head_branch == $head_branch
+              and .status == "completed"
+              and .conclusion == "success"
+              and .run_attempt == $run_attempt
+            ' "$package_run" > /dev/null
+
+          current_default_branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')
+          if [[ -z "$current_default_branch" || "$current_default_branch" != "$HEAD_BRANCH" ]]; then
+            echo 'repository default branch changed before release mutation' >&2
+            exit 1
+          fi
+          current_default_sha=$(gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/commits" \
+            -f sha="$current_default_branch" \
+            -f per_page=1 \
+            --jq 'if length == 1 then .[0].sha else error("default branch did not resolve exactly") end')
+          if [[ ! "$current_default_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'current default branch did not resolve to an exact commit before mutation' >&2
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/compare/$HEAD_SHA...$current_default_sha" \
+            > "$RUNNER_TEMP/stasis-ancestry-before-mutation.json"
+          jq -e --arg head_sha "$HEAD_SHA" '
+            .merge_base_commit.sha == $head_sha
+            and (.status == "ahead" or .status == "identical")
+          ' "$RUNNER_TEMP/stasis-ancestry-before-mutation.json" > /dev/null
+
+          workflow_tree_sha() {
+            local commit_sha=$1
+            local root_tree_sha dot_github_tree_sha
+            root_tree_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$commit_sha" \
+              --jq '.tree.sha')
+            dot_github_tree_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/trees/$root_tree_sha" \
+              --jq '.tree | map(select(.path == ".github" and .mode == "040000" and .type == "tree")) | if length == 1 then .[0].sha else error("missing .github tree") end')
+            gh api "repos/$GITHUB_REPOSITORY/git/trees/$dot_github_tree_sha" \
+              --jq '.tree | map(select(.path == "workflows" and .mode == "040000" and .type == "tree")) | if length == 1 then .[0].sha else error("missing .github/workflows tree") end'
+          }
+          packaged_workflow_tree=$(workflow_tree_sha "$HEAD_SHA")
+          current_workflow_tree=$(workflow_tree_sha "$current_default_sha")
+          executing_workflow_tree=$(workflow_tree_sha "$GITHUB_WORKFLOW_SHA")
+          if [[ ! "$packaged_workflow_tree" =~ ^[0-9a-f]{40}$ \
+            || ! "$current_workflow_tree" =~ ^[0-9a-f]{40}$ \
+            || ! "$executing_workflow_tree" =~ ^[0-9a-f]{40}$ \
+            || "$packaged_workflow_tree" != "$current_workflow_tree" \
+            || "$packaged_workflow_tree" != "$executing_workflow_tree" ]]; then
+            echo '.github/workflows changed before release mutation' >&2
+            exit 1
+          fi
+
       - name: Create the exact-SHA lightweight tag
         if: env.CREATE_TAG == 'true'
         shell: bash
@@ -2583,7 +3014,55 @@ jobs:
             exit 1
           fi
 
-          release_id=$DRAFT_RELEASE_ID
+          gh api --method GET --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > release-state/fresh-release-pages.json
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          pages = json.loads(
+              pathlib.Path("release-state/fresh-release-pages.json").read_text(encoding="utf-8")
+          )
+          if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+              raise SystemExit("fresh authenticated release enumeration is malformed")
+          releases = [release for page in pages for release in page]
+          identifiers = [release.get("id") for release in releases if isinstance(release, dict)]
+          if (
+              len(identifiers) != len(releases)
+              or any(type(identifier) is not int or identifier <= 0 for identifier in identifiers)
+              or len(set(identifiers)) != len(identifiers)
+          ):
+              raise SystemExit("fresh authenticated release identities are malformed or duplicated")
+          tag = os.environ["TAG"]
+          matches = [release for release in releases if release.get("tag_name") == tag]
+          if len(matches) > 1:
+              raise SystemExit(f"multiple releases use exact tag {tag}")
+          fresh_id = None
+          if matches:
+              release = matches[0]
+              notes = pathlib.Path("release-notes.md").read_text(encoding="utf-8")
+              if (
+                  release.get("name") != f"Stasis {tag}"
+                  or release.get("body") != notes
+                  or release.get("draft") is not True
+                  or release.get("prerelease") is not False
+                  or release.get("immutable") is not False
+                  or release.get("published_at") is not None
+              ):
+                  raise SystemExit(f"existing release {tag} changed before mutation")
+              fresh_id = release["id"]
+          snapshot = os.environ.get("DRAFT_RELEASE_ID") or None
+          snapshot_id = int(snapshot) if snapshot is not None else None
+          if fresh_id != snapshot_id:
+              raise SystemExit("draft release identity changed after the verified snapshot")
+          pathlib.Path("release-state/fresh-release-id.txt").write_text(
+              "" if fresh_id is None else f"{fresh_id}\n", encoding="ascii"
+          )
+          PY
+
+          release_id=$(tr -d '\n' < release-state/fresh-release-id.txt)
           if [[ -z "$release_id" ]]; then
             jq -n \
               --arg tag "$TAG" \
@@ -2620,44 +3099,150 @@ jobs:
             exit 1
           fi
 
-          while IFS= read -r starter_asset_id; do
-            if [[ ! "$starter_asset_id" =~ ^[1-9][0-9]*$ ]]; then
-              echo 'starter asset ID is invalid' >&2
+          mutation_count=0
+          while true; do
+            if ((mutation_count >= 32)); then
+              echo 'draft recovery exceeded its bounded mutation count' >&2
               exit 1
             fi
-            gh api --method DELETE \
-              "repos/$GITHUB_REPOSITORY/releases/assets/$starter_asset_id" \
-              --silent
-          done < <(jq -r '.starterAssetIds[]' release-state/draft-state.json)
+            read -r live_tag_type live_tag_sha < <(
+              gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+                --jq '[.object.type, .object.sha] | @tsv'
+            )
+            if [[ "$live_tag_type" != 'commit' || "$live_tag_sha" != "$HEAD_SHA" ]]; then
+              echo "$TAG changed during draft recovery" >&2
+              exit 1
+            fi
+            gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              > release-state/live-draft.json
+            DRAFT_RELEASE_ID="$release_id" python3 - <<'PY'
+          import json
+          import os
+          import pathlib
 
-          while IFS= read -r asset_name; do
-            asset_path=$(jq -er --arg name "$asset_name" '.[$name].path' \
-              release-state/expected-assets.json)
-            asset_size=$(jq -er --arg name "$asset_name" '.[$name].size' \
-              release-state/expected-assets.json)
-            asset_digest=$(jq -er --arg name "$asset_name" '.[$name].digest' \
-              release-state/expected-assets.json)
-            encoded_name=$(jq -rn --arg name "$asset_name" '$name | @uri')
-            curl --fail-with-body --silent --show-error \
-              --request POST \
-              --header 'Accept: application/vnd.github+json' \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header 'Content-Type: application/octet-stream' \
-              --header 'X-GitHub-Api-Version: 2026-03-10' \
-              --data-binary "@$asset_path" \
-              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$encoded_name" \
-              > release-state/uploaded-asset.json
-            jq -e \
-              --arg name "$asset_name" \
-              --arg digest "$asset_digest" \
-              --argjson size "$asset_size" '
-                (.id | type == "number" and . > 0)
-                and .name == $name
-                and .state == "uploaded"
-                and .size == $size
-                and .digest == $digest
-              ' release-state/uploaded-asset.json > /dev/null
-          done < <(jq -r '.missingAssetNames[]' release-state/draft-state.json)
+          release_id = int(os.environ["DRAFT_RELEASE_ID"])
+          tag = os.environ["TAG"]
+          release = json.loads(
+              pathlib.Path("release-state/live-draft.json").read_text(encoding="utf-8")
+          )
+          expected = json.loads(
+              pathlib.Path("release-state/expected-assets.json").read_text(encoding="utf-8")
+          )
+          notes = pathlib.Path("release-notes.md").read_text(encoding="utf-8")
+          if (
+              not isinstance(release, dict)
+              or release.get("id") != release_id
+              or release.get("tag_name") != tag
+              or release.get("name") != f"Stasis {tag}"
+              or release.get("body") != notes
+              or release.get("draft") is not True
+              or release.get("prerelease") is not False
+              or release.get("immutable") is not False
+              or release.get("published_at") is not None
+          ):
+              raise SystemExit("draft release identity changed during recovery")
+          assets = release.get("assets")
+          if not isinstance(assets, list):
+              raise SystemExit("live draft asset inventory is malformed")
+          missing = set(expected)
+          starters = []
+          seen = set()
+          for asset in assets:
+              if not isinstance(asset, dict):
+                  raise SystemExit("live draft has a malformed asset")
+              name = asset.get("name")
+              asset_id = asset.get("id")
+              if (
+                  not isinstance(name, str)
+                  or name not in expected
+                  or name in seen
+                  or type(asset_id) is not int
+                  or asset_id <= 0
+              ):
+                  raise SystemExit(f"live draft has an unexpected or duplicate asset: {name!r}")
+              seen.add(name)
+              binding = expected[name]
+              state = asset.get("state")
+              if state == "uploaded":
+                  if asset.get("size") != binding["size"] or asset.get("digest") != binding["digest"]:
+                      raise SystemExit(f"live draft asset bytes changed: {name}")
+                  missing.remove(name)
+              elif state == "starter":
+                  if asset.get("size") not in (0, None) or asset.get("digest") not in (None, ""):
+                      raise SystemExit(f"live draft starter asset is malformed: {name}")
+                  starters.append((name, asset_id))
+              else:
+                  raise SystemExit(f"live draft asset is not recoverable: {name}")
+          if starters:
+              name, asset_id = sorted(starters)[0]
+              action = {"kind": "delete", "name": name, "assetId": asset_id}
+          elif missing:
+              action = {"kind": "upload", "name": sorted(missing)[0]}
+          else:
+              action = {"kind": "done"}
+          pathlib.Path("release-state/next-draft-action.json").write_text(
+              json.dumps(action, ensure_ascii=True, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+            action_kind=$(jq -er '.kind' release-state/next-draft-action.json)
+            if [[ "$action_kind" == 'done' ]]; then
+              break
+            fi
+            if [[ "$action_kind" == 'delete' ]]; then
+              asset_name=$(jq -er '.name' release-state/next-draft-action.json)
+              starter_asset_id=$(jq -er '.assetId' release-state/next-draft-action.json)
+              if [[ ! "$starter_asset_id" =~ ^[1-9][0-9]*$ ]]; then
+                echo 'starter asset ID is invalid' >&2
+                exit 1
+              fi
+              gh api "repos/$GITHUB_REPOSITORY/releases/assets/$starter_asset_id" \
+                > release-state/live-starter-asset.json
+              jq -e \
+                --arg name "$asset_name" \
+                --argjson asset_id "$starter_asset_id" '
+                  .id == $asset_id
+                  and .name == $name
+                  and .state == "starter"
+                  and (.size == 0 or .size == null)
+                  and (.digest == null or .digest == "")
+                ' release-state/live-starter-asset.json > /dev/null
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$starter_asset_id" \
+                --silent
+            elif [[ "$action_kind" == 'upload' ]]; then
+              asset_name=$(jq -er '.name' release-state/next-draft-action.json)
+              asset_path=$(jq -er --arg name "$asset_name" '.[$name].path' \
+                release-state/expected-assets.json)
+              asset_size=$(jq -er --arg name "$asset_name" '.[$name].size' \
+                release-state/expected-assets.json)
+              asset_digest=$(jq -er --arg name "$asset_name" '.[$name].digest' \
+                release-state/expected-assets.json)
+              encoded_name=$(jq -rn --arg name "$asset_name" '$name | @uri')
+              curl --fail-with-body --silent --show-error \
+                --request POST \
+                --header 'Accept: application/vnd.github+json' \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header 'Content-Type: application/octet-stream' \
+                --header 'X-GitHub-Api-Version: 2026-03-10' \
+                --data-binary "@$asset_path" \
+                "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$encoded_name" \
+                > release-state/uploaded-asset.json
+              jq -e \
+                --arg name "$asset_name" \
+                --arg digest "$asset_digest" \
+                --argjson size "$asset_size" '
+                  (.id | type == "number" and . > 0)
+                  and .name == $name
+                  and .state == "uploaded"
+                  and .size == $size
+                  and .digest == $digest
+                ' release-state/uploaded-asset.json > /dev/null
+            else
+              echo "unknown draft recovery action: $action_kind" >&2
+              exit 1
+            fi
+            mutation_count=$((mutation_count + 1))
+          done
 
           gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" \
             > release-state/final-draft.json

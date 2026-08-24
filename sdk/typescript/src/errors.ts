@@ -40,12 +40,25 @@ export class StasisProcessError extends StasisTransportError {
 
 export type ProtocolStateEffect = "none" | "partial" | "indeterminate";
 
+export type ProtocolErrorDetailValue =
+  | null
+  | boolean
+  | number
+  | string
+  | readonly ProtocolErrorDetailValue[]
+  | ProtocolErrorDetails;
+
+export interface ProtocolErrorDetails {
+  readonly [key: string]: ProtocolErrorDetailValue;
+}
+
 export class StasisProtocolError extends StasisError {
   readonly code: string;
   readonly fatal: boolean;
   readonly stateEffect: ProtocolStateEffect;
   readonly requestId: string | null;
   readonly sessionId: string | null;
+  readonly details: ProtocolErrorDetails | undefined;
 
   constructor(options: {
     code: string;
@@ -55,6 +68,7 @@ export class StasisProtocolError extends StasisError {
     requestId: string | null;
     sessionId: string | null;
     stderrTail: string;
+    details: ProtocolErrorDetails | undefined;
   }) {
     super(options.message, options.stderrTail);
     this.code = options.code;
@@ -62,6 +76,7 @@ export class StasisProtocolError extends StasisError {
     this.stateEffect = options.stateEffect;
     this.requestId = options.requestId;
     this.sessionId = options.sessionId;
+    this.details = options.details;
   }
 }
 

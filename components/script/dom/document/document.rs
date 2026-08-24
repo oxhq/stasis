@@ -22,8 +22,8 @@ use data_url::mime::Mime;
 use devtools_traits::ScriptToDevtoolsControlMsg;
 use dom_struct::dom_struct;
 use embedder_traits::{
-    AllowOrDeny, AnimationState, CustomHandlersAutomationMode, EmbedderMsg, Image, LoadStatus,
-    Theme,
+    AllowOrDeny, AnimationState, CustomHandlersAutomationMode, DocumentControlProfile, EmbedderMsg,
+    Image, LoadStatus, Theme,
 };
 use encoding_rs::{Encoding, UTF_8};
 use html5ever::{LocalName, QualName, local_name, ns};
@@ -38,14 +38,17 @@ use layout_api::{
 };
 use metrics::{InteractiveFlag, InteractiveWindow, ProgressiveWebMetrics};
 use net_traits::CookieSource::NonHTTP;
-use net_traits::CoreResourceMsg::{GetCookieStringForUrl, SetCookiesForUrl};
+use net_traits::CoreResourceMsg::{
+    GetControlledCookieStringForUrl, GetCookieStringForUrl, SetControlledCookieForUrl,
+    SetCookiesForUrl,
+};
 use net_traits::image_cache::ImageCache;
 use net_traits::policy_container::PolicyContainer;
 use net_traits::pub_domains::is_pub_domain;
 use net_traits::request::{
     InsecureRequestsPolicy, PreloadId, PreloadKey, PreloadedResources, RequestBuilder,
 };
-use net_traits::{ReferrerPolicy, ResourceFetchTiming};
+use net_traits::{ControlledCookiePolicyError, ReferrerPolicy, ResourceFetchTiming};
 use paint_api::largest_contentful_paint_candidate::LCPCandidateID;
 use percent_encoding::percent_decode;
 use profile_traits::generic_channel as profile_generic_channel;
@@ -297,8 +300,8 @@ impl RefreshRedirectDue {
         // automatic features browsing context flag set,
         // then navigate document's node navigable to urlRecord using document,
         // with historyHandling set to "replace".
-        if self.from_meta_element &&
-            window.Document().has_active_sandboxing_flag(
+        if self.from_meta_element
+            && window.Document().has_active_sandboxing_flag(
                 SandboxingFlagSet::SANDBOXED_AUTOMATIC_FEATURES_BROWSING_CONTEXT_FLAG,
             )
         {
@@ -885,6 +888,23 @@ pub(crate) struct Document {
     window_detached: Cell<bool>,
 }
 
+fn controlled_cookie_policy_dom_error(error: ControlledCookiePolicyError) -> Error {
+    match error {
+        ControlledCookiePolicyError::SameSiteContextUnsupported => {
+            Error::NotSupported(Some("unsupported_cookie_same_site_context".to_owned()))
+        },
+        ControlledCookiePolicyError::PersistentCookieUnsupported => {
+            Error::NotSupported(Some("unsupported_persistent_cookie".to_owned()))
+        },
+        ControlledCookiePolicyError::PartitionedCookieUnsupported => {
+            Error::NotSupported(Some("unsupported_partitioned_cookie".to_owned()))
+        },
+        ControlledCookiePolicyError::InvalidCookie => {
+            Error::Type(c"invalid_controlled_cookie".to_owned())
+        },
+    }
+}
+
 impl Document {
     pub(crate) fn history(&self, cx: &mut JSContext) -> DomRoot<History> {
         self.history.or_init(|| History::new(cx, &self.window))
@@ -1313,8 +1333,8 @@ impl Document {
 
         // Step 2: If document's URL matches about:blank and document's about base URL is
         // non-null, then return document's about base URL.
-        if document_url.matches_about_blank() &&
-            let Some(about_base_url) = self.about_base_url()
+        if document_url.matches_about_blank()
+            && let Some(about_base_url) = self.about_base_url()
         {
             return about_base_url;
         }
@@ -1354,8 +1374,8 @@ impl Document {
         // FIXME: This should check the dirty bit on the document,
         // not the document element. Needs some layout changes to make
         // that workable.
-        if let Some(root) = self.get_document_element_unrooted(no_gc) &&
-            root.has_dirty_descendants()
+        if let Some(root) = self.get_document_element_unrooted(no_gc)
+            && root.has_dirty_descendants()
         {
             condition.insert(RestyleReason::DOMChanged);
         }
@@ -2280,8 +2300,8 @@ impl Document {
         // to fire an event named hashchange at document's relevant global object, using HashChangeEvent,
         // with the oldURL attribute initialized to the serialization of oldURL
         // and the newURL attribute initialized to the serialization of entry's URL.
-        if old_url.as_url()[Position::BeforeFragment..] !=
-            new_url.as_url()[Position::BeforeFragment..]
+        if old_url.as_url()[Position::BeforeFragment..]
+            != new_url.as_url()[Position::BeforeFragment..]
         {
             let window = Trusted::new(self.owner_window().deref());
             let old_url = old_url.to_string();
@@ -2363,8 +2383,8 @@ impl Document {
             .navigation_timing
             .top_level_dom_complete
             .get()
-            .is_none() &&
-            loader.is_only_blocked_by_iframes()
+            .is_none()
+            && loader.is_only_blocked_by_iframes()
         {
             update_with_current_instant(&self.navigation_timing.top_level_dom_complete);
         }
@@ -2928,8 +2948,8 @@ impl Document {
 
     /// Step 7 of <https://html.spec.whatwg.org/multipage/#the-end>
     fn wait_until_asap_scripts_have_executed(&self) {
-        if self.current_the_end_loading_phase.get() !=
-            TheEndLoadingPhase::ProcessingAsSoonAsPossibleScripts
+        if self.current_the_end_loading_phase.get()
+            != TheEndLoadingPhase::ProcessingAsSoonAsPossibleScripts
         {
             return;
         }
@@ -2962,8 +2982,8 @@ impl Document {
 
     /// Step 8 of <https://html.spec.whatwg.org/multipage/#the-end>
     pub(crate) fn wait_until_load_blockers_have_resolved(&self, _cx: &mut JSContext) {
-        if self.current_the_end_loading_phase.get() !=
-            TheEndLoadingPhase::WaitingForLoadEventBlockers
+        if self.current_the_end_loading_phase.get()
+            != TheEndLoadingPhase::WaitingForLoadEventBlockers
         {
             return;
         }
@@ -2976,8 +2996,8 @@ impl Document {
                 .navigation_timing
                 .top_level_dom_complete
                 .get()
-                .is_none() &&
-                loader.is_only_blocked_by_iframes()
+                .is_none()
+                && loader.is_only_blocked_by_iframes()
             {
                 update_with_current_instant(&self.navigation_timing.top_level_dom_complete);
             }
@@ -3257,6 +3277,64 @@ impl Document {
         !self.has_browsing_context || !url_has_network_scheme(&self.url())
     }
 
+    fn get_controlled_session_cookie(&self) -> Fallible<DOMString> {
+        if !self.window.is_top_level() {
+            return Err(Error::NotSupported(Some(
+                "unsupported_cookie_same_site_context".to_owned(),
+            )));
+        }
+
+        let url = self.url();
+        let (consumer, response) =
+            profile_generic_channel::channel(self.global().time_profiler_chan().clone()).unwrap();
+        self.window
+            .as_global_scope()
+            .resource_threads()
+            .send(GetControlledCookieStringForUrl(url.clone(), url, consumer))
+            .map_err(|_| {
+                Error::InvalidState(Some("controlled_cookie_resource_unavailable".to_owned()))
+            })?;
+        let cookies = response
+            .recv()
+            .map_err(|_| {
+                Error::InvalidState(Some("controlled_cookie_resource_unavailable".to_owned()))
+            })?
+            .map_err(controlled_cookie_policy_dom_error)?;
+        Ok(cookies.map_or(DOMString::new(), DOMString::from))
+    }
+
+    fn set_controlled_session_cookie(&self, cookie: String) -> ErrorResult {
+        // The session profile intentionally excludes nested browsing contexts. Do not borrow the
+        // current frame URL as a false top-level cookie context if one nevertheless reaches here.
+        if !self.window.is_top_level() {
+            return Err(Error::NotSupported(Some(
+                "unsupported_cookie_same_site_context".to_owned(),
+            )));
+        }
+
+        let url = self.url();
+        let (consumer, response) =
+            profile_generic_channel::channel(self.global().time_profiler_chan().clone()).unwrap();
+        self.window
+            .as_global_scope()
+            .resource_threads()
+            .send(SetControlledCookieForUrl(
+                url.clone(),
+                url,
+                cookie,
+                consumer,
+            ))
+            .map_err(|_| {
+                Error::InvalidState(Some("controlled_cookie_resource_unavailable".to_owned()))
+            })?;
+        response
+            .recv()
+            .map_err(|_| {
+                Error::InvalidState(Some("controlled_cookie_resource_unavailable".to_owned()))
+            })?
+            .map_err(controlled_cookie_policy_dom_error)
+    }
+
     pub(crate) fn custom_element_registry(&self) -> Option<DomRoot<CustomElementRegistry>> {
         self.document_or_shadow_root.custom_element_registry()
     }
@@ -3381,10 +3459,10 @@ impl Document {
         if !self.is_fully_active() {
             return false;
         }
-        if !self.window().layout_blocked() &&
-            (!self.restyle_reason(no_gc).is_empty() ||
-                self.window().layout().needs_new_display_list() ||
-                self.window().layout().needs_accessibility_update())
+        if !self.window().layout_blocked()
+            && (!self.restyle_reason(no_gc).is_empty()
+                || self.window().layout().needs_new_display_list()
+                || self.window().layout().needs_accessibility_update())
         {
             return true;
         }
@@ -3814,8 +3892,8 @@ impl Document {
     ) {
         let metrics = self.interactive_time.borrow();
         match metric_type {
-            ProgressiveWebMetricType::FirstPaint |
-            ProgressiveWebMetricType::FirstContentfulPaint => {
+            ProgressiveWebMetricType::FirstPaint
+            | ProgressiveWebMetricType::FirstContentfulPaint => {
                 let binding = PerformancePaintTiming::new(
                     cx,
                     self.window.as_global_scope(),
@@ -3913,8 +3991,8 @@ impl Document {
             _ => {
                 // Step 9.1: If document's unload counter is greater than 0 or
                 // document's ignore-destructive-writes counter is greater than 0, then return.
-                if self.is_prompting_or_unloading() ||
-                    self.ignore_destructive_writes_counter.get() > 0
+                if self.is_prompting_or_unloading()
+                    || self.ignore_destructive_writes_counter.get() > 0
                 {
                     return Ok(());
                 }
@@ -4306,8 +4384,8 @@ impl Document {
     pub(crate) fn insecure_requests_policy(&self) -> InsecureRequestsPolicy {
         if let Some(csp_list) = self.get_csp_list().as_ref() {
             for policy in &csp_list.0 {
-                if policy.contains_a_directive_whose_name_is("upgrade-insecure-requests") &&
-                    policy.disposition == PolicyDisposition::Enforce
+                if policy.contains_a_directive_whose_name_is("upgrade-insecure-requests")
+                    && policy.disposition == PolicyDisposition::Enforce
                 {
                     return InsecureRequestsPolicy::Upgrade;
                 }
@@ -4745,8 +4823,8 @@ impl Document {
             entry.hint.insert(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
         }
 
-        if vtable_for(el.upcast()).attribute_affects_presentational_hints(attr) ||
-            el.check_style_on_self_or_eager_pseudos(|style| {
+        if vtable_for(el.upcast()).attribute_affects_presentational_hints(attr)
+            || el.check_style_on_self_or_eager_pseudos(|style| {
                 if let Some(ref attribute_references) = style.attribute_references {
                     return attribute_references.contains_key(attr.local_name());
                 }
@@ -5325,8 +5403,8 @@ impl Document {
     }
 
     pub(crate) fn has_trustworthy_ancestor_or_current_origin(&self) -> bool {
-        self.has_trustworthy_ancestor_origin.get() ||
-            self.origin().immutable().is_potentially_trustworthy()
+        self.has_trustworthy_ancestor_origin.get()
+            || self.origin().immutable().is_potentially_trustworthy()
     }
 
     pub(crate) fn highlight_dom_node(&self, node: Option<&Node>) {
@@ -5493,9 +5571,9 @@ fn rendering_eligibility_observation(
         throttled,
         render_blocked,
         animation_tick_eligible: fully_active && !throttled,
-        rendering_opportunity_eligible: fully_active &&
-            !render_blocked &&
-            !waiting_on_canvas_image_updates,
+        rendering_opportunity_eligible: fully_active
+            && !render_blocked
+            && !waiting_on_canvas_image_updates,
     }
 }
 
@@ -6656,8 +6734,8 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
 
         let node = new_body.upcast::<Node>();
         match node.type_id() {
-            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLBodyElement)) |
-            NodeTypeId::Element(ElementTypeId::HTMLElement(
+            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLBodyElement))
+            | NodeTypeId::Element(ElementTypeId::HTMLElement(
                 HTMLElementTypeId::HTMLFrameSetElement,
             )) => {},
             _ => return Err(Error::HierarchyRequest(None)),
@@ -6722,8 +6800,8 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
     fn Links(&self, cx: &mut JSContext) -> DomRoot<HTMLCollection> {
         self.links.or_init(|| {
             HTMLCollection::new_with_filter_fn(cx, &self.window, self.upcast(), |element, _| {
-                (element.is::<HTMLAnchorElement>() || element.is::<HTMLAreaElement>()) &&
-                    element.has_attribute(&local_name!("href"))
+                (element.is::<HTMLAnchorElement>() || element.is::<HTMLAreaElement>())
+                    && element.has_attribute(&local_name!("href"))
             })
         })
     }
@@ -6854,6 +6932,12 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
             return Err(Error::Security(None));
         }
 
+        if ScriptThread::current_document_control_profile()
+            == DocumentControlProfile::TopLevelSession
+        {
+            return self.get_controlled_session_cookie();
+        }
+
         let url = self.url();
         let (tx, rx) =
             profile_generic_channel::channel(self.global().time_profiler_chan().clone()).unwrap();
@@ -6878,6 +6962,12 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
 
         if !cookie.is_valid_for_cookie() {
             return Ok(());
+        }
+
+        if ScriptThread::current_document_control_profile()
+            == DocumentControlProfile::TopLevelSession
+        {
+            return self.set_controlled_session_cookie(cookie.to_string());
         }
 
         let cookies = if let Some(cookie) = Cookie::parse(cookie.to_string()).ok().map(Serde) {
@@ -6970,8 +7060,8 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
                         elem.get_name().as_ref() == Some(&self.name)
                     },
                     HTMLElementTypeId::HTMLImageElement => elem.get_name().is_some_and(|name| {
-                        name == *self.name ||
-                            !name.is_empty() && elem.get_id().as_ref() == Some(&self.name)
+                        name == *self.name
+                            || !name.is_empty() && elem.get_id().as_ref() == Some(&self.name)
                     }),
                     // TODO handle <embed> and <object>; these depend on whether the element is
                     // “exposed”, a concept that doesn’t fully make sense until embed/object
@@ -7614,9 +7704,9 @@ fn is_named_element_with_name_attribute(elem: &Element) -> bool {
         _ => return false,
     };
     match type_ {
-        HTMLElementTypeId::HTMLFormElement |
-        HTMLElementTypeId::HTMLIFrameElement |
-        HTMLElementTypeId::HTMLImageElement => true,
+        HTMLElementTypeId::HTMLFormElement
+        | HTMLElementTypeId::HTMLIFrameElement
+        | HTMLElementTypeId::HTMLImageElement => true,
         // TODO handle <embed> and <object>; these depend on whether the element is
         // “exposed”, a concept that doesn’t fully make sense until embed/object
         // behaviour is actually implemented
