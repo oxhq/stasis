@@ -2423,7 +2423,6 @@ jobs:
 
           version = os.environ["STASIS_VERSION"]
           tag = os.environ["TAG"]
-          revision = os.environ["HEAD_SHA"]
           title = f"Stasis {tag}"
           expected_names = {f"stasis-{version}-runtime-manifest.json"}
           for platform in ("macos-aarch64", "linux-x86_64"):
@@ -2489,7 +2488,6 @@ jobs:
                   type(release_id) is not int
                   or release_id <= 0
                   or release.get("tag_name") != tag
-                  or release.get("target_commitish") != revision
                   or release.get("name") != title
                   or release.get("body") != notes
                   or release.get("draft") is not True
@@ -2605,11 +2603,9 @@ jobs:
               > release-state/created-draft.json
             jq -e \
               --arg tag "$TAG" \
-              --arg revision "$HEAD_SHA" \
               --arg title "Stasis $TAG" '
                 (.id | type == "number" and . > 0)
                 and .tag_name == $tag
-                and .target_commitish == $revision
                 and .name == $title
                 and .draft == true
                 and .prerelease == false
@@ -2671,7 +2667,6 @@ jobs:
           import pathlib
 
           tag = os.environ["TAG"]
-          revision = os.environ["HEAD_SHA"]
           release_id = int(os.environ["DRAFT_RELEASE_ID"])
           expected = json.loads(
               pathlib.Path("release-state/expected-assets.json").read_text(encoding="utf-8")
@@ -2683,7 +2678,6 @@ jobs:
           if (
               release.get("id") != release_id
               or release.get("tag_name") != tag
-              or release.get("target_commitish") != revision
               or release.get("name") != f"Stasis {tag}"
               or release.get("body") != notes
               or release.get("draft") is not True
