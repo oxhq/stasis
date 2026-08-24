@@ -146,7 +146,9 @@ The protected `release` environment receives only those staged files. Its job
 does not check out or execute candidate source. It rechecks inventories, hashes,
 proofs, source/run identities, runtime-manifest bindings, and provenance before
 creating a lightweight `v0.1.0` tag and a draft stable release. It refuses to
-mutate an existing release or a tag at another object.
+mutate a published or mismatched release, or a tag at another object. A retry
+may resume only the exact matching draft by ID, remove its starter placeholders,
+and upload any missing verified assets before revalidating the full inventory.
 
 Inspect the draft once, then publish that same draft as a non-prerelease. Do not
 replace assets, retarget the tag, or recreate the release. Repository immutable
@@ -166,8 +168,9 @@ are resolved independently from the latest exact successful producer jobs, with
 the same no-stale-fallback and ordering checks used by promotion. It compares
 the release runtime manifest with the SDK attempt's original attested manifest,
 regenerates the SDK module, and reproduces the SDK attempt's exact npm tarball.
-It then runs both the packed-SDK gate and the three-run North Star through
-managed runtime acquisition. The staged proof binds the combined gate log.
+It then runs the packed-SDK gate against the explicitly verified extracted
+binary and runs the three-run North Star through managed runtime acquisition.
+The staged proof binds the combined gate log.
 
 Only the minimal `publish` job enters the protected `npm` environment and
 receives `id-token: write`. It has no checkout and executes no package lifecycle
