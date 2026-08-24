@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
-const RECURSIVE_TIMER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+const BOUNDED_STRESS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
 const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 const STALL_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_VIRTUAL_TIME_NS: &str = "1000000000";
@@ -435,7 +435,7 @@ fn recursive_timers_terminate_with_the_typed_engine_limit() {
             "maxVirtualTimeNs": "1000000000000",
             "maxControlTurns": "1000000",
         }),
-        RECURSIVE_TIMER_RESPONSE_TIMEOUT,
+        BOUNDED_STRESS_RESPONSE_TIMEOUT,
     );
     assert_outcome(&settled, "task_limit_exceeded");
     assert_eq!(settled["processed"]["tasks"], "100000");
@@ -482,9 +482,15 @@ fn recursive_animation_frames_terminate_with_the_typed_rendering_limit() {
 
     // This fixture intentionally runs past the default 30s virtual-time horizon so the engine's
     // rendering-opportunity budget, rather than the caller policy, is the terminating authority.
-    let settled = shell.settle_with(json!({
-        "maxVirtualTimeNs": "400000000000",
-    }));
+    // Ten thousand serial rendering opportunities can exceed the generic protocol deadline on a
+    // contended runner; widen only the caller-owned wait while the engine rendering budget remains
+    // the terminating authority.
+    let settled = shell.settle_with_timeout(
+        json!({
+            "maxVirtualTimeNs": "400000000000",
+        }),
+        BOUNDED_STRESS_RESPONSE_TIMEOUT,
+    );
     assert_outcome(&settled, "rendering_limit_exceeded");
     assert_eq!(settled["processed"]["renderingOpportunities"], "10000");
     assert_eq!(settled["limit"]["kind"], "rendering_opportunities");
