@@ -1,0 +1,141 @@
+{
+  "schemaVersion": 1,
+  "id": "controlled-webapp-v1",
+  "clockMode": "controlled",
+  "documentScope": {
+    "webViews": 1,
+    "activeTopLevelDocuments": 1,
+    "scriptEventLoops": 1,
+    "childBrowsingContexts": "unsupported",
+    "auxiliaryWebViews": "unsupported"
+  },
+  "navigation": {
+    "initial": {
+      "schemes": [
+        "http",
+        "https"
+      ],
+      "fetchBacked": true
+    },
+    "applicationTopLevel": {
+      "sameOriginHttpHttps": "unsupported",
+      "crossEventLoop": "unsupported"
+    },
+    "explicitNavigateMethod": false
+  },
+  "selectors": {
+    "grammar": "local_compound_v1",
+    "supportedComponents": [
+      "type",
+      "universal",
+      "id",
+      "class",
+      "attribute"
+    ],
+    "namedNamespacePrefixes": false,
+    "combinators": false,
+    "pseudoClasses": false,
+    "persistentHandles": false
+  },
+  "automation": {
+    "fill": {
+      "elements": [
+        "input:text",
+        "input:search",
+        "input:url",
+        "input:tel",
+        "input:email",
+        "input:password",
+        "textarea"
+      ],
+      "effect": "replace_value_then_one_input_event",
+      "inputType": "insertReplacementText",
+      "focus": false,
+      "keyboardEvents": false,
+      "changeEvent": false
+    },
+    "activate": {
+      "effect": "html_element_click",
+      "layoutHitTesting": false,
+      "pointerEvents": false
+    }
+  },
+  "inspection": {
+    "generationBound": true,
+    "operations": [
+      "query_count",
+      "text",
+      "extract_text",
+      "extract_html"
+    ]
+  },
+  "execution": {
+    "tasks": true,
+    "microtasks": true,
+    "mutationObserver": true,
+    "oneShotTimers": "controlled",
+    "intervals": "persistent_work",
+    "finiteRendering": true,
+    "animationFrame": true,
+    "date": true,
+    "performance": true
+  },
+  "executionLimits": {
+    "ordinaryTasks": 100000,
+    "microtasks": 1000000,
+    "renderingOpportunities": 10000,
+    "mutations": 1000000
+  },
+  "settlementOutcomes": [
+    "quiescent",
+    "quiescent_with_persistent_work",
+    "blocked_on_external_io",
+    "blocked_on_open_ended_work",
+    "unsupported_work",
+    "virtual_time_limit_exceeded",
+    "task_limit_exceeded",
+    "microtask_limit_exceeded",
+    "rendering_limit_exceeded",
+    "mutation_limit_exceeded",
+    "control_turn_limit_exceeded",
+    "runtime_error"
+  ],
+  "network": {
+    "fetch": "asynchronous",
+    "xmlHttpRequest": "asynchronous",
+    "synchronousXmlHttpRequest": "rejected_before_start",
+    "externalIoTimeout": "typed_blocker",
+    "reproducibility": "local_or_intercepted_fixture_only"
+  },
+  "automationLimits": {
+    "maxSelectorBytes": 4096,
+    "maxFillValueBytes": 131072,
+    "maxFieldNameBytes": 256,
+    "maxExtractionFields": 16,
+    "maxMatches": 128,
+    "maxDomNodesVisited": 1000000,
+    "maxOutputBytes": 131072
+  },
+  "unsupportedRetention": "first_per_authority",
+  "unsupportedClasses": {
+    "iframe": [
+      "same_event_loop_iframe",
+      "cross_event_loop_iframe"
+    ],
+    "applicationTopLevelNavigation": "cross_event_loop_navigation",
+    "worker": "worker",
+    "worklet": "worklet",
+    "auxiliaryWebView": "auxiliary_web_view",
+    "webSocketAndServerSentEvents": "external_subscription",
+    "externalChannels": "external_subscription",
+    "storageAndUntrackedResourceIo": "resource_thread_io",
+    "media": "native_media",
+    "embedderControls": "embedder_control",
+    "hostTimestamp": "host_timestamp"
+  },
+  "determinismExcludes": [
+    "live_network",
+    "uncontrolled_randomness",
+    "ambient_system_state"
+  ]
+}

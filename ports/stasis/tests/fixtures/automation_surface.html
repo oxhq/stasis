@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Stasis controlled automation surface</title>
+  </head>
+  <body>
+    <form id="login">
+      <label>Email <input id="email" name="email" type="email"></label>
+      <label>Password <input id="password" name="password" type="password"></label>
+      <label>Remember <input id="remember" name="remember" type="checkbox"></label>
+      <button id="submit" type="submit">Sign in</button>
+    </form>
+
+    <output id="input-events">email=0,password=0</output>
+    <output id="status">idle</output>
+    <section id="dashboard"></section>
+
+    <script>
+      const inputCounts = { email: 0, password: 0 };
+      for (const name of ["email", "password"]) {
+        document.querySelector(`#${name}`).addEventListener("input", (event) => {
+          if (event.inputType !== "insertReplacementText") {
+            document.querySelector("#status").textContent = "unexpected input type";
+            return;
+          }
+          inputCounts[name] += 1;
+          document.querySelector("#input-events").textContent =
+            `email=${inputCounts.email},password=${inputCounts.password}`;
+        });
+      }
+
+      document.querySelector("#login").addEventListener("submit", (event) => {
+        event.preventDefault();
+        document.querySelector("#status").textContent = "submitting";
+        const email = document.querySelector("#email").value;
+
+        Promise.resolve().then(() => {
+          setTimeout(() => {
+            document.querySelector("#status").textContent = `signed in as ${email}`;
+            document.querySelector("#dashboard").innerHTML = `
+              <article class="dashboard-card">
+                <h2 class="card-title">Account</h2>
+                <div class="card-body"><strong>${email}</strong></div>
+              </article>
+              <article class="dashboard-card">
+                <h2 class="card-title">Status</h2>
+                <div class="card-body"><strong>Ready</strong></div>
+              </article>
+            `;
+          }, 1_000);
+        });
+      });
+    </script>
+  </body>
+</html>

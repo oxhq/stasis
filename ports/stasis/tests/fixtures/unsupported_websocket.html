@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Stasis unsupported WebSocket fixture</title>
+<button id="start" type="button">Start unsupported work</button>
+<output id="result">idle</output>
+<script>
+  document.querySelector("#start").addEventListener("click", () => {
+    try {
+      new WebSocket("ws://127.0.0.1:9/stasis-unsupported-proof");
+      document.querySelector("#result").textContent = "unexpectedly admitted";
+    } catch (error) {
+      document.querySelector("#result").textContent = error.name;
+    }
+  });
+</script>

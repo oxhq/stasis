@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Stasis v0.1 North Star</title>
+  </head>
+  <body>
+    <main>
+      <form id="login">
+        <label>Email <input id="email" name="email" type="email" autocomplete="username"></label>
+        <label>Password <input id="password" name="password" type="password" autocomplete="current-password"></label>
+        <button id="submit" type="submit">Sign in</button>
+      </form>
+
+      <output id="input-events">email=0,password=0</output>
+      <output id="status">idle</output>
+      <output id="trace">boot</output>
+      <section id="dashboard" aria-label="Dashboard"></section>
+    </main>
+
+    <script>
+      "use strict";
+
+      const inputCounts = { email: 0, password: 0 };
+      const trace = ["boot"];
+
+      function record(step) {
+        trace.push(step);
+        document.querySelector("#trace").textContent = trace.join(",");
+      }
+
+      for (const name of ["email", "password"]) {
+        document.querySelector(`#${name}`).addEventListener("input", (event) => {
+          if (event.inputType !== "insertReplacementText") {
+            document.querySelector("#status").textContent = "unexpected input type";
+            return;
+          }
+          inputCounts[name] += 1;
+          document.querySelector("#input-events").textContent =
+            `email=${inputCounts.email},password=${inputCounts.password}`;
+        });
+      }
+
+      document.querySelector("#login").addEventListener("submit", (event) => {
+        event.preventDefault();
+        const email = document.querySelector("#email").value;
+        const password = document.querySelector("#password").value;
+        document.querySelector("#status").textContent = "authenticating";
+        record("submit");
+
+        fetch("/login", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ email, password }),
+        })
+          .then((response) => {
+            record("fetch");
+            if (!response.ok) throw new Error(`login failed: ${response.status}`);
+            return response.json();
+          })
+          .then((session) => {
+            record("promise");
+            return new Promise((resolve) => {
+              queueMicrotask(() => {
+                record("microtask");
+                resolve(session);
+              });
+            });
+          })
+          .then((session) => {
+            const dashboard = document.querySelector("#dashboard");
+            document.querySelector("#login").remove();
+            dashboard.innerHTML = `
+              <article class="dashboard-card">
+                <h2 class="card-title">Account</h2>
+                <div class="card-body"><strong id="account-email"></strong></div>
+              </article>
+              <article class="dashboard-card">
+                <h2 class="card-title">Role</h2>
+                <div class="card-body"><strong id="account-role"></strong></div>
+              </article>
+              <article class="dashboard-card">
+                <h2 class="card-title">Settlement</h2>
+                <div class="card-body"><strong id="settlement-state">Pending</strong></div>
+              </article>
+            `;
+            document.querySelector("#account-email").textContent = session.email;
+            document.querySelector("#account-role").textContent = session.role;
+            document.querySelector("#status").textContent = "dashboard mounted";
+            record("dom");
+
+            setTimeout(() => {
+              record("timer");
+              requestAnimationFrame(() => {
+                document.querySelector("#settlement-state").textContent = "Ready";
+                document.querySelector("#status").textContent = "ready";
+                record("raf");
+              });
+            }, 250);
+          })
+          .catch(() => {
+            document.querySelector("#status").textContent = "login failed";
+            record("error");
+          });
+      });
+    </script>
+  </body>
+</html>

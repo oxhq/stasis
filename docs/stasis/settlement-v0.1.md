@@ -1,18 +1,17 @@
-# Settlement design contract 0.1 (future surface)
+# Settlement design contract 0.1
 
-> **Status:** Design history and future direction. This is not the shipped
-> contract for `v0.1.0-alpha.0`. The alpha's implemented public surface is the
-> exact method and mode list in `protocol-v1.md`; in particular, it does not
-> advertise fill, query/extract, screenshots, journals, or named support
-> profiles.
+> **Status:** Stable v0.1 controlled-settlement and semantic-automation
+> contract. `controlled-webapp-v1` is the one advertised support profile.
+> Screenshots, causal journals, and the larger surfaces discussed below remain
+> future direction unless the protocol capability list explicitly advertises them.
 
-## Historical target claim
+## Stable claim
 
 For one fully active top-level document on one ScriptThread, under a declared
 support profile, Stasis drives supported owned work without wall-clock polling
 and returns either a stable settlement proof or a typed blocker or limit.
 
-The PR-7 core proof profile includes:
+The `controlled-webapp-v1` profile includes:
 
 - semantic `fill` and `activate`;
 - tasks and individual microtasks;
@@ -22,16 +21,14 @@ The PR-7 core proof profile includes:
 - one finite rendering opportunity and rAF callback;
 - DOM inspection while controlled page turns remain paused.
 
-The proposed contract-0.1 envelope then adds the `test` profile's layout-backed
-click, hit testing, and basic screenshot. Those features consume the same
-settlement model but are not prerequisites for proving the controlled
-event-loop kernel.
+Layout-backed click, hit testing, and screenshots are possible post-0.1
+test-profile extensions. They are not part of the stable surface.
 
 Workers, every child browsing context (including same-loop iframes), auxiliary
 WebViews, WebSockets/SSE, media, and uncontrolled time surfaces are typed
-unsupported work under this proposed contract.
+unsupported work under this profile.
 
-## Proposed controlled-clock gate
+## Controlled-clock gate
 
 Stasis must not advertise `clock: controlled` until one document clock governs:
 
@@ -40,7 +37,7 @@ Stasis must not advertise `clock: controlled` until one document clock governs:
 - `performance.now()` and its origin;
 - rAF callback timestamps;
 - rendering updates and the document timeline;
-- execution-journal timestamps.
+- settlement and bounded-evidence timestamps.
 
 A supported surface must never silently fall back to host time. Workers, other
 realms/event loops, and remaining unaudited host-time surfaces are either out of
@@ -78,6 +75,7 @@ task_limit_exceeded
 microtask_limit_exceeded
 rendering_limit_exceeded
 mutation_limit_exceeded
+control_turn_limit_exceeded
 runtime_error
 ```
 
@@ -93,18 +91,21 @@ Quiescence is a proof at one linearization point. The result carries a state
 generation, and inspection is consistent only while the controlled event loop
 remains paused at that generation.
 
-Read-only inspection methods (`query`, `text`, `html`, and `extract`) accept an
-optional `expectedGeneration` and return `stale_generation` before reading if
-the state changed. Arbitrary `evaluate` is explicitly mutating-capable and
+Every v0.1 automation method requires `expectedGeneration` and returns
+`stale_generation` before acting or reading if the state changed. `query`,
+`text`, and `extract` are read-only; the wire result records the observed
+generation, while the TypeScript `text()` convenience API returns the string
+directly. Standalone `html` is not public in v0.1; bounded `extract` fields may
+read `innerHTML`. Arbitrary `evaluate` is explicitly mutating-capable and
 invalidates a prior settlement proof unless it can be proven read-only.
 
 Every settlement result contains distinct exact virtual time and measured wall
 time, the effective policy, processed task/microtask/rendering/mutation counts,
 the final raw pending snapshot, and structured persistent or unsupported work.
 
-## Network rule for the design proof
+## Network rule
 
-The proposed deterministic gate uses intercepted or local fixture network only.
+The deterministic release gate uses intercepted or local fixture network only.
 Live network is observable but does not receive a determinism claim. A later
 live-network policy must explicitly choose whether virtual timers freeze while
 I/O is pending or race against it; silently freezing can prevent an application
@@ -123,16 +124,21 @@ schedule timeouts. rAF may reschedule itself and a microtask may requeue itself
 inside one turn. Distinct execution limits must terminate all three cases with
 typed outcomes.
 
-Synchronous JavaScript that never returns cannot yet be interrupted by these
-turn-level limits. The contract-0.1 design uses an outer process supervisor
-until a SpiderMonkey interrupt/watchdog is implemented.
+Synchronous JavaScript that never returns cannot be interrupted by these
+turn-level limits. The v0.1 SDK therefore applies a mandatory wall-clock
+command supervisor and fail-stops the owned process with typed state-effect
+evidence. A future SpiderMonkey interrupt may provide a finer native boundary.
 
-## Proposed profiles and reproducibility
+## Supported profile and reproducibility
 
-`crawl` enables DOM, JavaScript, storage, network fixtures, semantic actions,
-and layout only on demand. `test` adds continuous layout where required, hit
-testing, pointer/focus input, rendering ticks, and screenshots. Both use the
-same pending snapshot and settlement state machine.
+`controlled-webapp-v1` is frozen in
+`profiles/controlled-webapp-v1.json`. It covers one top-level HTTP(S)
+document/event loop, semantic fill and activation, bounded CSS-subset
+inspection, tasks, microtasks, timers, finite rendering/rAF, MutationObserver,
+and asynchronous fetch/XHR. Its immutable engine limits are 100,000 ordinary
+tasks, 1,000,000 microtasks, 10,000 rendering opportunities, and 1,000,000
+mutation records. Iframes, workers/worklets, auxiliary WebViews, external
+subscriptions, media, and other named unaudited surfaces fail closed.
 
 Digest reproducibility is promised only for controlled inputs: fixture network,
 declared clock, identical actions, and controlled randomness/content. Live

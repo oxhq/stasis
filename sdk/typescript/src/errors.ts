@@ -68,11 +68,55 @@ export class StasisProtocolError extends StasisError {
 export class StasisAbortError extends StasisError {
   readonly code = "aborted";
   readonly reason: unknown;
+  readonly fatal: boolean;
+  readonly stateEffect: ProtocolStateEffect;
+  readonly method: string | null;
+  readonly requestId: string | null;
 
-  constructor(reason: unknown, stderrTail = "") {
+  constructor(
+    reason: unknown,
+    stderrTail = "",
+    options: {
+      fatal?: boolean;
+      stateEffect?: ProtocolStateEffect;
+      method?: string | null;
+      requestId?: string | null;
+    } = {},
+  ) {
     super("The Stasis operation was aborted", stderrTail, { cause: reason });
     this.name = "AbortError";
     this.reason = reason;
+    this.fatal = options.fatal ?? false;
+    this.stateEffect = options.stateEffect ?? "none";
+    this.method = options.method ?? null;
+    this.requestId = options.requestId ?? null;
+  }
+}
+
+/** A written native command exceeded its mandatory wall-clock supervision bound. */
+export class StasisCommandTimeoutError extends StasisTransportError {
+  readonly fatal = true;
+  readonly stateEffect: ProtocolStateEffect;
+  readonly method: string;
+  readonly requestId: string;
+  readonly timeoutMs: number;
+
+  constructor(options: {
+    method: string;
+    requestId: string;
+    timeoutMs: number;
+    stateEffect: ProtocolStateEffect;
+    stderrTail: string;
+  }) {
+    super(
+      "command_timeout",
+      `Stasis command ${options.method} did not complete within ${options.timeoutMs} ms`,
+      options.stderrTail,
+    );
+    this.stateEffect = options.stateEffect;
+    this.method = options.method;
+    this.requestId = options.requestId;
+    this.timeoutMs = options.timeoutMs;
   }
 }
 

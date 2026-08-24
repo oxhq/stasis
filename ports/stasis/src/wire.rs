@@ -31,12 +31,39 @@ use serde::de::value::MapAccessDeserializer;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use servo_base::id::ScriptEventLoopId;
-use timers::DocumentTimeSurface;
+use timers::{DocumentExecutionBudget, DocumentTimeSurface};
 
 use crate::settle::{
     PersistentWork as SettlePersistentWork, SettleCompletion, SettlePolicy as EngineSettlePolicy,
     SettleRuntimeFailure,
 };
+
+/// The public automation request/result envelope must fit the protocol's one-MiB frame limit even
+/// when every user string takes serde_json's six-byte `\u00xx` escape form. These product limits
+/// are intentionally narrower than Servo's same-build MVP ceilings: besides logical output, an
+/// extraction response pays JSON structure overhead for every row and field.
+const PUBLIC_AUTOMATION_MAX_SELECTOR_BYTES: u32 = 4 * 1024;
+const PUBLIC_AUTOMATION_MAX_FILL_VALUE_BYTES: u32 = 128 * 1024;
+const PUBLIC_AUTOMATION_MAX_FIELD_NAME_BYTES: u32 = 256;
+const PUBLIC_AUTOMATION_MAX_EXTRACTION_FIELDS: u32 = 16;
+const PUBLIC_AUTOMATION_MAX_MATCHES: u32 = 128;
+const PUBLIC_AUTOMATION_MAX_DOM_NODES_VISITED: u32 = 1_000_000;
+const PUBLIC_AUTOMATION_MAX_OUTPUT_BYTES: u64 = 128 * 1024;
+#[cfg(test)]
+const PUBLIC_AUTOMATION_FRAME_BUDGET_BYTES: usize = 1024 * 1024;
+
+fn public_automation_limits() -> DocumentAutomationLimits {
+    DocumentAutomationLimits::new_internal(
+        PUBLIC_AUTOMATION_MAX_SELECTOR_BYTES,
+        PUBLIC_AUTOMATION_MAX_FILL_VALUE_BYTES,
+        PUBLIC_AUTOMATION_MAX_FIELD_NAME_BYTES,
+        PUBLIC_AUTOMATION_MAX_EXTRACTION_FIELDS,
+        PUBLIC_AUTOMATION_MAX_MATCHES,
+        PUBLIC_AUTOMATION_MAX_DOM_NODES_VISITED,
+        PUBLIC_AUTOMATION_MAX_OUTPUT_BYTES,
+    )
+    .expect("the product automation limits stay within Servo's hard MVP ceilings")
+}
 
 /// An exact non-negative integer encoded as a canonical decimal JSON string.
 ///
@@ -95,9 +122,9 @@ impl Visitor<'_> for DecimalU128Visitor {
     where
         E: de::Error,
     {
-        if value.is_empty() ||
-            (value.len() > 1 && value.starts_with('0')) ||
-            !value.bytes().all(|byte| byte.is_ascii_digit())
+        if value.is_empty()
+            || (value.len() > 1 && value.starts_with('0'))
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
         {
             return Err(E::custom(
                 "expected a canonical non-negative decimal string",
@@ -121,10 +148,12 @@ impl<'de> Deserialize<'de> for DecimalU128 {
 
 /// Public automation operations supported by the native product wire.
 ///
-/// `Fill` and standalone `InnerHtml` deliberately have no public variant.
+/// Standalone `InnerHtml` deliberately has no public variant; bounded extraction can request an
+/// HTML field without adding another exact-one inspection method.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicAutomationKind {
     Activate,
+    Fill,
     Query,
     Text,
     Extract,
@@ -139,6 +168,7 @@ pub struct ResolvedAutomationParams {
     kind: PublicAutomationKind,
     expected_generation: RuntimeStateGeneration,
     operation: DocumentAutomationOperation,
+    limits: DocumentAutomationLimits,
 }
 
 impl ResolvedAutomationParams {
@@ -150,13 +180,15 @@ impl ResolvedAutomationParams {
         let expected_generation = u64::try_from(expected_generation.get())
             .map(RuntimeStateGeneration::new)
             .map_err(|_| AutomationParamsError::ExpectedGenerationOutOfRange)?;
+        let limits = public_automation_limits();
         operation
-            .validate(DocumentAutomationLimits::MVP)
+            .validate(limits)
             .map_err(AutomationParamsError::InvalidOperation)?;
         Ok(Self {
             kind,
             expected_generation,
             operation,
+            limits,
         })
     }
 
@@ -177,7 +209,7 @@ impl ResolvedAutomationParams {
             target,
             self.expected_generation,
             self.operation,
-            DocumentAutomationLimits::MVP,
+            self.limits,
         )
     }
 }
@@ -203,6 +235,28 @@ impl ActionActivateParams {
             self.expected_generation,
             DocumentAutomationOperation::Activate {
                 selector: self.selector,
+            },
+        )
+    }
+}
+
+/// Strict parameters for `action.fill`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ActionFillParams {
+    selector: String,
+    value: String,
+    expected_generation: DecimalU128,
+}
+
+impl ActionFillParams {
+    pub fn resolve(self) -> Result<ResolvedAutomationParams, AutomationParamsError> {
+        ResolvedAutomationParams::new(
+            PublicAutomationKind::Fill,
+            self.expected_generation,
+            DocumentAutomationOperation::Fill {
+                selector: self.selector,
+                value: self.value,
             },
         )
     }
@@ -301,7 +355,7 @@ impl DomExtractParams {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ActionActivateResult {
+pub struct ActionMutationResult {
     state_generation: DecimalU128,
 }
 
@@ -341,7 +395,8 @@ pub struct DomExtractResult {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum PublicAutomationResult {
-    Activate(ActionActivateResult),
+    Activate(ActionMutationResult),
+    Fill(ActionMutationResult),
     Query(DomQueryResult),
     Text(DomTextResult),
     Extract(DomExtractResult),
@@ -363,7 +418,10 @@ impl PublicAutomationResult {
         let state_generation = post_operation.state_generation.get().into();
         match (expected, result) {
             (PublicAutomationKind::Activate, EngineDocumentAutomationResult::Activated) => {
-                Ok(Self::Activate(ActionActivateResult { state_generation }))
+                Ok(Self::Activate(ActionMutationResult { state_generation }))
+            },
+            (PublicAutomationKind::Fill, EngineDocumentAutomationResult::Filled) => {
+                Ok(Self::Fill(ActionMutationResult { state_generation }))
             },
             (PublicAutomationKind::Query, EngineDocumentAutomationResult::QueryCount { count }) => {
                 Ok(Self::Query(DomQueryResult {
@@ -395,8 +453,7 @@ impl PublicAutomationResult {
                     state_generation,
                 }))
             },
-            (_, EngineDocumentAutomationResult::InnerHtml { .. }) |
-            (_, EngineDocumentAutomationResult::Filled) => {
+            (_, EngineDocumentAutomationResult::InnerHtml { .. }) => {
                 Err(AutomationResultProjectionError::InternalOnlyResult)
             },
             _ => Err(AutomationResultProjectionError::UnexpectedResult),
@@ -1115,6 +1172,10 @@ pub enum SettleOutcome {
     BlockedOnOpenEndedWork,
     UnsupportedWork,
     VirtualTimeLimitExceeded,
+    TaskLimitExceeded,
+    MicrotaskLimitExceeded,
+    RenderingLimitExceeded,
+    MutationLimitExceeded,
     ControlTurnLimitExceeded,
     RuntimeError,
 }
@@ -1123,6 +1184,10 @@ pub enum SettleOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct ProcessedWorkSnapshot {
     pub control_turns: DecimalU128,
+    pub tasks: DecimalU128,
+    pub microtasks: DecimalU128,
+    pub rendering_opportunities: DecimalU128,
+    pub mutations: DecimalU128,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1160,6 +1225,10 @@ pub struct EffectiveSettlePolicy {
 #[serde(rename_all = "snake_case")]
 pub enum SettleLimitKind {
     VirtualTime,
+    OrdinaryTasks,
+    Microtasks,
+    RenderingOpportunities,
+    Mutations,
     ControlTurns,
 }
 
@@ -1168,6 +1237,8 @@ pub enum SettleLimitKind {
 pub struct SettleLimitSnapshot {
     pub kind: SettleLimitKind,
     pub limit: DecimalU128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed: Option<DecimalU128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_virtual_time_ns: Option<DecimalU128>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1178,6 +1249,7 @@ pub struct SettleLimitSnapshot {
 #[serde(rename_all = "snake_case")]
 pub enum SettleFailureCode {
     RuntimeTerminals,
+    ExecutionCounterOverflow,
     WebViewIdentityChanged,
     ClockNotControlled,
     UnsupportedClockSurface,
@@ -1287,6 +1359,7 @@ impl RuntimeSettleResult {
                 limit = Some(SettleLimitSnapshot {
                     kind: SettleLimitKind::VirtualTime,
                     limit: virtual_limit.as_nanos().into(),
+                    observed: None,
                     start_virtual_time_ns: Some(start_virtual_time_ns.into()),
                     requested_virtual_time_ns: Some(requested_virtual_time_ns.into()),
                 });
@@ -1304,6 +1377,7 @@ impl RuntimeSettleResult {
                 limit = Some(SettleLimitSnapshot {
                     kind: SettleLimitKind::ControlTurns,
                     limit: control_limit.into(),
+                    observed: None,
                     start_virtual_time_ns: None,
                     requested_virtual_time_ns: None,
                 });
@@ -1312,6 +1386,40 @@ impl RuntimeSettleResult {
                     pending,
                     control_turns,
                 )
+            },
+            SettleCompletion::ExecutionLimitExceeded {
+                pending,
+                budget,
+                limit: execution_limit,
+                observed,
+                control_turns,
+            } => {
+                let (outcome, kind) = match budget {
+                    DocumentExecutionBudget::OrdinaryTasks => (
+                        SettleOutcome::TaskLimitExceeded,
+                        SettleLimitKind::OrdinaryTasks,
+                    ),
+                    DocumentExecutionBudget::Microtasks => (
+                        SettleOutcome::MicrotaskLimitExceeded,
+                        SettleLimitKind::Microtasks,
+                    ),
+                    DocumentExecutionBudget::RenderingOpportunities => (
+                        SettleOutcome::RenderingLimitExceeded,
+                        SettleLimitKind::RenderingOpportunities,
+                    ),
+                    DocumentExecutionBudget::MutationRecords => (
+                        SettleOutcome::MutationLimitExceeded,
+                        SettleLimitKind::Mutations,
+                    ),
+                };
+                limit = Some(SettleLimitSnapshot {
+                    kind,
+                    limit: execution_limit.into(),
+                    observed: Some(observed.into()),
+                    start_virtual_time_ns: None,
+                    requested_virtual_time_ns: None,
+                });
+                (outcome, pending, control_turns)
             },
             SettleCompletion::RuntimeError {
                 pending,
@@ -1326,11 +1434,15 @@ impl RuntimeSettleResult {
                 (projected.outcome, pending, control_turns)
             },
         };
-        if policy.persistent_work == PersistentWorkPolicy::Strict &&
-            outcome == SettleOutcome::QuiescentWithPersistentWork
+        if policy.persistent_work == PersistentWorkPolicy::Strict
+            && outcome == SettleOutcome::QuiescentWithPersistentWork
         {
             outcome = SettleOutcome::BlockedOnOpenEndedWork;
         }
+        let execution = pending
+            .execution
+            .map(|observation| observation.counters)
+            .unwrap_or_default();
         let snapshot = PendingWorkSnapshot::project(&pending, context);
         Self {
             outcome,
@@ -1346,6 +1458,10 @@ impl RuntimeSettleResult {
             },
             processed: ProcessedWorkSnapshot {
                 control_turns: control_turns.into(),
+                tasks: execution.ordinary_tasks.into(),
+                microtasks: execution.microtasks.into(),
+                rendering_opportunities: execution.rendering_opportunities.into(),
+                mutations: execution.mutations.into(),
             },
             snapshot,
             persistent_work,
@@ -1717,9 +1833,9 @@ fn project_rendering(raw: &RawPendingSnapshot) -> RenderingSnapshot {
         finite_animated_images += u128::from(pipeline.animated_images.finite_images);
         persistent_animated_images += u128::from(pipeline.animated_images.infinite_images);
         unsupported_animated_images +=
-            u128::from(pipeline.animated_images.unsupported.loop_count_unavailable) +
-                u128::from(pipeline.animated_images.unsupported.timeline_uncontrolled) +
-                u128::from(
+            u128::from(pipeline.animated_images.unsupported.loop_count_unavailable)
+                + u128::from(pipeline.animated_images.unsupported.timeline_uncontrolled)
+                + u128::from(
                     pipeline
                         .animated_images
                         .unsupported
@@ -1733,8 +1849,8 @@ fn project_rendering(raw: &RawPendingSnapshot) -> RenderingSnapshot {
                 .canvas
                 .unsupported
                 .live_source_inventory_unavailable,
-        ) + u128::from(pipeline.canvas.unsupported.offscreen_execution) +
-            u128::from(pipeline.canvas.unsupported.mutation_generation_unbound);
+        ) + u128::from(pipeline.canvas.unsupported.offscreen_execution)
+            + u128::from(pipeline.canvas.unsupported.mutation_generation_unbound);
         pending_fonts += u128::from(pipeline.pending_fonts);
         pending_images += u128::from(pipeline.pending_images);
     }
@@ -1946,6 +2062,11 @@ fn project_settle_failure(
                 unsupported_work,
             )
         },
+        SettleRuntimeFailure::ExecutionCounterOverflow(_) => (
+            SettleOutcome::RuntimeError,
+            SettleFailureCode::ExecutionCounterOverflow,
+            vec![],
+        ),
         SettleRuntimeFailure::WebViewIdentityChanged => (
             SettleOutcome::RuntimeError,
             SettleFailureCode::WebViewIdentityChanged,
@@ -2125,8 +2246,8 @@ fn project_unsupported_open_ended_source(
         PendingOpenEndedSourceReason::StorageEventListener => {
             UnsupportedReason::StorageEventListener
         },
-        PendingOpenEndedSourceReason::Interval { .. } |
-        PendingOpenEndedSourceReason::InfiniteAnimation => return None,
+        PendingOpenEndedSourceReason::Interval { .. }
+        | PendingOpenEndedSourceReason::InfiniteAnimation => return None,
     };
     Some(UnsupportedWork {
         source_id: Some(context.source_id(source.id.get())),
@@ -2154,9 +2275,9 @@ fn project_unsupported_rendering(
         UnsupportedReason::UnclassifiedAnimation,
     );
     push(
-        u128::from(rendering.animated_images.unsupported.loop_count_unavailable) +
-            u128::from(rendering.animated_images.unsupported.timeline_uncontrolled) +
-            u128::from(
+        u128::from(rendering.animated_images.unsupported.loop_count_unavailable)
+            + u128::from(rendering.animated_images.unsupported.timeline_uncontrolled)
+            + u128::from(
                 rendering
                     .animated_images
                     .unsupported
@@ -2170,8 +2291,8 @@ fn project_unsupported_rendering(
             .canvas
             .unsupported
             .live_source_inventory_unavailable,
-    ) + u128::from(rendering.canvas.unsupported.offscreen_execution) +
-        u128::from(rendering.canvas.unsupported.mutation_generation_unbound);
+    ) + u128::from(rendering.canvas.unsupported.offscreen_execution)
+        + u128::from(rendering.canvas.unsupported.mutation_generation_unbound);
     push(
         unsupported_canvases,
         SourceKind::TrackedPresence,
@@ -2192,18 +2313,18 @@ fn project_unsupported_rendering(
         SourceKind::TrackedPresence,
         UnsupportedReason::ImageLoad,
     );
-    let retained_work = rendering.runnable_animation_frame_callbacks != 0 ||
-        rendering.document_update_required ||
-        rendering.pending_animation_events != 0 ||
-        rendering.finite_animations != 0 ||
-        rendering.infinite_animations != 0 ||
-        rendering.animated_images.finite_images != 0 ||
-        rendering.animated_images.infinite_images != 0 ||
-        rendering.animated_images.update_ready ||
-        rendering.animated_images.scheduled_timer.is_some() ||
-        rendering.canvas.dirty_contexts != 0 ||
-        rendering.pending_fonts != 0 ||
-        rendering.pending_images != 0;
+    let retained_work = rendering.runnable_animation_frame_callbacks != 0
+        || rendering.document_update_required
+        || rendering.pending_animation_events != 0
+        || rendering.finite_animations != 0
+        || rendering.infinite_animations != 0
+        || rendering.animated_images.finite_images != 0
+        || rendering.animated_images.infinite_images != 0
+        || rendering.animated_images.update_ready
+        || rendering.animated_images.scheduled_timer.is_some()
+        || rendering.canvas.dirty_contexts != 0
+        || rendering.pending_fonts != 0
+        || rendering.pending_images != 0;
     if retained_work {
         match rendering.activity {
             PendingRenderingPipelineActivity::FullyActive => {},
@@ -2232,9 +2353,9 @@ fn project_all_unsupported_rendering(pending: &RawPendingSnapshot) -> Vec<Unsupp
     {
         for candidate in project_unsupported_rendering(rendering) {
             if let Some(existing) = projected.iter_mut().find(|existing| {
-                existing.source_id.is_none() &&
-                    existing.kind == candidate.kind &&
-                    existing.description == candidate.description
+                existing.source_id.is_none()
+                    && existing.kind == candidate.kind
+                    && existing.description == candidate.description
             }) {
                 existing.count = existing
                     .count
@@ -2255,30 +2376,30 @@ fn rendering_is_unsupported(rendering: &PendingPipelineRenderingObservation) -> 
     let unsupported_canvas = rendering
         .canvas
         .unsupported
-        .live_source_inventory_unavailable !=
-        0 ||
-        rendering.canvas.unsupported.offscreen_execution != 0 ||
-        rendering.canvas.unsupported.mutation_generation_unbound != 0;
-    let inactive_work = rendering.activity != PendingRenderingPipelineActivity::FullyActive &&
-        (rendering.runnable_animation_frame_callbacks != 0 ||
-            rendering.document_update_required ||
-            rendering.pending_animation_events != 0 ||
-            rendering.finite_animations != 0 ||
-            rendering.infinite_animations != 0 ||
-            rendering.animated_images.finite_images != 0 ||
-            rendering.animated_images.infinite_images != 0 ||
-            rendering.animated_images.update_ready ||
-            rendering.animated_images.scheduled_timer.is_some() ||
-            rendering.canvas.dirty_contexts != 0 ||
-            rendering.pending_fonts != 0 ||
-            rendering.pending_images != 0);
-    rendering.unsupported_animations != 0 ||
-        unsupported_images ||
-        unsupported_canvas ||
-        inactive_work ||
-        rendering.canvas.awaiting_async_upload ||
-        rendering.pending_fonts != 0 ||
-        rendering.pending_images != 0
+        .live_source_inventory_unavailable
+        != 0
+        || rendering.canvas.unsupported.offscreen_execution != 0
+        || rendering.canvas.unsupported.mutation_generation_unbound != 0;
+    let inactive_work = rendering.activity != PendingRenderingPipelineActivity::FullyActive
+        && (rendering.runnable_animation_frame_callbacks != 0
+            || rendering.document_update_required
+            || rendering.pending_animation_events != 0
+            || rendering.finite_animations != 0
+            || rendering.infinite_animations != 0
+            || rendering.animated_images.finite_images != 0
+            || rendering.animated_images.infinite_images != 0
+            || rendering.animated_images.update_ready
+            || rendering.animated_images.scheduled_timer.is_some()
+            || rendering.canvas.dirty_contexts != 0
+            || rendering.pending_fonts != 0
+            || rendering.pending_images != 0);
+    rendering.unsupported_animations != 0
+        || unsupported_images
+        || unsupported_canvas
+        || inactive_work
+        || rendering.canvas.awaiting_async_upload
+        || rendering.pending_fonts != 0
+        || rendering.pending_images != 0
 }
 
 fn unsupported_aggregate(
@@ -2320,9 +2441,10 @@ mod tests {
         PipelineNamespaceId, ScriptEventLoopId, WebViewId,
     };
     use timers::{
-        DocumentClock, DocumentClockConfiguration, DocumentProducerCheckpoint,
-        DocumentProducerFence, DocumentUnixTime, TimerDeadlineSnapshot, TimerEventRequest,
-        TimerScheduler,
+        DocumentClock, DocumentClockConfiguration, DocumentExecutionBudget,
+        DocumentExecutionCounters, DocumentExecutionLimits, DocumentExecutionObservation,
+        DocumentExecutionTerminal, DocumentProducerCheckpoint, DocumentProducerFence,
+        DocumentUnixTime, TimerDeadlineSnapshot, TimerEventRequest, TimerScheduler,
     };
 
     use super::*;
@@ -2396,6 +2518,12 @@ mod tests {
                 checkpoint_in_progress: false,
                 terminal: None,
             },
+            execution: Some(DocumentExecutionObservation {
+                clock_id: clock.id(),
+                limits: DocumentExecutionLimits::CONTROLLED_WEBAPP_V1,
+                counters: DocumentExecutionCounters::default(),
+                terminal: None,
+            }),
             producers: PendingProducerObservation::new(
                 event_loop_id,
                 microtask_checkpoint,
@@ -2455,9 +2583,8 @@ mod tests {
             assert!(serde_json::from_value::<ActionActivateParams>(invalid).is_err());
         }
 
-        let oversized_selector = "x".repeat(
-            usize::try_from(DocumentAutomationLimits::MVP.max_selector_bytes()).unwrap() + 1,
-        );
+        let oversized_selector = "x"
+            .repeat(usize::try_from(public_automation_limits().max_selector_bytes()).unwrap() + 1);
         let oversized: DomTextParams = serde_json::from_value(json!({
             "selector": oversized_selector,
             "expectedGeneration": "1",
@@ -2467,6 +2594,38 @@ mod tests {
             oversized.resolve(),
             Err(AutomationParamsError::InvalidOperation(
                 DocumentAutomationRequestError::SelectorTooLong { .. }
+            ))
+        ));
+
+        let maximum_fill = "\0"
+            .repeat(usize::try_from(public_automation_limits().max_fill_value_bytes()).unwrap());
+        let fill: ActionFillParams = serde_json::from_value(json!({
+            "selector": "#field",
+            "value": maximum_fill,
+            "expectedGeneration": "1",
+        }))
+        .unwrap();
+        let fill = fill.resolve().unwrap();
+        assert_eq!(fill.kind(), PublicAutomationKind::Fill);
+        assert!(matches!(
+            fill.operation,
+            DocumentAutomationOperation::Fill { ref selector, ref value }
+                if selector == "#field" &&
+                    value.len() == public_automation_limits().max_fill_value_bytes() as usize
+        ));
+
+        let oversized_fill: ActionFillParams = serde_json::from_value(json!({
+            "selector": "#field",
+            "value": "x".repeat(
+                usize::try_from(public_automation_limits().max_fill_value_bytes()).unwrap() + 1,
+            ),
+            "expectedGeneration": "1",
+        }))
+        .unwrap();
+        assert!(matches!(
+            oversized_fill.resolve(),
+            Err(AutomationParamsError::InvalidOperation(
+                DocumentAutomationRequestError::FillValueTooLong { .. }
             ))
         ));
     }
@@ -2536,7 +2695,7 @@ mod tests {
             .is_err()
         );
 
-        let too_many_fields: Vec<_> = (0..=DocumentAutomationLimits::MVP.max_extraction_fields())
+        let too_many_fields: Vec<_> = (0..=public_automation_limits().max_extraction_fields())
             .map(|index| {
                 json!({
                     "name": format!("field-{index}"),
@@ -2594,6 +2753,17 @@ mod tests {
         assert_eq!(
             serde_json::to_value(activated).unwrap(),
             json!({"stateGeneration": state_generation})
+        );
+
+        let filled = PublicAutomationResult::project(
+            PublicAutomationKind::Fill,
+            EngineDocumentAutomationResult::Filled,
+            &raw,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(filled).unwrap(),
+            json!({"stateGeneration": ABOVE_JS_SAFE_INTEGER.to_string()})
         );
 
         let queried = PublicAutomationResult::project(
@@ -2676,7 +2846,108 @@ mod tests {
                 EngineDocumentAutomationResult::Filled,
                 &raw,
             ),
-            Err(AutomationResultProjectionError::InternalOnlyResult)
+            Err(AutomationResultProjectionError::UnexpectedResult)
+        );
+    }
+
+    #[test]
+    fn worst_case_public_automation_frames_fit_the_protocol_budget() {
+        let limits = public_automation_limits();
+        let escaped_selector = "\0".repeat(limits.max_selector_bytes() as usize);
+        let escaped_fill = "\0".repeat(limits.max_fill_value_bytes() as usize);
+        let fill_request = json!({
+            "v": 1,
+            "type": "request",
+            "id": "18446744073709551615",
+            "sessionId": "s-1",
+            "method": "action.fill",
+            "params": {
+                "selector": escaped_selector,
+                "value": escaped_fill,
+                "expectedGeneration": u64::MAX.to_string(),
+            },
+        });
+        assert_frame_fits(&fill_request, "maximum escaped fill request");
+
+        let extraction_fields: Vec<_> = (0..limits.max_extraction_fields())
+            .map(|index| {
+                let prefix = index.to_string();
+                let name = format!(
+                    "{prefix}{}",
+                    "\0".repeat(limits.max_field_name_bytes() as usize - prefix.len()),
+                );
+                json!({
+                    "name": name,
+                    "selector": "\0".repeat(limits.max_selector_bytes() as usize),
+                    "read": "html",
+                })
+            })
+            .collect();
+        let extract_request = json!({
+            "v": 1,
+            "type": "request",
+            "id": "18446744073709551615",
+            "sessionId": "s-1",
+            "method": "dom.extract",
+            "params": {
+                "rootSelector": "\0".repeat(limits.max_selector_bytes() as usize),
+                "fields": extraction_fields,
+                "expectedGeneration": u64::MAX.to_string(),
+            },
+        });
+        assert_frame_fits(&extract_request, "maximum escaped extraction request");
+
+        let field_names: Vec<String> = (0..limits.max_extraction_fields())
+            .map(|index| format!("{index}\0"))
+            .collect();
+        let mut rows: Vec<_> = (0..limits.max_matches())
+            .map(|_| EngineDocumentExtractionRow {
+                fields: field_names
+                    .iter()
+                    .map(|name| EngineDocumentExtractionValue {
+                        name: name.clone(),
+                        value: "\0".repeat(55),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let logical_output_bytes: usize = rows
+            .iter()
+            .flat_map(|row| row.fields.iter())
+            .map(|field| field.name.len() + field.value.len())
+            .sum();
+        let remaining = limits.max_output_bytes() as usize - logical_output_bytes;
+        rows[0].fields[0].value.push_str(&"\0".repeat(remaining));
+        let logical_output_bytes: usize = rows
+            .iter()
+            .flat_map(|row| row.fields.iter())
+            .map(|field| field.name.len() + field.value.len())
+            .sum();
+        assert_eq!(logical_output_bytes, limits.max_output_bytes() as usize);
+        let result = PublicAutomationResult::project(
+            PublicAutomationKind::Extract,
+            EngineDocumentAutomationResult::Extract { rows },
+            &pending_fixture(),
+        )
+        .unwrap();
+        let extract_response = json!({
+            "v": 1,
+            "type": "response",
+            "wireSeq": u128::MAX.to_string(),
+            "id": "18446744073709551615",
+            "sessionId": "s-1",
+            "result": result,
+        });
+        assert_frame_fits(&extract_response, "maximum structured extraction response");
+    }
+
+    fn assert_frame_fits(frame: &serde_json::Value, label: &str) {
+        let encoded = serde_json::to_vec(frame).unwrap();
+        assert!(
+            encoded.len() + 1 <= PUBLIC_AUTOMATION_FRAME_BUDGET_BYTES,
+            "{label} encoded to {} bytes, exceeding the {}-byte frame budget",
+            encoded.len() + 1,
+            PUBLIC_AUTOMATION_FRAME_BUDGET_BYTES,
         );
     }
 
@@ -2771,9 +3042,9 @@ mod tests {
             .unwrap()
             .to_owned();
         assert!(
-            !surviving_id.is_empty() &&
-                surviving_id.bytes().all(|byte| byte.is_ascii_digit()) &&
-                (surviving_id == "0" || !surviving_id.starts_with('0'))
+            !surviving_id.is_empty()
+                && surviving_id.bytes().all(|byte| byte.is_ascii_digit())
+                && (surviving_id == "0" || !surviving_id.starts_with('0'))
         );
         assert_ne!(surviving_id, (ABOVE_JS_SAFE_INTEGER + 1).to_string());
 
@@ -2968,15 +3239,12 @@ mod tests {
         assert_eq!(settled["outcome"], "quiescent_with_persistent_work");
         assert_eq!(settled["wallTimeNs"], "22");
         assert_eq!(settled["processed"]["controlTurns"], "18");
-        assert_eq!(
-            settled["processed"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            ["controlTurns"]
-        );
+        let processed = settled["processed"].as_object().unwrap();
+        assert_eq!(processed.len(), 5);
+        assert_eq!(processed["tasks"], "0");
+        assert_eq!(processed["microtasks"], "0");
+        assert_eq!(processed["renderingOpportunities"], "0");
+        assert_eq!(processed["mutations"], "0");
         assert_eq!(settled["persistentWork"][0]["reason"], "interval");
         assert_eq!(
             settled["persistentWork"][0]["sourceId"],
@@ -3116,6 +3384,101 @@ mod tests {
     }
 
     #[test]
+    fn execution_limits_project_typed_outcomes_and_processed_counts() {
+        for (budget, outcome, kind, processed_key) in [
+            (
+                DocumentExecutionBudget::OrdinaryTasks,
+                "task_limit_exceeded",
+                "ordinary_tasks",
+                "tasks",
+            ),
+            (
+                DocumentExecutionBudget::Microtasks,
+                "microtask_limit_exceeded",
+                "microtasks",
+                "microtasks",
+            ),
+            (
+                DocumentExecutionBudget::RenderingOpportunities,
+                "rendering_limit_exceeded",
+                "rendering_opportunities",
+                "renderingOpportunities",
+            ),
+            (
+                DocumentExecutionBudget::MutationRecords,
+                "mutation_limit_exceeded",
+                "mutations",
+                "mutations",
+            ),
+        ] {
+            let mut raw = pending_fixture();
+            let mut limits = DocumentExecutionLimits {
+                ordinary_tasks: 100,
+                microtasks: 100,
+                rendering_opportunities: 100,
+                mutations: 100,
+            };
+            let mut counters = DocumentExecutionCounters::default();
+            match budget {
+                DocumentExecutionBudget::OrdinaryTasks => {
+                    limits.ordinary_tasks = 3;
+                    counters.ordinary_tasks = 3;
+                },
+                DocumentExecutionBudget::Microtasks => {
+                    limits.microtasks = 3;
+                    counters.microtasks = 3;
+                },
+                DocumentExecutionBudget::RenderingOpportunities => {
+                    limits.rendering_opportunities = 3;
+                    counters.rendering_opportunities = 3;
+                },
+                DocumentExecutionBudget::MutationRecords => {
+                    limits.mutations = 3;
+                    counters.mutations = 4;
+                },
+            }
+            raw.execution = Some(DocumentExecutionObservation {
+                clock_id: raw.clock.clock_id,
+                limits,
+                counters,
+                terminal: Some(DocumentExecutionTerminal::BudgetExceeded {
+                    budget,
+                    limit: 3,
+                    observed: 4,
+                }),
+            });
+            raw.validate().unwrap();
+
+            let mut context = WireProjectionContext::new();
+            let projected = RuntimeSettleResult::project(
+                SettleCompletion::ExecutionLimitExceeded {
+                    pending: Box::new(raw),
+                    budget,
+                    limit: 3,
+                    observed: 4,
+                    control_turns: 2,
+                },
+                Duration::from_nanos(9),
+                RuntimeSettleParams::default()
+                    .resolve(EngineSettlePolicy::default())
+                    .unwrap(),
+                &mut context,
+            );
+            let projected = serde_json::to_value(projected).unwrap();
+            assert_eq!(projected["outcome"], outcome);
+            assert_eq!(projected["limit"]["kind"], kind);
+            assert_eq!(projected["limit"]["limit"], "3");
+            assert_eq!(projected["limit"]["observed"], "4");
+            let processed = if budget == DocumentExecutionBudget::MutationRecords {
+                "4"
+            } else {
+                "3"
+            };
+            assert_eq!(projected["processed"][processed_key], processed);
+        }
+    }
+
+    #[test]
     fn golden_projection_never_exposes_engine_authority_or_urls() {
         let raw = pending_fixture();
         let mut context = WireProjectionContext::new();
@@ -3168,8 +3531,8 @@ mod tests {
                         assert!(
                             !authority_fragments
                                 .iter()
-                                .any(|fragment| normalized.contains(fragment)) &&
-                                !normalized.contains("url"),
+                                .any(|fragment| normalized.contains(fragment))
+                                && !normalized.contains("url"),
                             "forbidden wire field {key}"
                         );
                         audit(child);
@@ -3202,5 +3565,168 @@ mod tests {
         for result in [&pending, &settled, &value] {
             audit(result);
         }
+    }
+
+    #[test]
+    fn controlled_webapp_profile_matches_engine_wire_limits_and_outcomes() {
+        let profile: Value =
+            serde_json::from_str(include_str!("../../../profiles/controlled-webapp-v1.json"))
+                .unwrap();
+        assert_eq!(profile["schemaVersion"], 1);
+        assert_eq!(profile["id"], "controlled-webapp-v1");
+        assert_eq!(profile["clockMode"], "controlled");
+        assert_eq!(
+            profile["documentScope"],
+            json!({
+                "webViews": 1,
+                "activeTopLevelDocuments": 1,
+                "scriptEventLoops": 1,
+                "childBrowsingContexts": "unsupported",
+                "auxiliaryWebViews": "unsupported",
+            })
+        );
+        assert_eq!(
+            profile["navigation"],
+            json!({
+                "initial": {"schemes": ["http", "https"], "fetchBacked": true},
+                "applicationTopLevel": {
+                    "sameOriginHttpHttps": "unsupported",
+                    "crossEventLoop": "unsupported",
+                },
+                "explicitNavigateMethod": false,
+            })
+        );
+        assert_eq!(
+            profile["selectors"],
+            json!({
+                "grammar": "local_compound_v1",
+                "supportedComponents": ["type", "universal", "id", "class", "attribute"],
+                "namedNamespacePrefixes": false,
+                "combinators": false,
+                "pseudoClasses": false,
+                "persistentHandles": false,
+            })
+        );
+        assert_eq!(
+            profile["automation"],
+            json!({
+                "fill": {
+                    "elements": [
+                        "input:text", "input:search", "input:url", "input:tel",
+                        "input:email", "input:password", "textarea",
+                    ],
+                    "effect": "replace_value_then_one_input_event",
+                    "inputType": "insertReplacementText",
+                    "focus": false,
+                    "keyboardEvents": false,
+                    "changeEvent": false,
+                },
+                "activate": {
+                    "effect": "html_element_click",
+                    "layoutHitTesting": false,
+                    "pointerEvents": false,
+                },
+            })
+        );
+        assert_eq!(
+            profile["inspection"],
+            json!({
+                "generationBound": true,
+                "operations": ["query_count", "text", "extract_text", "extract_html"],
+            })
+        );
+        assert_eq!(
+            profile["execution"],
+            json!({
+                "tasks": true,
+                "microtasks": true,
+                "mutationObserver": true,
+                "oneShotTimers": "controlled",
+                "intervals": "persistent_work",
+                "finiteRendering": true,
+                "animationFrame": true,
+                "date": true,
+                "performance": true,
+            })
+        );
+
+        let automation = public_automation_limits();
+        assert_eq!(
+            profile["automationLimits"],
+            json!({
+                "maxSelectorBytes": automation.max_selector_bytes(),
+                "maxFillValueBytes": automation.max_fill_value_bytes(),
+                "maxFieldNameBytes": automation.max_field_name_bytes(),
+                "maxExtractionFields": automation.max_extraction_fields(),
+                "maxMatches": automation.max_matches(),
+                "maxDomNodesVisited": automation.max_dom_nodes_visited(),
+                "maxOutputBytes": automation.max_output_bytes(),
+            })
+        );
+
+        let execution = DocumentExecutionLimits::CONTROLLED_WEBAPP_V1;
+        assert_eq!(
+            profile["executionLimits"],
+            json!({
+                "ordinaryTasks": execution.ordinary_tasks,
+                "microtasks": execution.microtasks,
+                "renderingOpportunities": execution.rendering_opportunities,
+                "mutations": execution.mutations,
+            })
+        );
+
+        let outcomes = [
+            SettleOutcome::Quiescent,
+            SettleOutcome::QuiescentWithPersistentWork,
+            SettleOutcome::BlockedOnExternalIo,
+            SettleOutcome::BlockedOnOpenEndedWork,
+            SettleOutcome::UnsupportedWork,
+            SettleOutcome::VirtualTimeLimitExceeded,
+            SettleOutcome::TaskLimitExceeded,
+            SettleOutcome::MicrotaskLimitExceeded,
+            SettleOutcome::RenderingLimitExceeded,
+            SettleOutcome::MutationLimitExceeded,
+            SettleOutcome::ControlTurnLimitExceeded,
+            SettleOutcome::RuntimeError,
+        ];
+        assert_eq!(
+            profile["settlementOutcomes"],
+            serde_json::to_value(outcomes).unwrap()
+        );
+        assert_eq!(
+            profile["network"],
+            json!({
+                "fetch": "asynchronous",
+                "xmlHttpRequest": "asynchronous",
+                "synchronousXmlHttpRequest": "rejected_before_start",
+                "externalIoTimeout": "typed_blocker",
+                "reproducibility": "local_or_intercepted_fixture_only",
+            })
+        );
+        assert_eq!(profile["unsupportedRetention"], "first_per_authority");
+        assert_eq!(
+            profile["unsupportedClasses"],
+            json!({
+                "iframe": ["same_event_loop_iframe", "cross_event_loop_iframe"],
+                "applicationTopLevelNavigation": "cross_event_loop_navigation",
+                "worker": "worker",
+                "worklet": "worklet",
+                "auxiliaryWebView": "auxiliary_web_view",
+                "webSocketAndServerSentEvents": "external_subscription",
+                "externalChannels": "external_subscription",
+                "storageAndUntrackedResourceIo": "resource_thread_io",
+                "media": "native_media",
+                "embedderControls": "embedder_control",
+                "hostTimestamp": "host_timestamp",
+            })
+        );
+        assert_eq!(
+            profile["determinismExcludes"],
+            json!([
+                "live_network",
+                "uncontrolled_randomness",
+                "ambient_system_state"
+            ])
+        );
     }
 }

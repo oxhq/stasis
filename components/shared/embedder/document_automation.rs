@@ -492,6 +492,8 @@ pub enum DocumentAutomationOperationKind {
 pub enum DocumentAutomationError {
     InvalidRequest(DocumentAutomationRequestError),
     TargetChanged,
+    /// A sticky execution terminal was already authoritative before a requested mutation.
+    ExecutionTerminated,
     StaleStateGeneration {
         expected: RuntimeStateGeneration,
         observed: RuntimeStateGeneration,

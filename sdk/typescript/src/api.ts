@@ -2,28 +2,39 @@ import { readFileSync } from "node:fs";
 
 import { StasisAbortError, StasisProcessError, StasisStateError } from "./errors.js";
 import { ProtocolClient } from "./protocol.js";
+import { assertManagedRuntimeIdentity, resolveRuntimeExecutable } from "./runtime-resolver.js";
+import { CONTROLLED_WEBAPP_V1_PROFILE, type SupportProfile } from "./profile.js";
 import {
   METHOD,
   decodeActivation,
   decodeAdvanceToNext,
   decodeClose,
   decodeEvaluation,
+  decodeExtract,
+  decodeFill,
   decodeOpenResult,
   decodePending,
+  decodeQuery,
   decodeRuntimeInfo,
   decodeSettle,
   decodeText,
   encodeDocumentTargetParams,
+  encodeExtractParams,
+  encodeFillParams,
   encodeOpenParams,
   encodeSettleParams,
   type OpenResult,
 } from "./wire.js";
 import type {
   AdvanceToNextResult,
+  AutomationMutationResult,
   CommandOptions,
+  ExtractPlan,
+  ExtractResult,
   LaunchOptions,
   OpenOptions,
   PendingSnapshot,
+  QueryResult,
   RuntimeInfo,
   SettlePolicy,
   SettleResult,
@@ -32,14 +43,13 @@ import type {
 const DEFAULT_MAX_STDERR_BYTES = 64 * 1024;
 const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
 const DEFAULT_CLOSE_TIMEOUT_MS = 30_000;
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+const MAX_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const SDK_VERSION = readPackageVersion();
 
 type RuntimeState = "ready" | "opening" | "open" | "closed";
 
-export async function launch(options: LaunchOptions): Promise<Runtime> {
-  if (typeof options.executablePath !== "string" || options.executablePath.length === 0) {
-    throw new TypeError("executablePath must be a non-empty string");
-  }
+export async function launch(options: LaunchOptions = {}): Promise<Runtime> {
   if (options.signal?.aborted === true) {
     throw new StasisAbortError(options.signal.reason);
   }
@@ -53,22 +63,41 @@ export async function launch(options: LaunchOptions): Promise<Runtime> {
     "maxFrameBytes",
     false,
   );
-  const closeTimeoutMs = boundedSize(
+  const closeTimeoutMs = boundedTimeoutMs(
     options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS,
     "closeTimeoutMs",
-    false,
   );
+  const commandTimeoutMs = boundedTimeoutMs(
+    options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
+    "commandTimeoutMs",
+  );
+  const managedRuntime = options.executablePath === undefined;
+  let executablePath: string;
+  if (managedRuntime) {
+    executablePath = await resolveRuntimeExecutable(SDK_VERSION, {
+      ...(options.runtimeCacheDirectory === undefined
+        ? {}
+        : { cacheDirectory: options.runtimeCacheDirectory }),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
+  } else {
+    if (typeof options.executablePath !== "string" || options.executablePath.length === 0) {
+      throw new TypeError("executablePath must be a non-empty string when provided");
+    }
+    executablePath = options.executablePath;
+  }
 
   let client: ProtocolClient;
   try {
     client = ProtocolClient.spawn({
-      executablePath: options.executablePath,
+      executablePath,
       args: options.args ?? [],
       ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
       ...(options.env === undefined ? {} : { env: options.env }),
       maxStderrBytes,
       maxFrameBytes,
       closeTimeoutMs,
+      commandTimeoutMs,
     });
   } catch (error) {
     throw new StasisProcessError("Could not spawn Stasis", "", null, null, { cause: error });
@@ -81,10 +110,15 @@ export async function launch(options: LaunchOptions): Promise<Runtime> {
       {
         sessionId: null,
         expectedResponseSessionId: null,
+        timeoutStateEffect: "none",
+        ...(options.timeoutMs === undefined
+          ? {}
+          : { timeoutMs: boundedTimeoutMs(options.timeoutMs, "timeoutMs") }),
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       },
       decodeRuntimeInfo,
     );
+    if (managedRuntime) assertManagedRuntimeIdentity(SDK_VERSION, result);
     return Runtime.create(client, result);
   } catch (error) {
     await client.terminate().catch(() => undefined);
@@ -121,22 +155,38 @@ export class Runtime {
     }
     this.#state = "opening";
     try {
-      const params = encodeOpenParams(url, options.clock);
+      const params = encodeOpenParams(url, options.clock, options.profile);
       const expectedClockMode = params.clockMode === "controlled" ? "controlled" : "real";
+      const expectedProfile =
+        expectedClockMode === "controlled" ? CONTROLLED_WEBAPP_V1_PROFILE : null;
+      if (
+        expectedProfile !== null &&
+        !this.info.capabilities.profiles.includes(expectedProfile)
+      ) {
+        throw new StasisStateError(
+          `The Stasis runtime did not advertise profile ${expectedProfile}`,
+          this.stderrTail,
+        );
+      }
       const response = await this.#client.request(
         METHOD.open,
         params,
         {
           sessionId: null,
           expectedResponseSessionId: "<open>",
+          timeoutStateEffect: "indeterminate",
+          ...(options.timeoutMs === undefined
+            ? {}
+            : { timeoutMs: boundedTimeoutMs(options.timeoutMs, "timeoutMs") }),
           ...(options.signal === undefined ? {} : { signal: options.signal }),
         },
-        (value, sessionId) => decodeOpenResult(value, sessionId, expectedClockMode),
+        (value, sessionId) =>
+          decodeOpenResult(value, sessionId, expectedClockMode, expectedProfile),
       );
       this.#state = "open";
       return App.create(this, this.#client, response.result);
     } catch (error) {
-      this.#state = "ready";
+      this.#state = this.#client.isUsable ? "ready" : "closed";
       throw error;
     }
   }
@@ -163,6 +213,7 @@ export class App {
   readonly url: string;
   readonly boundary: "load_complete" | "controlled_ready";
   readonly clockMode: "real" | "controlled";
+  readonly profile: SupportProfile | null;
 
   private constructor(runtime: Runtime, client: ProtocolClient, open: OpenResult) {
     this.#runtime = runtime;
@@ -172,6 +223,7 @@ export class App {
     this.url = open.url;
     this.boundary = open.boundary;
     this.clockMode = open.clockMode;
+    this.profile = open.profile;
   }
 
   /** @internal */
@@ -189,7 +241,7 @@ export class App {
     const { result } = await this.#client.request(
       METHOD.evaluate,
       { expression },
-      this.#requestOptions(options),
+      this.#requestOptions(options, "indeterminate"),
       decodeEvaluation,
     );
     return result;
@@ -200,16 +252,51 @@ export class App {
     selector: string,
     expectedGeneration: bigint,
     options: CommandOptions = {},
-  ): Promise<void> {
+  ): Promise<AutomationMutationResult> {
     this.#assertOpen();
     this.#assertMethod(METHOD.activate);
     const { result } = await this.#client.request(
       METHOD.activate,
       encodeDocumentTargetParams(selector, expectedGeneration),
-      this.#requestOptions(options),
+      this.#requestOptions(options, "indeterminate"),
       decodeActivation,
     );
-    void result;
+    return result;
+  }
+
+  /** Replace the value of the exact-one supported form control matched by a native CSS selector. */
+  async fill(
+    selector: string,
+    value: string,
+    expectedGeneration: bigint,
+    options: CommandOptions = {},
+  ): Promise<AutomationMutationResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.fill);
+    const { result } = await this.#client.request(
+      METHOD.fill,
+      encodeFillParams(selector, value, expectedGeneration),
+      this.#requestOptions(options, "indeterminate"),
+      decodeFill,
+    );
+    return result;
+  }
+
+  /** Count selector matches without creating persistent DOM handles. */
+  async query(
+    selector: string,
+    expectedGeneration: bigint,
+    options: CommandOptions = {},
+  ): Promise<QueryResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.query);
+    const { result } = await this.#client.request(
+      METHOD.query,
+      encodeDocumentTargetParams(selector, expectedGeneration),
+      this.#requestOptions(options, "none"),
+      decodeQuery,
+    );
+    return result;
   }
 
   /** Read raw textContent from the exact-one element matched by a native CSS selector. */
@@ -223,8 +310,25 @@ export class App {
     const { result } = await this.#client.request(
       METHOD.text,
       encodeDocumentTargetParams(selector, expectedGeneration),
-      this.#requestOptions(options),
+      this.#requestOptions(options, "none"),
       decodeText,
+    );
+    return result;
+  }
+
+  /** Extract ordered text/HTML fields from every root matched by a native CSS selector. */
+  async extract(
+    plan: ExtractPlan,
+    expectedGeneration: bigint,
+    options: CommandOptions = {},
+  ): Promise<ExtractResult> {
+    this.#assertOpen();
+    this.#assertMethod(METHOD.extract);
+    const { result } = await this.#client.request(
+      METHOD.extract,
+      encodeExtractParams(plan, expectedGeneration),
+      this.#requestOptions(options, "none"),
+      decodeExtract,
     );
     return result;
   }
@@ -234,7 +338,7 @@ export class App {
     const { result } = await this.#client.request(
       METHOD.pending,
       {},
-      this.#requestOptions(options),
+      this.#requestOptions(options, "none"),
       decodePending,
     );
     return result;
@@ -246,7 +350,7 @@ export class App {
     const { result } = await this.#client.request(
       METHOD.settle,
       params,
-      this.#requestOptions(options),
+      this.#requestOptions(options, "indeterminate"),
       decodeSettle,
     );
     return result;
@@ -257,7 +361,7 @@ export class App {
     const { result } = await this.#client.request(
       METHOD.advanceToNext,
       {},
-      this.#requestOptions(options),
+      this.#requestOptions(options, "indeterminate"),
       decodeAdvanceToNext,
     );
     return result;
@@ -275,7 +379,7 @@ export class App {
         METHOD.close,
         {},
         {
-          ...this.#requestOptions(options),
+          ...this.#requestOptions(options, "indeterminate"),
           terminatesProcess: true,
         },
         (value) => {
@@ -306,17 +410,33 @@ export class App {
     }
   }
 
-  #requestOptions(options: CommandOptions): {
+  #requestOptions(
+    options: CommandOptions,
+    timeoutStateEffect: "none" | "indeterminate",
+  ): {
     sessionId: string;
     expectedResponseSessionId: string;
     signal?: AbortSignal;
+    timeoutMs?: number;
+    timeoutStateEffect: "none" | "indeterminate";
   } {
     return {
       sessionId: this.#sessionId,
       expectedResponseSessionId: this.#sessionId,
+      timeoutStateEffect,
       ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...(options.timeoutMs === undefined
+        ? {}
+        : { timeoutMs: boundedTimeoutMs(options.timeoutMs, "timeoutMs") }),
     };
   }
+}
+
+function boundedTimeoutMs(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_TIMEOUT_MS) {
+    throw new RangeError(`${label} must be a safe integer between 1 and ${MAX_TIMEOUT_MS} ms`);
+  }
+  return value;
 }
 
 function boundedSize(value: number, label: string, allowZero: boolean): number {

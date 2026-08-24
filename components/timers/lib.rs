@@ -12,12 +12,283 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, after, never};
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
+
+/// Immutable execution limits for one controlled document-clock domain.
+///
+/// These counters observe work at engine-owned hooks. Pre-work classes can be rejected at
+/// admission; mutation-record accounting is non-rejecting. CPU and host wall time require an
+/// interrupt/watchdog boundary and are intentionally not represented here.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub struct DocumentExecutionLimits {
+    /// Ordinary controlled event-loop turns that may begin.
+    pub ordinary_tasks: u64,
+    /// Individual microtask jobs that may begin.
+    pub microtasks: u64,
+    /// Rendering opportunities that may begin.
+    pub rendering_opportunities: u64,
+    /// Calls to Servo's central DOM mutation-record hook.
+    pub mutations: u64,
+}
+
+impl DocumentExecutionLimits {
+    /// Version-1 defaults for a controlled single-document web application.
+    pub const CONTROLLED_WEBAPP_V1: Self = Self {
+        ordinary_tasks: 100_000,
+        microtasks: 1_000_000,
+        rendering_opportunities: 10_000,
+        mutations: 1_000_000,
+    };
+}
+
+/// A controlled execution counter with a policy limit.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub enum DocumentExecutionBudget {
+    /// Ordinary controlled event-loop turns.
+    OrdinaryTasks,
+    /// Individual jobs removed from a microtask queue.
+    Microtasks,
+    /// Invocations of the HTML update-the-rendering algorithm.
+    RenderingOpportunities,
+    /// Calls to the central DOM mutation-record hook.
+    MutationRecords,
+}
+
+/// A controlled execution counter retained as exact evidence.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub enum DocumentExecutionCounter {
+    /// Ordinary controlled event-loop turns.
+    OrdinaryTasks,
+    /// Individual jobs removed from a microtask queue.
+    Microtasks,
+    /// Invocations of the HTML update-the-rendering algorithm.
+    RenderingOpportunities,
+    /// Calls to the central DOM mutation-record hook.
+    MutationRecords,
+}
+
+/// The first terminal execution failure latched for one controlled session.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub enum DocumentExecutionTerminal {
+    /// Starting or observing another unit would exceed its configured limit.
+    BudgetExceeded {
+        /// Work class whose policy boundary was reached.
+        budget: DocumentExecutionBudget,
+        /// Configured maximum.
+        limit: u64,
+        /// One-based unit rejected before work, or non-rejecting record observed beyond its limit.
+        observed: u64,
+    },
+    /// An evidence counter exhausted its exact integer representation.
+    CounterOverflow(DocumentExecutionCounter),
+}
+
+/// Exact counters retained by one controlled execution ledger.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub struct DocumentExecutionCounters {
+    /// Ordinary event-loop turns admitted before work.
+    pub ordinary_tasks: u64,
+    /// Individual microtask jobs admitted before work.
+    pub microtasks: u64,
+    /// Rendering opportunities admitted before work.
+    pub rendering_opportunities: u64,
+    /// Invocations of the central DOM mutation-record hook.
+    pub mutations: u64,
+}
+
+/// One mutex-consistent observation of controlled execution policy and use.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub struct DocumentExecutionObservation {
+    /// Stable owner identity for the document-clock/session domain whose work was counted.
+    pub clock_id: DocumentClockId,
+    /// Immutable limits installed before navigation.
+    pub limits: DocumentExecutionLimits,
+    /// Counters frozen when the first terminal failure is latched.
+    pub counters: DocumentExecutionCounters,
+    /// Sticky first failure, if a budget or representation boundary was reached.
+    pub terminal: Option<DocumentExecutionTerminal>,
+}
+
+#[derive(Debug)]
+struct DocumentExecutionLedgerState {
+    clock_id: DocumentClockId,
+    limits: DocumentExecutionLimits,
+    counters: DocumentExecutionCounters,
+    terminal: Option<DocumentExecutionTerminal>,
+}
+
+/// A clonable, session-scoped ledger shared by controlled ScriptThread work hooks.
+#[derive(Clone, Debug, MallocSizeOf)]
+pub struct DocumentExecutionLedger {
+    #[ignore_malloc_size_of = "The execution ledger is shared and measured by its owner"]
+    inner: Arc<Mutex<DocumentExecutionLedgerState>>,
+}
+
+/// Proof that one execution ledger was nonterminal when this guard was acquired.
+///
+/// The ledger lock remains held for the guard's lifetime, so a concurrent execution hook cannot
+/// latch a terminal between a guarded precondition check and its engine-owned mutation.
+#[derive(Debug)]
+pub struct DocumentExecutionActiveGuard<'a> {
+    _state: MutexGuard<'a, DocumentExecutionLedgerState>,
+}
+
+impl DocumentExecutionLedger {
+    /// Create an empty ledger with immutable limits.
+    pub fn new(clock_id: DocumentClockId, limits: DocumentExecutionLimits) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(DocumentExecutionLedgerState {
+                clock_id,
+                limits,
+                counters: DocumentExecutionCounters::default(),
+                terminal: None,
+            })),
+        }
+    }
+
+    /// Capture policy, counters, and the sticky first terminal failure under one lock.
+    pub fn observation(&self) -> DocumentExecutionObservation {
+        let state = self
+            .inner
+            .lock()
+            .expect("document execution ledger poisoned");
+        DocumentExecutionObservation {
+            clock_id: state.clock_id,
+            limits: state.limits,
+            counters: state.counters,
+            terminal: state.terminal,
+        }
+    }
+
+    /// Lock this ledger only if it has not reached a terminal boundary.
+    ///
+    /// Keep the returned guard alive across the engine mutation that the terminal check protects.
+    pub fn active_guard(
+        &self,
+    ) -> Result<DocumentExecutionActiveGuard<'_>, DocumentExecutionTerminal> {
+        let state = self
+            .inner
+            .lock()
+            .expect("document execution ledger poisoned");
+        if let Some(terminal) = state.terminal {
+            return Err(terminal);
+        }
+        Ok(DocumentExecutionActiveGuard { _state: state })
+    }
+
+    /// Admit one ordinary event-loop turn before any of its work runs.
+    pub fn begin_ordinary_task(&self) -> Result<(), DocumentExecutionTerminal> {
+        self.begin_budgeted(DocumentExecutionBudget::OrdinaryTasks)
+    }
+
+    /// Admit one microtask before invoking its job.
+    pub fn begin_microtask(&self) -> Result<(), DocumentExecutionTerminal> {
+        self.begin_budgeted(DocumentExecutionBudget::Microtasks)
+    }
+
+    /// Admit one rendering opportunity before invoking update-the-rendering.
+    pub fn begin_rendering_opportunity(&self) -> Result<(), DocumentExecutionTerminal> {
+        self.begin_budgeted(DocumentExecutionBudget::RenderingOpportunities)
+    }
+
+    /// Record one invocation of Servo's central DOM mutation-record hook.
+    ///
+    /// This is deliberately non-rejecting accounting: the observed record is included before the
+    /// limit comparison, and a breach latches failure without suppressing or rolling back the DOM
+    /// algorithm. Servo call sites do not all place this record hook on the same side of the
+    /// underlying write, so this layer does not claim a universal post-write mutation generation.
+    pub fn record_mutation_record(&self) {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("document execution ledger poisoned");
+        if state.terminal.is_some() {
+            return;
+        }
+        let Some(observed) = state.counters.mutations.checked_add(1) else {
+            state.terminal = Some(DocumentExecutionTerminal::CounterOverflow(
+                DocumentExecutionCounter::MutationRecords,
+            ));
+            return;
+        };
+        state.counters.mutations = observed;
+        let limit = state.limits.mutations;
+        if observed > limit {
+            state.terminal = Some(DocumentExecutionTerminal::BudgetExceeded {
+                budget: DocumentExecutionBudget::MutationRecords,
+                limit,
+                observed,
+            });
+        }
+    }
+
+    fn begin_budgeted(
+        &self,
+        budget: DocumentExecutionBudget,
+    ) -> Result<(), DocumentExecutionTerminal> {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("document execution ledger poisoned");
+        if let Some(terminal) = state.terminal {
+            return Err(terminal);
+        }
+        let (current, limit, counter_kind) = match budget {
+            DocumentExecutionBudget::OrdinaryTasks => (
+                state.counters.ordinary_tasks,
+                state.limits.ordinary_tasks,
+                DocumentExecutionCounter::OrdinaryTasks,
+            ),
+            DocumentExecutionBudget::Microtasks => (
+                state.counters.microtasks,
+                state.limits.microtasks,
+                DocumentExecutionCounter::Microtasks,
+            ),
+            DocumentExecutionBudget::RenderingOpportunities => (
+                state.counters.rendering_opportunities,
+                state.limits.rendering_opportunities,
+                DocumentExecutionCounter::RenderingOpportunities,
+            ),
+            DocumentExecutionBudget::MutationRecords => unreachable!(
+                "mutation records use non-rejecting accounting rather than pre-work admission"
+            ),
+        };
+        let Some(observed) = current.checked_add(1) else {
+            let terminal = DocumentExecutionTerminal::CounterOverflow(counter_kind);
+            state.terminal = Some(terminal);
+            return Err(terminal);
+        };
+        if observed > limit {
+            let terminal = DocumentExecutionTerminal::BudgetExceeded {
+                budget,
+                limit,
+                observed,
+            };
+            state.terminal = Some(terminal);
+            return Err(terminal);
+        }
+        match budget {
+            DocumentExecutionBudget::OrdinaryTasks => {
+                state.counters.ordinary_tasks = observed;
+            },
+            DocumentExecutionBudget::Microtasks => {
+                state.counters.microtasks = observed;
+            },
+            DocumentExecutionBudget::RenderingOpportunities => {
+                state.counters.rendering_opportunities = observed;
+            },
+            DocumentExecutionBudget::MutationRecords => unreachable!(
+                "mutation records use non-rejecting accounting rather than pre-work admission"
+            ),
+        }
+        Ok(())
+    }
+}
 
 /// A callback to pass to the [`TimerScheduler`] to be called when the timer is
 /// dispatched.
@@ -187,8 +458,8 @@ fn checked_javascript_date_time_microseconds(
     for anchor in [exact_candidate_microseconds, millisecond_anchor] {
         for candidate in [anchor, f64_next_down(anchor), f64_next_up(anchor)] {
             let observed_time_clip = simulated_javascript_date_time_clip(candidate);
-            if !observed_time_clip.is_finite() ||
-                observed_time_clip as i128 != expected_milliseconds
+            if !observed_time_clip.is_finite()
+                || observed_time_clip as i128 != expected_milliseconds
             {
                 continue;
             }
@@ -704,15 +975,15 @@ impl DocumentClock {
     /// this clock. Declaring a future surface early would let a controlled page leak host time
     /// without leaving fail-closed evidence.
     pub fn require_surface(&self, surface: DocumentTimeSurface) -> Result<(), DocumentClockError> {
-        if !self.is_controlled() ||
-            matches!(
+        if !self.is_controlled()
+            || matches!(
                 surface,
-                DocumentTimeSurface::WindowTimers |
-                    DocumentTimeSurface::JavaScriptDate |
-                    DocumentTimeSurface::Performance |
-                    DocumentTimeSurface::UpdateRendering |
-                    DocumentTimeSurface::AnimationFrame |
-                    DocumentTimeSurface::DocumentTimeline
+                DocumentTimeSurface::WindowTimers
+                    | DocumentTimeSurface::JavaScriptDate
+                    | DocumentTimeSurface::Performance
+                    | DocumentTimeSurface::UpdateRendering
+                    | DocumentTimeSurface::AnimationFrame
+                    | DocumentTimeSurface::DocumentTimeline
             )
         {
             Ok(())
@@ -1330,8 +1601,8 @@ impl DocumentProducerObserver {
         if checkpoint == DocumentProducerCheckpoint::ZERO {
             return Err(DocumentProducerFenceError::CheckpointNotCompleted);
         }
-        if let Some(previous) = self.last_checkpoint &&
-            checkpoint <= previous
+        if let Some(previous) = self.last_checkpoint
+            && checkpoint <= previous
         {
             return Err(DocumentProducerFenceError::StaleCheckpoint {
                 previous,
@@ -1857,6 +2128,114 @@ mod tests {
             initial_time_ns,
             unix_time_origin_ns: DocumentUnixTime::default(),
         })
+    }
+
+    fn execution_limits() -> DocumentExecutionLimits {
+        DocumentExecutionLimits {
+            ordinary_tasks: 2,
+            microtasks: 3,
+            rendering_opportunities: 1,
+            mutations: 1,
+        }
+    }
+
+    fn execution_ledger() -> DocumentExecutionLedger {
+        let clock = controlled_clock(0);
+        DocumentExecutionLedger::new(clock.id(), execution_limits())
+    }
+
+    #[test]
+    fn execution_ledger_starts_empty_and_round_trips_its_observation() {
+        let clock = controlled_clock(0);
+        let ledger = DocumentExecutionLedger::new(clock.id(), execution_limits());
+        let observation = DocumentExecutionObservation {
+            clock_id: clock.id(),
+            limits: execution_limits(),
+            counters: DocumentExecutionCounters::default(),
+            terminal: None,
+        };
+
+        assert_eq!(ledger.observation(), observation);
+        assert_postcard_round_trip(observation);
+    }
+
+    #[test]
+    fn prework_budget_latches_first_breach_without_counting_the_rejected_unit() {
+        let ledger = execution_ledger();
+        assert!(ledger.begin_ordinary_task().is_ok());
+        assert!(ledger.begin_ordinary_task().is_ok());
+
+        let first = ledger.begin_ordinary_task().unwrap_err();
+        assert_eq!(
+            first,
+            DocumentExecutionTerminal::BudgetExceeded {
+                budget: DocumentExecutionBudget::OrdinaryTasks,
+                limit: 2,
+                observed: 3,
+            }
+        );
+        assert_eq!(ledger.begin_microtask(), Err(first));
+        assert_eq!(ledger.begin_rendering_opportunity(), Err(first));
+        assert_eq!(ledger.active_guard().unwrap_err(), first);
+        assert_eq!(
+            ledger.observation().counters,
+            DocumentExecutionCounters {
+                ordinary_tasks: 2,
+                ..DocumentExecutionCounters::default()
+            }
+        );
+        assert_eq!(ledger.observation().terminal, Some(first));
+    }
+
+    #[test]
+    fn each_prework_class_counts_only_admitted_units() {
+        let ledger = execution_ledger();
+        for _ in 0..execution_limits().microtasks {
+            ledger.begin_microtask().unwrap();
+        }
+        assert_eq!(
+            ledger.begin_microtask(),
+            Err(DocumentExecutionTerminal::BudgetExceeded {
+                budget: DocumentExecutionBudget::Microtasks,
+                limit: 3,
+                observed: 4,
+            })
+        );
+        assert_eq!(ledger.observation().counters.microtasks, 3);
+
+        let ledger = execution_ledger();
+        ledger.begin_rendering_opportunity().unwrap();
+        assert_eq!(
+            ledger.begin_rendering_opportunity(),
+            Err(DocumentExecutionTerminal::BudgetExceeded {
+                budget: DocumentExecutionBudget::RenderingOpportunities,
+                limit: 1,
+                observed: 2,
+            })
+        );
+        assert_eq!(ledger.observation().counters.rendering_opportunities, 1);
+    }
+
+    #[test]
+    fn mutation_breach_counts_the_nonrejecting_over_limit_record() {
+        let ledger = execution_ledger();
+        ledger.record_mutation_record();
+        assert_eq!(ledger.observation().terminal, None);
+
+        ledger.record_mutation_record();
+        assert_eq!(ledger.observation().counters.mutations, 2);
+        assert_eq!(
+            ledger.observation().terminal,
+            Some(DocumentExecutionTerminal::BudgetExceeded {
+                budget: DocumentExecutionBudget::MutationRecords,
+                limit: 1,
+                observed: 2,
+            })
+        );
+
+        // The first terminal freezes every counter, including non-rejecting evidence.
+        ledger.record_mutation_record();
+        assert_eq!(ledger.observation().counters.mutations, 2);
     }
 
     fn recording_request(

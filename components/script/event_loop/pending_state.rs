@@ -31,9 +31,9 @@ use embedder_traits::document_pending::{
 };
 use servo_base::id::{MessagePortId, PipelineId, ScriptEventLoopId, WebViewId};
 use timers::{
-    DocumentProducerCheckpoint, DocumentProducerFenceId, DocumentProducerKind,
-    DocumentProducerObservation, DocumentProducerSnapshot, DocumentTime, TimerControlError,
-    TimerDeadlineSnapshot,
+    DocumentExecutionObservation, DocumentProducerCheckpoint, DocumentProducerFenceId,
+    DocumentProducerKind, DocumentProducerObservation, DocumentProducerSnapshot, DocumentTime,
+    TimerControlError, TimerDeadlineSnapshot,
 };
 
 use super::pending_network::{
@@ -79,11 +79,11 @@ impl PendingLogicalTimerFacts {
             PendingLogicalTimerKind::EventSourceReconnect => {
                 PendingSourceDisposition::OpenEnded(PendingOpenEndedSourceReason::EventSource)
             },
-            PendingLogicalTimerKind::JavaScriptOneShot |
-            PendingLogicalTimerKind::XmlHttpRequestTimeout |
-            PendingLogicalTimerKind::RefreshRedirect |
-            PendingLogicalTimerKind::RunStepsAfterTimeout |
-            PendingLogicalTimerKind::TestBindingCallback => {
+            PendingLogicalTimerKind::JavaScriptOneShot
+            | PendingLogicalTimerKind::XmlHttpRequestTimeout
+            | PendingLogicalTimerKind::RefreshRedirect
+            | PendingLogicalTimerKind::RunStepsAfterTimeout
+            | PendingLogicalTimerKind::TestBindingCallback => {
                 let deadline = match self.outer_wake {
                     Some(wake) => wake.deadline,
                     None => self.logical_deadline,
@@ -195,13 +195,13 @@ pub(crate) struct PendingPersistentSourceIdentity {
 impl PendingPersistentSourceIdentity {
     const fn source_kind(self) -> PendingSourceKind {
         match self.stable_id {
-            PendingPersistentSourceStableId::WebSocket(_) |
-            PendingPersistentSourceStableId::EventSource(_) => PendingSourceKind::Network,
-            PendingPersistentSourceStableId::BroadcastChannel(_) |
-            PendingPersistentSourceStableId::MessagePort(_) |
-            PendingPersistentSourceStableId::MediaSessionActionHandler |
-            PendingPersistentSourceStableId::StorageEventListener |
-            PendingPersistentSourceStableId::Worker => PendingSourceKind::TrackedPresence,
+            PendingPersistentSourceStableId::WebSocket(_)
+            | PendingPersistentSourceStableId::EventSource(_) => PendingSourceKind::Network,
+            PendingPersistentSourceStableId::BroadcastChannel(_)
+            | PendingPersistentSourceStableId::MessagePort(_)
+            | PendingPersistentSourceStableId::MediaSessionActionHandler
+            | PendingPersistentSourceStableId::StorageEventListener
+            | PendingPersistentSourceStableId::Worker => PendingSourceKind::TrackedPresence,
         }
     }
 
@@ -236,13 +236,13 @@ impl PendingPersistentSourceIdentity {
 
     const fn is_valid(self) -> bool {
         match self.stable_id {
-            PendingPersistentSourceStableId::WebSocket(id) |
-            PendingPersistentSourceStableId::EventSource(id) => id != 0,
+            PendingPersistentSourceStableId::WebSocket(id)
+            | PendingPersistentSourceStableId::EventSource(id) => id != 0,
             PendingPersistentSourceStableId::BroadcastChannel(id) => id != 0,
-            PendingPersistentSourceStableId::MessagePort(_) |
-            PendingPersistentSourceStableId::MediaSessionActionHandler |
-            PendingPersistentSourceStableId::StorageEventListener |
-            PendingPersistentSourceStableId::Worker => true,
+            PendingPersistentSourceStableId::MessagePort(_)
+            | PendingPersistentSourceStableId::MediaSessionActionHandler
+            | PendingPersistentSourceStableId::StorageEventListener
+            | PendingPersistentSourceStableId::Worker => true,
         }
     }
 }
@@ -892,8 +892,8 @@ impl PendingStateLedger {
             .webview(webview_id)?
             .source_keys
             .get(&PendingStableSourceKey::Parser(identity.stable_key()))
-            .copied() !=
-            Some(identity.source_id)
+            .copied()
+            != Some(identity.source_id)
         {
             return Err(PendingStateError::UnknownParser(identity));
         }
@@ -902,8 +902,8 @@ impl PendingStateLedger {
             .parsers
             .get(&identity.source_id)
             .ok_or(PendingStateError::UnknownParser(identity))?;
-        if current_parser.pipeline_id != identity.pipeline_id ||
-            current_parser.kind != identity.kind
+        if current_parser.pipeline_id != identity.pipeline_id
+            || current_parser.kind != identity.kind
         {
             return Err(PendingStateError::UnknownParser(identity));
         }
@@ -1016,8 +1016,8 @@ impl PendingStateLedger {
             return Ok(());
         }
         let webview_id = current.facts().webview_id;
-        let source_changed = current.source_disposition() !=
-            disposition_for_network_phase(phase, current.facts().evidence);
+        let source_changed = current.source_disposition()
+            != disposition_for_network_phase(phase, current.facts().evidence);
         let source_versions = if source_changed {
             Some(self.prepare_source_advance(webview_id)?)
         } else {
@@ -1064,8 +1064,8 @@ impl PendingStateLedger {
             .network
             .get(operation_id)
             .ok_or(PendingNetworkRegistryError::UnknownOperation(operation_id))?;
-        if record.phase() !=
-            embedder_traits::document_pending::PendingExternalIoPhase::TerminalTaskQueued
+        if record.phase()
+            != embedder_traits::document_pending::PendingExternalIoPhase::TerminalTaskQueued
         {
             return Err(PendingNetworkRegistryError::TerminalTaskNotQueued(operation_id).into());
         }
@@ -1089,10 +1089,10 @@ impl PendingStateLedger {
         if self.network.operation_id_exhausted() {
             return Err(PendingStateError::NetworkOperationIdExhausted);
         }
-        let sources_complete = state.logical_timers_authoritative &&
-            state.parser_authoritative &&
-            state.persistent_sources_authoritative &&
-            state.resource_fence_authority.is_some();
+        let sources_complete = state.logical_timers_authoritative
+            && state.parser_authoritative
+            && state.persistent_sources_authoritative
+            && state.resource_fence_authority.is_some();
         let sources = if sources_complete {
             Some(PendingSourceSnapshot::new(
                 state.source_epoch,
@@ -1274,10 +1274,10 @@ impl PendingStateLedger {
         // joined explicitly.
         let fallback_needed = pending_resources != 0;
         let current = self.webview(webview_id)?.resource_fallback;
-        if fallback_needed &&
-            current.is_some_and(|fallback| {
-                fallback.fence_id == producers.fence_id() &&
-                    target.contains_pipeline(fallback.pipeline_id)
+        if fallback_needed
+            && current.is_some_and(|fallback| {
+                fallback.fence_id == producers.fence_id()
+                    && target.contains_pipeline(fallback.pipeline_id)
             })
         {
             return Ok(());
@@ -1309,8 +1309,8 @@ impl PendingStateLedger {
             .ok_or(PendingNormalizeError::ResourceFallbackTargetUnavailable(
                 webview_id,
             ))?;
-        if let Some(mut fallback) = current &&
-            fallback.fence_id == producers.fence_id()
+        if let Some(mut fallback) = current
+            && fallback.fence_id == producers.fence_id()
         {
             let next_state = self.prepare_state_advance(webview_id)?;
             fallback.pipeline_id = pipeline_id;
@@ -1588,9 +1588,9 @@ const fn disposition_for_network_phase(
         embedder_traits::document_pending::PendingExternalIoPhase::TerminalTaskQueued => {
             PendingSourceDisposition::Ready
         },
-        embedder_traits::document_pending::PendingExternalIoPhase::Queued |
-        embedder_traits::document_pending::PendingExternalIoPhase::AwaitingResponse |
-        embedder_traits::document_pending::PendingExternalIoPhase::StreamingBody => {
+        embedder_traits::document_pending::PendingExternalIoPhase::Queued
+        | embedder_traits::document_pending::PendingExternalIoPhase::AwaitingResponse
+        | embedder_traits::document_pending::PendingExternalIoPhase::StreamingBody => {
             PendingSourceDisposition::AwaitingExternalIo(evidence)
         },
     }
@@ -1643,10 +1643,10 @@ impl PendingProducerQualificationLedger {
         checkpoint: DocumentProducerCheckpoint,
         fresh_snapshot: DocumentProducerSnapshot,
     ) -> Result<PendingProducerObservation, PendingStateError> {
-        if let Some(qualified) = self.last_qualified &&
-            qualified.microtask_checkpoint == microtask_checkpoint &&
-            qualified.checkpoint == checkpoint &&
-            qualified.snapshot == fresh_snapshot
+        if let Some(qualified) = self.last_qualified
+            && qualified.microtask_checkpoint == microtask_checkpoint
+            && qualified.checkpoint == checkpoint
+            && qualified.snapshot == fresh_snapshot
         {
             return Ok(qualified);
         }
@@ -1747,9 +1747,9 @@ const fn producer_observation_snapshot(
     observation: DocumentProducerObservation,
 ) -> DocumentProducerSnapshot {
     match observation {
-        DocumentProducerObservation::Busy(snapshot) |
-        DocumentProducerObservation::FirstEmpty(snapshot) |
-        DocumentProducerObservation::StableEmpty(snapshot) => snapshot,
+        DocumentProducerObservation::Busy(snapshot)
+        | DocumentProducerObservation::FirstEmpty(snapshot)
+        | DocumentProducerObservation::StableEmpty(snapshot) => snapshot,
     }
 }
 
@@ -1804,6 +1804,7 @@ pub(crate) struct RawPendingBuildFacts {
     pub(crate) scheduler: PendingSchedulerFacts,
     pub(crate) input: PendingInputFacts,
     pub(crate) microtasks: PendingMicrotaskFacts,
+    pub(crate) execution: Option<DocumentExecutionObservation>,
     pub(crate) producers: PendingProducerObservation,
     pub(crate) rendering: Option<PendingRenderingObservation>,
     /// Terminals from owners outside this ledger: target routing, DOM, logical/image timers, and
@@ -1897,6 +1898,7 @@ impl RawPendingBuilder {
             scheduler,
             input,
             microtasks,
+            execution,
             producers,
             rendering,
             mut supplemental_terminals,
@@ -1929,15 +1931,15 @@ impl RawPendingBuilder {
             .ok_or(PendingBuildError::MissingFact(PendingFactKind::Network))?;
         let rendering =
             rendering.ok_or(PendingBuildError::MissingFact(PendingFactKind::Rendering))?;
-        if require_resource_coverage &&
-            producers
+        if require_resource_coverage
+            && producers
                 .snapshot
                 .for_kind(DocumentProducerKind::Resource)
-                .pending() !=
-                0 &&
-            !network.active().iter().any(|operation| {
-                operation.kind == PendingNetworkKind::ProducerFallback &&
-                    operation.evidence == PendingResourceFallback::EVIDENCE
+                .pending()
+                != 0
+            && !network.active().iter().any(|operation| {
+                operation.kind == PendingNetworkKind::ProducerFallback
+                    && operation.evidence == PendingResourceFallback::EVIDENCE
             })
         {
             return Err(PendingBuildError::UnrepresentedResourceProducer);
@@ -2011,6 +2013,7 @@ impl RawPendingBuilder {
                 checkpoint_in_progress: microtasks.checkpoint_in_progress,
                 terminal: microtasks.terminal,
             },
+            execution,
             producers,
             parser,
             network,
@@ -2095,8 +2098,9 @@ mod tests {
         TEST_PIPELINE_ID, TEST_SCRIPT_EVENT_LOOP_ID, TEST_WEBVIEW_ID,
     };
     use timers::{
-        DocumentClock, DocumentClockConfiguration, DocumentProducerFence, DocumentProducerObserver,
-        DocumentUnixTime, TimerEventRequest, TimerScheduler,
+        DocumentClock, DocumentClockConfiguration, DocumentExecutionCounters,
+        DocumentExecutionLimits, DocumentProducerFence, DocumentProducerObserver, DocumentUnixTime,
+        TimerEventRequest, TimerScheduler,
     };
 
     use super::*;
@@ -2278,6 +2282,12 @@ mod tests {
                 checkpoint_in_progress: false,
                 terminal: None,
             },
+            execution: Some(DocumentExecutionObservation {
+                clock_id: clock.id(),
+                limits: DocumentExecutionLimits::CONTROLLED_WEBAPP_V1,
+                counters: DocumentExecutionCounters::default(),
+                terminal: None,
+            }),
             producers,
             rendering: Some(rendering()),
             supplemental_terminals: PendingRuntimeTerminals::default(),
@@ -3063,10 +3073,24 @@ mod tests {
         second_facts.clock.observation.now = DocumentTime::from_nanos(6);
         let second = ledger.normalize_and_build(second_facts.clone()).unwrap();
         second_facts.owner = ledger.owner_snapshot(TEST_WEBVIEW_ID).unwrap();
-        let unchanged = ledger.normalize_and_build(second_facts).unwrap();
+        let unchanged = ledger.normalize_and_build(second_facts.clone()).unwrap();
 
         assert!(second.state_generation > first.state_generation);
         assert_eq!(unchanged.state_generation, second.state_generation);
+
+        let mut execution_facts = second_facts;
+        execution_facts.owner = ledger.owner_snapshot(TEST_WEBVIEW_ID).unwrap();
+        execution_facts.execution = Some(DocumentExecutionObservation {
+            clock_id: execution_facts.clock.observation.clock_id,
+            limits: DocumentExecutionLimits::CONTROLLED_WEBAPP_V1,
+            counters: DocumentExecutionCounters {
+                ordinary_tasks: 1,
+                ..DocumentExecutionCounters::default()
+            },
+            terminal: None,
+        });
+        let execution_changed = ledger.normalize_and_build(execution_facts).unwrap();
+        assert!(execution_changed.state_generation > unchanged.state_generation);
     }
 
     #[test]
@@ -3108,11 +3132,9 @@ mod tests {
             }
         );
         assert!(first.sources.sources().iter().any(|source| {
-            source.kind == PendingSourceKind::Network &&
-                source.disposition ==
-                    PendingSourceDisposition::OpenEnded(
-                        PendingOpenEndedSourceReason::WebSocket,
-                    )
+            source.kind == PendingSourceKind::Network
+                && source.disposition
+                    == PendingSourceDisposition::OpenEnded(PendingOpenEndedSourceReason::WebSocket)
         }));
 
         let repeated = ledger

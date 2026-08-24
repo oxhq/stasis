@@ -1,10 +1,60 @@
+import type { SupportProfile } from "./profile.js";
+
 export interface CommandOptions {
   signal?: AbortSignal;
+  /** Wall-clock bound for a written native command. Defaults to the launch command timeout. */
+  timeoutMs?: number;
+}
+
+/** Authoritative state after a mutating automation operation completes. */
+export interface AutomationMutationResult {
+  stateGeneration: bigint;
+}
+
+/** Bounded match count for a selector; this is not a persistent DOM handle. */
+export interface QueryResult {
+  count: bigint;
+  stateGeneration: bigint;
+}
+
+export type ExtractRead = "text" | "html";
+
+export interface ExtractField {
+  name: string;
+  selector: string;
+  read: ExtractRead;
+}
+
+export interface ExtractPlan {
+  rootSelector: string;
+  fields: readonly ExtractField[];
+}
+
+export interface ExtractValue {
+  name: string;
+  value: string;
+}
+
+export interface ExtractRow {
+  /** Field order is preserved exactly as requested. */
+  fields: ExtractValue[];
+}
+
+export interface ExtractResult {
+  /** Root match order and each row's field order are preserved. */
+  rows: ExtractRow[];
+  stateGeneration: bigint;
 }
 
 export interface LaunchOptions extends CommandOptions {
-  /** Absolute or directly executable path. It is passed to spawn with shell disabled. */
-  executablePath: string;
+  /**
+   * Highest-priority native runtime override. It is passed directly to spawn
+   * with shell disabled. When omitted, the exact runtime bound to this SDK
+   * version is acquired into a verified per-user cache.
+   */
+  executablePath?: string;
+  /** Override the per-user managed-runtime cache. Ignored when executablePath is provided. */
+  runtimeCacheDirectory?: string;
   args?: readonly string[];
   cwd?: string;
   env?: Record<string, string | undefined>;
@@ -14,6 +64,8 @@ export interface LaunchOptions extends CommandOptions {
   maxFrameBytes?: number;
   /** Maximum wait after session.close succeeds for a clean child exit. Defaults to 30 seconds. */
   closeTimeoutMs?: number;
+  /** Mandatory wall-clock bound for every written native command. Defaults to 30 seconds. */
+  commandTimeoutMs?: number;
 }
 
 export type ClockOptions =
@@ -27,6 +79,8 @@ export type ClockOptions =
 
 export interface OpenOptions extends CommandOptions {
   clock?: ClockOptions;
+  /** Defaults to controlled-webapp-v1 for a controlled open and is forbidden for real time. */
+  profile?: SupportProfile;
 }
 
 export interface RuntimeInfo {
@@ -352,10 +406,20 @@ export type SettleOutcome =
   | "blocked_on_open_ended_work"
   | "unsupported_work"
   | "virtual_time_limit_exceeded"
+  | "task_limit_exceeded"
+  | "microtask_limit_exceeded"
+  | "rendering_limit_exceeded"
+  | "mutation_limit_exceeded"
   | "control_turn_limit_exceeded"
   | "runtime_error";
 
-export type SettleLimitKind = "virtual_time" | "control_turns";
+export type SettleLimitKind =
+  | "virtual_time"
+  | "ordinary_tasks"
+  | "microtasks"
+  | "rendering_opportunities"
+  | "mutations"
+  | "control_turns";
 
 export type SettleLimit =
   | {
@@ -367,12 +431,21 @@ export type SettleLimit =
   | {
       kind: "control_turns";
       limit: bigint;
+      observed?: never;
+      startVirtualTimeNs?: never;
+      requestedVirtualTimeNs?: never;
+    }
+  | {
+      kind: "ordinary_tasks" | "microtasks" | "rendering_opportunities" | "mutations";
+      limit: bigint;
+      observed: bigint;
       startVirtualTimeNs?: never;
       requestedVirtualTimeNs?: never;
     };
 
 export type SettleFailureCode =
   | "runtime_terminals"
+  | "execution_counter_overflow"
   | "clock_not_controlled"
   | "unsupported_clock_surface"
   | "web_view_identity_changed"
@@ -398,6 +471,10 @@ interface SettleResultBase {
   effectivePolicy: EffectiveSettlePolicy;
   processed: {
     controlTurns: bigint;
+    tasks: bigint;
+    microtasks: bigint;
+    renderingOpportunities: bigint;
+    mutations: bigint;
   };
   snapshot: PendingSnapshot;
   persistentWork: PersistentWork[];
@@ -426,6 +503,18 @@ export type SettleResult =
   | (SettleResultBase & {
       outcome: "control_turn_limit_exceeded";
       limit: Extract<SettleLimit, { kind: "control_turns" }>;
+      failure?: never;
+    })
+  | (SettleResultBase & {
+      outcome:
+        | "task_limit_exceeded"
+        | "microtask_limit_exceeded"
+        | "rendering_limit_exceeded"
+        | "mutation_limit_exceeded";
+      limit: Extract<
+        SettleLimit,
+        { kind: "ordinary_tasks" | "microtasks" | "rendering_opportunities" | "mutations" }
+      >;
       failure?: never;
     });
 

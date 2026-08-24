@@ -24,13 +24,13 @@ boundary.
 Current status:
 
 - Servo base and Pliego donor revisions are pinned in `STASIS_UPSTREAM.toml`.
-- `ports/stasis` ships the `v0.1.0-alpha.0` wake-driven NDJSON runtime. Real
+- `ports/stasis` ships the `v0.1.0` wake-driven NDJSON runtime. Real
   sessions support initialization, open, evaluation, and close. Controlled
   sessions add exact pending-work snapshots, bounded settlement and virtual
   advancement, generation-bound activation and text inspection, and
-  cancellation.
+  cancellation, semantic fill, bounded queries, and structured extraction.
 - Controlled document time covers DOM timers, `Date`, Performance, rAF, and
-  the document timeline inside the alpha's audited single-top-level-document
+  the document timeline inside the stable profile's audited single-top-level-document
   support boundary. Unsupported or open-ended work is reported as a typed
   outcome instead of silently falling back to uncontrolled progress.
 - `sdk/typescript` provides the matching `@oxhq/stasis` client, while the

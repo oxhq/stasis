@@ -10,7 +10,7 @@ use std::io;
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
-use embedder_traits::document_automation::DocumentAutomationResult;
+use embedder_traits::document_automation::{DocumentAutomationError, DocumentAutomationResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use servo::document_control::{
@@ -29,6 +29,7 @@ use crate::wake::{ShellWaker, WakeGeneration, WakeWaitError};
 
 const SOURCE_IDENTITIES: &str = include_str!("../../../STASIS_UPSTREAM.toml");
 const SESSION_ID: &str = "s-1";
+const CONTROLLED_WEBAPP_V1_PROFILE: &str = "controlled-webapp-v1";
 const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROLLED_OPEN_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const OWNER_LOOP_SAFETY_TIMEOUT: Duration = Duration::from_secs(86_400);
@@ -239,16 +240,9 @@ struct AutomationState {
 }
 
 struct SettleHostWait {
-    kind: SettleHostWaitKind,
     observed: WakeGeneration,
     started_at: Instant,
     deadline: Option<Instant>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SettleHostWaitKind {
-    ForegroundExternalIo,
-    ProducerHandoff,
 }
 
 enum ActiveTransition {
@@ -442,7 +436,10 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         ) {
             return self.begin_runtime_request(request).map(|()| false);
         }
-        if matches!(method.as_str(), "action.activate" | "dom.text") {
+        if matches!(
+            method.as_str(),
+            "action.activate" | "action.fill" | "dom.query" | "dom.text" | "dom.extract"
+        ) {
             return self.begin_automation_request(request).map(|()| false);
         }
         if method == "session.open" {
@@ -554,10 +551,31 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     })
                 })
             },
+            "action.fill" => parse_params::<wire::ActionFillParams>(&request).and_then(|params| {
+                params.resolve().map_err(|error| {
+                    ProtocolError::invalid_request(format!(
+                        "invalid action.fill parameters: {error:?}"
+                    ))
+                })
+            }),
+            "dom.query" => parse_params::<wire::DomQueryParams>(&request).and_then(|params| {
+                params.resolve().map_err(|error| {
+                    ProtocolError::invalid_request(format!(
+                        "invalid dom.query parameters: {error:?}"
+                    ))
+                })
+            }),
             "dom.text" => parse_params::<wire::DomTextParams>(&request).and_then(|params| {
                 params.resolve().map_err(|error| {
                     ProtocolError::invalid_request(format!(
                         "invalid dom.text parameters: {error:?}"
+                    ))
+                })
+            }),
+            "dom.extract" => parse_params::<wire::DomExtractParams>(&request).and_then(|params| {
+                params.resolve().map_err(|error| {
+                    ProtocolError::invalid_request(format!(
+                        "invalid dom.extract parameters: {error:?}"
                     ))
                 })
             }),
@@ -723,32 +741,27 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 state.cumulative_external_io_wall_time,
             )
         };
-        let cumulative = if wait.kind == SettleHostWaitKind::ForegroundExternalIo {
-            let elapsed = now.saturating_duration_since(wait.started_at);
-            let Some(cumulative) = previous_cumulative.checked_add(elapsed) else {
-                return self
-                    .apply_active_transition(
-                        active,
-                        ActiveTransition::Fail(ActiveFailure {
-                            error: ProtocolError::operation(
-                                "settlement_wall_time_overflow",
-                                "external-I/O wall-time accounting overflowed",
-                                state_effect.as_protocol_str(),
-                            ),
-                            fail_stop: false,
-                        }),
-                    )
-                    .map(|()| true);
-            };
-            cumulative
-        } else {
-            previous_cumulative
+        let elapsed = now.saturating_duration_since(wait.started_at);
+        let Some(cumulative) = previous_cumulative.checked_add(elapsed) else {
+            return self
+                .apply_active_transition(
+                    active,
+                    ActiveTransition::Fail(ActiveFailure {
+                        error: ProtocolError::operation(
+                            "settlement_wall_time_overflow",
+                            "external-I/O wall-time accounting overflowed",
+                            state_effect.as_protocol_str(),
+                        ),
+                        fail_stop: false,
+                    }),
+                )
+                .map(|()| true);
         };
         let ActiveOperation::Settle(state) = &mut active.operation else {
             unreachable!("settle wait changed operation kind")
         };
         state.cumulative_external_io_wall_time = cumulative;
-        let progress = if expired && wait.kind == SettleHostWaitKind::ForegroundExternalIo {
+        let progress = if expired {
             state.coordinator.external_io_wait_expired(cumulative)
         } else {
             state.coordinator.resume_after_wake(cumulative)
@@ -847,7 +860,7 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             ActiveTransition::Wait(wait) => {
                 let state_effect = active.state_effect;
                 let now = Instant::now();
-                let (kind, deadline) = match wait {
+                let deadline = match wait {
                     settle::SettleWait::ForegroundExternalIo {
                         remaining_wall_time,
                         ..
@@ -865,10 +878,26 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                                 }),
                             );
                         };
-                        (SettleHostWaitKind::ForegroundExternalIo, Some(deadline))
+                        Some(deadline)
                     },
-                    settle::SettleWait::ProducerHandoff { .. } => {
-                        (SettleHostWaitKind::ProducerHandoff, None)
+                    settle::SettleWait::ProducerHandoff {
+                        remaining_wall_time,
+                        ..
+                    } => {
+                        let Some(deadline) = now.checked_add(remaining_wall_time) else {
+                            return self.apply_active_transition(
+                                active,
+                                ActiveTransition::Fail(ActiveFailure {
+                                    error: ProtocolError::operation(
+                                        "settlement_deadline_overflow",
+                                        "producer-handoff wait deadline overflowed",
+                                        state_effect.as_protocol_str(),
+                                    ),
+                                    fail_stop: false,
+                                }),
+                            );
+                        };
+                        Some(deadline)
                     },
                 };
                 let ActiveOperation::Settle(state) = &mut active.operation else {
@@ -885,7 +914,6 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     );
                 };
                 state.waiting = Some(SettleHostWait {
-                    kind,
                     observed: self.servo_cursor,
                     started_at: now,
                     deadline,
@@ -1139,12 +1167,15 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     "runtime.settle",
                     "runtime.advance_to_next",
                     "action.activate",
+                    "action.fill",
+                    "dom.query",
                     "dom.text",
+                    "dom.extract",
                     "protocol.cancel",
                     "session.close"
                 ],
                 "clockModes": ["real", "controlled"],
-                "profiles": [],
+                "profiles": [CONTROLLED_WEBAPP_V1_PROFILE],
                 "settlement": true,
                 "settlementLimits": [
                     "maxVirtualTimeNs",
@@ -1250,6 +1281,7 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 "url": final_url,
                 "boundary": boundary,
                 "clockMode": "real",
+                "profile": null,
             })),
         )
     }
@@ -1428,6 +1460,7 @@ fn transition_from_control_completion(
                 "url": state.current_url,
                 "boundary": "controlled_ready",
                 "clockMode": "controlled",
+                "profile": CONTROLLED_WEBAPP_V1_PROFILE,
             }))
         },
         ActiveOperation::Pending => {
@@ -1704,11 +1737,7 @@ fn completed_automation(
                     observation,
                 } => Ok((result, observation)),
                 DocumentControlOutcome::Rejected(error) => Err(ActiveFailure {
-                    error: ProtocolError::operation(
-                        "document_automation_rejected",
-                        format!("document automation was rejected: {error:?}"),
-                        state_effect.as_protocol_str(),
-                    ),
+                    error: automation_rejection(error, state_effect),
                     fail_stop: false,
                 }),
                 DocumentControlOutcome::AutomationOutcomeIndeterminate { .. } => {
@@ -1761,6 +1790,54 @@ fn completed_automation(
                 fail_stop: true,
             })
         },
+    }
+}
+
+fn automation_rejection(
+    error: DocumentControlError,
+    state_effect: RequestStateEffect,
+) -> ProtocolError {
+    let code = match &error {
+        DocumentControlError::Automation(error) => automation_error_code(error),
+        _ => "document_automation_rejected",
+    };
+    ProtocolError::operation(
+        code,
+        format!("document automation was rejected: {error:?}"),
+        state_effect.as_protocol_str(),
+    )
+}
+
+fn automation_error_code(error: &DocumentAutomationError) -> &'static str {
+    match error {
+        DocumentAutomationError::InvalidRequest(_) => "invalid_automation_request",
+        DocumentAutomationError::TargetChanged => "automation_target_changed",
+        DocumentAutomationError::ExecutionTerminated => "execution_terminated",
+        DocumentAutomationError::StaleStateGeneration { .. } => "stale_generation",
+        DocumentAutomationError::InvalidSelector { .. } => "invalid_selector",
+        DocumentAutomationError::UnsupportedSelector { .. } => "unsupported_selector",
+        DocumentAutomationError::MatchLimitExceeded { .. } => "automation_match_limit_exceeded",
+        DocumentAutomationError::DomTraversalLimitExceeded { .. } => {
+            "automation_dom_traversal_limit_exceeded"
+        },
+        DocumentAutomationError::SelectorEvaluationLimitExceeded { .. } => {
+            "automation_selector_evaluation_limit_exceeded"
+        },
+        DocumentAutomationError::ElementNotFound { .. } => "element_not_found",
+        DocumentAutomationError::SelectorAmbiguous { .. } => "selector_ambiguous",
+        DocumentAutomationError::ExtractionFieldNotFound { .. } => "extraction_field_not_found",
+        DocumentAutomationError::ExtractionFieldAmbiguous { .. } => "extraction_field_ambiguous",
+        DocumentAutomationError::UnsupportedFillElement { .. } => "unsupported_fill_element",
+        DocumentAutomationError::ImmutableFillElement { .. } => "immutable_fill_element",
+        DocumentAutomationError::UnsupportedActivationElement { .. } => {
+            "unsupported_activation_element"
+        },
+        DocumentAutomationError::DisabledActivationElement { .. } => "disabled_activation_element",
+        DocumentAutomationError::UnsupportedLazyAttributeSerialization { .. } => {
+            "unsupported_dom_serialization"
+        },
+        DocumentAutomationError::DomOperationFailed { .. } => "document_automation_failed",
+        DocumentAutomationError::OutputLimitExceeded { .. } => "automation_output_limit_exceeded",
     }
 }
 
@@ -1918,20 +1995,30 @@ struct OpenParams {
     initial_virtual_time_ns: Option<wire::DecimalU128>,
     #[serde(default)]
     unix_time_origin_ns: Option<wire::DecimalU128>,
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 impl OpenParams {
     fn clock_mode(&self) -> Result<(EngineClockMode, &'static str), ProtocolError> {
         match self.clock_mode {
             OpenClockMode::Real => {
-                if self.initial_virtual_time_ns.is_some() || self.unix_time_origin_ns.is_some() {
+                if self.initial_virtual_time_ns.is_some() ||
+                    self.unix_time_origin_ns.is_some() ||
+                    self.profile.is_some()
+                {
                     return Err(ProtocolError::invalid_request(
-                        "controlled time fields require clockMode controlled",
+                        "controlled time fields and profile require clockMode controlled",
                     ));
                 }
                 Ok((EngineClockMode::Real, "load_complete"))
             },
             OpenClockMode::Controlled => {
+                if self.profile.as_deref() != Some(CONTROLLED_WEBAPP_V1_PROFILE) {
+                    return Err(ProtocolError::invalid_request(format!(
+                        "controlled sessions require profile {CONTROLLED_WEBAPP_V1_PROFILE}",
+                    )));
+                }
                 let unix_origin = self
                     .unix_time_origin_ns
                     .as_ref()
@@ -2314,10 +2401,11 @@ mod tests {
     }
 
     #[test]
-    fn controlled_open_accepts_only_the_supported_unix_origin() {
+    fn controlled_open_requires_the_named_profile_and_supported_unix_origin() {
         let controlled: OpenParams = serde_json::from_value(json!({
             "url": "about:blank",
             "clockMode": "controlled",
+            "profile": CONTROLLED_WEBAPP_V1_PROFILE,
             "initialVirtualTimeNs": "42",
             "unixTimeOriginNs": "0"
         }))
@@ -2335,6 +2423,7 @@ mod tests {
         let unsupported: OpenParams = serde_json::from_value(json!({
             "url": "about:blank",
             "clockMode": "controlled",
+            "profile": CONTROLLED_WEBAPP_V1_PROFILE,
             "unixTimeOriginNs": "1"
         }))
         .unwrap();
@@ -2342,6 +2431,26 @@ mod tests {
             unsupported.clock_mode().unwrap_err().code,
             "invalid_request"
         );
+
+        for invalid in [
+            json!({
+                "url": "about:blank",
+                "clockMode": "controlled",
+            }),
+            json!({
+                "url": "about:blank",
+                "clockMode": "controlled",
+                "profile": "controlled-webapp-v2",
+            }),
+            json!({
+                "url": "about:blank",
+                "clockMode": "real",
+                "profile": CONTROLLED_WEBAPP_V1_PROFILE,
+            }),
+        ] {
+            let params: OpenParams = serde_json::from_value(invalid).unwrap();
+            assert_eq!(params.clock_mode().unwrap_err().code, "invalid_request");
+        }
     }
 
     #[test]
@@ -2373,6 +2482,7 @@ mod tests {
             open.params = json!({
                 "url": "about:blank",
                 "clockMode": "controlled",
+                "profile": CONTROLLED_WEBAPP_V1_PROFILE,
             });
 
             assert!(!shell.handle(open).unwrap());
@@ -2422,6 +2532,7 @@ mod tests {
             open.params = json!({
                 "url": "about:blank",
                 "clockMode": "controlled",
+                "profile": CONTROLLED_WEBAPP_V1_PROFILE,
             });
 
             assert!(!shell.handle(open).unwrap());
@@ -2461,6 +2572,7 @@ mod tests {
             open.params = json!({
                 "url": "https://example.test/",
                 "clockMode": "controlled",
+                "profile": CONTROLLED_WEBAPP_V1_PROFILE,
             });
 
             assert!(!shell.handle(open).unwrap());
@@ -2584,6 +2696,102 @@ mod tests {
         }
 
         assert!(frames(&bytes).is_empty());
+    }
+
+    #[test]
+    fn every_public_automation_method_enters_the_observe_then_bind_path() {
+        for (method, params, expected_kind) in [
+            (
+                "action.fill",
+                json!({
+                    "selector": "#email",
+                    "value": "person@example.test",
+                    "expectedGeneration": "7",
+                }),
+                wire::PublicAutomationKind::Fill,
+            ),
+            (
+                "dom.query",
+                json!({"selector": ".row", "expectedGeneration": "7"}),
+                wire::PublicAutomationKind::Query,
+            ),
+            (
+                "dom.extract",
+                json!({
+                    "rootSelector": ".row",
+                    "fields": [
+                        {"name": "title", "selector": ".title", "read": "text"},
+                    ],
+                    "expectedGeneration": "7",
+                }),
+                wire::PublicAutomationKind::Extract,
+            ),
+        ] {
+            let mut bytes = Vec::new();
+            {
+                let mut shell = shell(&mut bytes, ShellState::Open, Some(FakeEngine::controlled()));
+                let mut request = request(method, Some(SESSION_ID));
+                request.params = params;
+
+                assert!(!shell.handle(request).unwrap());
+                assert_eq!(
+                    shell.engine.as_ref().unwrap().submitted,
+                    vec![DocumentControlCommand::Observe],
+                    "{method} did not begin with a passive observation",
+                );
+                assert!(matches!(
+                    shell.active.as_ref().map(|active| &active.operation),
+                    Some(ActiveOperation::Automation(AutomationState {
+                        kind,
+                        unresolved: Some(_),
+                    })) if *kind == expected_kind
+                ));
+            }
+            assert!(frames(&bytes).is_empty());
+        }
+    }
+
+    #[test]
+    fn automation_rejections_have_stable_public_codes() {
+        use embedder_traits::document_pending::RuntimeStateGeneration;
+
+        for (error, expected_code) in [
+            (
+                DocumentAutomationError::StaleStateGeneration {
+                    expected: RuntimeStateGeneration::new(7),
+                    observed: RuntimeStateGeneration::new(8),
+                },
+                "stale_generation",
+            ),
+            (
+                DocumentAutomationError::UnsupportedFillElement {
+                    selector: "#choice".into(),
+                },
+                "unsupported_fill_element",
+            ),
+            (
+                DocumentAutomationError::SelectorAmbiguous {
+                    selector: ".row".into(),
+                    matches: 2,
+                },
+                "selector_ambiguous",
+            ),
+            (
+                DocumentAutomationError::OutputLimitExceeded {
+                    attempted: 131_073,
+                    limit: 131_072,
+                },
+                "automation_output_limit_exceeded",
+            ),
+        ] {
+            let projected = automation_rejection(
+                DocumentControlError::Automation(error),
+                RequestStateEffect::None,
+            );
+            assert_eq!(projected.code, expected_code);
+            assert!(!projected.fatal);
+            assert_eq!(projected.state_effect, "none");
+        }
     }
 
     #[test]

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Stasis recursive animation-frame limit</title>
+  </head>
+  <body>
+    <button id="start" type="button">Start recursive animation frames</button>
+    <p id="count">0</p>
+    <script>
+      document.querySelector("#start").addEventListener("click", () => {
+        const count = document.querySelector("#count");
+        let frames = 0;
+        const recurse = () => {
+          frames += 1;
+          count.textContent = String(frames);
+          requestAnimationFrame(recurse);
+        };
+        requestAnimationFrame(recurse);
+      });
+    </script>
+  </body>
+</html>

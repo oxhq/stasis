@@ -1,4 +1,4 @@
-name: Publish @oxhq/stasis alpha
+name: Publish @oxhq/stasis stable
 
 on:
   release:
@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Immutable prerelease tag to verify
+        description: Immutable stable release tag to verify
         required: true
-        default: v0.1.0-alpha.0
+        default: v0.1.0
         type: string
       publication_run_id:
         description: Release-event workflow run that published the npm package
@@ -40,12 +40,12 @@ jobs:
           (
             github.event_name == 'release'
               && github.event.release.draft == false
-              && github.event.release.prerelease == true
-              && github.event.release.tag_name == 'v0.1.0-alpha.0'
+              && github.event.release.prerelease == false
+              && github.event.release.tag_name == 'v0.1.0'
           )
           || (
             github.event_name == 'workflow_dispatch'
-              && inputs.release_tag == 'v0.1.0-alpha.0'
+              && inputs.release_tag == 'v0.1.0'
           )
         )
     runs-on: macos-15
@@ -55,14 +55,16 @@ jobs:
       attestations: read
       contents: read
     outputs:
+      linux_run_attempt: ${{ steps.inputs.outputs.linux_run_attempt }}
+      macos_run_attempt: ${{ steps.inputs.outputs.macos_run_attempt }}
       native_binary_sha256: ${{ steps.inputs.outputs.native_binary_sha256 }}
-      package_run_attempt: ${{ steps.inputs.outputs.package_run_attempt }}
       package_run_id: ${{ steps.inputs.outputs.package_run_id }}
       prepublish_run_attempt: ${{ steps.prepublish_gate.outputs.run_attempt }}
       publication_run_attempt: ${{ steps.release.outputs.publication_run_attempt }}
       publication_run_id: ${{ steps.release.outputs.publication_run_id }}
       release_id: ${{ steps.release.outputs.release_id }}
       revision: ${{ steps.release.outputs.revision }}
+      sdk_run_attempt: ${{ steps.inputs.outputs.sdk_run_attempt }}
       staged_artifact_name: ${{ steps.inputs.outputs.staged_artifact_name }}
       version: ${{ steps.release.outputs.version }}
     env:
@@ -102,7 +104,7 @@ jobs:
           jq -e --arg tag "$TAG" '
             .tag_name == $tag
             and .draft == false
-            and .prerelease == true
+            and .prerelease == false
             and .immutable == true
           ' release.json > /dev/null
           read -r tag_type tag_sha < <(
@@ -145,7 +147,7 @@ jobs:
                 and .head_branch == $tag
                 and .head_sha == $revision
                 and .path == ".github/workflows/stasis-publish-npm.yml"
-                and .name == "Publish @oxhq/stasis alpha"
+                and .name == "Publish @oxhq/stasis stable"
                 and .repository.full_name == "oxhq/stasis"
                 and .head_repository.full_name == "oxhq/stasis"
               ' publication-run.json > /dev/null
@@ -155,13 +157,25 @@ jobs:
           cargo_version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("ports/stasis/Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')
           sdk_version=$(node -p 'JSON.parse(require("node:fs").readFileSync("sdk/typescript/package.json", "utf8")).version')
           version=${TAG#v}
-          if [[ "$version" != '0.1.0-alpha.0' || "$cargo_version" != "$version" || "$sdk_version" != "$version" ]]; then
-            echo 'native, SDK, and release tag versions do not match the first alpha' >&2
+          if [[ "$version" != '0.1.0' || "$cargo_version" != "$version" || "$sdk_version" != "$version" ]]; then
+            echo 'native, SDK, and release tag versions do not match stable 0.1.0' >&2
             exit 1
           fi
           bundle="stasis-${version}-${STASIS_PLATFORM}"
-          expected_assets=$(jq -cn --arg archive "${bundle}.tar.gz" --arg proof "${bundle}-act-settle-inspect.json" \
-            '[$archive, ($archive + ".sha256"), ($archive | sub("\\.tar\\.gz$"; ".binary.sha256")), $proof] | sort')
+          expected_assets=$(jq -cn --arg version "$version" '
+            ["macos-aarch64", "linux-x86_64"]
+            | map(
+                "stasis-\($version)-\(.).tar.gz" as $archive
+                | [
+                    $archive,
+                    ($archive + ".sha256"),
+                    ($archive | sub("\\.tar\\.gz$"; ".binary.sha256")),
+                    ($archive | sub("\\.tar\\.gz$"; "-act-settle-inspect.json"))
+                  ]
+              )
+            | add + ["stasis-\($version)-runtime-manifest.json"]
+            | sort
+          ')
           jq -e --argjson expected "$expected_assets" '
             ([.assets[].name] | sort) == $expected
           ' release.json > /dev/null
@@ -189,32 +203,353 @@ jobs:
           TAG: ${{ env.STASIS_RELEASE_TAG }}
         run: |
           set -euo pipefail
-          mkdir release-assets gate-proof
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release-assets \
-            --pattern "$STASIS_ARCHIVE" \
-            --pattern "$STASIS_ARCHIVE.sha256" \
-            --pattern "$STASIS_BINARY_SHA256"
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir gate-proof \
-            --pattern "$STASIS_GATE_PROOF"
-          python3 etc/ci/stasis/release_archive.py verify \
-            --asset-directory release-assets \
-            --version "$STASIS_VERSION" \
-            --platform "$STASIS_PLATFORM" \
-            --revision "$STASIS_REVISION" \
-            --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-            --source-root . \
-            --extract-to "$RUNNER_TEMP/stasis-published-release"
-          proof_run_id=$(jq -er '.workflowRunId' "gate-proof/$STASIS_GATE_PROOF")
-          proof_run_attempt=$(jq -er '.workflowRunAttempt' "gate-proof/$STASIS_GATE_PROOF")
-          python3 etc/ci/stasis/release_archive.py verify-gate-proof \
-            --proof-directory gate-proof \
-            --asset-directory release-assets \
-            --version "$STASIS_VERSION" \
-            --platform "$STASIS_PLATFORM" \
-            --revision "$STASIS_REVISION" \
-            --run-id "$proof_run_id" \
-            --run-attempt "$proof_run_attempt"
-          for release_asset in release-assets/* gate-proof/*; do
+          mkdir -p release-assets/macos-aarch64 release-assets/linux-x86_64 \
+            gate-proof/macos-aarch64 gate-proof/linux-x86_64 runtime-manifest
+          for platform in macos-aarch64 linux-x86_64; do
+            bundle="stasis-${STASIS_VERSION}-${platform}"
+            archive="${bundle}.tar.gz"
+            proof="${bundle}-act-settle-inspect.json"
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --dir "release-assets/$platform" \
+              --pattern "$archive" \
+              --pattern "$archive.sha256" \
+              --pattern "${bundle}.binary.sha256"
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --dir "gate-proof/$platform" \
+              --pattern "$proof"
+            if [[ "$platform" == "$STASIS_PLATFORM" ]]; then
+              python3 etc/ci/stasis/release_archive.py verify \
+                --asset-directory "release-assets/$platform" \
+                --version "$STASIS_VERSION" \
+                --platform "$platform" \
+                --revision "$STASIS_REVISION" \
+                --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+                --source-root . \
+                --extract-to "$RUNNER_TEMP/stasis-published-release"
+            else
+              python3 etc/ci/stasis/release_archive.py verify \
+                --asset-directory "release-assets/$platform" \
+                --version "$STASIS_VERSION" \
+                --platform "$platform" \
+                --revision "$STASIS_REVISION" \
+                --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+                --source-root .
+            fi
+          done
+          runtime_manifest="runtime-manifest/stasis-${STASIS_VERSION}-runtime-manifest.json"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --dir runtime-manifest \
+            --pattern "$(basename "$runtime_manifest")"
+          node sdk/typescript/scripts/generate-runtime-manifest.mjs \
+            --input "$runtime_manifest" \
+            --output sdk/typescript/src/runtime-manifest.generated.ts
+
+          read -r macos_run_id macos_claim_attempt linux_run_id linux_claim_attempt < <(
+            python3 - <<'PY'
+          import json
+          import math
+          import os
+          import pathlib
+          import re
+
+          def reject_duplicate_members(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate object key {key!r}")
+                  value[key] = item
+              return value
+
+          claims = []
+          version = os.environ["STASIS_VERSION"]
+          for platform in ("macos-aarch64", "linux-x86_64"):
+              proof = pathlib.Path(
+                  "gate-proof",
+                  platform,
+                  f"stasis-{version}-{platform}-act-settle-inspect.json",
+              )
+              try:
+                  document = json.loads(
+                      proof.read_text(encoding="utf-8"),
+                      object_pairs_hook=reject_duplicate_members,
+                      parse_float=lambda value: (
+                          parsed
+                          if math.isfinite(parsed := float(value))
+                          else (_ for _ in ()).throw(ValueError(f"non-finite number {value!r}"))
+                      ),
+                      parse_constant=lambda value: (_ for _ in ()).throw(
+                          ValueError(f"non-finite number {value!r}")
+                      ),
+                  )
+              except (OSError, UnicodeError, ValueError, RecursionError) as error:
+                  raise SystemExit(f"cannot read strict {platform} gate proof: {error}") from error
+              if not isinstance(document, dict):
+                  raise SystemExit(f"{platform} gate proof is not an object")
+              run_id = document.get("workflowRunId")
+              run_attempt = document.get("workflowRunAttempt")
+              if (
+                  not isinstance(run_id, str)
+                  or re.fullmatch(r"[1-9][0-9]*", run_id) is None
+                  or not isinstance(run_attempt, str)
+                  or re.fullmatch(r"[1-9][0-9]*", run_attempt) is None
+              ):
+                  raise SystemExit(f"{platform} gate proof has an invalid producer identity")
+              claims.extend((run_id, run_attempt))
+          print(*claims)
+          PY
+          )
+          if [[ "$macos_run_id" != "$linux_run_id" ]]; then
+            echo 'native gate proofs do not share one package workflow run' >&2
+            exit 1
+          fi
+          package_run_id=$macos_run_id
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$package_run_id" > package-run.json
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$package_run_id/artifacts?per_page=100" \
+            > package-artifact-pages.json
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$package_run_id/jobs?filter=all&per_page=100" \
+            > package-job-pages.json
+          read -r overall_run_attempt macos_run_attempt linux_run_attempt sdk_run_attempt < <(
+            PACKAGE_RUN_ID="$package_run_id" \
+              MACOS_CLAIM_ATTEMPT="$macos_claim_attempt" \
+              LINUX_CLAIM_ATTEMPT="$linux_claim_attempt" \
+              python3 - <<'PY'
+          import json
+          import math
+          import os
+          import re
+
+          package_run_id_text = os.environ["PACKAGE_RUN_ID"]
+          package_run_id = int(package_run_id_text)
+          revision = os.environ["STASIS_REVISION"]
+          default_branch = os.environ["DEFAULT_BRANCH"]
+          claimed_attempts = {
+              "macos-aarch64": int(os.environ["MACOS_CLAIM_ATTEMPT"]),
+              "linux-x86_64": int(os.environ["LINUX_CLAIM_ATTEMPT"]),
+          }
+
+          def reject_duplicate_members(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate object key {key!r}")
+                  value[key] = item
+              return value
+
+          def load_strict(filename, context):
+              try:
+                  with open(filename, encoding="utf-8") as source:
+                      return json.load(
+                          source,
+                          object_pairs_hook=reject_duplicate_members,
+                          parse_float=lambda value: (
+                              parsed
+                              if math.isfinite(parsed := float(value))
+                              else (_ for _ in ()).throw(
+                                  ValueError(f"non-finite number {value!r}")
+                              )
+                          ),
+                          parse_constant=lambda value: (_ for _ in ()).throw(
+                              ValueError(f"non-finite number {value!r}")
+                          ),
+                      )
+              except (OSError, UnicodeError, ValueError, RecursionError) as error:
+                  raise SystemExit(f"{context} is invalid strict JSON: {error}") from error
+
+          run = load_strict("package-run.json", "package run response")
+          repository = run.get("repository") if isinstance(run, dict) else None
+          head_repository = run.get("head_repository") if isinstance(run, dict) else None
+          overall_attempt = run.get("run_attempt") if isinstance(run, dict) else None
+          if (
+              not isinstance(run, dict)
+              or run.get("id") != package_run_id
+              or not isinstance(repository, dict)
+              or repository.get("full_name") != os.environ["GITHUB_REPOSITORY"]
+              or not isinstance(head_repository, dict)
+              or head_repository.get("full_name") != os.environ["GITHUB_REPOSITORY"]
+              or run.get("name") != "Stasis package and promote"
+              or run.get("path") != ".github/workflows/stasis-package.yml"
+              or run.get("event") != "push"
+              or run.get("status") != "completed"
+              or run.get("conclusion") != "success"
+              or run.get("head_sha") != revision
+              or run.get("head_branch") != default_branch
+              or type(overall_attempt) is not int
+              or overall_attempt < 1
+          ):
+              raise SystemExit("package workflow run identity is invalid")
+
+          def flatten_pages(filename, key):
+              pages = load_strict(filename, f"{key} pagination response")
+              if not isinstance(pages, list) or not pages:
+                  raise SystemExit(f"{key} pagination response is malformed")
+              entries = []
+              totals = set()
+              for page in pages:
+                  if not isinstance(page, dict) or type(page.get("total_count")) is not int:
+                      raise SystemExit(f"{key} pagination response is malformed")
+                  values = page.get(key)
+                  if not isinstance(values, list):
+                      raise SystemExit(f"{key} pagination response is malformed")
+                  totals.add(page["total_count"])
+                  entries.extend(values)
+              if len(totals) != 1 or totals.pop() != len(entries):
+                  raise SystemExit(f"{key} pagination response is incomplete")
+              identifiers = [entry.get("id") for entry in entries if isinstance(entry, dict)]
+              if len(identifiers) != len(entries) or any(type(value) is not int for value in identifiers):
+                  raise SystemExit(f"{key} identity is malformed")
+              if len(set(identifiers)) != len(identifiers):
+                  raise SystemExit(f"{key} pagination response contains duplicates")
+              return entries
+
+          artifacts = flatten_pages("package-artifact-pages.json", "artifacts")
+          jobs = flatten_pages("package-job-pages.json", "jobs")
+          prefixes = (
+              "stasis-macos-aarch64",
+              "stasis-macos-aarch64-act-settle-inspect-proof",
+              "stasis-linux-x86_64",
+              "stasis-linux-x86_64-act-settle-inspect-proof",
+              "stasis-runtime-manifest",
+              "stasis-typescript",
+          )
+          patterns = tuple(
+              (prefix, re.compile(rf"^{re.escape(prefix)}-attempt-([1-9][0-9]*)$"))
+              for prefix in prefixes
+          )
+          prefix_groups = {
+              "stasis-macos-aarch64": "macos-aarch64",
+              "stasis-macos-aarch64-act-settle-inspect-proof": "macos-aarch64",
+              "stasis-linux-x86_64": "linux-x86_64",
+              "stasis-linux-x86_64-act-settle-inspect-proof": "linux-x86_64",
+              "stasis-runtime-manifest": "sdk",
+              "stasis-typescript": "sdk",
+          }
+          by_group_attempt = {group: {} for group in set(prefix_groups.values())}
+          seen_artifact_names = set()
+          for artifact in artifacts:
+              expired = artifact.get("expired")
+              workflow_run = artifact.get("workflow_run")
+              if (
+                  type(expired) is not bool
+                  or not isinstance(workflow_run, dict)
+                  or workflow_run.get("id") != package_run_id
+                  or workflow_run.get("head_sha") != revision
+                  or workflow_run.get("head_branch") != default_branch
+              ):
+                  raise SystemExit("package artifact identity is malformed")
+              name = artifact.get("name")
+              if not isinstance(name, str):
+                  raise SystemExit("package artifact name is malformed")
+              if name in seen_artifact_names:
+                  raise SystemExit("package artifact name is duplicated")
+              seen_artifact_names.add(name)
+              matched = next(
+                  ((prefix, match) for prefix, pattern in patterns if (match := pattern.fullmatch(name))),
+                  None,
+              )
+              if matched is None:
+                  raise SystemExit(f"unexpected active package artifact: {name!r}")
+              attempt = int(matched[1].group(1))
+              if attempt > overall_attempt:
+                  raise SystemExit("package artifact claims a future run attempt")
+              if expired:
+                  continue
+              group = prefix_groups[matched[0]]
+              by_group_attempt[group].setdefault(attempt, []).append(name)
+
+          producer_names = {
+              "macos-aarch64": "Package and gate macos-aarch64",
+              "linux-x86_64": "Package and gate linux-x86_64",
+              "sdk": "Bind both native runtimes and gate the TypeScript package",
+          }
+          producer_jobs = {name: {} for name in producer_names.values()}
+          seen_jobs = set()
+          for job in jobs:
+              name = job.get("name")
+              if name not in producer_names.values():
+                  continue
+              attempt = job.get("run_attempt")
+              identity = (attempt, name)
+              if (
+                  type(attempt) is not int
+                  or attempt < 1
+                  or attempt > overall_attempt
+                  or job.get("run_id") != package_run_id
+                  or job.get("head_sha") != revision
+                  or identity in seen_jobs
+              ):
+                  raise SystemExit("package producer job identity is malformed or ambiguous")
+              seen_jobs.add(identity)
+              producer_jobs[name][attempt] = (job.get("status"), job.get("conclusion"))
+
+          group_prefixes = {
+              "macos-aarch64": (
+                  "stasis-macos-aarch64",
+                  "stasis-macos-aarch64-act-settle-inspect-proof",
+              ),
+              "linux-x86_64": (
+                  "stasis-linux-x86_64",
+                  "stasis-linux-x86_64-act-settle-inspect-proof",
+              ),
+              "sdk": ("stasis-runtime-manifest", "stasis-typescript"),
+          }
+          selected = {}
+          for group, expected_prefixes in group_prefixes.items():
+              attempts = producer_jobs[producer_names[group]]
+              if not attempts:
+                  raise SystemExit(f"no {group} producer job exists")
+              producer_attempt = max(attempts)
+              if attempts[producer_attempt] != ("completed", "success"):
+                  raise SystemExit(f"latest {group} producer job did not succeed")
+              expected = sorted(
+                  f"{prefix}-attempt-{producer_attempt}" for prefix in expected_prefixes
+              )
+              if sorted(by_group_attempt[group].get(producer_attempt, [])) != expected:
+                  raise SystemExit(f"latest successful {group} producer artifacts are unavailable")
+              if max(by_group_attempt[group], default=0) > producer_attempt:
+                  raise SystemExit(f"newer incomplete or unsuccessful {group} artifacts exist")
+              selected[group] = producer_attempt
+
+          for platform, claimed_attempt in claimed_attempts.items():
+              if selected[platform] != claimed_attempt:
+                  raise SystemExit(f"published {platform} proof does not name the selected producer")
+          if (
+              selected["macos-aarch64"] > selected["sdk"]
+              or selected["linux-x86_64"] > selected["sdk"]
+          ):
+              raise SystemExit("selected SDK producer predates a selected native producer")
+          print(
+              overall_attempt,
+              selected["macos-aarch64"],
+              selected["linux-x86_64"],
+              selected["sdk"],
+          )
+          PY
+          )
+          if [[ ! "$overall_run_attempt" =~ ^[1-9][0-9]*$ \
+            || ! "$macos_run_attempt" =~ ^[1-9][0-9]*$ \
+            || ! "$linux_run_attempt" =~ ^[1-9][0-9]*$ \
+            || ! "$sdk_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'selected package producer attempts are invalid' >&2
+            exit 1
+          fi
+          for platform in macos-aarch64 linux-x86_64; do
+            if [[ "$platform" == 'macos-aarch64' ]]; then
+              producer_attempt=$macos_run_attempt
+            else
+              producer_attempt=$linux_run_attempt
+            fi
+            python3 etc/ci/stasis/release_archive.py verify-gate-proof \
+              --proof-directory "gate-proof/$platform" \
+              --asset-directory "release-assets/$platform" \
+              --version "$STASIS_VERSION" \
+              --platform "$platform" \
+              --revision "$STASIS_REVISION" \
+              --run-id "$package_run_id" \
+              --run-attempt "$producer_attempt"
+          done
+          for release_asset in release-assets/*/* gate-proof/*/* runtime-manifest/*; do
             gh attestation verify "$release_asset" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
@@ -223,52 +558,26 @@ jobs:
               --deny-self-hosted-runners
           done
 
-          binary_sha256=$(awk '{print $1}' "release-assets/$STASIS_BINARY_SHA256")
-          test "$binary_sha256" = "$(jq -er '.binary.sha256' "gate-proof/$STASIS_GATE_PROOF")"
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$proof_run_id" > package-run.json
-          jq -e \
-            --arg repository "$GITHUB_REPOSITORY" \
-            --arg revision "$STASIS_REVISION" \
-            --arg default_branch "$DEFAULT_BRANCH" \
-            --argjson attempt "$proof_run_attempt" '
-              .repository.full_name == $repository
-              and .head_repository.full_name == $repository
-              and .name == "Stasis package and promote"
-              and .path == ".github/workflows/stasis-package.yml"
-              and .event == "push"
-              and .status == "completed"
-              and .conclusion == "success"
-              and .head_sha == $revision
-              and .head_branch == $default_branch
-              and .run_attempt >= $attempt
-            ' package-run.json > /dev/null
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$proof_run_id/artifacts?per_page=100" > package-artifacts.json
-          jq -e --argjson run_id "$proof_run_id" --arg attempt "$proof_run_attempt" '
-            .artifacts as $artifacts
-            | [
-              "stasis-macos-aarch64-attempt-\($attempt)",
-              "stasis-macos-aarch64-act-settle-inspect-proof-attempt-\($attempt)",
-              "stasis-typescript-alpha-attempt-\($attempt)"
-            ] as $expected
-            | .total_count == ($artifacts | length)
-            and ([$artifacts[].name | select(endswith("-attempt-\($attempt)"))] | sort) == ($expected | sort)
-            and all($expected[]; . as $name |
-              ([$artifacts[] | select(
-                .name == $name and .expired == false and .workflow_run.id == $run_id
-              )] | length) == 1
-            )
-          ' package-artifacts.json > /dev/null
-          sdk_artifact="stasis-typescript-alpha-attempt-$proof_run_attempt"
-          gh run download "$proof_run_id" --repo "$GITHUB_REPOSITORY" \
+          binary_sha256=$(awk '{print $1}' \
+            "release-assets/macos-aarch64/$STASIS_BINARY_SHA256")
+          test "$binary_sha256" = "$(jq -er '.binary.sha256' \
+            "gate-proof/macos-aarch64/$STASIS_GATE_PROOF")"
+          sdk_artifact="stasis-typescript-attempt-$sdk_run_attempt"
+          manifest_artifact="stasis-runtime-manifest-attempt-$sdk_run_attempt"
+          gh run download "$package_run_id" --repo "$GITHUB_REPOSITORY" \
             --name "$sdk_artifact" --dir pregated-sdk
+          gh run download "$package_run_id" --repo "$GITHUB_REPOSITORY" \
+            --name "$manifest_artifact" --dir package-runtime-manifest
+          cmp "$runtime_manifest" \
+            "package-runtime-manifest/stasis-${STASIS_VERSION}-runtime-manifest.json"
           python3 etc/ci/stasis/npm_release.py verify-proof \
             --directory pregated-sdk \
             --version "$STASIS_VERSION" \
             --revision "$STASIS_REVISION" \
             --native-binary-sha256 "$binary_sha256" \
-            --run-id "$proof_run_id" \
-            --run-attempt "$proof_run_attempt"
-          for sdk_asset in pregated-sdk/*; do
+            --run-id "$package_run_id" \
+            --run-attempt "$sdk_run_attempt"
+          for sdk_asset in pregated-sdk/* package-runtime-manifest/*; do
             gh attestation verify "$sdk_asset" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
@@ -278,13 +587,17 @@ jobs:
           done
           {
             echo "NPM_TARBALL=$GITHUB_WORKSPACE/pregated-sdk/oxhq-stasis-${STASIS_VERSION}.tgz"
-            echo "PACKAGE_RUN_ID=$proof_run_id"
-            echo "PACKAGE_RUN_ATTEMPT=$proof_run_attempt"
+            echo "PACKAGE_RUN_ID=$package_run_id"
+            echo "MACOS_RUN_ATTEMPT=$macos_run_attempt"
+            echo "LINUX_RUN_ATTEMPT=$linux_run_attempt"
+            echo "SDK_RUN_ATTEMPT=$sdk_run_attempt"
             echo "STASIS_NATIVE_BINARY_SHA256=$binary_sha256"
           } >> "$GITHUB_ENV"
           {
-            echo "package_run_id=$proof_run_id"
-            echo "package_run_attempt=$proof_run_attempt"
+            echo "package_run_id=$package_run_id"
+            echo "macos_run_attempt=$macos_run_attempt"
+            echo "linux_run_attempt=$linux_run_attempt"
+            echo "sdk_run_attempt=$sdk_run_attempt"
             echo "native_binary_sha256=$binary_sha256"
             echo "staged_artifact_name=verified-stasis-npm-package-attempt-$GITHUB_RUN_ATTEMPT"
           } >> "$GITHUB_OUTPUT"
@@ -348,6 +661,18 @@ jobs:
             --revision "$STASIS_REVISION" \
             --version "$STASIS_VERSION" \
             2>&1 | tee "$gate_log"
+          cp sdk/typescript/test/fixtures/public-package-north-star.mjs \
+            "$consumer/public-package-north-star.mjs"
+          cp sdk/typescript/test/fixtures/north-star.html "$consumer/north-star.html"
+          north_star_log="$RUNNER_TEMP/stasis-prepublish-north-star.jsonl"
+          (
+            cd "$consumer"
+            unset STASIS_NORTH_STAR_BINARY
+            node ./public-package-north-star.mjs
+          ) 2>&1 | tee "$north_star_log"
+          grep -F '"proof":"stasis-v0.1-north-star"' "$north_star_log"
+          grep -F '"runs":3' "$north_star_log"
+          cat "$north_star_log" >> "$gate_log"
           cp "$gate_log" "$staged_gate_log"
           python3 etc/ci/stasis/npm_release.py create-proof \
             --package "$NPM_TARBALL" \
@@ -387,8 +712,9 @@ jobs:
       id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
+      LINUX_RUN_ATTEMPT: ${{ needs.verify.outputs.linux_run_attempt }}
+      MACOS_RUN_ATTEMPT: ${{ needs.verify.outputs.macos_run_attempt }}
       NPM_CONFIG_PROVENANCE: "true"
-      PACKAGE_RUN_ATTEMPT: ${{ needs.verify.outputs.package_run_attempt }}
       PACKAGE_RUN_ID: ${{ needs.verify.outputs.package_run_id }}
       PREPUBLISH_RUN_ATTEMPT: ${{ needs.verify.outputs.prepublish_run_attempt }}
       RELEASE_ID: ${{ needs.verify.outputs.release_id }}
@@ -396,8 +722,9 @@ jobs:
       STASIS_NATIVE_BINARY_SHA256: ${{ needs.verify.outputs.native_binary_sha256 }}
       STASIS_REVISION: ${{ needs.verify.outputs.revision }}
       STASIS_VERSION: ${{ needs.verify.outputs.version }}
+      SDK_RUN_ATTEMPT: ${{ needs.verify.outputs.sdk_run_attempt }}
     steps:
-      - name: Recheck the exact published prerelease and lightweight tag
+      - name: Recheck the exact published stable release and lightweight tag
         shell: bash
         run: |
           set -euo pipefail
@@ -419,7 +746,7 @@ jobs:
                 .id == $release_id
                 and .tag_name == $tag
                 and .draft == false
-                and .prerelease == true
+                and .prerelease == false
                 and .immutable == true
                 and (.published_at | type == "string" and length > 0)
               ' <<< "$release" > /dev/null
@@ -724,7 +1051,7 @@ jobs:
                   not isinstance(publish, dict)
                   or set(publish) != {"access", "tag", "provenance"}
                   or publish.get("access") != "public"
-                  or publish.get("tag") != "alpha"
+                  or publish.get("tag") != "latest"
                   or publish.get("provenance") is not True
               ):
                   raise SystemExit("SDK package publication policy changed")
@@ -748,19 +1075,35 @@ jobs:
           version = os.environ["STASIS_VERSION"]
           revision = os.environ["STASIS_REVISION"]
           run_id = os.environ["PACKAGE_RUN_ID"]
-          run_attempt = os.environ["PACKAGE_RUN_ATTEMPT"]
+          producer_attempts = {
+              "macos-aarch64": os.environ["MACOS_RUN_ATTEMPT"],
+              "linux-x86_64": os.environ["LINUX_RUN_ATTEMPT"],
+              "sdk": os.environ["SDK_RUN_ATTEMPT"],
+          }
+          sdk_run_attempt = producer_attempts["sdk"]
           prepublish_run_id = os.environ["GITHUB_RUN_ID"]
           prepublish_run_attempt = os.environ["PREPUBLISH_RUN_ATTEMPT"]
           current_publish_attempt = os.environ["GITHUB_RUN_ATTEMPT"]
           binary_digest = os.environ["STASIS_NATIVE_BINARY_SHA256"]
-          if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+", version) is None:
+          if version != "0.1.0":
               raise SystemExit("invalid staged SDK version")
           if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
               raise SystemExit("invalid staged SDK revision")
           if os.environ["GITHUB_EVENT_NAME"] == "release" and revision != os.environ["GITHUB_SHA"]:
               raise SystemExit("staged SDK revision differs from the release-event provenance SHA")
-          if re.fullmatch(r"[1-9][0-9]*", run_id) is None or re.fullmatch(r"[1-9][0-9]*", run_attempt) is None:
+          if (
+              re.fullmatch(r"[1-9][0-9]*", run_id) is None
+              or any(
+                  re.fullmatch(r"[1-9][0-9]*", attempt) is None
+                  for attempt in producer_attempts.values()
+              )
+          ):
               raise SystemExit("invalid staged package run identity")
+          if (
+              int(producer_attempts["macos-aarch64"]) > int(sdk_run_attempt)
+              or int(producer_attempts["linux-x86_64"]) > int(sdk_run_attempt)
+          ):
+              raise SystemExit("staged SDK producer predates a selected native producer")
           if (
               re.fullmatch(r"[1-9][0-9]*", prepublish_run_id) is None
               or re.fullmatch(r"[1-9][0-9]*", prepublish_run_attempt) is None
@@ -801,7 +1144,7 @@ jobs:
               "package": f"@oxhq/stasis@{version}",
               "revision": revision,
               "workflowRunId": run_id,
-              "workflowRunAttempt": run_attempt,
+              "workflowRunAttempt": sdk_run_attempt,
               "source": {
                   "servo_repository": "https://github.com/servo/servo.git",
                   "servo_revision": "0d579bd5aab6df3764fad805427254751632a6e4",
@@ -879,6 +1222,7 @@ jobs:
           ):
               raise SystemExit("prepublish SDK proof is not bound to its staged gate log")
           gate_records = []
+          north_star_records = []
           try:
               prepublish_log_text = prepublish_log_bytes.decode("utf-8")
           except UnicodeError as error:
@@ -892,8 +1236,40 @@ jobs:
                   continue
               if isinstance(record, dict) and record.get("gate") == "sdk-act-settle-inspect":
                   gate_records.append(record)
+              if isinstance(record, dict) and record.get("proof") == "stasis-v0.1-north-star":
+                  north_star_records.append(record)
           if len(gate_records) != 1:
               raise SystemExit("prepublish SDK log has no unique structured gate success")
+          if len(north_star_records) != 1:
+              raise SystemExit("prepublish SDK log has no unique North Star proof")
+          north_star = north_star_records[0]
+          expected_evidence_shape = {
+              "schemaVersion": 1,
+              "completeness": "terminal_snapshot",
+              "profile": "controlled-webapp-v1",
+              "outcome": "quiescent",
+              "reasonKind": "quiescent",
+              "maxItems": 32,
+          }
+          virtual_time_delta_ns = north_star.get("virtualTimeDeltaNs")
+          dom_epoch = north_star.get("domEpoch")
+          if (
+              set(north_star) != {
+                  "proof", "runs", "profile", "outcome", "virtualTimeDeltaNs",
+                  "domEpoch", "cardCount", "evidenceShape",
+              }
+              or north_star.get("runs") != 3
+              or north_star.get("profile") != "controlled-webapp-v1"
+              or north_star.get("outcome") != "quiescent"
+              or not isinstance(virtual_time_delta_ns, str)
+              or re.fullmatch(r"[1-9][0-9]*", virtual_time_delta_ns) is None
+              or int(virtual_time_delta_ns) < 250_000_000
+              or not isinstance(dom_epoch, str)
+              or re.fullmatch(r"[1-9][0-9]*", dom_epoch) is None
+              or north_star.get("cardCount") != "3"
+              or north_star.get("evidenceShape") != expected_evidence_shape
+          ):
+              raise SystemExit("prepublish North Star proof changed or is incomplete")
           gate_record = gate_records[0]
           wall_elapsed = gate_record.get("wallElapsedMs")
           expected_gate_fields = {
@@ -981,7 +1357,7 @@ jobs:
                 .id == $release_id
                 and .tag_name == $tag
                 and .draft == false
-                and .prerelease == true
+                and .prerelease == false
                 and .immutable == true
                 and (.published_at | type == "string" and length > 0)
               ' <<< "$release" > /dev/null
@@ -995,17 +1371,12 @@ jobs:
             exit 1
           fi
 
-      - name: Publish with npm OIDC or the one-time seed token
+      - name: Publish with npm trusted publishing and provenance
         if: github.event_name == 'release' && steps.npm-state.outputs.publish_required == 'true'
         shell: bash
-        env:
-          NPM_BOOTSTRAP_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          if [[ -n "$NPM_BOOTSTRAP_TOKEN" ]]; then
-            export NODE_AUTH_TOKEN="$NPM_BOOTSTRAP_TOKEN"
-          fi
-          npm publish "$NPM_TARBALL" --ignore-scripts --access public --tag alpha --provenance \
+          npm publish "$NPM_TARBALL" --ignore-scripts --access public --tag latest --provenance \
             --registry="$NPM_CONFIG_REGISTRY"
 
       - name: Require registry convergence to exact bytes and npm tag aliases
@@ -1038,7 +1409,7 @@ jobs:
                   keys.length === 2
                     && keys[0] === "alpha"
                     && keys[1] === "latest"
-                    && tags.alpha === process.argv[2]
+                    && tags.alpha === "0.1.0-alpha.0"
                     && tags.latest === process.argv[2]
                 ));
               ' "$dist_tags" "$STASIS_VERSION")
@@ -1052,7 +1423,7 @@ jobs:
             sleep 10
           done
           if [[ "$matched" != 'true' ]]; then
-            echo 'npm registry did not converge to the exact alpha bytes and tag aliases' >&2
+            echo 'npm registry did not converge to the exact stable bytes and dist-tags' >&2
             exit 1
           fi
           mkdir "$RUNNER_TEMP/stasis-registry-pack"
@@ -1113,7 +1484,7 @@ jobs:
             const assert = require("node:assert/strict");
             const tags = JSON.parse(process.argv[1]);
             assert.deepEqual(Object.keys(tags).sort(), ["alpha", "latest"]);
-            assert.equal(tags.alpha, process.argv[2]);
+            assert.equal(tags.alpha, "0.1.0-alpha.0");
             assert.equal(tags.latest, process.argv[2]);
           ' "$dist_tags" "$STASIS_VERSION"
           test "$registry_version" = "$STASIS_VERSION"
@@ -1128,7 +1499,7 @@ jobs:
           cmp "$npm_tarball" "${registry_packages[0]}"
 
   verify-registry:
-    name: Verify registry-installed SDK end to end
+    name: Verify registry SDK on ${{ matrix.release_platform }}
     needs:
       - verify
       - publish
@@ -1143,21 +1514,36 @@ jobs:
               && needs.recover_published.result == 'success'
           )
         )
-    runs-on: macos-15
-    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release_platform: macos-aarch64
+            runner: macos-15
+            kernel: Darwin
+            architecture: arm64
+          - release_platform: linux-x86_64
+            runner: ubuntu-22.04
+            kernel: Linux
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     permissions:
       actions: read
       attestations: read
       contents: read
     env:
       GH_TOKEN: ${{ github.token }}
-      PACKAGE_RUN_ATTEMPT: ${{ needs.verify.outputs.package_run_attempt }}
+      LINUX_RUN_ATTEMPT: ${{ needs.verify.outputs.linux_run_attempt }}
+      MACOS_RUN_ATTEMPT: ${{ needs.verify.outputs.macos_run_attempt }}
       PACKAGE_RUN_ID: ${{ needs.verify.outputs.package_run_id }}
       PUBLICATION_RUN_ATTEMPT: ${{ github.event_name == 'release' && github.run_attempt || needs.verify.outputs.publication_run_attempt }}
       PUBLICATION_RUN_ID: ${{ github.event_name == 'release' && github.run_id || needs.verify.outputs.publication_run_id }}
       STASIS_NATIVE_BINARY_SHA256: ${{ needs.verify.outputs.native_binary_sha256 }}
+      STASIS_PLATFORM: ${{ matrix.release_platform }}
       STASIS_REVISION: ${{ needs.verify.outputs.revision }}
       STASIS_VERSION: ${{ needs.verify.outputs.version }}
+      SDK_RUN_ATTEMPT: ${{ needs.verify.outputs.sdk_run_attempt }}
     steps:
       - name: Check out the exact published tag
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -1166,9 +1552,24 @@ jobs:
           persist-credentials: false
           ref: ${{ env.STASIS_RELEASE_TAG }}
 
+      - name: Set up pinned Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+
       - name: Require space for bounded public artifact verification
+        if: matrix.release_platform == 'macos-aarch64'
         shell: bash
         run: bash etc/ci/stasis/prepare_macos_runner.sh check 4194304
+
+      - name: Prepare the Linux public-fixture runner
+        if: matrix.release_platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(LC_ALL=C getconf GNU_LIBC_VERSION)" = 'glibc 2.35'
+          sudo apt-get update
+          sudo apt-get install --yes xvfb
 
       - name: Set up Node without publication credentials
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -1182,21 +1583,44 @@ jobs:
           TAG: ${{ env.STASIS_RELEASE_TAG }}
         run: |
           set -euo pipefail
-          test "$(uname -s)" = 'Darwin'
-          test "$(uname -m)" = 'arm64'
-          test "$(sysctl -n hw.optional.arm64)" = '1'
+          test "$(uname -s)" = '${{ matrix.kernel }}'
+          test "$(uname -m)" = '${{ matrix.architecture }}'
+          if [[ "$STASIS_PLATFORM" == 'macos-aarch64' ]]; then
+            test "$(sysctl -n hw.optional.arm64)" = '1'
+          else
+            test "$(LC_ALL=C getconf GNU_LIBC_VERSION)" = 'glibc 2.35'
+          fi
+          for producer_attempt in \
+            "$MACOS_RUN_ATTEMPT" "$LINUX_RUN_ATTEMPT" "$SDK_RUN_ATTEMPT"; do
+            if [[ ! "$producer_attempt" =~ ^[1-9][0-9]*$ ]]; then
+              echo 'public verification received an invalid package producer attempt' >&2
+              exit 1
+            fi
+          done
+          if [[ "$MACOS_RUN_ATTEMPT" -gt "$SDK_RUN_ATTEMPT" \
+            || "$LINUX_RUN_ATTEMPT" -gt "$SDK_RUN_ATTEMPT" ]]; then
+            echo 'public verification received an SDK attempt older than a native attempt' >&2
+            exit 1
+          fi
+          if [[ "$STASIS_PLATFORM" == 'macos-aarch64' ]]; then
+            native_run_attempt=$MACOS_RUN_ATTEMPT
+          else
+            native_run_attempt=$LINUX_RUN_ATTEMPT
+          fi
           test "$(git rev-parse HEAD)" = "$STASIS_REVISION"
           bundle="stasis-${STASIS_VERSION}-${STASIS_PLATFORM}"
           archive="${bundle}.tar.gz"
           binary_sidecar="${bundle}.binary.sha256"
           proof="${bundle}-act-settle-inspect.json"
-          mkdir release-assets gate-proof
+          mkdir release-assets gate-proof runtime-manifest
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release-assets \
             --pattern "$archive" \
             --pattern "$archive.sha256" \
             --pattern "$binary_sidecar"
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir gate-proof \
             --pattern "$proof"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir runtime-manifest \
+            --pattern "stasis-${STASIS_VERSION}-runtime-manifest.json"
           python3 etc/ci/stasis/release_archive.py verify \
             --asset-directory release-assets \
             --version "$STASIS_VERSION" \
@@ -1212,9 +1636,35 @@ jobs:
             --platform "$STASIS_PLATFORM" \
             --revision "$STASIS_REVISION" \
             --run-id "$PACKAGE_RUN_ID" \
-            --run-attempt "$PACKAGE_RUN_ATTEMPT"
-          test "$STASIS_NATIVE_BINARY_SHA256" = "$(awk '{print $1}' "release-assets/$binary_sidecar")"
-          for release_asset in release-assets/* gate-proof/*; do
+            --run-attempt "$native_run_attempt"
+          selected_binary_sha256=$(awk '{print $1}' "release-assets/$binary_sidecar")
+          if [[ "$STASIS_PLATFORM" == 'macos-aarch64' ]]; then
+            test "$STASIS_NATIVE_BINARY_SHA256" = "$selected_binary_sha256"
+          fi
+          node sdk/typescript/scripts/generate-runtime-manifest.mjs \
+            --input "runtime-manifest/stasis-${STASIS_VERSION}-runtime-manifest.json" \
+            --output "$RUNNER_TEMP/runtime-manifest.generated.ts"
+          node - \
+            "runtime-manifest/stasis-${STASIS_VERSION}-runtime-manifest.json" \
+            "release-assets/$archive" \
+            "$archive" \
+            "$selected_binary_sha256" \
+            "$STASIS_PLATFORM" <<'JS'
+          const assert = require("node:assert/strict");
+          const crypto = require("node:crypto");
+          const fs = require("node:fs");
+          const [manifestFile, archiveFile, archiveName, executableSha256, platform] = process.argv.slice(2);
+          const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+          const key = platform === "macos-aarch64" ? "darwin-arm64" : "linux-x64";
+          const artifact = manifest.artifacts[key];
+          const archiveBytes = fs.readFileSync(archiveFile);
+          assert.equal(artifact.releasePlatform, platform);
+          assert.equal(artifact.archiveSizeBytes, archiveBytes.byteLength);
+          assert.equal(artifact.archiveSha256, crypto.createHash("sha256").update(archiveBytes).digest("hex"));
+          assert.equal(artifact.executableSha256, executableSha256);
+          assert.equal(new URL(artifact.archiveUrl).pathname.split("/").at(-1), archiveName);
+          JS
+          for release_asset in release-assets/* gate-proof/* runtime-manifest/*; do
             gh attestation verify "$release_asset" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
@@ -1246,7 +1696,7 @@ jobs:
             --revision "$STASIS_REVISION" \
             --native-binary-sha256 "$STASIS_NATIVE_BINARY_SHA256" \
             --run-id "$PACKAGE_RUN_ID" \
-            --run-attempt "$PACKAGE_RUN_ATTEMPT"
+            --run-attempt "$SDK_RUN_ATTEMPT"
           for sdk_asset in verified-sdk/*; do
             gh attestation verify "$sdk_asset" \
               --repo "$GITHUB_REPOSITORY" \
@@ -1282,7 +1732,7 @@ jobs:
               const assert = require("node:assert/strict");
               const tags = JSON.parse(process.argv[1]);
               assert.deepEqual(Object.keys(tags).sort(), ["alpha", "latest"]);
-              assert.equal(tags.alpha, process.argv[2]);
+              assert.equal(tags.alpha, "0.1.0-alpha.0");
               assert.equal(tags.latest, process.argv[2]);
             ' "$dist_tags" "$STASIS_VERSION"
             test "$(npm view "@oxhq/stasis@$STASIS_VERSION" dist.integrity \
@@ -1466,10 +1916,25 @@ jobs:
               f"run {run_id} attempt {provenance_attempt}"
           )
           PY
-          node etc/ci/stasis/verify_registry_sdk.mjs \
+          gate_runner=(env)
+          if [[ "$STASIS_PLATFORM" == 'linux-x86_64' ]]; then
+            gate_runner=(xvfb-run -a env)
+          fi
+          "${gate_runner[@]}" node etc/ci/stasis/verify_registry_sdk.mjs \
             --binary "$RUNNER_TEMP/stasis-registry-release/$STASIS_BUNDLE/stasis" \
             --fixture ports/stasis/tests/fixtures/timer_10s.html \
             --consumer-root "$consumer" \
             --package "${registry_packages[0]}" \
             --revision "$STASIS_REVISION" \
             --version "$STASIS_VERSION"
+          cp sdk/typescript/test/fixtures/public-package-north-star.mjs \
+            "$consumer/public-package-north-star.mjs"
+          cp sdk/typescript/test/fixtures/north-star.html "$consumer/north-star.html"
+          north_star_log="$RUNNER_TEMP/stasis-public-package-north-star.jsonl"
+          (
+            cd "$consumer"
+            unset STASIS_NORTH_STAR_BINARY
+            "${gate_runner[@]}" node ./public-package-north-star.mjs
+          ) 2>&1 | tee "$north_star_log"
+          grep -F '"proof":"stasis-v0.1-north-star"' "$north_star_log"
+          grep -F '"runs":3' "$north_star_log"

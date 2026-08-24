@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Stasis mutation limit</title>
+  </head>
+  <body>
+    <button id="start" type="button">Start mutation storm</button>
+    <div id="target"></div>
+    <script>
+      document.querySelector("#start").addEventListener("click", () => {
+        const target = document.querySelector("#target");
+        for (let index = 0; index < 1_000_100; index += 1) {
+          target.setAttribute("data-step", String(index));
+        }
+      });
+    </script>
+  </body>
+</html>

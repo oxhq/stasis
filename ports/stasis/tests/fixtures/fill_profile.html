@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Stasis controlled fill profile</title>
+<input id="text" type="text">
+<input id="search" type="search">
+<input id="url" type="url">
+<input id="tel" type="tel">
+<input id="email" type="email">
+<input id="password" type="password">
+<textarea id="textarea"></textarea>
+<output id="events">text=0,search=0,url=0,tel=0,email=0,password=0,textarea=0</output>
+<script>
+  const names = ["text", "search", "url", "tel", "email", "password", "textarea"];
+  const counts = Object.fromEntries(names.map((name) => [name, 0]));
+  for (const name of names) {
+    document.querySelector(`#${name}`).addEventListener("input", (event) => {
+      if (
+        event.inputType !== "insertReplacementText" ||
+        !event.bubbles ||
+        !event.composed ||
+        event.cancelable
+      ) {
+        document.querySelector("#events").textContent = "invalid input event";
+        return;
+      }
+      counts[name] += 1;
+      document.querySelector("#events").textContent =
+        names.map((field) => `${field}=${counts[field]}`).join(",");
+    });
+  }
+</script>

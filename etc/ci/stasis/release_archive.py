@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Build and verify the intentionally small Stasis alpha release archive."""
+"""Build and verify the exact Stasis 0.1.0 native release archives."""
 
 from __future__ import annotations
 
 import argparse
 import gzip
 import hashlib
+import io
 import json
 import os
 import re
@@ -19,21 +20,57 @@ from pathlib import Path
 from typing import BinaryIO, Iterable
 
 
-VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+")
+STABLE_VERSION = "0.1.0"
+VERSION_RE = re.compile(re.escape(STABLE_VERSION))
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
-PLATFORM_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9_]+)+")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 RUN_ID_RE = re.compile(r"[1-9][0-9]*")
 
 BINARY_NAME = "stasis"
 THIRD_PARTY_NAME = "THIRD_PARTY_LICENSES.html"
+PLATFORM_CONTRACTS: dict[str, dict[str, str]] = {
+    "linux-x86_64": {
+        "display_name": "Linux x86_64",
+        "operating_system": "Linux",
+        "architecture": "x86_64",
+        "abi": "GNU/Linux with glibc 2.35 or newer",
+        "install_note": (
+            "This executable targets x86_64 GNU/Linux with glibc 2.35 or newer "
+            "(the Ubuntu 22.04 compatibility floor)."
+        ),
+        "dependency_note": (
+            "External runtime baseline: Ubuntu 22.04-compatible x86_64 userspace with "
+            "glibc 2.35 or newer; system shared libraries are resolved by the GNU/Linux "
+            "dynamic loader."
+        ),
+    },
+    "macos-aarch64": {
+        "display_name": "macOS Apple Silicon",
+        "operating_system": "macOS",
+        "architecture": "arm64",
+        "abi": "macOS arm64",
+        "install_note": (
+            "This macOS arm64 executable is unsigned and is not Apple-notarized."
+        ),
+        "dependency_note": (
+            "External runtime dependencies: Apple system libraries and frameworks "
+            "supplied by macOS."
+        ),
+    },
+}
 SOURCE_ASSETS = {
     "LICENSE": Path("LICENSE"),
     "LICENSE_WHATWG_SPECS": Path("LICENSE_WHATWG_SPECS"),
     "STASIS_UPSTREAM.toml": Path("STASIS_UPSTREAM.toml"),
     THIRD_PARTY_NAME: Path("resources/resource_protocol/license.html"),
 }
-GENERATED_ASSETS = {"INSTALL.txt", "SOURCE.txt", "VERSION.txt"}
+GENERATED_ASSETS = {
+    "INSTALL.txt",
+    "NATIVE-LIBRARIES.txt",
+    "README.md",
+    "SOURCE.txt",
+    "VERSION.txt",
+}
 EXPECTED_FILES = {BINARY_NAME, *SOURCE_ASSETS, *GENERATED_ASSETS}
 MAX_COMPRESSED_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_BINARY_MEMBER_BYTES = 512 * 1024 * 1024
@@ -91,10 +128,22 @@ def require_fullmatch(pattern: re.Pattern[str], value: str, field: str) -> str:
 
 def validate_identity(version: str, platform: str, revision: str, repository: str) -> None:
     require_fullmatch(VERSION_RE, version, "version")
-    require_fullmatch(PLATFORM_RE, platform, "platform")
+    if platform not in PLATFORM_CONTRACTS:
+        raise ReleaseError(
+            f"unsupported platform {platform!r}; expected one of {sorted(PLATFORM_CONTRACTS)}"
+        )
     require_fullmatch(REVISION_RE, revision, "revision")
     if not repository.startswith("https://") or repository.endswith("/"):
         raise ReleaseError(f"repository must be an https URL without a trailing slash: {repository!r}")
+
+
+def platform_contract(platform: str) -> dict[str, str]:
+    contract = PLATFORM_CONTRACTS.get(platform)
+    if contract is None:
+        raise ReleaseError(
+            f"unsupported platform {platform!r}; expected one of {sorted(PLATFORM_CONTRACTS)}"
+        )
+    return contract
 
 
 def expected_source_identities(revision: str) -> dict[str, str]:
@@ -112,7 +161,7 @@ def verify_upstream_manifest(filename: Path) -> None:
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
         raise ReleaseError(f"cannot parse Stasis upstream manifest: {error}") from error
     if manifest != UPSTREAM_IDENTITIES:
-        raise ReleaseError("STASIS_UPSTREAM.toml does not contain the exact first-alpha source identities")
+        raise ReleaseError("STASIS_UPSTREAM.toml does not contain the exact release source identities")
 
 
 def bundle_name(version: str, platform: str) -> str:
@@ -144,11 +193,42 @@ def version_text(version: str, platform: str, revision: str) -> str:
 
 def install_text(version: str, platform: str) -> str:
     names = release_asset_names(version, platform)
+    contract = platform_contract(platform)
     return (
         f"1. Verify {names['archive_sha256']} before extracting this archive.\n"
         f"2. Extract {names['archive']} and put the stasis executable on PATH.\n"
         f"3. Optionally verify the extracted executable with {names['binary_sha256']}.\n"
-        "4. This alpha macOS executable is unsigned and is not Apple-notarized.\n"
+        "4. Read README.md and NATIVE-LIBRARIES.txt for the exact platform contract.\n"
+        f"5. {contract['install_note']}\n"
+    )
+
+
+def readme_text(version: str, platform: str, repository: str) -> str:
+    contract = platform_contract(platform)
+    return (
+        f"# Stasis {version}\n\n"
+        "Stasis is a controlled Servo runtime for deterministic web-application "
+        "automation within its declared support profile.\n\n"
+        f"- Artifact: `{platform}`\n"
+        f"- Platform: {contract['display_name']}\n"
+        f"- Operating system: {contract['operating_system']}\n"
+        f"- Architecture: {contract['architecture']}\n"
+        f"- ABI: {contract['abi']}\n"
+        f"- Source: {repository}\n\n"
+        "Start with INSTALL.txt. NATIVE-LIBRARIES.txt records the native runtime "
+        "dependency boundary for this exact artifact.\n"
+    )
+
+
+def native_libraries_text(version: str, platform: str) -> str:
+    contract = platform_contract(platform)
+    return (
+        f"Artifact: {bundle_name(version, platform)}\n"
+        f"Operating system: {contract['operating_system']}\n"
+        f"Architecture: {contract['architecture']}\n"
+        f"ABI: {contract['abi']}\n"
+        "Separate bundled native-library files: none\n"
+        f"{contract['dependency_note']}\n"
     )
 
 
@@ -293,9 +373,25 @@ def expected_generated_assets(
 ) -> dict[str, bytes]:
     return {
         "INSTALL.txt": install_text(version, platform).encode("utf-8"),
+        "NATIVE-LIBRARIES.txt": native_libraries_text(version, platform).encode("utf-8"),
+        "README.md": readme_text(version, platform, repository).encode("utf-8"),
         "SOURCE.txt": source_text(repository, revision).encode("utf-8"),
         "VERSION.txt": version_text(version, platform, revision).encode("utf-8"),
     }
+
+
+def member_size_limit(name: str) -> int:
+    return MAX_BINARY_MEMBER_BYTES if name == BINARY_NAME else MAX_TEXT_MEMBER_BYTES
+
+
+def require_bounded_nonempty_file(filename: Path, name: str) -> None:
+    require_regular_file(filename, f"bundle member {name}")
+    size = filename.stat().st_size
+    limit = member_size_limit(name)
+    if size <= 0 or size > limit:
+        raise ReleaseError(
+            f"bundle member {name} has invalid size {size}; allowed range is 1..{limit} bytes"
+        )
 
 
 def validate_bundle_directory(
@@ -314,7 +410,7 @@ def validate_bundle_directory(
             f"extra={sorted(actual - EXPECTED_FILES)}"
         )
     for name in EXPECTED_FILES:
-        require_regular_file(directory / name, f"bundle member {name}")
+        require_bounded_nonempty_file(directory / name, name)
     if stat.S_IMODE((directory / BINARY_NAME).stat().st_mode) & 0o111 == 0:
         raise ReleaseError("packaged stasis executable is not executable")
     for packaged_name, source_name in SOURCE_ASSETS.items():
@@ -339,11 +435,18 @@ def create_release(
     source_root: Path,
 ) -> dict[str, str]:
     validate_identity(version, platform, revision, repository)
-    require_regular_file(binary, "Stasis binary")
+    require_bounded_nonempty_file(binary, BINARY_NAME)
     if stat.S_IMODE(binary.stat().st_mode) & 0o111 == 0:
         raise ReleaseError(f"Stasis binary is not executable: {binary}")
     for packaged_name, source_name in SOURCE_ASSETS.items():
-        require_regular_file(source_root / source_name, f"source asset for {packaged_name}")
+        source = source_root / source_name
+        require_regular_file(source, f"source asset for {packaged_name}")
+        size = source.stat().st_size
+        if size <= 0 or size > MAX_TEXT_MEMBER_BYTES:
+            raise ReleaseError(
+                f"source asset {source_name} has invalid size {size}; "
+                f"allowed range is 1..{MAX_TEXT_MEMBER_BYTES} bytes"
+            )
 
     dist.mkdir(parents=True, exist_ok=True)
     names = release_asset_names(version, platform)
@@ -431,11 +534,11 @@ def verify_tar_metadata(package: tarfile.TarFile, bundle: str) -> dict[str, tarf
         expected_mode = 0o755 if relative == BINARY_NAME else 0o644
         if not member.isfile() or member.mode != expected_mode:
             raise ReleaseError(f"archive member type or mode is invalid: {member.name}")
-        member_limit = MAX_BINARY_MEMBER_BYTES if relative == BINARY_NAME else MAX_TEXT_MEMBER_BYTES
-        if member.size < 0 or member.size > member_limit:
+        member_limit = member_size_limit(relative)
+        if member.size <= 0 or member.size > member_limit:
             raise ReleaseError(
                 f"archive member {member.name} has invalid size {member.size}; "
-                f"maximum is {member_limit} bytes"
+                f"allowed range is 1..{member_limit} bytes"
             )
     total_member_bytes = sum(member.size for member in members if member.isfile())
     if total_member_bytes > MAX_UNCOMPRESSED_ARCHIVE_BYTES:
@@ -733,6 +836,9 @@ def verify_gate_proof(
 def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="stasis-release-self-test-") as temporary:
         root = Path(temporary)
+        version = STABLE_VERSION
+        revision = "1" * 40
+        repository = "https://github.com/oxhq/stasis"
         source_root = root / "source"
         source_root.mkdir()
         for source_name in SOURCE_ASSETS.values():
@@ -749,28 +855,163 @@ def self_test() -> None:
         binary = root / BINARY_NAME
         binary.write_bytes(b"#!/bin/sh\nexit 0\n")
         binary.chmod(0o755)
-        dist = root / "dist"
-        result = create_release(
-            binary=binary,
-            dist=dist,
-            version="0.1.0-alpha.0",
-            platform="macos-aarch64",
-            revision="1" * 40,
-            repository="https://github.com/oxhq/stasis",
-            source_root=source_root,
+
+        release_cases: dict[
+            str,
+            tuple[Path, dict[str, str], Path, Path, dict[str, object], str],
+        ] = {}
+        for index, platform in enumerate(sorted(PLATFORM_CONTRACTS), start=1):
+            dist = root / f"dist-{platform}"
+            result = create_release(
+                binary=binary,
+                dist=dist,
+                version=version,
+                platform=platform,
+                revision=revision,
+                repository=repository,
+                source_root=source_root,
+            )
+            extracted = root / f"extracted-{platform}"
+            verified = verify_release(
+                asset_directory=dist,
+                version=version,
+                platform=platform,
+                revision=revision,
+                repository=repository,
+                source_root=source_root,
+                extract_to=extracted,
+            )
+            if result["archiveSha256"] != verified["archiveSha256"]:
+                raise ReleaseError(
+                    f"self-test {platform} archive digest changed during verification"
+                )
+
+            names = release_asset_names(version, platform)
+            archive = dist / names["archive"]
+            bundle = bundle_name(version, platform)
+            extracted_bundle = extracted / bundle
+            actual_files = {entry.name for entry in extracted_bundle.iterdir()}
+            if actual_files != EXPECTED_FILES:
+                raise ReleaseError(f"self-test {platform} extracted inventory changed")
+            generated = expected_generated_assets(version, platform, revision, repository)
+            for name, expected in generated.items():
+                if (extracted_bundle / name).read_bytes() != expected:
+                    raise ReleaseError(f"self-test {platform} metadata changed: {name}")
+            contract = platform_contract(platform)
+            if contract["display_name"] not in generated["README.md"].decode("utf-8"):
+                raise ReleaseError(f"self-test {platform} README lost its platform identity")
+            if contract["dependency_note"] not in generated["NATIVE-LIBRARIES.txt"].decode(
+                "utf-8"
+            ):
+                raise ReleaseError(
+                    f"self-test {platform} native dependency metadata changed"
+                )
+            if contract["install_note"] not in generated["INSTALL.txt"].decode("utf-8"):
+                raise ReleaseError(f"self-test {platform} install metadata changed")
+
+            archive_digest = sha256_file(archive)
+            binary_digest = parse_sidecar(
+                dist / names["binary_sha256"],
+                f"{bundle}/{BINARY_NAME}",
+            )
+            gate_record: dict[str, object] = {
+                "schema": GATE_PROOF_SCHEMA,
+                "gate": GATE_NAME,
+                "test": GATE_TEST,
+                "version": version,
+                "archive": {"name": names["archive"], "sha256": archive_digest},
+                "binary": {"path": "/tmp/stasis", "sha256": binary_digest},
+                "source": expected_source_identities(revision),
+            }
+            log = root / f"gate-{platform}.log"
+            log.write_text(
+                f"{GATE_RECORD_PREFIX}"
+                f"{json.dumps(gate_record, allow_nan=False, separators=(',', ':'), sort_keys=True)}\n"
+                f"test {GATE_TEST} ... ok\n{GATE_SUCCESS} 0 measured; 0 filtered out\n",
+                encoding="utf-8",
+            )
+            proof_dir = root / f"proof-{platform}"
+            proof_dir.mkdir()
+            proof = proof_dir / names["gate_proof"]
+            run_id = str(122 + index)
+            created_proof = create_gate_proof(
+                proof=proof,
+                gate_log=log,
+                asset_directory=dist,
+                version=version,
+                platform=platform,
+                revision=revision,
+                run_id=run_id,
+                run_attempt="1",
+            )
+            if (
+                created_proof["schema"] != GATE_PROOF_SCHEMA
+                or created_proof["platform"] != platform
+            ):
+                raise ReleaseError(f"self-test {platform} gate proof identity changed")
+            verify_gate_proof(
+                proof_directory=proof_dir,
+                asset_directory=dist,
+                version=version,
+                platform=platform,
+                revision=revision,
+                run_id=run_id,
+                run_attempt="1",
+            )
+            release_cases[platform] = (
+                dist,
+                names,
+                archive,
+                extracted_bundle,
+                gate_record,
+                binary_digest,
+            )
+
+        mac_generated = expected_generated_assets(
+            version, "macos-aarch64", revision, repository
         )
-        extracted = root / "extracted"
-        verified = verify_release(
-            asset_directory=dist,
-            version="0.1.0-alpha.0",
-            platform="macos-aarch64",
-            revision="1" * 40,
-            repository="https://github.com/oxhq/stasis",
-            source_root=source_root,
-            extract_to=extracted,
+        linux_generated = expected_generated_assets(
+            version, "linux-x86_64", revision, repository
         )
-        if result["archiveSha256"] != verified["archiveSha256"]:
-            raise ReleaseError("self-test archive digest changed during verification")
+        for name in ("INSTALL.txt", "NATIVE-LIBRARIES.txt", "README.md", "VERSION.txt"):
+            if mac_generated[name] == linux_generated[name]:
+                raise ReleaseError(f"self-test generated platform-neutral {name}")
+        if b"glibc 2.35" not in linux_generated["NATIVE-LIBRARIES.txt"]:
+            raise ReleaseError("self-test Linux metadata lost the glibc compatibility floor")
+        if b"unsigned and is not Apple-notarized" not in mac_generated["INSTALL.txt"]:
+            raise ReleaseError("self-test macOS metadata lost its signing boundary")
+
+        linux_bundle = release_cases["linux-x86_64"][3]
+        try:
+            validate_bundle_directory(
+                linux_bundle,
+                version=version,
+                platform="macos-aarch64",
+                revision=revision,
+                repository=repository,
+                source_root=source_root,
+            )
+        except ReleaseError as error:
+            if "generated release asset differs" not in str(error):
+                raise
+        else:
+            raise ReleaseError("self-test accepted Linux metadata as macOS metadata")
+
+        for invalid_version in ("0.1.0-alpha.0", "0.1.1", "v0.1.0"):
+            try:
+                validate_identity(invalid_version, "macos-aarch64", revision, repository)
+            except ReleaseError:
+                pass
+            else:
+                raise ReleaseError(f"self-test accepted non-release version {invalid_version!r}")
+        for invalid_platform in ("linux-aarch64", "macos-x86_64", "windows-x86_64"):
+            try:
+                validate_identity(version, invalid_platform, revision, repository)
+            except ReleaseError:
+                pass
+            else:
+                raise ReleaseError(f"self-test accepted unsupported platform {invalid_platform!r}")
+
         for invalid_json in (
             '{"outer":{"member":1,"member":2}}',
             '{"number":NaN}',
@@ -784,53 +1025,8 @@ def self_test() -> None:
             else:
                 raise ReleaseError("self-test accepted duplicate-member or non-finite JSON")
 
-        names = release_asset_names("0.1.0-alpha.0", "macos-aarch64")
-        archive = dist / names["archive"]
+        dist, names, archive, _, gate_record, binary_digest = release_cases["macos-aarch64"]
         archive_digest = sha256_file(archive)
-        log = root / "gate.log"
-        binary_digest = parse_sidecar(
-            dist / names["binary_sha256"],
-            "stasis-0.1.0-alpha.0-macos-aarch64/stasis",
-        )
-        gate_record: dict[str, object] = {
-            "schema": GATE_PROOF_SCHEMA,
-            "gate": GATE_NAME,
-            "test": GATE_TEST,
-            "version": "0.1.0-alpha.0",
-            "archive": {"name": names["archive"], "sha256": archive_digest},
-            "binary": {"path": "/tmp/stasis", "sha256": binary_digest},
-            "source": expected_source_identities("1" * 40),
-        }
-        log.write_text(
-            f"{GATE_RECORD_PREFIX}"
-            f"{json.dumps(gate_record, allow_nan=False, separators=(',', ':'), sort_keys=True)}\n"
-            f"test {GATE_TEST} ... ok\n{GATE_SUCCESS} 0 measured; 0 filtered out\n",
-            encoding="utf-8",
-        )
-        proof_dir = root / "proof"
-        proof_dir.mkdir()
-        proof = proof_dir / release_asset_names("0.1.0-alpha.0", "macos-aarch64")["gate_proof"]
-        created_proof = create_gate_proof(
-            proof=proof,
-            gate_log=log,
-            asset_directory=dist,
-            version="0.1.0-alpha.0",
-            platform="macos-aarch64",
-            revision="1" * 40,
-            run_id="123",
-            run_attempt="1",
-        )
-        if created_proof["schema"] != GATE_PROOF_SCHEMA:
-            raise ReleaseError("self-test gate proof did not use the current schema")
-        verify_gate_proof(
-            proof_directory=proof_dir,
-            asset_directory=dist,
-            version="0.1.0-alpha.0",
-            platform="macos-aarch64",
-            revision="1" * 40,
-            run_id="123",
-            run_attempt="1",
-        )
 
         unrelated_record = dict(gate_record)
         unrelated_record["archive"] = {"name": names["archive"], "sha256": "2" * 64}
@@ -846,9 +1042,9 @@ def self_test() -> None:
                 proof=root / "unrelated-archive-proof.json",
                 gate_log=unrelated_log,
                 asset_directory=dist,
-                version="0.1.0-alpha.0",
+                version=version,
                 platform="macos-aarch64",
-                revision="1" * 40,
+                revision=revision,
                 run_id="123",
                 run_attempt="1",
             )
@@ -859,7 +1055,7 @@ def self_test() -> None:
             raise ReleaseError("self-test attached an archive absent from the native gate record")
 
         overfull_tar = root / "overfull.tar"
-        bundle = bundle_name("0.1.0-alpha.0", "macos-aarch64")
+        bundle = bundle_name(version, "macos-aarch64")
         with tarfile.open(overfull_tar, mode="w", format=tarfile.USTAR_FORMAT) as package:
             package.addfile(normalized_tar_info(bundle, directory=True))
             for name in sorted(EXPECTED_FILES):
@@ -881,6 +1077,27 @@ def self_test() -> None:
             else:
                 raise ReleaseError("self-test accepted an archive beyond its member limit")
 
+        empty_member_tar = root / "empty-member.tar"
+        with tarfile.open(empty_member_tar, mode="w", format=tarfile.USTAR_FORMAT) as package:
+            package.addfile(normalized_tar_info(bundle, directory=True))
+            for name in sorted(EXPECTED_FILES):
+                payload = b"" if name == "README.md" else b"x"
+                member = normalized_tar_info(
+                    f"{bundle}/{name}",
+                    directory=False,
+                    executable=name == BINARY_NAME,
+                )
+                member.size = len(payload)
+                package.addfile(member, io.BytesIO(payload))
+        with tarfile.open(empty_member_tar, mode="r:") as package:
+            try:
+                verify_tar_metadata(package, bundle)
+            except ReleaseError as error:
+                if "invalid size 0" not in str(error):
+                    raise
+            else:
+                raise ReleaseError("self-test accepted an empty required archive member")
+
         sidecar = dist / names["archive_sha256"]
         try:
             decompress_canonical_gzip(
@@ -898,10 +1115,10 @@ def self_test() -> None:
         try:
             verify_release(
                 asset_directory=dist,
-                version="0.1.0-alpha.0",
+                version=version,
                 platform="macos-aarch64",
-                revision="1" * 40,
-                repository="https://github.com/oxhq/stasis",
+                revision=revision,
+                repository=repository,
                 source_root=source_root,
                 extract_to=None,
             )
@@ -915,10 +1132,10 @@ def self_test() -> None:
         try:
             verify_release(
                 asset_directory=dist,
-                version="0.1.0-alpha.0",
+                version=version,
                 platform="macos-aarch64",
-                revision="1" * 40,
-                repository="https://github.com/oxhq/stasis",
+                revision=revision,
+                repository=repository,
                 source_root=source_root,
                 extract_to=None,
             )

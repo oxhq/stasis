@@ -82,16 +82,17 @@ token, then consumes that token while advancing. A new input, producer event,
 navigation, cancellation, or timer change makes the token stale without moving
 the clock.
 
-## Alpha owner loop
+## v0.1 owner loop
 
 The shell's main thread exclusively owns Servo and the WebView. A dedicated
 stdin reader and Servo's `EventLoopWaker` increment separate wake generations
 on one condition variable. The owner thread drives Servo and waits for a
 generation change; it never uses `sleep()` to discover progress.
 
-The alpha uses this owner loop as the authority for controlled bootstrap,
-pending observations, bounded event-loop turns, conditional virtual-time
-advancement, settlement, and generation-bound actions and inspection. Those
+The stable `controlled-webapp-v1` profile uses this owner loop as the authority
+for controlled bootstrap, pending observations, bounded event-loop turns,
+conditional virtual-time advancement, settlement, and generation-bound actions
+and inspection. Those
 claims apply only to the exact shipped method and support boundary in
 `protocol-v1.md`; the loop by itself is not evidence for future profiles,
 journals, artifacts, or broader browsing-context support.

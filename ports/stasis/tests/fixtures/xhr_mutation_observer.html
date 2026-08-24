@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled XHR and MutationObserver fixture</title>
+<button id="async" type="button">async XHR</button>
+<button id="sync" type="button">sync XHR</button>
+<output id="result">idle</output>
+<output id="observed">idle</output>
+<script>
+  const result = document.querySelector('#result');
+  const observed = document.querySelector('#observed');
+  const observer = new MutationObserver(() => {
+    observed.textContent = result.textContent;
+  });
+  observer.observe(result, { childList: true });
+
+  document.querySelector('#async').addEventListener('click', () => {
+    result.textContent = 'loading';
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', '/xhr', true);
+    xhr.onload = () => {
+      result.textContent = xhr.responseText;
+    };
+    xhr.send();
+  });
+
+  document.querySelector('#sync').addEventListener('click', () => {
+    try {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', '/xhr', false);
+      xhr.send();
+      result.textContent = 'unexpected success';
+    } catch (error) {
+      result.textContent = error.name;
+    }
+  });
+</script>

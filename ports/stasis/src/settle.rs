@@ -26,17 +26,19 @@ use embedder_traits::document_pending::{
     PendingSourceKind, PendingSourceObservation, PendingTargetObservation, PendingTaskObservation,
     RawPendingSnapshot,
 };
-use timers::{DocumentClockId, TimerControlError};
+use timers::{
+    DocumentClockId, DocumentExecutionBudget, DocumentExecutionCounter, DocumentExecutionTerminal,
+    TimerControlError,
+};
 
 /// Conservative limits for one settlement request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SettlePolicy {
     /// Maximum document-clock span reachable from the first authoritative observation.
     pub max_virtual_time: Duration,
-    /// Maximum number of completed `DriveOneTurn` commands.
-    ///
-    /// This is intentionally not called `max_events`: the current observation surface has no
-    /// execution-ledger counts for nested microtasks, rendering opportunities, or mutations.
+    /// Maximum number of completed `DriveOneTurn` commands used as a final coordinator guard.
+    /// Engine-owned task, microtask, rendering, and mutation budgets terminate first under the
+    /// named v0.1 profile; callers may still select a lower explicit control-turn ceiling.
     pub max_control_turns: u64,
     /// Cumulative wall time which may be spent waiting for foreground external I/O.
     pub wall_io_timeout: Duration,
@@ -46,7 +48,7 @@ impl Default for SettlePolicy {
     fn default() -> Self {
         Self {
             max_virtual_time: Duration::from_secs(30),
-            max_control_turns: 100_000,
+            max_control_turns: 1_000_000,
             wall_io_timeout: Duration::from_secs(10),
         }
     }
@@ -79,6 +81,8 @@ pub enum SettleWait {
     ProducerHandoff {
         /// Latest authoritative observation.
         pending: Box<RawPendingSnapshot>,
+        /// Cumulative wall-I/O budget remaining at this decision.
+        remaining_wall_time: Duration,
     },
 }
 
@@ -131,6 +135,14 @@ pub enum SettleCompletion {
         limit: u64,
         control_turns: u64,
     },
+    /// One engine-owned execution class reached its immutable session budget.
+    ExecutionLimitExceeded {
+        pending: Box<RawPendingSnapshot>,
+        budget: DocumentExecutionBudget,
+        limit: u64,
+        observed: u64,
+        control_turns: u64,
+    },
     /// Authoritative runtime evidence failed closed without an indeterminate command outcome.
     RuntimeError {
         pending: Box<RawPendingSnapshot>,
@@ -143,6 +155,7 @@ pub enum SettleCompletion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SettleRuntimeFailure {
     RuntimeTerminals(PendingRuntimeTerminals),
+    ExecutionCounterOverflow(DocumentExecutionCounter),
     ClockNotControlled(PendingClockMode),
     UnsupportedClockSurface,
     ClockIdentityChanged,
@@ -310,8 +323,8 @@ impl SettleCoordinator {
                         let action = observation.action();
                         if matches!(
                             action,
-                            DocumentControlAction::CheckpointTurnProcessed { .. } |
-                                DocumentControlAction::TurnProcessed { .. }
+                            DocumentControlAction::CheckpointTurnProcessed { .. }
+                                | DocumentControlAction::TurnProcessed { .. }
                         ) {
                             self.control_turns = self
                                 .control_turns
@@ -323,8 +336,8 @@ impl SettleCoordinator {
                         self.decide(pending, token, action, in_flight.quiet_candidate)
                     },
                     DocumentControlOutcome::Rejected(error)
-                        if in_flight.command != DocumentControlCommand::Observe &&
-                            should_reobserve(&error) =>
+                        if in_flight.command != DocumentControlCommand::Observe
+                            && should_reobserve(&error) =>
                     {
                         self.issue_command(DocumentControlCommand::Observe, None)
                     },
@@ -337,8 +350,8 @@ impl SettleCoordinator {
                     outcome @ DocumentControlOutcome::AdvanceOutcomeIndeterminate { .. } => Err(
                         SettleFailure::AdvanceOutcomeIndeterminate(Box::new(outcome)),
                     ),
-                    DocumentControlOutcome::AutomationCompleted { .. } |
-                    DocumentControlOutcome::AutomationOutcomeIndeterminate { .. } => {
+                    DocumentControlOutcome::AutomationCompleted { .. }
+                    | DocumentControlOutcome::AutomationOutcomeIndeterminate { .. } => {
                         Err(SettleFailure::InvalidCoordinatorState(
                             "settlement received an automation command outcome",
                         ))
@@ -372,8 +385,8 @@ impl SettleCoordinator {
         self.issue_command(DocumentControlCommand::Observe, None)
     }
 
-    /// Mark the cumulative foreground-I/O wall budget expired and require one final Observe before
-    /// returning `BlockedOnExternalIo`.
+    /// Mark the cumulative external-I/O/producer-handoff wall budget expired and require one
+    /// final Observe before returning `BlockedOnExternalIo`.
     pub fn external_io_wait_expired(
         &mut self,
         cumulative_external_io_wall_time: Duration,
@@ -387,11 +400,9 @@ impl SettleCoordinator {
         cumulative_external_io_wall_time: Duration,
     ) -> Result<SettleProgress, SettleFailure> {
         self.observe_external_io_wall_time(cumulative_external_io_wall_time)?;
-        if self.phase != CoordinatorPhase::Waiting ||
-            self.waiting != Some(WaitKind::ForegroundExternalIo)
-        {
+        if self.phase != CoordinatorPhase::Waiting || self.waiting.is_none() {
             return Err(SettleFailure::InvalidCoordinatorState(
-                "foreground external I/O is not awaiting a wake",
+                "external I/O or a producer handoff is not awaiting a wake",
             ));
         }
         if self.cumulative_external_io_wall_time < self.policy.wall_io_timeout {
@@ -429,9 +440,29 @@ impl SettleCoordinator {
             Some(_) => {},
         }
 
+        if let Some(terminal) = pending.execution.and_then(|execution| execution.terminal) {
+            return match terminal {
+                DocumentExecutionTerminal::BudgetExceeded {
+                    budget,
+                    limit,
+                    observed,
+                } => self.complete(SettleCompletion::ExecutionLimitExceeded {
+                    pending,
+                    budget,
+                    limit,
+                    observed,
+                    control_turns: self.control_turns,
+                }),
+                DocumentExecutionTerminal::CounterOverflow(counter) => self.complete_runtime(
+                    pending,
+                    SettleRuntimeFailure::ExecutionCounterOverflow(counter),
+                ),
+            };
+        }
+
         if !pending.terminals.is_empty() {
-            if only_target_time_terminal(&pending.terminals) &&
-                pending.target.unsupported_time_surface.is_some()
+            if only_target_time_terminal(&pending.terminals)
+                && pending.target.unsupported_time_surface.is_some()
             {
                 return self
                     .complete_runtime(pending, SettleRuntimeFailure::UnsupportedClockSurface);
@@ -441,8 +472,8 @@ impl SettleCoordinator {
                 SettleRuntimeFailure::RuntimeTerminals(pending.terminals.clone()),
             );
         }
-        if pending.clock.unsupported_surface.is_some() ||
-            pending.target.unsupported_time_surface.is_some()
+        if pending.clock.unsupported_surface.is_some()
+            || pending.target.unsupported_time_surface.is_some()
         {
             return self.complete_runtime(pending, SettleRuntimeFailure::UnsupportedClockSurface);
         }
@@ -483,37 +514,37 @@ impl SettleCoordinator {
         let classification = classify_sources(&pending);
 
         // Ready work always runs before external waiting or virtual advancement.
-        if pending.input.intake_saturated ||
-            pending.input.ready_events != 0 ||
-            pending.input.tasks.ready != 0 ||
-            pending
+        if pending.input.intake_saturated
+            || pending.input.ready_events != 0
+            || pending.input.tasks.ready != 0
+            || pending
                 .logical_timers
                 .timers()
                 .iter()
-                .any(|timer| timer.delivery_ready) ||
-            pending.microtasks.queued != 0 ||
-            pending.microtasks.checkpoint_in_progress ||
-            pending.parser.sources().iter().any(|source| {
+                .any(|timer| timer.delivery_ready)
+            || pending.microtasks.queued != 0
+            || pending.microtasks.checkpoint_in_progress
+            || pending.parser.sources().iter().any(|source| {
                 matches!(
                     source.phase,
                     PendingParserPhase::Ready | PendingParserPhase::AwaitingCommit
                 )
-            }) ||
-            pending
+            })
+            || pending
                 .network
                 .active()
                 .iter()
-                .any(|operation| operation.phase == PendingExternalIoPhase::TerminalTaskQueued) ||
-            classification.ready ||
-            rendering_ready(&pending)
+                .any(|operation| operation.phase == PendingExternalIoPhase::TerminalTaskQueued)
+            || classification.ready
+            || rendering_ready(&pending)
         {
             return self.drive(pending, None);
         }
 
         // Real external I/O freezes virtual time. A wall expiry never trusts this observation: it
         // requests one final Observe and only that response may become BlockedOnExternalIo.
-        if !classification.foreground_network.is_empty() ||
-            classification.has_source_only_external_io
+        if !classification.foreground_network.is_empty()
+            || classification.has_source_only_external_io
         {
             if final_external_io_observation {
                 return self.complete(SettleCompletion::BlockedOnExternalIo {
@@ -540,7 +571,25 @@ impl SettleCoordinator {
         // Producer handoffs precede unsupported/source/rendering decisions because a live producer
         // can atomically replace itself with newly classified terminal work.
         if pending.producers.snapshot.pending() != 0 {
-            return self.wait(SettleWait::ProducerHandoff { pending });
+            if final_external_io_observation {
+                return self.complete(SettleCompletion::BlockedOnExternalIo {
+                    pending,
+                    network: classification.foreground_network,
+                    control_turns: self.control_turns,
+                });
+            }
+            if self.cumulative_external_io_wall_time >= self.policy.wall_io_timeout {
+                self.final_external_io_observation_required = true;
+                return self.issue_command(DocumentControlCommand::Observe, None);
+            }
+            let remaining_wall_time = self
+                .policy
+                .wall_io_timeout
+                .saturating_sub(self.cumulative_external_io_wall_time);
+            return self.wait(SettleWait::ProducerHandoff {
+                pending,
+                remaining_wall_time,
+            });
         }
         if pending.producers.stability != PendingProducerStability::StableEmpty {
             return self.drive(pending, None);
@@ -600,8 +649,8 @@ impl SettleCoordinator {
             let exact_logical_timer_head = logical_head.is_some_and(|timer| {
                 !matches!(
                     timer.kind,
-                    PendingLogicalTimerKind::JavaScriptInterval { .. } |
-                        PendingLogicalTimerKind::EventSourceReconnect
+                    PendingLogicalTimerKind::JavaScriptInterval { .. }
+                        | PendingLogicalTimerKind::EventSourceReconnect
                 )
             });
             if !exact_logical_timer_head && !finite.exact_rendering_head {
@@ -775,20 +824,20 @@ impl SettleCoordinator {
 }
 
 fn only_target_time_terminal(terminals: &PendingRuntimeTerminals) -> bool {
-    terminals.target_time.is_some() &&
-        terminals.clock.is_none() &&
-        terminals.outer_scheduler.is_none() &&
-        terminals.producer.is_none() &&
-        terminals.microtask.is_none() &&
-        terminals.input_revision.is_none() &&
-        terminals.source_id.is_none() &&
-        terminals.logical_timers().is_empty() &&
-        terminals.image_timers().is_empty() &&
-        terminals.dom_generation.is_none() &&
-        terminals.state_generation.is_none() &&
-        terminals.navigation_revision.is_none() &&
-        terminals.pipeline_membership_revision.is_none() &&
-        terminals.source_epoch.is_none()
+    terminals.target_time.is_some()
+        && terminals.clock.is_none()
+        && terminals.outer_scheduler.is_none()
+        && terminals.producer.is_none()
+        && terminals.microtask.is_none()
+        && terminals.input_revision.is_none()
+        && terminals.source_id.is_none()
+        && terminals.logical_timers().is_empty()
+        && terminals.image_timers().is_empty()
+        && terminals.dom_generation.is_none()
+        && terminals.state_generation.is_none()
+        && terminals.navigation_revision.is_none()
+        && terminals.pipeline_membership_revision.is_none()
+        && terminals.source_epoch.is_none()
 }
 
 fn classify_sources(pending: &RawPendingSnapshot) -> SourceClassification {
@@ -859,24 +908,24 @@ fn rendering_ready(pending: &RawPendingSnapshot) -> bool {
     // that timer. Once activation dispatches its callback, capture publishes opportunity_ready and
     // no live scheduled_opportunity.
     let rendering_opportunity_is_unscheduled = pending.rendering.scheduled_opportunity.is_none();
-    pending.rendering.opportunity_ready ||
-        pending.rendering.pipelines().iter().any(|rendering| {
-            rendering.activity == PendingRenderingPipelineActivity::FullyActive &&
-                (rendering.pending_animation_events != 0 ||
-                    rendering.animated_images.update_ready ||
-                    (rendering_opportunity_is_unscheduled &&
-                        (rendering.runnable_animation_frame_callbacks != 0 ||
-                            rendering.document_update_required ||
-                            rendering.canvas.dirty_contexts != 0)))
+    pending.rendering.opportunity_ready
+        || pending.rendering.pipelines().iter().any(|rendering| {
+            rendering.activity == PendingRenderingPipelineActivity::FullyActive
+                && (rendering.pending_animation_events != 0
+                    || rendering.animated_images.update_ready
+                    || (rendering_opportunity_is_unscheduled
+                        && (rendering.runnable_animation_frame_callbacks != 0
+                            || rendering.document_update_required
+                            || rendering.canvas.dirty_contexts != 0)))
         })
 }
 
 fn has_finite_rendering_demand(rendering: &PendingPipelineRenderingObservation) -> bool {
-    rendering.activity == PendingRenderingPipelineActivity::FullyActive &&
-        (rendering.runnable_animation_frame_callbacks != 0 ||
-            rendering.document_update_required ||
-            rendering.finite_animations != 0 ||
-            rendering.canvas.dirty_contexts != 0)
+    rendering.activity == PendingRenderingPipelineActivity::FullyActive
+        && (rendering.runnable_animation_frame_callbacks != 0
+            || rendering.document_update_required
+            || rendering.finite_animations != 0
+            || rendering.canvas.dirty_contexts != 0)
 }
 
 fn unsupported_rendering(pending: &RawPendingSnapshot) -> Option<SettleRuntimeFailure> {
@@ -885,30 +934,30 @@ fn unsupported_rendering(pending: &RawPendingSnapshot) -> Option<SettleRuntimeFa
         let unsupported_canvas = rendering
             .canvas
             .unsupported
-            .live_source_inventory_unavailable !=
-            0 ||
-            rendering.canvas.unsupported.offscreen_execution != 0 ||
-            rendering.canvas.unsupported.mutation_generation_unbound != 0;
-        let inactive_work = rendering.activity != PendingRenderingPipelineActivity::FullyActive &&
-            (rendering.runnable_animation_frame_callbacks != 0 ||
-                rendering.document_update_required ||
-                rendering.pending_animation_events != 0 ||
-                rendering.finite_animations != 0 ||
-                rendering.infinite_animations != 0 ||
-                rendering.animated_images.finite_images != 0 ||
-                rendering.animated_images.infinite_images != 0 ||
-                rendering.animated_images.update_ready ||
-                rendering.animated_images.scheduled_timer.is_some() ||
-                rendering.canvas.dirty_contexts != 0 ||
-                rendering.pending_fonts != 0 ||
-                rendering.pending_images != 0);
-        if rendering.unsupported_animations != 0 ||
-            unsupported_images ||
-            unsupported_canvas ||
-            inactive_work ||
-            rendering.canvas.awaiting_async_upload ||
-            rendering.pending_fonts != 0 ||
-            rendering.pending_images != 0
+            .live_source_inventory_unavailable
+            != 0
+            || rendering.canvas.unsupported.offscreen_execution != 0
+            || rendering.canvas.unsupported.mutation_generation_unbound != 0;
+        let inactive_work = rendering.activity != PendingRenderingPipelineActivity::FullyActive
+            && (rendering.runnable_animation_frame_callbacks != 0
+                || rendering.document_update_required
+                || rendering.pending_animation_events != 0
+                || rendering.finite_animations != 0
+                || rendering.infinite_animations != 0
+                || rendering.animated_images.finite_images != 0
+                || rendering.animated_images.infinite_images != 0
+                || rendering.animated_images.update_ready
+                || rendering.animated_images.scheduled_timer.is_some()
+                || rendering.canvas.dirty_contexts != 0
+                || rendering.pending_fonts != 0
+                || rendering.pending_images != 0);
+        if rendering.unsupported_animations != 0
+            || unsupported_images
+            || unsupported_canvas
+            || inactive_work
+            || rendering.canvas.awaiting_async_upload
+            || rendering.pending_fonts != 0
+            || rendering.pending_images != 0
         {
             Some(SettleRuntimeFailure::UnsupportedRendering(*rendering))
         } else {
@@ -925,11 +974,11 @@ fn rendering_needs_unscheduled_turn(
         return true;
     }
     pending.rendering.pipelines().iter().any(|rendering| {
-        rendering.activity == PendingRenderingPipelineActivity::FullyActive &&
-            ((rendering.finite_animations != 0 &&
-                pending.rendering.scheduled_opportunity.is_none()) ||
-                (rendering.animated_images.finite_images != 0 &&
-                    rendering.animated_images.scheduled_timer.is_none()))
+        rendering.activity == PendingRenderingPipelineActivity::FullyActive
+            && ((rendering.finite_animations != 0
+                && pending.rendering.scheduled_opportunity.is_none())
+                || (rendering.animated_images.finite_images != 0
+                    && rendering.animated_images.scheduled_timer.is_none()))
     })
 }
 
@@ -949,8 +998,8 @@ fn persistent_rendering_owns_head(
     pending: &RawPendingSnapshot,
     head: timers::TimerDeadlineSnapshot,
 ) -> bool {
-    let scheduled_finite_rendering = pending.rendering.scheduled_opportunity.is_some() &&
-        pending
+    let scheduled_finite_rendering = pending.rendering.scheduled_opportunity.is_some()
+        && pending
             .rendering
             .pipelines()
             .iter()
@@ -963,17 +1012,17 @@ fn persistent_rendering_owns_head_with_finite(
     head: timers::TimerDeadlineSnapshot,
     scheduled_finite_rendering: bool,
 ) -> bool {
-    (pending.rendering.scheduled_opportunity == Some(head) &&
-        pending.rendering.pipelines().iter().any(|rendering| {
-            rendering.activity == PendingRenderingPipelineActivity::FullyActive &&
-                rendering.infinite_animations != 0
-        }) &&
-        !scheduled_finite_rendering) ||
-        pending.rendering.pipelines().iter().any(|rendering| {
-            rendering.activity == PendingRenderingPipelineActivity::FullyActive &&
-                rendering.animated_images.scheduled_timer == Some(head) &&
-                rendering.animated_images.infinite_images != 0 &&
-                rendering.animated_images.finite_images == 0
+    (pending.rendering.scheduled_opportunity == Some(head)
+        && pending.rendering.pipelines().iter().any(|rendering| {
+            rendering.activity == PendingRenderingPipelineActivity::FullyActive
+                && rendering.infinite_animations != 0
+        })
+        && !scheduled_finite_rendering)
+        || pending.rendering.pipelines().iter().any(|rendering| {
+            rendering.activity == PendingRenderingPipelineActivity::FullyActive
+                && rendering.animated_images.scheduled_timer == Some(head)
+                && rendering.animated_images.infinite_images != 0
+                && rendering.animated_images.finite_images == 0
         })
 }
 
@@ -985,26 +1034,26 @@ struct FiniteWork {
 
 fn finite_work(pending: &RawPendingSnapshot, classification: &SourceClassification) -> FiniteWork {
     let head = pending.scheduler.next_deadline;
-    let has_scheduled_finite_rendering = pending.rendering.scheduled_opportunity.is_some() &&
-        (classification.finite_rendering_opportunity ||
-            pending
+    let has_scheduled_finite_rendering = pending.rendering.scheduled_opportunity.is_some()
+        && (classification.finite_rendering_opportunity
+            || pending
                 .rendering
                 .pipelines()
                 .iter()
                 .any(has_finite_rendering_demand));
     let exact_rendering_deadline = head.is_some_and(|head| {
-        (has_scheduled_finite_rendering && pending.rendering.scheduled_opportunity == Some(head)) ||
-            pending.rendering.pipelines().iter().any(|rendering| {
-                rendering.activity == PendingRenderingPipelineActivity::FullyActive &&
-                    rendering.animated_images.finite_images != 0 &&
-                    rendering.animated_images.scheduled_timer == Some(head)
+        (has_scheduled_finite_rendering && pending.rendering.scheduled_opportunity == Some(head))
+            || pending.rendering.pipelines().iter().any(|rendering| {
+                rendering.activity == PendingRenderingPipelineActivity::FullyActive
+                    && rendering.animated_images.finite_images != 0
+                    && rendering.animated_images.scheduled_timer == Some(head)
             })
     });
-    let has_finite_rendering = has_scheduled_finite_rendering ||
-        pending.rendering.pipelines().iter().any(|rendering| {
-            rendering.activity == PendingRenderingPipelineActivity::FullyActive &&
-                rendering.animated_images.finite_images != 0 &&
-                rendering.animated_images.scheduled_timer.is_some()
+    let has_finite_rendering = has_scheduled_finite_rendering
+        || pending.rendering.pipelines().iter().any(|rendering| {
+            rendering.activity == PendingRenderingPipelineActivity::FullyActive
+                && rendering.animated_images.finite_images != 0
+                && rendering.animated_images.scheduled_timer.is_some()
         });
     let persistent_rendering_owns_head = head.is_some_and(|head| {
         persistent_rendering_owns_head_with_finite(pending, head, has_scheduled_finite_rendering)
@@ -1017,25 +1066,25 @@ fn finite_work(pending: &RawPendingSnapshot, classification: &SourceClassificati
 }
 
 fn quiet_snapshots_match(first: &RawPendingSnapshot, second: &RawPendingSnapshot) -> bool {
-    second.state_generation >= first.state_generation &&
-        second.microtasks.completed_checkpoint > first.microtasks.completed_checkpoint &&
-        first.target == second.target &&
-        first.dom_epoch == second.dom_epoch &&
-        first.clock == second.clock &&
-        first.scheduler == second.scheduler &&
-        first.input == second.input &&
-        first.microtasks.event_loop_id == second.microtasks.event_loop_id &&
-        first.microtasks.queued == second.microtasks.queued &&
-        first.microtasks.checkpoint_in_progress == second.microtasks.checkpoint_in_progress &&
-        first.microtasks.terminal == second.microtasks.terminal &&
-        first.producers.fence_id == second.producers.fence_id &&
-        first.producers.snapshot == second.producers.snapshot &&
-        first.parser == second.parser &&
-        first.network == second.network &&
-        first.logical_timers == second.logical_timers &&
-        first.rendering == second.rendering &&
-        first.sources == second.sources &&
-        first.terminals == second.terminals
+    second.state_generation >= first.state_generation
+        && second.microtasks.completed_checkpoint > first.microtasks.completed_checkpoint
+        && first.target == second.target
+        && first.dom_epoch == second.dom_epoch
+        && first.clock == second.clock
+        && first.scheduler == second.scheduler
+        && first.input == second.input
+        && first.microtasks.event_loop_id == second.microtasks.event_loop_id
+        && first.microtasks.queued == second.microtasks.queued
+        && first.microtasks.checkpoint_in_progress == second.microtasks.checkpoint_in_progress
+        && first.microtasks.terminal == second.microtasks.terminal
+        && first.producers.fence_id == second.producers.fence_id
+        && first.producers.snapshot == second.producers.snapshot
+        && first.parser == second.parser
+        && first.network == second.network
+        && first.logical_timers == second.logical_timers
+        && first.rendering == second.rendering
+        && first.sources == second.sources
+        && first.terminals == second.terminals
 }
 
 fn should_reobserve(error: &DocumentControlError) -> bool {
@@ -1043,30 +1092,30 @@ fn should_reobserve(error: &DocumentControlError) -> bool {
         DocumentControlError::EventLoopUnavailable => true,
         DocumentControlError::AdvancePrecondition(error) => matches!(
             error,
-            DocumentAdvanceTokenInvariantError::RuntimeTerminal |
-                DocumentAdvanceTokenInvariantError::UnsupportedClockSurface(_) |
-                DocumentAdvanceTokenInvariantError::AuthoritativeReadyWork(_) |
-                DocumentAdvanceTokenInvariantError::NoFiniteDeadline |
-                DocumentAdvanceTokenInvariantError::DeadlineBeforeCurrentTime { .. } |
-                DocumentAdvanceTokenInvariantError::InputIntakeSaturated { .. } |
-                DocumentAdvanceTokenInvariantError::ReadyInput(_) |
-                DocumentAdvanceTokenInvariantError::MicrotasksNotDrained(_) |
-                DocumentAdvanceTokenInvariantError::ProducerNotStableEmpty(_) |
-                DocumentAdvanceTokenInvariantError::TargetChanged { .. } |
-                DocumentAdvanceTokenInvariantError::StateGenerationChanged { .. } |
-                DocumentAdvanceTokenInvariantError::ClockChanged { .. } |
-                DocumentAdvanceTokenInvariantError::SchedulerChanged { .. } |
-                DocumentAdvanceTokenInvariantError::DeadlineChanged { .. } |
-                DocumentAdvanceTokenInvariantError::InputChanged { .. } |
-                DocumentAdvanceTokenInvariantError::MicrotasksChanged { .. } |
-                DocumentAdvanceTokenInvariantError::ProducersChanged { .. }
+            DocumentAdvanceTokenInvariantError::RuntimeTerminal
+                | DocumentAdvanceTokenInvariantError::UnsupportedClockSurface(_)
+                | DocumentAdvanceTokenInvariantError::AuthoritativeReadyWork(_)
+                | DocumentAdvanceTokenInvariantError::NoFiniteDeadline
+                | DocumentAdvanceTokenInvariantError::DeadlineBeforeCurrentTime { .. }
+                | DocumentAdvanceTokenInvariantError::InputIntakeSaturated { .. }
+                | DocumentAdvanceTokenInvariantError::ReadyInput(_)
+                | DocumentAdvanceTokenInvariantError::MicrotasksNotDrained(_)
+                | DocumentAdvanceTokenInvariantError::ProducerNotStableEmpty(_)
+                | DocumentAdvanceTokenInvariantError::TargetChanged { .. }
+                | DocumentAdvanceTokenInvariantError::StateGenerationChanged { .. }
+                | DocumentAdvanceTokenInvariantError::ClockChanged { .. }
+                | DocumentAdvanceTokenInvariantError::SchedulerChanged { .. }
+                | DocumentAdvanceTokenInvariantError::DeadlineChanged { .. }
+                | DocumentAdvanceTokenInvariantError::InputChanged { .. }
+                | DocumentAdvanceTokenInvariantError::MicrotasksChanged { .. }
+                | DocumentAdvanceTokenInvariantError::ProducersChanged { .. }
         ),
-        DocumentControlError::UnsupportedSurface(_) |
-        DocumentControlError::Clock(
+        DocumentControlError::UnsupportedSurface(_)
+        | DocumentControlError::Clock(
             DocumentClockError::TimeChanged { .. } | DocumentClockError::UnsupportedSurface(_),
         ) => true,
-        DocumentControlError::AdvanceTokenUnavailable { .. } |
-        DocumentControlError::StaleAdvanceToken { .. } => true,
+        DocumentControlError::AdvanceTokenUnavailable { .. }
+        | DocumentControlError::StaleAdvanceToken { .. } => true,
         DocumentControlError::Timer(
             TimerControlError::StaleDeadline { .. } | TimerControlError::TimerNotDue { .. },
         ) => true,
@@ -1094,9 +1143,11 @@ mod tests {
     use servo_base::Epoch;
     use servo_base::id::{TEST_PIPELINE_ID, TEST_SCRIPT_EVENT_LOOP_ID, TEST_WEBVIEW_ID};
     use timers::{
-        DocumentClock, DocumentClockConfiguration, DocumentProducerCheckpoint,
-        DocumentProducerFence, DocumentProducerKind, DocumentTime, DocumentTimeSurface,
-        DocumentUnixTime, TimerDeadlineSnapshot, TimerEventRequest, TimerScheduler,
+        DocumentClock, DocumentClockConfiguration, DocumentExecutionBudget,
+        DocumentExecutionCounters, DocumentExecutionLimits, DocumentExecutionObservation,
+        DocumentExecutionTerminal, DocumentProducerCheckpoint, DocumentProducerFence,
+        DocumentProducerKind, DocumentTime, DocumentTimeSurface, DocumentUnixTime,
+        TimerDeadlineSnapshot, TimerEventRequest, TimerScheduler,
     };
 
     use super::*;
@@ -1145,6 +1196,12 @@ mod tests {
                 },
                 input: PendingInputObservation::default(),
                 microtasks,
+                execution: Some(DocumentExecutionObservation {
+                    clock_id: self.clock.id(),
+                    limits: DocumentExecutionLimits::CONTROLLED_WEBAPP_V1,
+                    counters: DocumentExecutionCounters::default(),
+                    terminal: None,
+                }),
                 producers,
                 parser: PendingParserObservation::default(),
                 network: PendingNetworkObservation::default(),
@@ -1253,15 +1310,15 @@ mod tests {
         outer_wake: Option<TimerDeadlineSnapshot>,
     ) -> PendingLogicalTimerObservation {
         let stable_id = match kind {
-            PendingLogicalTimerKind::JavaScriptOneShot |
-            PendingLogicalTimerKind::JavaScriptInterval { .. } => {
+            PendingLogicalTimerKind::JavaScriptOneShot
+            | PendingLogicalTimerKind::JavaScriptInterval { .. } => {
                 PendingLogicalTimerStableId::JavaScriptHandle(i32::try_from(source_id).unwrap())
             },
-            PendingLogicalTimerKind::XmlHttpRequestTimeout |
-            PendingLogicalTimerKind::EventSourceReconnect |
-            PendingLogicalTimerKind::RefreshRedirect |
-            PendingLogicalTimerKind::RunStepsAfterTimeout |
-            PendingLogicalTimerKind::TestBindingCallback => {
+            PendingLogicalTimerKind::XmlHttpRequestTimeout
+            | PendingLogicalTimerKind::EventSourceReconnect
+            | PendingLogicalTimerKind::RefreshRedirect
+            | PendingLogicalTimerKind::RunStepsAfterTimeout
+            | PendingLogicalTimerKind::TestBindingCallback => {
                 PendingLogicalTimerStableId::EngineHandle(i32::try_from(source_id).unwrap())
             },
         };
@@ -1336,6 +1393,49 @@ mod tests {
         ));
     }
 
+    fn execution_limit_observation(
+        clock_id: DocumentClockId,
+        budget: DocumentExecutionBudget,
+        limit: u64,
+    ) -> DocumentExecutionObservation {
+        let observed = limit.checked_add(1).unwrap();
+        let mut limits = DocumentExecutionLimits {
+            ordinary_tasks: 100,
+            microtasks: 100,
+            rendering_opportunities: 100,
+            mutations: 100,
+        };
+        let mut counters = DocumentExecutionCounters::default();
+        match budget {
+            DocumentExecutionBudget::OrdinaryTasks => {
+                limits.ordinary_tasks = limit;
+                counters.ordinary_tasks = limit;
+            },
+            DocumentExecutionBudget::Microtasks => {
+                limits.microtasks = limit;
+                counters.microtasks = limit;
+            },
+            DocumentExecutionBudget::RenderingOpportunities => {
+                limits.rendering_opportunities = limit;
+                counters.rendering_opportunities = limit;
+            },
+            DocumentExecutionBudget::MutationRecords => {
+                limits.mutations = limit;
+                counters.mutations = observed;
+            },
+        }
+        DocumentExecutionObservation {
+            clock_id,
+            limits,
+            counters,
+            terminal: Some(DocumentExecutionTerminal::BudgetExceeded {
+                budget,
+                limit,
+                observed,
+            }),
+        }
+    }
+
     #[test]
     fn starts_with_observe_and_rejects_a_second_start() {
         let mut coordinator = SettleCoordinator::new(SettlePolicy::default());
@@ -1346,6 +1446,43 @@ mod tests {
                 "settlement has already started"
             ))
         );
+    }
+
+    #[test]
+    fn every_engine_execution_budget_completes_with_its_typed_limit() {
+        for budget in [
+            DocumentExecutionBudget::OrdinaryTasks,
+            DocumentExecutionBudget::Microtasks,
+            DocumentExecutionBudget::RenderingOpportunities,
+            DocumentExecutionBudget::MutationRecords,
+        ] {
+            let fixture = Fixture::new();
+            let mut pending = fixture.snapshot(2, 1);
+            pending.execution = Some(execution_limit_observation(
+                pending.clock.clock_id,
+                budget,
+                3,
+            ));
+            pending.validate().unwrap();
+
+            let mut coordinator = SettleCoordinator::new(SettlePolicy::default());
+            assert_observe(coordinator.start().unwrap());
+            match observe(&mut coordinator, pending, None).unwrap() {
+                SettleProgress::Complete(SettleCompletion::ExecutionLimitExceeded {
+                    budget: observed_budget,
+                    limit,
+                    observed,
+                    control_turns,
+                    ..
+                }) => {
+                    assert_eq!(observed_budget, budget);
+                    assert_eq!(limit, 3);
+                    assert_eq!(observed, 4);
+                    assert_eq!(control_turns, 0);
+                },
+                other => panic!("expected execution limit for {budget:?}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1583,7 +1720,7 @@ mod tests {
     }
 
     #[test]
-    fn producer_handoff_waits_for_a_wake_before_reobserving() {
+    fn producer_handoff_is_bounded_and_requires_final_observation() {
         let mut fixture = Fixture::new();
         fixture.schedule(Duration::from_secs(10));
         let mut pending = fixture.snapshot(2, 1);
@@ -1614,14 +1751,42 @@ mod tests {
         .unwrap();
         pending.validate().unwrap();
 
-        let mut coordinator = SettleCoordinator::new(SettlePolicy::default());
+        let policy = SettlePolicy {
+            wall_io_timeout: Duration::from_millis(50),
+            ..SettlePolicy::default()
+        };
+        let mut coordinator = SettleCoordinator::new(policy);
         assert_observe(coordinator.start().unwrap());
-        assert!(matches!(
-            observe(&mut coordinator, pending, None).unwrap(),
-            SettleProgress::Wait(SettleWait::ProducerHandoff { .. })
-        ));
+        match observe(&mut coordinator, pending.clone(), None).unwrap() {
+            SettleProgress::Wait(SettleWait::ProducerHandoff {
+                remaining_wall_time,
+                ..
+            }) => assert_eq!(remaining_wall_time, Duration::from_millis(50)),
+            other => panic!("expected bounded producer handoff, got {other:?}"),
+        }
+        assert_observe(
+            coordinator
+                .external_io_wait_expired(Duration::from_millis(50))
+                .unwrap(),
+        );
+        match coordinator
+            .consume_receive_outcome(
+                received(DocumentControlAction::Observed, pending, None),
+                Duration::from_millis(50),
+            )
+            .unwrap()
+        {
+            SettleProgress::Complete(SettleCompletion::BlockedOnExternalIo {
+                network,
+                control_turns,
+                ..
+            }) => {
+                assert!(network.is_empty());
+                assert_eq!(control_turns, 0);
+            },
+            other => panic!("expected blocked producer handoff, got {other:?}"),
+        }
         drop(guard);
-        assert_observe(coordinator.resume_after_wake(Duration::ZERO).unwrap());
     }
 
     #[test]

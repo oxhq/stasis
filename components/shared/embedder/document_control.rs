@@ -265,7 +265,11 @@ impl DocumentAdvanceAuthority {
         pending
             .validate()
             .map_err(DocumentAdvanceTokenInvariantError::PendingSnapshot)?;
-        if !pending.terminals.is_empty() {
+        if !pending.terminals.is_empty()
+            || pending
+                .execution
+                .is_some_and(|execution| execution.terminal.is_some())
+        {
             return Err(DocumentAdvanceTokenInvariantError::RuntimeTerminal);
         }
         if pending.clock.mode != PendingClockMode::Controlled {
@@ -527,25 +531,25 @@ pub fn is_exact_initial_pipeline_activation_transition(
     after: &PendingTargetObservation,
     pipeline_id: PipelineId,
 ) -> bool {
-    before.active_top_level.is_none() &&
-        before.pipelines() == [pipeline_id] &&
-        before.fully_active_pipelines().is_empty() &&
-        before.pending_top_level_pipelines() == [pipeline_id] &&
-        after.webview_id == before.webview_id &&
-        after.event_loop_id == before.event_loop_id &&
-        after
+    before.active_top_level.is_none()
+        && before.pipelines() == [pipeline_id]
+        && before.fully_active_pipelines().is_empty()
+        && before.pending_top_level_pipelines() == [pipeline_id]
+        && after.webview_id == before.webview_id
+        && after.event_loop_id == before.event_loop_id
+        && after
             .active_top_level
-            .is_some_and(|active| active.pipeline_id == pipeline_id) &&
-        after.pipelines() == [pipeline_id] &&
-        after.fully_active_pipelines() == [pipeline_id] &&
-        after.pending_top_level_pipelines().is_empty() &&
-        after.pipeline_membership_revision == before.pipeline_membership_revision &&
-        after.unsupported_time_surface == before.unsupported_time_surface &&
-        before
+            .is_some_and(|active| active.pipeline_id == pipeline_id)
+        && after.pipelines() == [pipeline_id]
+        && after.fully_active_pipelines() == [pipeline_id]
+        && after.pending_top_level_pipelines().is_empty()
+        && after.pipeline_membership_revision == before.pipeline_membership_revision
+        && after.unsupported_time_surface == before.unsupported_time_surface
+        && before
             .navigation_revision
             .checked_next()
-            .and_then(PendingNavigationRevision::checked_next) ==
-            Some(after.navigation_revision)
+            .and_then(PendingNavigationRevision::checked_next)
+            == Some(after.navigation_revision)
 }
 
 /// Mechanical action completed immediately before an authoritative observation.
@@ -563,6 +567,8 @@ pub enum DocumentControlAction {
         /// Whether the turn completed a new microtask checkpoint.
         microtask_checkpoint_advanced: bool,
     },
+    /// A sticky controlled-execution failure prevented the requested ordinary turn from starting.
+    ExecutionTerminated,
     /// One bounded native automation operation completed before this observation.
     Automated(DocumentControlAutomationKind),
     /// Exactly one timer callback was activated; resulting page work has not run yet.
@@ -612,10 +618,10 @@ impl DocumentControlAutomationKind {
             ) | (
                 Self::TextContent,
                 DocumentAutomationResult::TextContent { .. }
-            ) | (Self::InnerHtml, DocumentAutomationResult::InnerHtml { .. }) |
-                (Self::Extract, DocumentAutomationResult::Extract { .. }) |
-                (Self::Fill, DocumentAutomationResult::Filled) |
-                (Self::Activate, DocumentAutomationResult::Activated)
+            ) | (Self::InnerHtml, DocumentAutomationResult::InnerHtml { .. })
+                | (Self::Extract, DocumentAutomationResult::Extract { .. })
+                | (Self::Fill, DocumentAutomationResult::Filled)
+                | (Self::Activate, DocumentAutomationResult::Activated)
         )
     }
 }
@@ -665,6 +671,14 @@ impl DocumentControlObservation {
         self.pending
             .validate()
             .map_err(DocumentControlObservationInvariantError::PendingSnapshot)?;
+        if self.action == DocumentControlAction::ExecutionTerminated
+            && !self
+                .pending
+                .execution
+                .is_some_and(|execution| execution.terminal.is_some())
+        {
+            return Err(DocumentControlObservationInvariantError::ExecutionTerminationMissing);
+        }
         if let Some(token) = &self.advance_token {
             token
                 .validate_against(&self.pending)
@@ -679,6 +693,8 @@ impl DocumentControlObservation {
 pub enum DocumentControlObservationInvariantError {
     /// The contained pending-state observation was invalid.
     PendingSnapshot(PendingSnapshotInvariantError),
+    /// An execution-terminated action lacked the sticky terminal which prevented admission.
+    ExecutionTerminationMissing,
     /// The contained token did not bind the contained pending observation exactly.
     AdvanceToken(DocumentAdvanceTokenInvariantError),
 }
@@ -757,8 +773,8 @@ impl DocumentControlOutcome {
             Self::Rejected(error) => error
                 .validate()
                 .map_err(DocumentControlOutcomeInvariantError::Rejection),
-            Self::DriveOneTurnOutcomeIndeterminate { target } |
-            Self::AdvanceOutcomeIndeterminate { target, .. } => target
+            Self::DriveOneTurnOutcomeIndeterminate { target }
+            | Self::AdvanceOutcomeIndeterminate { target, .. } => target
                 .validate()
                 .map_err(DocumentControlOutcomeInvariantError::IndeterminateTarget),
             Self::AutomationOutcomeIndeterminate { target, operation } => {
@@ -889,6 +905,7 @@ impl DocumentControlOutcome {
                     observation.action,
                     DocumentControlAction::CheckpointTurnProcessed { .. }
                         | DocumentControlAction::TurnProcessed { .. }
+                        | DocumentControlAction::ExecutionTerminated
                 ) {
                     Ok(())
                 } else {
@@ -904,7 +921,11 @@ impl DocumentControlOutcome {
                 DocumentControlCommand::BootstrapInitialPipeline { .. },
                 Self::Completed(observation),
             ) => {
-                if matches!(observation.action, DocumentControlAction::TurnProcessed { .. }) {
+                if matches!(
+                    observation.action,
+                    DocumentControlAction::TurnProcessed { .. }
+                        | DocumentControlAction::ExecutionTerminated
+                ) {
                     Ok(())
                 } else {
                     Err(
@@ -1688,8 +1709,10 @@ mod tests {
         Index, TEST_NAMESPACE, TEST_PIPELINE_ID, TEST_SCRIPT_EVENT_LOOP_ID, TEST_WEBVIEW_ID,
     };
     use timers::{
-        DocumentClock, DocumentClockConfiguration, DocumentProducerCheckpoint,
-        DocumentProducerFence, DocumentUnixTime, TimerEventRequest, TimerScheduler,
+        DocumentClock, DocumentClockConfiguration, DocumentExecutionBudget,
+        DocumentExecutionCounters, DocumentExecutionLimits, DocumentExecutionObservation,
+        DocumentExecutionTerminal, DocumentProducerCheckpoint, DocumentProducerFence,
+        DocumentUnixTime, TimerEventRequest, TimerScheduler,
     };
 
     use super::*;
@@ -1826,6 +1849,12 @@ mod tests {
                 tasks: PendingTaskObservation::default(),
             },
             microtasks,
+            execution: Some(DocumentExecutionObservation {
+                clock_id: clock.id(),
+                limits: DocumentExecutionLimits::CONTROLLED_WEBAPP_V1,
+                counters: DocumentExecutionCounters::default(),
+                terminal: None,
+            }),
             producers,
             parser: PendingParserObservation::default(),
             network: PendingNetworkObservation::default(),
@@ -1834,6 +1863,30 @@ mod tests {
             sources: PendingSourceSnapshot::default(),
             terminals: PendingRuntimeTerminals::default(),
         };
+        pending.validate().unwrap();
+        pending
+    }
+
+    fn execution_terminated_pending() -> RawPendingSnapshot {
+        let mut pending = eligible_pending();
+        pending.execution = Some(DocumentExecutionObservation {
+            clock_id: pending.clock.clock_id,
+            limits: DocumentExecutionLimits {
+                ordinary_tasks: 1,
+                microtasks: 2,
+                rendering_opportunities: 3,
+                mutations: 4,
+            },
+            counters: DocumentExecutionCounters {
+                ordinary_tasks: 1,
+                ..DocumentExecutionCounters::default()
+            },
+            terminal: Some(DocumentExecutionTerminal::BudgetExceeded {
+                budget: DocumentExecutionBudget::OrdinaryTasks,
+                limit: 1,
+                observed: 2,
+            }),
+        });
         pending.validate().unwrap();
         pending
     }
@@ -1980,6 +2033,48 @@ mod tests {
             )
         ));
         assert_postcard_round_trip(rejection);
+    }
+
+    #[test]
+    fn execution_termination_is_an_authoritative_completed_drive_or_bootstrap() {
+        let terminated = completed_outcome(
+            DocumentControlAction::ExecutionTerminated,
+            execution_terminated_pending(),
+        );
+        terminated
+            .validate_for_command(&DocumentControlCommand::DriveOneTurn)
+            .unwrap();
+        terminated
+            .validate_for_command(&DocumentControlCommand::BootstrapInitialPipeline {
+                pipeline_id: TEST_PIPELINE_ID,
+            })
+            .unwrap();
+        assert!(matches!(
+            terminated.validate_for_command(&DocumentControlCommand::Observe),
+            Err(
+                DocumentControlOutcomeInvariantError::CompletedActionMismatch {
+                    command: DocumentControlCommandKind::Observe,
+                    observed: DocumentControlAction::ExecutionTerminated,
+                }
+            )
+        ));
+        assert_postcard_round_trip(terminated);
+
+        assert_eq!(
+            DocumentControlObservation::new_internal(
+                DocumentControlAction::ExecutionTerminated,
+                Box::new(eligible_pending()),
+                None,
+            ),
+            Err(DocumentControlObservationInvariantError::ExecutionTerminationMissing)
+        );
+        assert_eq!(
+            DocumentAdvanceToken::new_internal(
+                DocumentAdvanceTokenId::new(71),
+                &execution_terminated_pending(),
+            ),
+            Err(DocumentAdvanceTokenInvariantError::RuntimeTerminal)
+        );
     }
 
     #[test]
@@ -2782,6 +2877,7 @@ mod tests {
         });
         let mut wrong_clock_identity = advanced_pending.clone();
         wrong_clock_identity.clock.clock_id = foreign_clock.id();
+        wrong_clock_identity.execution.as_mut().unwrap().clock_id = foreign_clock.id();
         let mismatched_clock_identity = completed_outcome(
             DocumentControlAction::TimerActivated(token.deadline()),
             wrong_clock_identity,

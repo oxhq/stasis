@@ -13,7 +13,10 @@ use embedder_traits::document_pending::{
     PendingOuterSchedulerTerminalObservation, PendingSchedulerObservation, PendingTaskObservation,
 };
 use servo_base::id::ScriptEventLoopId;
-use timers::{DocumentClock, DocumentClockError, TimerControlError, TimerScheduler};
+use timers::{
+    DocumentClock, DocumentClockError, DocumentExecutionObservation, TimerControlError,
+    TimerScheduler,
+};
 
 use super::pending_state::{
     PendingBuildError, PendingCountKind, PendingFactKind, PendingNormalizeError,
@@ -33,6 +36,7 @@ pub(crate) struct PendingBarrierObservation {
     pub(crate) input_terminal: Option<PendingEventLoopGenerationTerminalObservation>,
     pub(crate) microtasks: PendingMicrotaskObservation,
     pub(crate) microtask_terminal: Option<PendingMicrotaskTerminalObservation>,
+    pub(crate) execution: DocumentExecutionObservation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +55,7 @@ pub(crate) fn capture_barrier_observation(
     scheduler_terminal: Option<TimerControlError>,
     input: PendingInputBarrierFacts,
     microtasks: MicrotaskQueueObservation,
+    execution: DocumentExecutionObservation,
 ) -> Result<PendingBarrierObservation, DocumentControlError> {
     if !clock.is_controlled() {
         return Err(DocumentControlError::NotControlled);
@@ -126,6 +131,7 @@ pub(crate) fn capture_barrier_observation(
         input_terminal,
         microtasks: microtask_observation,
         microtask_terminal,
+        execution,
     })
 }
 
@@ -161,8 +167,8 @@ pub(crate) fn map_pending_normalize_error(error: PendingNormalizeError) -> Docum
     match error {
         PendingNormalizeError::Build(error) => map_pending_build_error(error),
         PendingNormalizeError::State(error) => map_pending_state_error(error),
-        PendingNormalizeError::StaleOwnerFacts |
-        PendingNormalizeError::NonMonotonicStateGeneration { .. } => {
+        PendingNormalizeError::StaleOwnerFacts
+        | PendingNormalizeError::NonMonotonicStateGeneration { .. } => {
             DocumentControlError::PendingFactUnavailable(DocumentPendingFact::StateGeneration)
         },
         PendingNormalizeError::ResourceFallbackTargetUnavailable(_) => {
@@ -188,8 +194,8 @@ fn map_pending_build_error(error: PendingBuildError) -> DocumentControlError {
                 PendingFactKind::Rendering => DocumentPendingFact::Rendering,
             })
         },
-        PendingBuildError::WebViewOwnerMismatch { .. } |
-        PendingBuildError::EventLoopOwnerMismatch { .. } => {
+        PendingBuildError::WebViewOwnerMismatch { .. }
+        | PendingBuildError::EventLoopOwnerMismatch { .. } => {
             DocumentControlError::PendingFactUnavailable(DocumentPendingFact::TargetMembership)
         },
         PendingBuildError::OwnedTerminalConflict(slot) => {
@@ -206,11 +212,11 @@ fn map_pending_build_error(error: PendingBuildError) -> DocumentControlError {
             })
         },
         PendingBuildError::CountOverflow(count) => match count {
-            PendingCountKind::ReadyEvents |
-            PendingCountKind::ReadyTasks |
-            PendingCountKind::ThrottledTasks |
-            PendingCountKind::InactiveTasks |
-            PendingCountKind::Microtasks => DocumentControlError::QueueLengthOverflow,
+            PendingCountKind::ReadyEvents
+            | PendingCountKind::ReadyTasks
+            | PendingCountKind::ThrottledTasks
+            | PendingCountKind::InactiveTasks
+            | PendingCountKind::Microtasks => DocumentControlError::QueueLengthOverflow,
         },
         PendingBuildError::InputRevisionTerminalBeforeExhaustion => {
             DocumentControlError::PendingFactUnavailable(DocumentPendingFact::Input)
@@ -230,23 +236,23 @@ fn map_pending_state_error(error: PendingStateError) -> DocumentControlError {
         PendingStateError::StateGenerationExhausted(_) => {
             DocumentControlError::PendingFactUnavailable(DocumentPendingFact::StateGeneration)
         },
-        PendingStateError::UnknownSource(_) |
-        PendingStateError::SourceEpochExhausted(_) |
-        PendingStateError::SourceIdExhausted => {
+        PendingStateError::UnknownSource(_)
+        | PendingStateError::SourceEpochExhausted(_)
+        | PendingStateError::SourceIdExhausted => {
             DocumentControlError::PendingFactUnavailable(DocumentPendingFact::Sources)
         },
-        PendingStateError::UnknownParser(_) |
-        PendingStateError::DuplicateParserOwner(_) |
-        PendingStateError::MissingNetworkParent(_) |
-        PendingStateError::NetworkParentKindMismatch { .. } |
-        PendingStateError::NetworkParentPipelineMismatch { .. } => {
+        PendingStateError::UnknownParser(_)
+        | PendingStateError::DuplicateParserOwner(_)
+        | PendingStateError::MissingNetworkParent(_)
+        | PendingStateError::NetworkParentKindMismatch { .. }
+        | PendingStateError::NetworkParentPipelineMismatch { .. } => {
             DocumentControlError::PendingFactUnavailable(DocumentPendingFact::Parser)
         },
         PendingStateError::Network(_) | PendingStateError::NetworkOperationIdExhausted => {
             DocumentControlError::PendingFactUnavailable(DocumentPendingFact::Network)
         },
-        PendingStateError::DuplicatePersistentSource(_) |
-        PendingStateError::InvalidPersistentSource(_) => {
+        PendingStateError::DuplicatePersistentSource(_)
+        | PendingStateError::InvalidPersistentSource(_) => {
             DocumentControlError::PendingFactUnavailable(DocumentPendingFact::Sources)
         },
         PendingStateError::ResourceFenceAlreadyBound { .. } => {
@@ -263,7 +269,8 @@ fn map_pending_state_error(error: PendingStateError) -> DocumentControlError {
 mod tests {
     use servo_base::id::ScriptEventLoopId;
     use timers::{
-        DocumentClock, DocumentClockConfiguration, DocumentTime, DocumentUnixTime,
+        DocumentClock, DocumentClockConfiguration, DocumentExecutionCounters,
+        DocumentExecutionLimits, DocumentExecutionObservation, DocumentTime, DocumentUnixTime,
         TimerEventRequest, TimerScheduler,
     };
 
@@ -284,6 +291,12 @@ mod tests {
             })
             .unwrap();
 
+        let execution = DocumentExecutionObservation {
+            clock_id: clock.id(),
+            limits: DocumentExecutionLimits::CONTROLLED_WEBAPP_V1,
+            counters: DocumentExecutionCounters::default(),
+            terminal: None,
+        };
         let observation = capture_barrier_observation(
             event_loop_id,
             &clock,
@@ -306,6 +319,7 @@ mod tests {
                 completed_checkpoint_generation: 7,
                 terminal_error: None,
             },
+            execution,
         )
         .unwrap();
 
@@ -321,6 +335,7 @@ mod tests {
         assert!(observation.input.intake_saturated);
         assert_eq!(observation.microtasks.queued, 6);
         assert_eq!(observation.microtasks.completed_checkpoint.get(), 7);
+        assert_eq!(observation.execution, execution);
     }
 
     #[test]
@@ -346,6 +361,12 @@ mod tests {
                     checkpoint_in_progress: false,
                     completed_checkpoint_generation: 0,
                     terminal_error: None,
+                },
+                DocumentExecutionObservation {
+                    clock_id: clock.id(),
+                    limits: DocumentExecutionLimits::CONTROLLED_WEBAPP_V1,
+                    counters: DocumentExecutionCounters::default(),
+                    terminal: None,
                 },
             ),
             Err(DocumentControlError::NotControlled)

@@ -3,6 +3,7 @@ import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from "n
 
 import {
   StasisAbortError,
+  StasisCommandTimeoutError,
   StasisProcessError,
   StasisProtocolError,
   StasisStateError,
@@ -24,6 +25,8 @@ interface RequestOptions {
   expectedResponseSessionId: SessionExpectation;
   signal?: AbortSignal;
   terminatesProcess?: boolean;
+  timeoutMs?: number;
+  timeoutStateEffect: ProtocolStateEffect;
 }
 
 interface QueuedRequest {
@@ -33,6 +36,7 @@ interface QueuedRequest {
   state: "queued" | "active" | "settled";
   id: string | null;
   abortListener: (() => void) | null;
+  timeoutTimer: ReturnType<typeof setTimeout> | null;
   decode: (result: unknown, sessionId: string | null) => unknown;
   resolve: (result: ProtocolSuccess) => void;
   reject: (error: unknown) => void;
@@ -286,6 +290,7 @@ export interface SpawnClientOptions {
   maxStderrBytes: number;
   maxFrameBytes: number;
   closeTimeoutMs: number;
+  commandTimeoutMs: number;
 }
 
 interface ExitWaiter {
@@ -301,6 +306,7 @@ export class ProtocolClient {
   readonly #stderr: StderrTail;
   readonly #decoder: NdjsonDecoder;
   readonly #closeTimeoutMs: number;
+  readonly #commandTimeoutMs: number;
   readonly #queue: QueuedRequest[] = [];
   readonly #exitWaiters: ExitWaiter[] = [];
   #active: QueuedRequest | null = null;
@@ -330,6 +336,7 @@ export class ProtocolClient {
       options.maxStderrBytes,
       options.maxFrameBytes,
       options.closeTimeoutMs,
+      options.commandTimeoutMs,
     );
   }
 
@@ -338,10 +345,12 @@ export class ProtocolClient {
     maxStderrBytes: number,
     maxFrameBytes: number,
     closeTimeoutMs: number,
+    commandTimeoutMs: number,
   ) {
     this.#child = child;
     this.#stderr = new StderrTail(maxStderrBytes);
     this.#closeTimeoutMs = closeTimeoutMs;
+    this.#commandTimeoutMs = commandTimeoutMs;
     this.#decoder = new NdjsonDecoder(maxFrameBytes, (frame) => this.#handleFrame(frame));
 
     child.stderr.on("data", (chunk: Buffer) => this.#stderr.append(chunk));
@@ -449,10 +458,18 @@ export class ProtocolClient {
     return this.#stderr.snapshot();
   }
 
+  get isUsable(): boolean {
+    return this.#accepting && this.#terminalError === null;
+  }
+
   waitForCleanExit(signal?: AbortSignal): Promise<void> {
     if (this.#terminalError !== null) return Promise.reject(this.#terminalError);
     if (signal?.aborted === true) {
-      const error = new StasisAbortError(signal.reason, this.stderrTail);
+      const error = new StasisAbortError(signal.reason, this.stderrTail, {
+        fatal: true,
+        stateEffect: "indeterminate",
+        method: "session.close",
+      });
       this.#failStop(error);
       return Promise.reject(error);
     }
@@ -484,7 +501,13 @@ export class ProtocolClient {
       };
       if (signal !== undefined) {
         waiter.abortListener = () => {
-          this.#failStop(new StasisAbortError(signal.reason, this.stderrTail));
+          this.#failStop(
+            new StasisAbortError(signal.reason, this.stderrTail, {
+              fatal: true,
+              stateEffect: "indeterminate",
+              method: "session.close",
+            }),
+          );
         };
         signal.addEventListener("abort", waiter.abortListener, { once: true });
       }
@@ -515,6 +538,7 @@ export class ProtocolClient {
         state: "queued",
         id: null,
         abortListener: null,
+        timeoutTimer: null,
         decode,
         resolve: (success) => resolve(success as ProtocolSuccess<Result>),
         reject,
@@ -618,6 +642,9 @@ export class ProtocolClient {
 
     request.state = "active";
     this.#active = request;
+    const timeoutMs = request.options.timeoutMs ?? this.#commandTimeoutMs;
+    request.timeoutTimer = setTimeout(() => this.#commandTimedOut(request, timeoutMs), timeoutMs);
+    request.timeoutTimer.unref();
     this.#child.stdin.write(frame, (error) => {
       if (error !== null && error !== undefined) {
         this.#failStop(
@@ -634,15 +661,34 @@ export class ProtocolClient {
 
   #abort(request: QueuedRequest, reason: unknown): void {
     if (request.state === "settled") return;
-    const error = new StasisAbortError(reason, this.stderrTail);
     if (request.state === "queued") {
+      const error = new StasisAbortError(reason, this.stderrTail);
       const index = this.#queue.indexOf(request);
       if (index !== -1) this.#queue.splice(index, 1);
       this.#settleRequest(request);
       request.reject(error);
       return;
     }
+    const error = new StasisAbortError(reason, this.stderrTail, {
+      fatal: true,
+      stateEffect: request.options.timeoutStateEffect,
+      method: request.method,
+      requestId: request.id,
+    });
     this.#failStop(error);
+  }
+
+  #commandTimedOut(request: QueuedRequest, timeoutMs: number): void {
+    if (request.state !== "active" || this.#active !== request || request.id === null) return;
+    this.#failStop(
+      new StasisCommandTimeoutError({
+        method: request.method,
+        requestId: request.id,
+        timeoutMs,
+        stateEffect: request.options.timeoutStateEffect,
+        stderrTail: this.stderrTail,
+      }),
+    );
   }
 
   #handleFrame(frame: unknown): void {
@@ -862,6 +908,8 @@ export class ProtocolClient {
       request.options.signal.removeEventListener("abort", request.abortListener);
     }
     request.abortListener = null;
+    if (request.timeoutTimer !== null) clearTimeout(request.timeoutTimer);
+    request.timeoutTimer = null;
   }
 
   #resolveExitWaiters(): void {

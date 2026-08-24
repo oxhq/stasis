@@ -1,9 +1,14 @@
 import { StasisTransportError } from "./errors.js";
+import { CONTROLLED_WEBAPP_V1_PROFILE, type SupportProfile } from "./profile.js";
 import type {
   AdvanceToNextResult,
+  AutomationMutationResult,
   ClockOptions,
   EffectiveSettlePolicy,
+  ExtractPlan,
+  ExtractResult,
   PendingSnapshot,
+  QueryResult,
   RuntimeInfo,
   SettleOutcome,
   SettlePolicy,
@@ -18,7 +23,10 @@ export const METHOD = {
   initialize: "protocol.initialize",
   open: "session.open",
   evaluate: "dom.evaluate",
+  query: "dom.query",
   text: "dom.text",
+  extract: "dom.extract",
+  fill: "action.fill",
   activate: "action.activate",
   pending: "runtime.pending",
   settle: "runtime.settle",
@@ -33,6 +41,10 @@ const SETTLE_OUTCOMES = new Set<SettleOutcome>([
   "blocked_on_open_ended_work",
   "unsupported_work",
   "virtual_time_limit_exceeded",
+  "task_limit_exceeded",
+  "microtask_limit_exceeded",
+  "rendering_limit_exceeded",
+  "mutation_limit_exceeded",
   "control_turn_limit_exceeded",
   "runtime_error",
 ]);
@@ -168,6 +180,7 @@ const RUNTIME_FAILURE_COMPONENTS = stringSet([
 ]);
 const SETTLE_FAILURE_CODES = stringSet([
   "runtime_terminals",
+  "execution_counter_overflow",
   "web_view_identity_changed",
   "clock_not_controlled",
   "unsupported_clock_surface",
@@ -238,31 +251,46 @@ const WIDE_INTEGER_FIELDS = new Set([
   "maxVirtualTimeNs",
   "maxControlTurns",
   "controlTurns",
+  "tasks",
+  "microtasks",
+  "renderingOpportunities",
+  "mutations",
   "count",
   "fromVirtualTimeNs",
   "limit",
+  "observed",
   "startVirtualTimeNs",
   "requestedVirtualTimeNs",
 ]);
 
-export function encodeOpenParams(url: string | URL, clock: ClockOptions | undefined): Record<string, unknown> {
+export function encodeOpenParams(
+  url: string | URL,
+  clock: ClockOptions | undefined,
+  profile: SupportProfile | undefined,
+): Record<string, unknown> {
   const serializedUrl = typeof url === "string" ? url : url.toString();
   if (serializedUrl.length === 0) throw new TypeError("url must not be empty");
   const params: Record<string, unknown> = { url: serializedUrl };
-  if (clock === undefined) return params;
-  if (clock.mode === "real") {
+  if (clock?.mode === "real") {
+    if (profile !== undefined) {
+      throw new TypeError("profile is supported only with the controlled clock");
+    }
     params.clockMode = "real";
     return params;
   }
-  if (clock.mode !== "controlled") {
+  if (clock !== undefined && clock.mode !== "controlled") {
     throw new TypeError("clock.mode must be real or controlled");
   }
+  if (profile !== undefined && profile !== CONTROLLED_WEBAPP_V1_PROFILE) {
+    throw new TypeError(`profile must be ${CONTROLLED_WEBAPP_V1_PROFILE}`);
+  }
   params.clockMode = "controlled";
+  params.profile = profile ?? CONTROLLED_WEBAPP_V1_PROFILE;
   params.initialVirtualTimeNs = encodeU128(
-    clock.initialVirtualTimeNs ?? 0n,
+    clock?.initialVirtualTimeNs ?? 0n,
     "initialVirtualTimeNs",
   );
-  const unixTimeOriginNs = clock.unixTimeOriginNs ?? 0n;
+  const unixTimeOriginNs = clock?.unixTimeOriginNs ?? 0n;
   if (unixTimeOriginNs !== 0n) {
     throw new RangeError("unixTimeOriginNs must be 0 in the controlled MVP");
   }
@@ -293,6 +321,53 @@ export function encodeDocumentTargetParams(
   if (typeof selector !== "string") throw new TypeError("selector must be a string");
   return {
     selector,
+    expectedGeneration: encodeU64(expectedGeneration, "expectedGeneration"),
+  };
+}
+
+export function encodeFillParams(
+  selector: string,
+  value: string,
+  expectedGeneration: bigint,
+): Record<string, unknown> {
+  if (typeof value !== "string") throw new TypeError("value must be a string");
+  return {
+    ...encodeDocumentTargetParams(selector, expectedGeneration),
+    value,
+  };
+}
+
+export function encodeExtractParams(
+  plan: ExtractPlan,
+  expectedGeneration: bigint,
+): Record<string, unknown> {
+  if (typeof plan !== "object" || plan === null || Array.isArray(plan)) {
+    throw new TypeError("plan must be an object");
+  }
+  if (typeof plan.rootSelector !== "string") {
+    throw new TypeError("plan.rootSelector must be a string");
+  }
+  if (!Array.isArray(plan.fields)) {
+    throw new TypeError("plan.fields must be an array");
+  }
+  const fields = plan.fields.map((field, index) => {
+    if (typeof field !== "object" || field === null || Array.isArray(field)) {
+      throw new TypeError(`plan.fields[${index}] must be an object`);
+    }
+    if (typeof field.name !== "string") {
+      throw new TypeError(`plan.fields[${index}].name must be a string`);
+    }
+    if (typeof field.selector !== "string") {
+      throw new TypeError(`plan.fields[${index}].selector must be a string`);
+    }
+    if (field.read !== "text" && field.read !== "html") {
+      throw new TypeError(`plan.fields[${index}].read must be text or html`);
+    }
+    return { name: field.name, selector: field.selector, read: field.read };
+  });
+  return {
+    rootSelector: plan.rootSelector,
+    fields,
     expectedGeneration: encodeU64(expectedGeneration, "expectedGeneration"),
   };
 }
@@ -335,15 +410,17 @@ export interface OpenResult {
   url: string;
   boundary: "load_complete" | "controlled_ready";
   clockMode: "real" | "controlled";
+  profile: SupportProfile | null;
 }
 
 export function decodeOpenResult(
   value: unknown,
   envelopeSessionId: string | null,
   expectedClockMode: "real" | "controlled",
+  expectedProfile: SupportProfile | null,
 ): OpenResult {
   const result = record(value, "session.open result");
-  exactKeys(result, ["sessionId", "requestedUrl", "url", "boundary", "clockMode"]);
+  exactKeys(result, ["sessionId", "requestedUrl", "url", "boundary", "clockMode", "profile"]);
   const sessionId = requireString(result.sessionId, "session.open result.sessionId");
   if (sessionId.length === 0 || sessionId !== envelopeSessionId) {
     invalid("session.open result and response envelope disagree on sessionId");
@@ -358,6 +435,19 @@ export function decodeOpenResult(
       `session.open requested ${expectedClockMode} clock mode but the runtime returned ${clockMode}`,
     );
   }
+  const profile =
+    result.profile === null
+      ? null
+      : (expectEnum(
+          result.profile,
+          new Set([CONTROLLED_WEBAPP_V1_PROFILE]),
+          "session.open result.profile",
+        ) as SupportProfile);
+  if (profile !== expectedProfile) {
+    invalid(
+      `session.open requested profile ${String(expectedProfile)} but the runtime returned ${String(profile)}`,
+    );
+  }
   return {
     sessionId,
     requestedUrl: requireString(result.requestedUrl, "session.open result.requestedUrl"),
@@ -368,6 +458,7 @@ export function decodeOpenResult(
       "session.open result.boundary",
     ) as "load_complete" | "controlled_ready",
     clockMode,
+    profile,
   };
 }
 
@@ -385,10 +476,68 @@ export function decodeText(value: unknown): string {
   return text;
 }
 
-export function decodeActivation(value: unknown): void {
-  const result = record(value, "action.activate result");
+export function decodeActivation(value: unknown): AutomationMutationResult {
+  return decodeAutomationMutation(value, "action.activate result");
+}
+
+export function decodeFill(value: unknown): AutomationMutationResult {
+  return decodeAutomationMutation(value, "action.fill result");
+}
+
+export function decodeQuery(value: unknown): QueryResult {
+  const result = record(value, "dom.query result");
+  exactKeys(result, ["count", "stateGeneration"]);
+  return {
+    count: decodeU128(result.count, "dom.query result.count"),
+    stateGeneration: decodeU64(
+      result.stateGeneration,
+      "dom.query result.stateGeneration",
+    ),
+  };
+}
+
+export function decodeExtract(value: unknown): ExtractResult {
+  const result = record(value, "dom.extract result");
+  exactKeys(result, ["rows", "stateGeneration"]);
+  const rows = array(result.rows, "dom.extract result.rows").map((rowValue, rowIndex) => {
+    const row = record(rowValue, `dom.extract result.rows[${rowIndex}]`);
+    exactKeys(row, ["fields"]);
+    const fields = array(row.fields, `dom.extract result.rows[${rowIndex}].fields`).map(
+      (fieldValue, fieldIndex) => {
+        const field = record(
+          fieldValue,
+          `dom.extract result.rows[${rowIndex}].fields[${fieldIndex}]`,
+        );
+        exactKeys(field, ["name", "value"]);
+        return {
+          name: requireString(
+            field.name,
+            `dom.extract result.rows[${rowIndex}].fields[${fieldIndex}].name`,
+          ),
+          value: requireString(
+            field.value,
+            `dom.extract result.rows[${rowIndex}].fields[${fieldIndex}].value`,
+          ),
+        };
+      },
+    );
+    return { fields };
+  });
+  return {
+    rows,
+    stateGeneration: decodeU64(
+      result.stateGeneration,
+      "dom.extract result.stateGeneration",
+    ),
+  };
+}
+
+function decodeAutomationMutation(value: unknown, label: string): AutomationMutationResult {
+  const result = record(value, label);
   exactKeys(result, ["stateGeneration"]);
-  decodeU64(result.stateGeneration, "action.activate result.stateGeneration");
+  return {
+    stateGeneration: decodeU64(result.stateGeneration, `${label}.stateGeneration`),
+  };
 }
 
 export function decodePending(value: unknown): PendingSnapshot {
@@ -487,8 +636,18 @@ export function decodeSettle(value: unknown): SettleResult {
   requireBigInt(policy.wallIoTimeoutNs, "effectivePolicy.wallIoTimeoutNs");
   result.effectivePolicy = policy as unknown as EffectiveSettlePolicy;
   const processed = record(result.processed, "processed");
-  exactKeys(processed, ["controlTurns"]);
+  exactKeys(processed, [
+    "controlTurns",
+    "tasks",
+    "microtasks",
+    "renderingOpportunities",
+    "mutations",
+  ]);
   requireBigInt(processed.controlTurns, "processed.controlTurns");
+  requireBigInt(processed.tasks, "processed.tasks");
+  requireBigInt(processed.microtasks, "processed.microtasks");
+  requireBigInt(processed.renderingOpportunities, "processed.renderingOpportunities");
+  requireBigInt(processed.mutations, "processed.mutations");
   validateClassifiedWork(result.persistentWork, "persistentWork", true);
   validateClassifiedWork(result.unsupportedWork, "unsupportedWork", false);
   array(result.externalIo, "externalIo").forEach(validateExternalIo);
@@ -774,6 +933,28 @@ function validateSettleOutcomePayload(result: Record<string, unknown>): void {
     exactKeys(limit, ["kind", "limit"]);
     if (limit.kind !== "control_turns") invalid(`${outcome} requires a control_turns limit`);
     requireBigInt(limit.limit, "limit.limit");
+    return;
+  }
+  const executionLimitKind =
+    outcome === "task_limit_exceeded"
+      ? "ordinary_tasks"
+      : outcome === "microtask_limit_exceeded"
+        ? "microtasks"
+        : outcome === "rendering_limit_exceeded"
+          ? "rendering_opportunities"
+          : outcome === "mutation_limit_exceeded"
+            ? "mutations"
+            : null;
+  if (executionLimitKind !== null) {
+    if (result.failure !== undefined) invalid(`${outcome} must omit failure`);
+    const limit = record(result.limit, "limit");
+    exactKeys(limit, ["kind", "limit", "observed"]);
+    if (limit.kind !== executionLimitKind) {
+      invalid(`${outcome} requires a ${executionLimitKind} limit`);
+    }
+    const configured = requireBigInt(limit.limit, "limit.limit");
+    const observed = requireBigInt(limit.observed, "limit.observed");
+    if (observed <= configured) invalid(`${outcome} observed work must exceed its limit`);
     return;
   }
   if (outcome === "unsupported_work" || outcome === "runtime_error") {

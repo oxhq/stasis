@@ -1,8 +1,9 @@
 # Execution journal design contract 0.1 (future surface)
 
 > **Status:** Design history and future direction. Execution journals are not
-> advertised or published by `v0.1.0-alpha.0`; the alpha has no journal or
-> artifact method. See `protocol-v1.md` for the exact shipped method surface.
+> advertised by `v0.1.0`; the stable release instead exposes bounded, redacted
+> terminal settlement evidence in the TypeScript SDK. See `protocol-v1.md` for
+> the exact shipped method surface.
 
 The proposed journal is append-only execution evidence, not replay or time travel.
 

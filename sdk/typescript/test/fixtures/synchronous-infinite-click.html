@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Stasis synchronous infinite click fixture</title>
+  </head>
+  <body>
+    <button id="spin" type="button">Enter synchronous loop</button>
+    <output id="status">ready</output>
+
+    <script>
+      "use strict";
+
+      document.querySelector("#spin").addEventListener("click", () => {
+        document.querySelector("#status").textContent = "entered";
+        window.__stasisInfiniteClickCounter = 0;
+        for (;;) {
+          window.__stasisInfiniteClickCounter =
+            (window.__stasisInfiniteClickCounter + 1) >>> 0;
+        }
+      });
+    </script>
+  </body>
+</html>

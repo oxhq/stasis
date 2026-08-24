@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Stasis recursive timer limit</title>
+  </head>
+  <body>
+    <button id="start" type="button">Start recursive timers</button>
+    <p id="status">idle</p>
+    <script>
+      document.querySelector("#start").addEventListener("click", () => {
+        document.querySelector("#status").textContent = "running";
+        const recurse = () => setTimeout(recurse, 0);
+        setTimeout(recurse, 0);
+      });
+    </script>
+  </body>
+</html>

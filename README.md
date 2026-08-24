@@ -1,12 +1,12 @@
 # Stasis
 
 Stasis is an experimental Servo-based runtime for executing a supported web
-application as a controlled event system. The first alpha exposes the
+application as a controlled event system. The stable v0.1 release exposes the
 `open -> act -> settle -> inspect` loop through a native NDJSON shell and the
 matching `@oxhq/stasis` TypeScript client.
 
 Start with [STASIS.md](STASIS.md) for the product boundary and
-[the alpha protocol](docs/stasis/protocol-v1.md) for the exact shipped methods,
+[the v0.1 protocol](docs/stasis/protocol-v1.md) for the exact shipped methods,
 typed outcomes, and unsupported surfaces. Build and release operators should
 also read [the release runbook](docs/stasis/releases.md).
 

@@ -14,10 +14,11 @@ use serde::{Deserialize, Serialize};
 use servo_base::Epoch;
 use servo_base::id::{PipelineId, ScriptEventLoopId, WebViewId};
 use timers::{
-    DocumentClockError, DocumentClockId, DocumentProducerCheckpoint, DocumentProducerFenceError,
-    DocumentProducerFenceId, DocumentProducerKind, DocumentProducerObservation,
-    DocumentProducerSnapshot, DocumentTime, DocumentTimeSurface, DocumentUnixTime,
-    TimerControlError, TimerDeadlineSnapshot, TimerSchedulerId,
+    DocumentClockError, DocumentClockId, DocumentExecutionBudget, DocumentExecutionCounter,
+    DocumentExecutionObservation, DocumentExecutionTerminal, DocumentProducerCheckpoint,
+    DocumentProducerFenceError, DocumentProducerFenceId, DocumentProducerKind,
+    DocumentProducerObservation, DocumentProducerSnapshot, DocumentTime, DocumentTimeSurface,
+    DocumentUnixTime, TimerControlError, TimerDeadlineSnapshot, TimerSchedulerId,
 };
 
 /// Checked Constellation revision for active and pending top-level navigation membership.
@@ -654,20 +655,20 @@ impl PendingRuntimeTerminals {
 
     /// Return whether no independent runtime owner has latched a terminal.
     pub fn is_empty(&self) -> bool {
-        self.clock.is_none() &&
-            self.target_time.is_none() &&
-            self.outer_scheduler.is_none() &&
-            self.producer.is_none() &&
-            self.microtask.is_none() &&
-            self.input_revision.is_none() &&
-            self.source_id.is_none() &&
-            self.logical_timers.is_empty() &&
-            self.image_timers.is_empty() &&
-            self.dom_generation.is_none() &&
-            self.state_generation.is_none() &&
-            self.navigation_revision.is_none() &&
-            self.pipeline_membership_revision.is_none() &&
-            self.source_epoch.is_none()
+        self.clock.is_none()
+            && self.target_time.is_none()
+            && self.outer_scheduler.is_none()
+            && self.producer.is_none()
+            && self.microtask.is_none()
+            && self.input_revision.is_none()
+            && self.source_id.is_none()
+            && self.logical_timers.is_empty()
+            && self.image_timers.is_empty()
+            && self.dom_generation.is_none()
+            && self.state_generation.is_none()
+            && self.navigation_revision.is_none()
+            && self.pipeline_membership_revision.is_none()
+            && self.source_epoch.is_none()
     }
 
     fn validate(&self) -> Result<(), PendingSnapshotInvariantError> {
@@ -942,10 +943,10 @@ impl PendingProducerObservation {
                 return Err(PendingSnapshotInvariantError::ProducerPriorEmptyMissing);
             },
             (PendingProducerStability::StableEmpty, Some(prior)) => {
-                if prior.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO ||
-                    prior.microtask_checkpoint >= self.microtask_checkpoint ||
-                    prior.checkpoint == DocumentProducerCheckpoint::ZERO ||
-                    prior.checkpoint >= self.checkpoint
+                if prior.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
+                    || prior.microtask_checkpoint >= self.microtask_checkpoint
+                    || prior.checkpoint == DocumentProducerCheckpoint::ZERO
+                    || prior.checkpoint >= self.checkpoint
                 {
                     return Err(
                         PendingSnapshotInvariantError::ProducerPriorEmptyCheckpointMismatch,
@@ -967,8 +968,8 @@ impl PendingProducerObservation {
         }
         match self.stability {
             PendingProducerStability::NotCheckpointed => {
-                if self.checkpoint != DocumentProducerCheckpoint::ZERO ||
-                    self.microtask_checkpoint != PendingMicrotaskCheckpoint::ZERO
+                if self.checkpoint != DocumentProducerCheckpoint::ZERO
+                    || self.microtask_checkpoint != PendingMicrotaskCheckpoint::ZERO
                 {
                     return Err(PendingSnapshotInvariantError::ProducerCheckpointMismatch {
                         microtask_checkpoint: self.microtask_checkpoint,
@@ -978,8 +979,8 @@ impl PendingProducerObservation {
                 }
             },
             PendingProducerStability::Busy => {
-                if self.checkpoint == DocumentProducerCheckpoint::ZERO ||
-                    self.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
+                if self.checkpoint == DocumentProducerCheckpoint::ZERO
+                    || self.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
                 {
                     return Err(PendingSnapshotInvariantError::ProducerCheckpointMismatch {
                         microtask_checkpoint: self.microtask_checkpoint,
@@ -995,8 +996,8 @@ impl PendingProducerObservation {
                 }
             },
             PendingProducerStability::Unqualified => {
-                if self.checkpoint == DocumentProducerCheckpoint::ZERO ||
-                    self.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
+                if self.checkpoint == DocumentProducerCheckpoint::ZERO
+                    || self.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
                 {
                     return Err(PendingSnapshotInvariantError::ProducerCheckpointMismatch {
                         microtask_checkpoint: self.microtask_checkpoint,
@@ -1006,8 +1007,8 @@ impl PendingProducerObservation {
                 }
             },
             PendingProducerStability::FirstEmpty | PendingProducerStability::StableEmpty => {
-                if self.checkpoint == DocumentProducerCheckpoint::ZERO ||
-                    self.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
+                if self.checkpoint == DocumentProducerCheckpoint::ZERO
+                    || self.microtask_checkpoint == PendingMicrotaskCheckpoint::ZERO
                 {
                     return Err(PendingSnapshotInvariantError::ProducerCheckpointMismatch {
                         microtask_checkpoint: self.microtask_checkpoint,
@@ -1057,8 +1058,8 @@ fn validate_producer_snapshot_conservation(
     if snapshot.completed().checked_add(snapshot.pending()) != Some(snapshot.enqueued()) {
         return Err(PendingSnapshotInvariantError::ProducerGlobalConservationMismatch);
     }
-    if (summed_enqueued, summed_completed, summed_pending) !=
-        (
+    if (summed_enqueued, summed_completed, summed_pending)
+        != (
             snapshot.enqueued(),
             snapshot.completed(),
             snapshot.pending(),
@@ -1080,12 +1081,12 @@ fn validate_producer_snapshot_conservation(
     {
         let observed_sequence = lease_id.sequence().get();
         let resource = snapshot.for_kind(DocumentProducerKind::Resource);
-        if lease_id.fence_id() != snapshot.fence_id() ||
-            lease_id.kind() != DocumentProducerKind::Resource ||
-            observed_sequence == 0 ||
-            observed_sequence > snapshot.enqueued() ||
-            resource.enqueued() == 0 ||
-            resource.completed() == 0
+        if lease_id.fence_id() != snapshot.fence_id()
+            || lease_id.kind() != DocumentProducerKind::Resource
+            || observed_sequence == 0
+            || observed_sequence > snapshot.enqueued()
+            || resource.enqueued() == 0
+            || resource.completed() == 0
         {
             return Err(
                 PendingSnapshotInvariantError::ProducerAbandonedLeaseMismatch {
@@ -1155,14 +1156,14 @@ impl PendingParserSourceObservation {
                 PendingSourceDisposition::AwaitingExternalIo(_)
             ),
             PendingParserPhase::AwaitingScriptInput => {
-                self.disposition ==
-                    PendingSourceDisposition::Unsupported(
+                self.disposition
+                    == PendingSourceDisposition::Unsupported(
                         PendingUnsupportedSourceReason::ScriptCreatedParserInput,
                     )
             },
             PendingParserPhase::Suspended => {
-                self.disposition ==
-                    PendingSourceDisposition::Unsupported(
+                self.disposition
+                    == PendingSourceDisposition::Unsupported(
                         PendingUnsupportedSourceReason::SuspendedParser,
                     )
             },
@@ -1547,8 +1548,8 @@ impl PendingLogicalTimerSnapshot {
         }
         for (index, timer) in self.timers.iter().enumerate() {
             let stable_handle = match timer.stable_id {
-                PendingLogicalTimerStableId::JavaScriptHandle(handle) |
-                PendingLogicalTimerStableId::EngineHandle(handle) => handle,
+                PendingLogicalTimerStableId::JavaScriptHandle(handle)
+                | PendingLogicalTimerStableId::EngineHandle(handle) => handle,
             };
             if stable_handle <= 0 {
                 return Err(
@@ -1561,15 +1562,15 @@ impl PendingLogicalTimerSnapshot {
             let stable_kind_matches = matches!(
                 (timer.kind, timer.stable_id),
                 (
-                    PendingLogicalTimerKind::JavaScriptOneShot |
-                        PendingLogicalTimerKind::JavaScriptInterval { .. },
+                    PendingLogicalTimerKind::JavaScriptOneShot
+                        | PendingLogicalTimerKind::JavaScriptInterval { .. },
                     PendingLogicalTimerStableId::JavaScriptHandle(_),
                 ) | (
-                    PendingLogicalTimerKind::XmlHttpRequestTimeout |
-                        PendingLogicalTimerKind::EventSourceReconnect |
-                        PendingLogicalTimerKind::RefreshRedirect |
-                        PendingLogicalTimerKind::RunStepsAfterTimeout |
-                        PendingLogicalTimerKind::TestBindingCallback,
+                    PendingLogicalTimerKind::XmlHttpRequestTimeout
+                        | PendingLogicalTimerKind::EventSourceReconnect
+                        | PendingLogicalTimerKind::RefreshRedirect
+                        | PendingLogicalTimerKind::RunStepsAfterTimeout
+                        | PendingLogicalTimerKind::TestBindingCallback,
                     PendingLogicalTimerStableId::EngineHandle(_),
                 )
             );
@@ -1593,8 +1594,8 @@ impl PendingLogicalTimerSnapshot {
                 );
             }
             if self.timers[..index].iter().any(|prior| {
-                prior.pipeline_id == timer.pipeline_id &&
-                    prior.creation_sequence == timer.creation_sequence
+                prior.pipeline_id == timer.pipeline_id
+                    && prior.creation_sequence == timer.creation_sequence
             }) {
                 return Err(
                     PendingSnapshotInvariantError::DuplicateLogicalTimerCreationIdentity {
@@ -1625,8 +1626,8 @@ impl PendingLogicalTimerSnapshot {
                     timer.source_id,
                 ));
             }
-            if let Some(wake) = timer.outer_wake &&
-                wake.deadline < timer.logical_deadline
+            if let Some(wake) = timer.outer_wake
+                && wake.deadline < timer.logical_deadline
             {
                 return Err(
                     PendingSnapshotInvariantError::LogicalTimerWakeBeforeLogicalDeadline {
@@ -1983,30 +1984,30 @@ impl PendingRenderingObservation {
     /// are authoritative aggregates and are not required to have unstable one-to-one source IDs
     /// in this type-only foundation.
     pub fn has_observed_work(&self) -> bool {
-        self.scheduled_opportunity.is_some() ||
-            self.opportunity_ready ||
-            self.pipelines.iter().any(|observation| {
+        self.scheduled_opportunity.is_some()
+            || self.opportunity_ready
+            || self.pipelines.iter().any(|observation| {
                 let images = observation.animated_images;
                 let canvas = observation.canvas;
-                observation.retained_animation_frame_callbacks != 0 ||
-                    observation.runnable_animation_frame_callbacks != 0 ||
-                    observation.document_update_required ||
-                    observation.pending_animation_events != 0 ||
-                    observation.finite_animations != 0 ||
-                    observation.infinite_animations != 0 ||
-                    observation.unsupported_animations != 0 ||
-                    images.finite_images != 0 ||
-                    images.infinite_images != 0 ||
-                    images.unsupported.checked_total() != Some(0) ||
-                    images.update_ready ||
-                    images.scheduled_timer.is_some() ||
-                    canvas.dirty_contexts != 0 ||
-                    canvas.awaiting_async_upload ||
-                    canvas.unsupported.live_source_inventory_unavailable != 0 ||
-                    canvas.unsupported.offscreen_execution != 0 ||
-                    canvas.unsupported.mutation_generation_unbound != 0 ||
-                    observation.pending_fonts != 0 ||
-                    observation.pending_images != 0
+                observation.retained_animation_frame_callbacks != 0
+                    || observation.runnable_animation_frame_callbacks != 0
+                    || observation.document_update_required
+                    || observation.pending_animation_events != 0
+                    || observation.finite_animations != 0
+                    || observation.infinite_animations != 0
+                    || observation.unsupported_animations != 0
+                    || images.finite_images != 0
+                    || images.infinite_images != 0
+                    || images.unsupported.checked_total() != Some(0)
+                    || images.update_ready
+                    || images.scheduled_timer.is_some()
+                    || canvas.dirty_contexts != 0
+                    || canvas.awaiting_async_upload
+                    || canvas.unsupported.live_source_inventory_unavailable != 0
+                    || canvas.unsupported.offscreen_execution != 0
+                    || canvas.unsupported.mutation_generation_unbound != 0
+                    || observation.pending_fonts != 0
+                    || observation.pending_images != 0
             })
     }
 
@@ -2268,6 +2269,12 @@ pub struct RawPendingSnapshot {
     pub input: PendingInputObservation,
     /// Microtask queue and checkpoint evidence.
     pub microtasks: PendingMicrotaskObservation,
+    /// Controlled execution policy, counters, and sticky terminal, when this runtime installed a
+    /// document execution ledger before navigation.
+    ///
+    /// `None` is retained for realtime embedders and same-build callers which do not install the
+    /// controlled execution ledger. Stasis controlled sessions publish `Some`.
+    pub execution: Option<DocumentExecutionObservation>,
     /// Producer-fence watermarks and mechanical stability.
     pub producers: PendingProducerObservation,
     /// Authoritative parser and top-level navigation evidence.
@@ -2295,6 +2302,21 @@ impl RawPendingSnapshot {
             return Err(PendingSnapshotInvariantError::ProducerEventLoopMismatch);
         }
         self.microtasks.validate()?;
+        match self.execution {
+            None if self.clock.mode == PendingClockMode::Controlled => {
+                return Err(PendingSnapshotInvariantError::ControlledExecutionMissing);
+            },
+            Some(execution) => {
+                validate_execution_observation(execution)?;
+                if execution.clock_id != self.clock.clock_id {
+                    return Err(PendingSnapshotInvariantError::ExecutionClockMismatch {
+                        expected: self.clock.clock_id,
+                        observed: execution.clock_id,
+                    });
+                }
+            },
+            None => {},
+        }
         self.producers.validate()?;
         self.parser.validate()?;
         self.network.validate()?;
@@ -2329,8 +2351,9 @@ impl RawPendingSnapshot {
                     parser.pipeline_id,
                 ));
             }
-            if parser.kind == PendingParserSourceKind::TopLevelNavigation &&
-                self.target
+            if parser.kind == PendingParserSourceKind::TopLevelNavigation
+                && self
+                    .target
                     .pending_top_level_pipelines()
                     .binary_search(&parser.pipeline_id)
                     .is_err()
@@ -2541,27 +2564,27 @@ impl RawPendingSnapshot {
             } else {
                 match timer.kind {
                     PendingLogicalTimerKind::JavaScriptInterval { requested_period } => {
-                        source.disposition ==
-                            PendingSourceDisposition::OpenEnded(
+                        source.disposition
+                            == PendingSourceDisposition::OpenEnded(
                                 PendingOpenEndedSourceReason::Interval { requested_period },
                             )
                     },
                     PendingLogicalTimerKind::EventSourceReconnect => {
-                        source.disposition ==
-                            PendingSourceDisposition::OpenEnded(
+                        source.disposition
+                            == PendingSourceDisposition::OpenEnded(
                                 PendingOpenEndedSourceReason::EventSource,
                             )
                     },
-                    PendingLogicalTimerKind::JavaScriptOneShot |
-                    PendingLogicalTimerKind::XmlHttpRequestTimeout |
-                    PendingLogicalTimerKind::RefreshRedirect |
-                    PendingLogicalTimerKind::RunStepsAfterTimeout |
-                    PendingLogicalTimerKind::TestBindingCallback => {
+                    PendingLogicalTimerKind::JavaScriptOneShot
+                    | PendingLogicalTimerKind::XmlHttpRequestTimeout
+                    | PendingLogicalTimerKind::RefreshRedirect
+                    | PendingLogicalTimerKind::RunStepsAfterTimeout
+                    | PendingLogicalTimerKind::TestBindingCallback => {
                         let effective_deadline = timer
                             .outer_wake
                             .map_or(timer.logical_deadline, |wake| wake.deadline);
-                        source.disposition ==
-                            PendingSourceDisposition::FiniteDeadline(effective_deadline)
+                        source.disposition
+                            == PendingSourceDisposition::FiniteDeadline(effective_deadline)
                     },
                 }
             };
@@ -2572,8 +2595,8 @@ impl RawPendingSnapshot {
                     ),
                 );
             }
-            if let Some(wake) = timer.outer_wake &&
-                wake.scheduler_id != self.scheduler.scheduler_id
+            if let Some(wake) = timer.outer_wake
+                && wake.scheduler_id != self.scheduler.scheduler_id
             {
                 return Err(
                     PendingSnapshotInvariantError::LogicalTimerSchedulerIdentityMismatch {
@@ -2626,8 +2649,8 @@ impl RawPendingSnapshot {
             }
         }
         for source in self.sources.sources() {
-            if source.kind == PendingSourceKind::Timer &&
-                self.logical_timers.get(source.id).is_none()
+            if source.kind == PendingSourceKind::Timer
+                && self.logical_timers.get(source.id).is_none()
             {
                 return Err(
                     PendingSnapshotInvariantError::MissingLogicalTimerObservation(source.id),
@@ -2647,14 +2670,14 @@ impl RawPendingSnapshot {
             self.terminals.target_time,
         ) {
             (Some(surface), Some(terminal))
-                if terminal.webview_id == self.target.webview_id &&
-                    terminal.unsupported_surface == surface => {},
+                if terminal.webview_id == self.target.webview_id
+                    && terminal.unsupported_surface == surface => {},
             (None, None) => {},
             _ => return Err(PendingSnapshotInvariantError::TargetTimeTerminalMismatch),
         }
         if self.terminals.outer_scheduler.is_some_and(|terminal| {
-            terminal.event_loop_id != self.target.event_loop_id ||
-                terminal.scheduler_id != self.scheduler.scheduler_id
+            terminal.event_loop_id != self.target.event_loop_id
+                || terminal.scheduler_id != self.scheduler.scheduler_id
         }) {
             return Err(PendingSnapshotInvariantError::SchedulerTerminalIdentityMismatch);
         }
@@ -2667,8 +2690,8 @@ impl RawPendingSnapshot {
         }
         match (self.terminals.microtask, self.microtasks.terminal) {
             (Some(terminal), Some(error))
-                if terminal.event_loop_id == self.target.event_loop_id &&
-                    terminal.error == error => {},
+                if terminal.event_loop_id == self.target.event_loop_id
+                    && terminal.error == error => {},
             (None, None) => {},
             _ => return Err(PendingSnapshotInvariantError::MicrotaskTerminalMismatch),
         }
@@ -2722,13 +2745,13 @@ impl RawPendingSnapshot {
         if self.terminals.state_generation.is_some() && self.state_generation.get() != u64::MAX {
             return Err(PendingSnapshotInvariantError::GenerationTerminalBeforeExhaustion);
         }
-        if self.terminals.navigation_revision.is_some() &&
-            self.target.navigation_revision.get() != u64::MAX
+        if self.terminals.navigation_revision.is_some()
+            && self.target.navigation_revision.get() != u64::MAX
         {
             return Err(PendingSnapshotInvariantError::GenerationTerminalBeforeExhaustion);
         }
-        if self.terminals.pipeline_membership_revision.is_some() &&
-            self.target.pipeline_membership_revision.get() != u64::MAX
+        if self.terminals.pipeline_membership_revision.is_some()
+            && self.target.pipeline_membership_revision.get() != u64::MAX
         {
             return Err(PendingSnapshotInvariantError::GenerationTerminalBeforeExhaustion);
         }
@@ -2749,9 +2772,133 @@ impl RawPendingSnapshot {
     }
 }
 
+fn validate_execution_observation(
+    execution: DocumentExecutionObservation,
+) -> Result<(), PendingSnapshotInvariantError> {
+    let terminal_budget = match execution.terminal {
+        Some(
+            terminal @ DocumentExecutionTerminal::BudgetExceeded {
+                budget,
+                limit,
+                observed,
+            },
+        ) => {
+            let expected_limit = execution_limit(execution, budget);
+            let counter = execution_counter(execution, budget);
+            let expected_observed = expected_limit.checked_add(1);
+            let terminal_matches = limit == expected_limit
+                && expected_observed == Some(observed)
+                && match budget {
+                    DocumentExecutionBudget::MutationRecords => counter == observed,
+                    DocumentExecutionBudget::OrdinaryTasks
+                    | DocumentExecutionBudget::Microtasks
+                    | DocumentExecutionBudget::RenderingOpportunities => counter == limit,
+                };
+            if !terminal_matches {
+                return Err(PendingSnapshotInvariantError::ExecutionTerminalMismatch(
+                    terminal,
+                ));
+            }
+            Some(budget)
+        },
+        Some(terminal @ DocumentExecutionTerminal::CounterOverflow(counter)) => {
+            let budget = execution_counter_budget(counter);
+            if execution_limit(execution, budget) != u64::MAX
+                || execution_counter(execution, budget) != u64::MAX
+            {
+                return Err(PendingSnapshotInvariantError::ExecutionTerminalMismatch(
+                    terminal,
+                ));
+            }
+            Some(budget)
+        },
+        None => None,
+    };
+
+    for budget in [
+        DocumentExecutionBudget::OrdinaryTasks,
+        DocumentExecutionBudget::Microtasks,
+        DocumentExecutionBudget::RenderingOpportunities,
+        DocumentExecutionBudget::MutationRecords,
+    ] {
+        if terminal_budget == Some(budget) {
+            continue;
+        }
+        let limit = execution_limit(execution, budget);
+        let observed = execution_counter(execution, budget);
+        if observed > limit {
+            return Err(
+                PendingSnapshotInvariantError::ExecutionCounterExceedsLimit {
+                    budget,
+                    limit,
+                    observed,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+const fn execution_limit(
+    execution: DocumentExecutionObservation,
+    budget: DocumentExecutionBudget,
+) -> u64 {
+    match budget {
+        DocumentExecutionBudget::OrdinaryTasks => execution.limits.ordinary_tasks,
+        DocumentExecutionBudget::Microtasks => execution.limits.microtasks,
+        DocumentExecutionBudget::RenderingOpportunities => execution.limits.rendering_opportunities,
+        DocumentExecutionBudget::MutationRecords => execution.limits.mutations,
+    }
+}
+
+const fn execution_counter(
+    execution: DocumentExecutionObservation,
+    budget: DocumentExecutionBudget,
+) -> u64 {
+    match budget {
+        DocumentExecutionBudget::OrdinaryTasks => execution.counters.ordinary_tasks,
+        DocumentExecutionBudget::Microtasks => execution.counters.microtasks,
+        DocumentExecutionBudget::RenderingOpportunities => {
+            execution.counters.rendering_opportunities
+        },
+        DocumentExecutionBudget::MutationRecords => execution.counters.mutations,
+    }
+}
+
+const fn execution_counter_budget(counter: DocumentExecutionCounter) -> DocumentExecutionBudget {
+    match counter {
+        DocumentExecutionCounter::OrdinaryTasks => DocumentExecutionBudget::OrdinaryTasks,
+        DocumentExecutionCounter::Microtasks => DocumentExecutionBudget::Microtasks,
+        DocumentExecutionCounter::RenderingOpportunities => {
+            DocumentExecutionBudget::RenderingOpportunities
+        },
+        DocumentExecutionCounter::MutationRecords => DocumentExecutionBudget::MutationRecords,
+    }
+}
+
 /// A structural inconsistency in raw pending evidence.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PendingSnapshotInvariantError {
+    /// A controlled snapshot omitted the execution ledger installed with its document clock.
+    ControlledExecutionMissing,
+    /// Execution evidence came from a different document-clock/session authority.
+    ExecutionClockMismatch {
+        /// Clock identity carried by the pending snapshot.
+        expected: DocumentClockId,
+        /// Clock identity carried by the execution ledger observation.
+        observed: DocumentClockId,
+    },
+    /// A controlled execution counter exceeded its limit without the matching first terminal.
+    ExecutionCounterExceedsLimit {
+        /// Work class containing the contradictory counter.
+        budget: DocumentExecutionBudget,
+        /// Immutable configured maximum for the work class.
+        limit: u64,
+        /// Counter retained by the execution ledger.
+        observed: u64,
+    },
+    /// A controlled execution terminal disagreed with the immutable limit or frozen counter.
+    ExecutionTerminalMismatch(DocumentExecutionTerminal),
     /// The target pipeline list contained one identity more than once.
     DuplicateTargetPipeline(PipelineId),
     /// Target pipelines were not in canonical identity order.
@@ -3396,6 +3543,12 @@ mod tests {
                 checkpoint_in_progress: false,
                 terminal: None,
             },
+            execution: Some(DocumentExecutionObservation {
+                clock_id: clock.id(),
+                limits: timers::DocumentExecutionLimits::CONTROLLED_WEBAPP_V1,
+                counters: timers::DocumentExecutionCounters::default(),
+                terminal: None,
+            }),
             producers: empty_producers(event_loop_id),
             parser: PendingParserObservation::new(vec![top_level_navigation(
                 navigation_id,
@@ -3434,6 +3587,7 @@ mod tests {
             now: clock.now(),
             unsupported_surface: None,
         };
+        snapshot.execution.as_mut().unwrap().clock_id = clock.id();
         snapshot.scheduler = scheduler;
         snapshot.sources = PendingSourceSnapshot::new(
             PendingSourceEpoch::new(1),
@@ -3454,6 +3608,15 @@ mod tests {
         assert!(snapshot.target.contains_pipeline(pending_pipeline));
         snapshot.logical_timers = PendingLogicalTimerSnapshot::new(vec![timer]).unwrap();
         snapshot
+    }
+
+    fn execution_limits(limit: u64) -> timers::DocumentExecutionLimits {
+        timers::DocumentExecutionLimits {
+            ordinary_tasks: limit,
+            microtasks: limit,
+            rendering_opportunities: limit,
+            mutations: limit,
+        }
     }
 
     #[test]
@@ -3614,6 +3777,12 @@ mod tests {
                 checkpoint_in_progress: false,
                 terminal: None,
             },
+            execution: Some(DocumentExecutionObservation {
+                clock_id: clock.id(),
+                limits: timers::DocumentExecutionLimits::CONTROLLED_WEBAPP_V1,
+                counters: timers::DocumentExecutionCounters::default(),
+                terminal: None,
+            }),
             producers: empty_producers(event_loop_id),
             parser,
             network,
@@ -3622,6 +3791,107 @@ mod tests {
             sources,
             terminals,
         };
+        snapshot.validate().unwrap();
+        assert_postcard_round_trip(snapshot);
+    }
+
+    #[test]
+    fn raw_snapshot_validates_execution_counter_and_terminal_evidence() {
+        let mut snapshot = minimal_raw_snapshot();
+        snapshot.execution = Some(DocumentExecutionObservation {
+            clock_id: snapshot.clock.clock_id,
+            limits: execution_limits(3),
+            counters: timers::DocumentExecutionCounters {
+                ordinary_tasks: 3,
+                ..timers::DocumentExecutionCounters::default()
+            },
+            terminal: Some(DocumentExecutionTerminal::BudgetExceeded {
+                budget: DocumentExecutionBudget::OrdinaryTasks,
+                limit: 3,
+                observed: 4,
+            }),
+        });
+        snapshot.validate().unwrap();
+
+        snapshot.execution = Some(DocumentExecutionObservation {
+            clock_id: snapshot.clock.clock_id,
+            limits: execution_limits(3),
+            counters: timers::DocumentExecutionCounters {
+                mutations: 4,
+                ..timers::DocumentExecutionCounters::default()
+            },
+            terminal: Some(DocumentExecutionTerminal::BudgetExceeded {
+                budget: DocumentExecutionBudget::MutationRecords,
+                limit: 3,
+                observed: 4,
+            }),
+        });
+        snapshot.validate().unwrap();
+
+        snapshot.execution = Some(DocumentExecutionObservation {
+            clock_id: snapshot.clock.clock_id,
+            limits: execution_limits(3),
+            counters: timers::DocumentExecutionCounters {
+                microtasks: 4,
+                ..timers::DocumentExecutionCounters::default()
+            },
+            terminal: None,
+        });
+        assert_eq!(
+            snapshot.validate(),
+            Err(
+                PendingSnapshotInvariantError::ExecutionCounterExceedsLimit {
+                    budget: DocumentExecutionBudget::Microtasks,
+                    limit: 3,
+                    observed: 4,
+                }
+            )
+        );
+
+        let terminal = DocumentExecutionTerminal::BudgetExceeded {
+            budget: DocumentExecutionBudget::RenderingOpportunities,
+            limit: 3,
+            observed: 5,
+        };
+        snapshot.execution = Some(DocumentExecutionObservation {
+            clock_id: snapshot.clock.clock_id,
+            limits: execution_limits(3),
+            counters: timers::DocumentExecutionCounters {
+                rendering_opportunities: 3,
+                ..timers::DocumentExecutionCounters::default()
+            },
+            terminal: Some(terminal),
+        });
+        assert_eq!(
+            snapshot.validate(),
+            Err(PendingSnapshotInvariantError::ExecutionTerminalMismatch(
+                terminal
+            ))
+        );
+    }
+
+    #[test]
+    fn controlled_snapshot_requires_execution_evidence_from_its_clock_owner() {
+        let mut snapshot = minimal_raw_snapshot();
+        snapshot.execution = None;
+        assert_eq!(
+            snapshot.validate(),
+            Err(PendingSnapshotInvariantError::ControlledExecutionMissing)
+        );
+
+        snapshot = minimal_raw_snapshot();
+        let foreign_clock = controlled_clock();
+        snapshot.execution.as_mut().unwrap().clock_id = foreign_clock.id();
+        let mismatch = PendingSnapshotInvariantError::ExecutionClockMismatch {
+            expected: snapshot.clock.clock_id,
+            observed: foreign_clock.id(),
+        };
+        assert_eq!(snapshot.validate(), Err(mismatch));
+        assert_postcard_round_trip(mismatch);
+
+        snapshot = minimal_raw_snapshot();
+        snapshot.clock.mode = PendingClockMode::Realtime;
+        snapshot.execution = None;
         snapshot.validate().unwrap();
         assert_postcard_round_trip(snapshot);
     }
@@ -5071,6 +5341,7 @@ mod tests {
         let pipeline_id = target.active_top_level.unwrap().pipeline_id;
         let pending_pipeline_id = target.pending_top_level_pipelines()[0];
         let event_loop_id = target.event_loop_id;
+        let clock = controlled_clock();
         let evidence = external_io_evidence();
         let network = PendingNetworkObservation::new(vec![PendingExternalIoObservation {
             source_id: network_id,
@@ -5086,7 +5357,7 @@ mod tests {
             state_generation: RuntimeStateGeneration::ZERO,
             dom_epoch: DomEpoch::ZERO,
             clock: PendingClockObservation {
-                clock_id: controlled_clock().id(),
+                clock_id: clock.id(),
                 mode: PendingClockMode::Controlled,
                 now: DocumentTime::ZERO,
                 unsupported_surface: None,
@@ -5100,6 +5371,12 @@ mod tests {
                 checkpoint_in_progress: false,
                 terminal: None,
             },
+            execution: Some(DocumentExecutionObservation {
+                clock_id: clock.id(),
+                limits: timers::DocumentExecutionLimits::CONTROLLED_WEBAPP_V1,
+                counters: timers::DocumentExecutionCounters::default(),
+                terminal: None,
+            }),
             producers: empty_producers(event_loop_id),
             parser: PendingParserObservation::new(vec![top_level_navigation(
                 navigation_id,

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const RECURSIVE_TIMER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
 const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 const STALL_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_VIRTUAL_TIME_NS: &str = "1000000000";
@@ -33,6 +34,7 @@ const RELEASE_GATE_RECORD_SCHEMA: u64 = 2;
 const MAX_STDERR_TAIL_BYTES: usize = 64 * 1024;
 const EXPECTED_SOURCE_IDENTITIES: &str = include_str!("../../../STASIS_UPSTREAM.toml");
 const EXPECTED_STASIS_REPOSITORY: &str = "https://github.com/oxhq/stasis.git";
+const CONTROLLED_WEBAPP_V1_PROFILE: &str = "controlled-webapp-v1";
 
 const STATIC_FIXTURE: &[u8] = include_bytes!("fixtures/static.html");
 const TIMER_10S_FIXTURE: &[u8] = include_bytes!("fixtures/timer_10s.html");
@@ -40,6 +42,17 @@ const TIMER_MICROTASK_FIXTURE: &[u8] = include_bytes!("fixtures/timer_microtask_
 const RAF_FIXTURE: &[u8] = include_bytes!("fixtures/raf_correlation.html");
 const EXTERNAL_IO_FIXTURE: &[u8] = include_bytes!("fixtures/external_io.html");
 const INTERVAL_FIXTURE: &[u8] = include_bytes!("fixtures/interval.html");
+const APPLICATION_NAVIGATION_FIXTURE: &[u8] =
+    include_bytes!("fixtures/application_navigation.html");
+const UNSUPPORTED_WEBSOCKET_FIXTURE: &[u8] = include_bytes!("fixtures/unsupported_websocket.html");
+const XHR_MUTATION_OBSERVER_FIXTURE: &[u8] =
+    include_bytes!("fixtures/xhr_mutation_observer.html");
+const AUTOMATION_SURFACE_FIXTURE: &[u8] = include_bytes!("fixtures/automation_surface.html");
+const FILL_PROFILE_FIXTURE: &[u8] = include_bytes!("fixtures/fill_profile.html");
+const RECURSIVE_MICROTASK_FIXTURE: &[u8] = include_bytes!("fixtures/recursive_microtask.html");
+const RECURSIVE_TIMER_FIXTURE: &[u8] = include_bytes!("fixtures/recursive_timer.html");
+const MUTATION_STORM_FIXTURE: &[u8] = include_bytes!("fixtures/mutation_storm.html");
+const RECURSIVE_RAF_FIXTURE: &[u8] = include_bytes!("fixtures/recursive_raf.html");
 
 static PROCESS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -143,6 +156,145 @@ fn static_page_settles_and_is_inspected_with_protocol_only_stdout() {
 }
 
 #[test]
+fn semantic_fill_activate_query_and_extract_are_generation_bound() {
+    let _serial = process_test_guard();
+    let server = FixtureServer::start(AUTOMATION_SURFACE_FIXTURE, false);
+    let mut shell = TestShell::spawn();
+    let capabilities = shell.initialize();
+    assert_capabilities(
+        &capabilities,
+        &[
+            "runtime.settle",
+            "action.fill",
+            "action.activate",
+            "dom.query",
+            "dom.text",
+            "dom.extract",
+        ],
+        true,
+    );
+
+    shell.open_controlled(server.url());
+    let initial = shell.settle_default();
+    assert_outcome(&initial, "quiescent");
+    let initial_generation = state_generation(&initial);
+
+    let email_generation = shell.fill("#email", "person@example.test", &initial_generation);
+    assert!(
+        assert_canonical_decimal(&email_generation, "action.fill.stateGeneration")
+            > assert_canonical_decimal(&initial_generation, "initial.stateGeneration"),
+        "semantic fill did not advance stateGeneration",
+    );
+
+    let stale = Requests::text(
+        shell.next_id("stale-text"),
+        shell.session_id(),
+        "#status",
+        &initial_generation,
+    );
+    let stale = expect_error(shell.call(stale));
+    assert_eq!(stale["code"], "stale_generation");
+    assert_eq!(stale["fatal"], false);
+    assert_eq!(stale["stateEffect"], "none");
+
+    let unsupported = Requests::fill(
+        shell.next_id("unsupported-fill"),
+        shell.session_id(),
+        "#remember",
+        "true",
+        &email_generation,
+    );
+    let unsupported = expect_error(shell.call(unsupported));
+    assert_eq!(unsupported["code"], "unsupported_fill_element");
+    assert_eq!(unsupported["stateEffect"], "none");
+
+    let password_generation = shell.fill("#password", "correct horse", &email_generation);
+    assert_eq!(
+        shell.text("#input-events", &password_generation),
+        "email=1,password=1",
+    );
+    let action_generation = shell.activate("#submit", &password_generation);
+
+    let after_submit = shell.pending();
+    assert_eq!(state_generation(&after_submit), action_generation);
+    assert_eq!(after_submit["microtasks"]["queued"], "0");
+    assert_eq!(after_submit["timers"]["futureFinite"], "1");
+
+    let settled = shell.settle_default();
+    assert_outcome(&settled, "quiescent");
+    let settled_generation = state_generation(&settled);
+    assert_eq!(
+        shell.text("#status", &settled_generation),
+        "signed in as person@example.test",
+    );
+    assert_eq!(shell.query(".dashboard-card", &settled_generation), 2);
+
+    let extracted = shell.extract(
+        ".dashboard-card",
+        &[
+            ("title", ".card-title", "text"),
+            ("body", ".card-body", "html"),
+        ],
+        &settled_generation,
+    );
+    let rows = extracted
+        .as_array()
+        .expect("dom.extract result rows must be an array");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0]["fields"][0],
+        json!({"name": "title", "value": "Account"})
+    );
+    assert_eq!(
+        rows[0]["fields"][1],
+        json!({"name": "body", "value": "<strong>person@example.test</strong>"}),
+    );
+    assert_eq!(
+        rows[1]["fields"][0],
+        json!({"name": "title", "value": "Status"})
+    );
+    assert_eq!(
+        rows[1]["fields"][1],
+        json!({"name": "body", "value": "<strong>Ready</strong>"}),
+    );
+    shell.close_cleanly();
+}
+
+#[test]
+fn controlled_fill_profile_admits_every_declared_text_control() {
+    let _serial = process_test_guard();
+    let server = FixtureServer::start(FILL_PROFILE_FIXTURE, false);
+    let mut shell = TestShell::spawn();
+    let capabilities = shell.initialize();
+    assert_capabilities(
+        &capabilities,
+        &["runtime.settle", "action.fill", "dom.text"],
+        true,
+    );
+
+    shell.open_controlled(server.url());
+    let settled = shell.settle_default();
+    assert_outcome(&settled, "quiescent");
+    let mut generation = state_generation(&settled);
+    for (selector, value) in [
+        ("#text", "plain"),
+        ("#search", "stasis"),
+        ("#url", "https://example.test/"),
+        ("#tel", "+1-555-0100"),
+        ("#email", "person@example.test"),
+        ("#password", "correct horse"),
+        ("#textarea", "two\nlines"),
+    ] {
+        generation = shell.fill(selector, value, &generation);
+    }
+    assert_eq!(
+        shell.text("#events", &generation),
+        "text=1,search=1,url=1,tel=1,email=1,password=1,textarea=1",
+    );
+    shell.close_cleanly();
+}
+
+#[test]
 fn ten_second_timeout_advances_without_ten_seconds_of_wall_time() {
     let _serial = process_test_guard();
     let server = FixtureServer::start(TIMER_10S_FIXTURE, false);
@@ -222,6 +374,122 @@ fn timer_callback_microtasks_run_before_the_next_timer_turn() {
         shell.text("#order", &state_generation(&settled)),
         "timer-1,microtask,timer-2"
     );
+    shell.close_cleanly();
+}
+
+#[test]
+fn recursive_microtasks_terminate_with_the_typed_engine_limit() {
+    let _serial = process_test_guard();
+    let server = FixtureServer::start(RECURSIVE_MICROTASK_FIXTURE, false);
+    let mut shell = TestShell::spawn();
+    let capabilities = shell.initialize();
+    assert_capabilities(&capabilities, &["runtime.settle", "action.activate"], true);
+
+    shell.open_controlled(server.url());
+    let initial = shell.settle_default();
+    assert_outcome(&initial, "quiescent");
+    let _ = shell.activate("#start", &state_generation(&initial));
+
+    let settled = shell.settle_default();
+    assert_outcome(&settled, "microtask_limit_exceeded");
+    assert_eq!(settled["processed"]["microtasks"], "1000000");
+    assert_eq!(settled["limit"]["kind"], "microtasks");
+    assert_eq!(settled["limit"]["limit"], "1000000");
+    assert_eq!(settled["limit"]["observed"], "1000001");
+    let terminal_generation = state_generation(&settled);
+    let rejected = Requests::activate(
+        shell.next_id("activate-after-terminal"),
+        shell.session_id(),
+        "#start",
+        &terminal_generation,
+    );
+    let rejected = expect_error(shell.call(rejected));
+    assert_eq!(rejected["code"], "execution_terminated");
+    assert_eq!(rejected["fatal"], false);
+    assert_eq!(rejected["stateEffect"], "none");
+    assert_eq!(
+        shell.text("#status", &terminal_generation),
+        "running",
+        "read-only inspection must remain available after an execution terminal",
+    );
+    shell.close_cleanly();
+}
+
+#[test]
+fn recursive_timers_terminate_with_the_typed_engine_limit() {
+    let _serial = process_test_guard();
+    let server = FixtureServer::start(RECURSIVE_TIMER_FIXTURE, false);
+    let mut shell = TestShell::spawn();
+    let capabilities = shell.initialize();
+    assert_capabilities(&capabilities, &["runtime.settle", "action.activate"], true);
+
+    shell.open_controlled(server.url());
+    let initial = shell.settle_default();
+    assert_outcome(&initial, "quiescent");
+    let _ = shell.activate("#start", &state_generation(&initial));
+
+    // Timer nesting can advance virtual time. Widen both caller-owned limits so the engine's
+    // ordinary-task budget is the terminating authority for this fixture.
+    let settled = shell.settle_with_timeout(
+        json!({
+            "maxVirtualTimeNs": "1000000000000",
+            "maxControlTurns": "1000000",
+        }),
+        RECURSIVE_TIMER_RESPONSE_TIMEOUT,
+    );
+    assert_outcome(&settled, "task_limit_exceeded");
+    assert_eq!(settled["processed"]["tasks"], "100000");
+    assert_eq!(settled["limit"]["kind"], "ordinary_tasks");
+    assert_eq!(settled["limit"]["limit"], "100000");
+    assert_eq!(settled["limit"]["observed"], "100001");
+    shell.close_cleanly();
+}
+
+#[test]
+fn mutation_storm_terminates_with_non_rejecting_limit_evidence() {
+    let _serial = process_test_guard();
+    let server = FixtureServer::start(MUTATION_STORM_FIXTURE, false);
+    let mut shell = TestShell::spawn();
+    let capabilities = shell.initialize();
+    assert_capabilities(&capabilities, &["runtime.settle", "action.activate"], true);
+
+    shell.open_controlled(server.url());
+    let initial = shell.settle_default();
+    assert_outcome(&initial, "quiescent");
+    let _ = shell.activate("#start", &state_generation(&initial));
+
+    let settled = shell.settle_default();
+    assert_outcome(&settled, "mutation_limit_exceeded");
+    assert_eq!(settled["processed"]["mutations"], "1000001");
+    assert_eq!(settled["limit"]["kind"], "mutations");
+    assert_eq!(settled["limit"]["limit"], "1000000");
+    assert_eq!(settled["limit"]["observed"], "1000001");
+    shell.close_cleanly();
+}
+
+#[test]
+fn recursive_animation_frames_terminate_with_the_typed_rendering_limit() {
+    let _serial = process_test_guard();
+    let server = FixtureServer::start(RECURSIVE_RAF_FIXTURE, false);
+    let mut shell = TestShell::spawn();
+    let capabilities = shell.initialize();
+    assert_capabilities(&capabilities, &["runtime.settle", "action.activate"], true);
+
+    shell.open_controlled(server.url());
+    let initial = shell.settle_default();
+    assert_outcome(&initial, "quiescent");
+    let _ = shell.activate("#start", &state_generation(&initial));
+
+    // This fixture intentionally runs past the default 30s virtual-time horizon so the engine's
+    // rendering-opportunity budget, rather than the caller policy, is the terminating authority.
+    let settled = shell.settle_with(json!({
+        "maxVirtualTimeNs": "400000000000",
+    }));
+    assert_outcome(&settled, "rendering_limit_exceeded");
+    assert_eq!(settled["processed"]["renderingOpportunities"], "10000");
+    assert_eq!(settled["limit"]["kind"], "rendering_opportunities");
+    assert_eq!(settled["limit"]["limit"], "10000");
+    assert_eq!(settled["limit"]["observed"], "10001");
     shell.close_cleanly();
 }
 
@@ -381,9 +649,9 @@ fn interval_head_blocks_deferred_finite_work_without_executing_either() {
     let interval = persistent
         .iter()
         .find(|work| {
-            work["kind"] == "timer" &&
-                work["reason"] == "interval" &&
-                work["requestedPeriodNs"] == "5000000000"
+            work["kind"] == "timer"
+                && work["reason"] == "interval"
+                && work["requestedPeriodNs"] == "5000000000"
         })
         .unwrap_or_else(|| {
             panic!("the 5s interval was not returned as persistent work: {persistent:?}")
@@ -412,6 +680,133 @@ fn interval_head_blocks_deferred_finite_work_without_executing_either() {
         shell.text("#deferred-count", &state_generation(&settled)),
         "0",
         "settlement skipped the interval head and executed finite work behind it"
+    );
+    shell.close_cleanly();
+}
+
+#[test]
+fn websocket_is_rejected_before_dispatch_and_settlement_reports_unsupported_work() {
+    let _serial = process_test_guard();
+    let server = FixtureServer::start(UNSUPPORTED_WEBSOCKET_FIXTURE, false);
+    let mut shell = TestShell::spawn();
+    let capabilities = shell.initialize();
+    assert_capabilities(
+        &capabilities,
+        &["runtime.settle", "action.activate", "dom.text"],
+        true,
+    );
+
+    shell.open_controlled(server.url());
+    let initial = shell.settle_default();
+    assert_outcome(&initial, "quiescent");
+    let action_generation = shell.activate("#start", &state_generation(&initial));
+    assert_eq!(
+        shell.text("#result", &action_generation),
+        "NotSupportedError",
+        "the controlled profile did not reject WebSocket before native dispatch",
+    );
+
+    let settled = shell.settle_default();
+    assert_outcome(&settled, "unsupported_work");
+    assert_eq!(settled["failure"]["code"], "unsupported_clock_surface");
+    let unsupported = settled["unsupportedWork"]
+        .as_array()
+        .expect("unsupported settlement must include bounded evidence");
+    assert_eq!(unsupported.len(), 1);
+    assert_eq!(unsupported[0]["kind"], "other");
+    assert_eq!(unsupported[0]["count"], "1");
+    assert_eq!(unsupported[0]["reason"], "time_surface");
+    assert_eq!(unsupported[0]["timeSurface"], "external_subscription");
+    shell.close_cleanly();
+}
+
+#[test]
+fn asynchronous_xhr_and_mutation_observer_reach_quiescence() {
+    let _serial = process_test_guard();
+    let server = FixtureServer::start(XHR_MUTATION_OBSERVER_FIXTURE, false);
+    let mut shell = TestShell::spawn();
+    let capabilities = shell.initialize();
+    assert_capabilities(
+        &capabilities,
+        &["runtime.settle", "action.activate", "dom.text"],
+        true,
+    );
+
+    shell.open_controlled(server.url());
+    let initial = shell.settle_default();
+    assert_outcome(&initial, "quiescent");
+    shell.activate("#async", &state_generation(&initial));
+
+    let settled = shell.settle_default();
+    assert_outcome(&settled, "quiescent");
+    let generation = state_generation(&settled);
+    assert_eq!(shell.text("#result", &generation), "xhr complete");
+    assert_eq!(shell.text("#observed", &generation), "xhr complete");
+    shell.close_cleanly();
+}
+
+#[test]
+fn synchronous_xhr_is_rejected_before_start_without_poisoning_settlement() {
+    let _serial = process_test_guard();
+    let server = FixtureServer::start(XHR_MUTATION_OBSERVER_FIXTURE, false);
+    let mut shell = TestShell::spawn();
+    let capabilities = shell.initialize();
+    assert_capabilities(
+        &capabilities,
+        &["runtime.settle", "action.activate", "dom.text"],
+        true,
+    );
+
+    shell.open_controlled(server.url());
+    let initial = shell.settle_default();
+    assert_outcome(&initial, "quiescent");
+    let generation = shell.activate("#sync", &state_generation(&initial));
+    assert_eq!(shell.text("#result", &generation), "InvalidAccessError");
+
+    let settled = shell.settle_default();
+    assert_outcome(&settled, "quiescent");
+    shell.close_cleanly();
+}
+
+#[test]
+fn application_top_level_navigation_is_rejected_as_typed_unsupported_work() {
+    let _serial = process_test_guard();
+    let server = FixtureServer::start(APPLICATION_NAVIGATION_FIXTURE, false);
+    let mut shell = TestShell::spawn();
+    let capabilities = shell.initialize();
+    assert_capabilities(
+        &capabilities,
+        &["runtime.settle", "action.activate", "dom.text"],
+        true,
+    );
+
+    shell.open_controlled(server.url());
+    let initial = shell.settle_default();
+    assert_outcome(&initial, "quiescent");
+    assert_eq!(
+        shell.text("#result", &state_generation(&initial)),
+        "original"
+    );
+
+    shell.activate("#navigate", &state_generation(&initial));
+    let settled = shell.settle_default();
+    assert_outcome(&settled, "unsupported_work");
+    assert_eq!(settled["failure"]["code"], "unsupported_clock_surface");
+    let unsupported = settled["unsupportedWork"]
+        .as_array()
+        .expect("unsupported settlement must include bounded evidence");
+    assert_eq!(unsupported.len(), 1);
+    assert_eq!(unsupported[0]["kind"], "other");
+    assert_eq!(unsupported[0]["count"], "1");
+    assert_eq!(unsupported[0]["reason"], "time_surface");
+    assert_eq!(
+        unsupported[0]["timeSurface"],
+        "cross_event_loop_navigation"
+    );
+    assert_eq!(
+        shell.text("#result", &state_generation(&settled)),
+        "original",
+        "unsupported application navigation replaced the controlled document",
     );
     shell.close_cleanly();
 }
@@ -496,10 +891,13 @@ fn assert_capabilities(capabilities: &Capabilities, methods: &[&str], controlled
         .filter(|method| !capabilities.supports_method(method))
         .collect::<Vec<_>>();
     let missing_clock = controlled_clock && !capabilities.supports_clock("controlled");
+    let missing_profile =
+        controlled_clock && !capabilities.supports_profile(CONTROLLED_WEBAPP_V1_PROFILE);
     assert!(
-        missing_methods.is_empty() && !missing_clock,
-        "release artifact is missing mandatory MVP capabilities: methods={missing_methods:?}, controlledClock={}",
-        !missing_clock
+        missing_methods.is_empty() && !missing_clock && !missing_profile,
+        "release artifact is missing mandatory v0.1 capabilities: methods={missing_methods:?}, controlledClock={}, controlledProfile={}",
+        !missing_clock,
+        !missing_profile,
     );
 }
 
@@ -629,8 +1027,8 @@ fn release_artifact_sha256(artifact: &Path) -> String {
 
 fn assert_sha256(digest: &str, field: &str) {
     assert!(
-        digest.len() == 64 &&
-            digest
+        digest.len() == 64
+            && digest
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
         "{field} is not a canonical lowercase SHA-256 digest: {digest:?}"
@@ -639,8 +1037,8 @@ fn assert_sha256(digest: &str, field: &str) {
 
 fn assert_git_commit(commit: &str, field: &str) {
     assert!(
-        commit.len() == 40 &&
-            commit
+        commit.len() == 40
+            && commit
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
         "{field} is not a canonical lowercase full Git commit: {commit:?}"
@@ -651,6 +1049,7 @@ fn assert_git_commit(commit: &str, field: &str) {
 struct Capabilities {
     methods: BTreeSet<String>,
     clock_modes: BTreeSet<String>,
+    profiles: BTreeSet<String>,
     implementation_name: String,
     implementation_version: String,
     source_identities: BTreeMap<String, String>,
@@ -682,6 +1081,18 @@ impl Capabilities {
             .map(|mode| {
                 mode.as_str()
                     .expect("clock mode must be a string")
+                    .to_owned()
+            })
+            .collect();
+        let profiles = capabilities
+            .get("profiles")
+            .and_then(Value::as_array)
+            .expect("capabilities.profiles must be an array")
+            .iter()
+            .map(|profile| {
+                profile
+                    .as_str()
+                    .expect("capability profile must be a string")
                     .to_owned()
             })
             .collect();
@@ -717,6 +1128,7 @@ impl Capabilities {
         Self {
             methods,
             clock_modes,
+            profiles,
             implementation_name,
             implementation_version,
             source_identities,
@@ -729,6 +1141,10 @@ impl Capabilities {
 
     fn supports_clock(&self, mode: &str) -> bool {
         self.clock_modes.contains(mode)
+    }
+
+    fn supports_profile(&self, profile: &str) -> bool {
+        self.profiles.contains(profile)
     }
 }
 
@@ -759,6 +1175,7 @@ impl Requests {
             json!({
                 "url": url,
                 "clockMode": "controlled",
+                "profile": CONTROLLED_WEBAPP_V1_PROFILE,
                 "initialVirtualTimeNs": INITIAL_VIRTUAL_TIME_NS,
                 "unixTimeOriginNs": "0",
             }),
@@ -782,12 +1199,57 @@ impl Requests {
         )
     }
 
+    fn fill(id: String, session_id: &str, selector: &str, value: &str, generation: &str) -> Value {
+        Self::envelope(
+            id,
+            Some(session_id),
+            "action.fill",
+            json!({
+                "selector": selector,
+                "value": value,
+                "expectedGeneration": generation,
+            }),
+        )
+    }
+
+    fn query(id: String, session_id: &str, selector: &str, generation: &str) -> Value {
+        Self::envelope(
+            id,
+            Some(session_id),
+            "dom.query",
+            json!({"selector": selector, "expectedGeneration": generation}),
+        )
+    }
+
     fn text(id: String, session_id: &str, selector: &str, generation: &str) -> Value {
         Self::envelope(
             id,
             Some(session_id),
             "dom.text",
             json!({"selector": selector, "expectedGeneration": generation}),
+        )
+    }
+
+    fn extract(
+        id: String,
+        session_id: &str,
+        root_selector: &str,
+        fields: &[(&str, &str, &str)],
+        generation: &str,
+    ) -> Value {
+        let fields: Vec<_> = fields
+            .iter()
+            .map(|(name, selector, read)| json!({"name": name, "selector": selector, "read": read}))
+            .collect();
+        Self::envelope(
+            id,
+            Some(session_id),
+            "dom.extract",
+            json!({
+                "rootSelector": root_selector,
+                "fields": fields,
+                "expectedGeneration": generation,
+            }),
         )
     }
 
@@ -934,6 +1396,7 @@ impl TestShell {
         assert_eq!(envelope_session_id, session_id);
         assert_eq!(result["clockMode"], "controlled");
         assert_eq!(result["boundary"], "controlled_ready");
+        assert_eq!(result["profile"], CONTROLLED_WEBAPP_V1_PROFILE);
         self.session_id = Some(session_id);
         result
     }
@@ -953,6 +1416,12 @@ impl TestShell {
         expect_result(self.call(request))
     }
 
+    fn settle_with_timeout(&mut self, params: Value, timeout: Duration) -> Value {
+        let request = Requests::settle(self.next_id("settle"), self.session_id(), params);
+        let id = self.send(request);
+        expect_result(self.wait_for_response_with_timeout(&id, timeout))
+    }
+
     fn activate(&mut self, selector: &str, generation: &str) -> String {
         let request = Requests::activate(
             self.next_id("activate"),
@@ -964,11 +1433,41 @@ impl TestShell {
         assert_object_keys(&result, &["stateGeneration"], "action.activate result");
         let observed = state_generation(&result);
         assert!(
-            assert_canonical_decimal(&observed, "action.activate.stateGeneration") >
-                assert_canonical_decimal(generation, "action.activate.expectedGeneration"),
+            assert_canonical_decimal(&observed, "action.activate.stateGeneration")
+                > assert_canonical_decimal(generation, "action.activate.expectedGeneration"),
             "fixture activation did not advance stateGeneration"
         );
         observed
+    }
+
+    fn fill(&mut self, selector: &str, value: &str, generation: &str) -> String {
+        let request = Requests::fill(
+            self.next_id("fill"),
+            self.session_id(),
+            selector,
+            value,
+            generation,
+        );
+        let result = expect_result(self.call(request));
+        assert_object_keys(&result, &["stateGeneration"], "action.fill result");
+        state_generation(&result)
+    }
+
+    fn query(&mut self, selector: &str, generation: &str) -> u128 {
+        let request = Requests::query(
+            self.next_id("query"),
+            self.session_id(),
+            selector,
+            generation,
+        );
+        let result = expect_result(self.call(request));
+        assert_object_keys(&result, &["count", "stateGeneration"], "dom.query result");
+        assert_eq!(
+            state_generation(&result),
+            generation,
+            "passive dom.query changed stateGeneration",
+        );
+        exact_decimal(&result, "count")
     }
 
     fn text(&mut self, selector: &str, generation: &str) -> String {
@@ -990,6 +1489,29 @@ impl TestShell {
             .and_then(Value::as_str)
             .expect("dom.text result.value must be a string")
             .to_owned()
+    }
+
+    fn extract(
+        &mut self,
+        root_selector: &str,
+        fields: &[(&str, &str, &str)],
+        generation: &str,
+    ) -> Value {
+        let request = Requests::extract(
+            self.next_id("extract"),
+            self.session_id(),
+            root_selector,
+            fields,
+            generation,
+        );
+        let result = expect_result(self.call(request));
+        assert_object_keys(&result, &["rows", "stateGeneration"], "dom.extract result");
+        assert_eq!(
+            state_generation(&result),
+            generation,
+            "passive dom.extract changed stateGeneration",
+        );
+        result["rows"].clone()
     }
 
     fn close_cleanly(&mut self) {
@@ -1032,6 +1554,10 @@ impl TestShell {
     }
 
     fn wait_for_response(&mut self, request_id: &str) -> Value {
+        self.wait_for_response_with_timeout(request_id, RESPONSE_TIMEOUT)
+    }
+
+    fn wait_for_response_with_timeout(&mut self, request_id: &str, timeout: Duration) -> Value {
         if let Some(response) = self.response_backlog.remove(request_id) {
             return response;
         }
@@ -1040,7 +1566,7 @@ impl TestShell {
             "cannot await unknown or already-consumed request {request_id}"
         );
         let deadline = Instant::now()
-            .checked_add(RESPONSE_TIMEOUT)
+            .checked_add(timeout)
             .expect("response deadline overflowed");
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1298,9 +1824,9 @@ fn exact_decimal(result: &Value, field: &str) -> u128 {
 
 fn assert_canonical_decimal(encoded: &str, field: &str) -> u128 {
     assert!(
-        !encoded.is_empty() &&
-            !(encoded.len() > 1 && encoded.starts_with('0')) &&
-            encoded.bytes().all(|byte| byte.is_ascii_digit()),
+        !encoded.is_empty()
+            && !(encoded.len() > 1 && encoded.starts_with('0'))
+            && encoded.bytes().all(|byte| byte.is_ascii_digit()),
         "{field} is not a canonical decimal string: {encoded:?}"
     );
     encoded
@@ -1558,6 +2084,12 @@ fn serve_fixture_request(mut stream: TcpStream, fixture: &'static [u8], stall: O
                 br#"{"status":"done"}"#,
             );
         },
+        "/xhr" => write_http_response(
+            &mut stream,
+            "200 OK",
+            "text/plain; charset=utf-8",
+            b"xhr complete",
+        ),
         _ => write_http_response(&mut stream, "404 Not Found", "text/plain", b"not found"),
     }
 }

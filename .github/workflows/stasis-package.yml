@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       release_tag:
-        description: Exact v-prefixed Stasis version for promotion, for example v0.1.0-alpha.0
+        description: Exact stable Stasis release tag; v0.1.0 is the only accepted value
         required: false
         type: string
   push:
@@ -26,8 +26,7 @@ concurrency:
 env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
-  STASIS_ALPHA_VERSION: 0.1.0-alpha.0
-  STASIS_PLATFORM: macos-aarch64
+  STASIS_RELEASE_VERSION: 0.1.0
 
 jobs:
   validate-invocation:
@@ -74,30 +73,38 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("ports/stasis/Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')
-          test "$version" = "$STASIS_ALPHA_VERSION"
+          test "$version" = "$STASIS_RELEASE_VERSION"
           python3 etc/ci/stasis/release_archive.py self-test
           python3 etc/ci/stasis/npm_release.py self-test
           node --check etc/ci/stasis/verify_registry_sdk.mjs
 
-  package:
-    name: Package and gate macOS Apple Silicon
+  package-native:
+    name: Package and gate ${{ matrix.release_platform }}
     needs:
       - validate-invocation
       - archive-contract
     if: |
       needs.validate-invocation.outputs.mode == 'package'
         && needs.archive-contract.result == 'success'
-    runs-on: macos-15
-    timeout-minutes: 120
-    outputs:
-      native_artifact_name: ${{ steps.package-names.outputs.native_artifact_name }}
-      native_proof_artifact_name: ${{ steps.package-names.outputs.native_proof_artifact_name }}
-      package_run_attempt: ${{ steps.package-names.outputs.package_run_attempt }}
-      sdk_artifact_name: ${{ steps.package-names.outputs.sdk_artifact_name }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - release_platform: macos-aarch64
+            runner: macos-15
+            kernel: Darwin
+            architecture: arm64
+          - release_platform: linux-x86_64
+            runner: ubuntu-22.04
+            kernel: Linux
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
     permissions:
       contents: read
     env:
       STASIS_REVISION: ${{ github.sha }}
+      STASIS_PLATFORM: ${{ matrix.release_platform }}
     steps:
       - name: Check out the exact event commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -106,17 +113,26 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
 
+      - name: Set up pinned Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+
       - id: package-names
         name: Resolve immutable package names
         shell: bash
         run: |
           set -euo pipefail
-          test "$(uname -s)" = 'Darwin'
-          test "$(uname -m)" = 'arm64'
-          test "$(sysctl -n hw.optional.arm64)" = '1'
+          test "$(uname -s)" = '${{ matrix.kernel }}'
+          test "$(uname -m)" = '${{ matrix.architecture }}'
+          if [[ "$STASIS_PLATFORM" == 'macos-aarch64' ]]; then
+            test "$(sysctl -n hw.optional.arm64)" = '1'
+          else
+            test "$(LC_ALL=C getconf GNU_LIBC_VERSION)" = 'glibc 2.35'
+          fi
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("ports/stasis/Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')
-          test "$version" = "$STASIS_ALPHA_VERSION"
+          test "$version" = "$STASIS_RELEASE_VERSION"
           bundle="stasis-${version}-${STASIS_PLATFORM}"
           {
             echo "STASIS_VERSION=$version"
@@ -126,20 +142,23 @@ jobs:
             echo "STASIS_GATE_PROOF=${bundle}-act-settle-inspect.json"
           } >> "$GITHUB_ENV"
           {
-            echo "native_artifact_name=stasis-macos-aarch64-attempt-$GITHUB_RUN_ATTEMPT"
-            echo "native_proof_artifact_name=stasis-macos-aarch64-act-settle-inspect-proof-attempt-$GITHUB_RUN_ATTEMPT"
-            echo "package_run_attempt=$GITHUB_RUN_ATTEMPT"
-            echo "sdk_artifact_name=stasis-typescript-alpha-attempt-$GITHUB_RUN_ATTEMPT"
+            echo "native_artifact_name=stasis-${STASIS_PLATFORM}-attempt-$GITHUB_RUN_ATTEMPT"
+            echo "native_proof_artifact_name=stasis-${STASIS_PLATFORM}-act-settle-inspect-proof-attempt-$GITHUB_RUN_ATTEMPT"
           } >> "$GITHUB_OUTPUT"
 
       - name: Prepare and measure the ephemeral macOS runner
+        if: matrix.release_platform == 'macos-aarch64'
         shell: bash
         run: bash etc/ci/stasis/prepare_macos_runner.sh prepare 10485760
 
-      - name: Set up pinned Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version-file: .python-version
+      - name: Require the Ubuntu 22.04 compatibility floor
+        if: matrix.release_platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = 'Linux'
+          test "$(uname -m)" = 'x86_64'
+          test "$(LC_ALL=C getconf GNU_LIBC_VERSION)" = 'glibc 2.35'
 
       - name: Set up pinned uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
@@ -148,7 +167,17 @@ jobs:
           enable-cache: false
 
       - name: Bootstrap macOS build dependencies
+        if: matrix.release_platform == 'macos-aarch64'
         run: ./mach bootstrap --yes --skip-lints --skip-nextest
+
+      - name: Bootstrap Linux build dependencies
+        if: matrix.release_platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes xvfb
+          ./mach bootstrap --yes --skip-lints --skip-nextest
 
       - name: Build the exact-SHA Stasis executable
         shell: bash
@@ -156,7 +185,43 @@ jobs:
           set -euo pipefail
           test "$STASIS_REVISION" = "$GITHUB_SHA"
           cargo build --locked -p stasis-shell --profile production-stripped
-          bash etc/ci/stasis/prepare_macos_runner.sh check 4194304
+          if [[ "$STASIS_PLATFORM" == 'macos-aarch64' ]]; then
+            bash etc/ci/stasis/prepare_macos_runner.sh check 4194304
+          else
+            test "$(LC_ALL=C getconf GNU_LIBC_VERSION)" = 'glibc 2.35'
+            file target/production-stripped/stasis | grep -F 'ELF 64-bit LSB'
+            ldd target/production-stripped/stasis | LC_ALL=C sort > dist-linux-dependencies.txt
+            test -s dist-linux-dependencies.txt
+            if grep -F 'not found' dist-linux-dependencies.txt; then
+              echo 'the Linux release binary has an unresolved shared-library dependency' >&2
+              exit 1
+            fi
+            max_glibc=$(objdump -T target/production-stripped/stasis \
+              | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+              | sort -Vu \
+              | tail -n 1)
+            python3 - "$max_glibc" <<'PY'
+          import re
+          import sys
+
+          match = re.fullmatch(r"GLIBC_([0-9]+)\.([0-9]+)", sys.argv[1])
+          if match is None or tuple(map(int, match.groups())) > (2, 35):
+              raise SystemExit(f"Linux binary exceeds the glibc 2.35 floor: {sys.argv[1]!r}")
+          PY
+          fi
+
+      - name: Gate the automation and bounded-settlement fixture matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_runner=(env)
+          if [[ "$STASIS_PLATFORM" == 'linux-x86_64' ]]; then
+            test_runner=(xvfb-run -a env)
+          fi
+          "${test_runner[@]}" \
+            cargo test --locked --profile production-stripped \
+              -p stasis-shell --test controlled_mvp \
+              -- --test-threads=1 --show-output
 
       - name: Build and verify the release archive
         shell: bash
@@ -186,10 +251,15 @@ jobs:
           binary="$RUNNER_TEMP/stasis-release-gate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/$STASIS_BUNDLE/stasis"
           binary_sha256=$(awk '{print $1}' "dist/$STASIS_BINARY_SHA256")
           gate_log="$RUNNER_TEMP/stasis-act-settle-inspect.log"
-          STASIS_RELEASE_BINARY="$binary" \
-          STASIS_RELEASE_ARCHIVE="$GITHUB_WORKSPACE/dist/$STASIS_ARCHIVE" \
-          STASIS_RELEASE_REVISION="$GITHUB_SHA" \
-          STASIS_RELEASE_SHA256="$binary_sha256" \
+          gate_runner=(env)
+          if [[ "$STASIS_PLATFORM" == 'linux-x86_64' ]]; then
+            gate_runner=(xvfb-run -a env)
+          fi
+          "${gate_runner[@]}" \
+            STASIS_RELEASE_BINARY="$binary" \
+            STASIS_RELEASE_ARCHIVE="$GITHUB_WORKSPACE/dist/$STASIS_ARCHIVE" \
+            STASIS_RELEASE_REVISION="$GITHUB_SHA" \
+            STASIS_RELEASE_SHA256="$binary_sha256" \
             cargo test --locked --profile production-stripped -p stasis-shell --test controlled_mvp \
               release_gate_published_binary_completes_act_settle_inspect \
               -- --ignored --exact --test-threads=1 --show-output \
@@ -207,14 +277,413 @@ jobs:
             --run-attempt "$GITHUB_RUN_ATTEMPT"
 
       - name: Recheck runner disk after the native release gate
+        if: matrix.release_platform == 'macos-aarch64'
         shell: bash
         run: bash etc/ci/stasis/prepare_macos_runner.sh check 2097152
 
-      - name: Set up Node for the SDK release preflight
+      - name: Upload exact release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.package-names.outputs.native_artifact_name }}
+          path: |
+            dist/${{ env.STASIS_ARCHIVE }}
+            dist/${{ env.STASIS_ARCHIVE }}.sha256
+            dist/${{ env.STASIS_BINARY_SHA256 }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload artifact-bound gate proof
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.package-names.outputs.native_proof_artifact_name }}
+          path: dist/${{ env.STASIS_GATE_PROOF }}
+          if-no-files-found: error
+          retention-days: 90
+
+  package-sdk:
+    name: Bind both native runtimes and gate the TypeScript package
+    needs:
+      - validate-invocation
+      - archive-contract
+      - package-native
+    if: |
+      needs.validate-invocation.outputs.mode == 'package'
+        && needs.archive-contract.result == 'success'
+        && needs.package-native.result == 'success'
+    outputs:
+      linux_run_attempt: ${{ steps.producer-attempts.outputs.linux_run_attempt }}
+      macos_run_attempt: ${{ steps.producer-attempts.outputs.macos_run_attempt }}
+      sdk_run_attempt: ${{ steps.producer-attempts.outputs.sdk_run_attempt }}
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      STASIS_VERSION: 0.1.0
+      STASIS_REVISION: ${{ github.sha }}
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Require space for native verification and SDK packing
+        shell: bash
+        run: bash etc/ci/stasis/prepare_macos_runner.sh prepare 6291456
+
+      - id: producer-attempts
+        name: Resolve the exact successful native producer attempts
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            > "$RUNNER_TEMP/native-artifact-pages.json"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100" \
+            > "$RUNNER_TEMP/native-job-pages.json"
+          read -r macos_run_attempt linux_run_attempt < <(
+            RUN_ID="$GITHUB_RUN_ID" HEAD_SHA="$GITHUB_SHA" \
+              OVERALL_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          run_id = int(os.environ["RUN_ID"])
+          head_sha = os.environ["HEAD_SHA"]
+          overall_attempt = int(os.environ["OVERALL_RUN_ATTEMPT"])
+
+          def flatten_pages(filename, key):
+              pages = json.load(open(filename, encoding="utf-8"))
+              if not isinstance(pages, list) or not pages:
+                  raise SystemExit(f"{key} pagination response is malformed")
+              entries = []
+              totals = set()
+              for page in pages:
+                  if not isinstance(page, dict) or type(page.get("total_count")) is not int:
+                      raise SystemExit(f"{key} pagination response is malformed")
+                  values = page.get(key)
+                  if not isinstance(values, list):
+                      raise SystemExit(f"{key} pagination response is malformed")
+                  totals.add(page["total_count"])
+                  entries.extend(values)
+              if len(totals) != 1 or totals.pop() != len(entries):
+                  raise SystemExit(f"{key} pagination response is incomplete")
+              identifiers = [entry.get("id") for entry in entries if isinstance(entry, dict)]
+              if len(identifiers) != len(entries) or any(type(value) is not int for value in identifiers):
+                  raise SystemExit(f"{key} identity is malformed")
+              if len(set(identifiers)) != len(identifiers):
+                  raise SystemExit(f"{key} pagination response contains duplicates")
+              return entries
+
+          artifacts = flatten_pages(
+              os.path.join(os.environ["RUNNER_TEMP"], "native-artifact-pages.json"),
+              "artifacts",
+          )
+          jobs = flatten_pages(
+              os.path.join(os.environ["RUNNER_TEMP"], "native-job-pages.json"),
+              "jobs",
+          )
+          prefixes = (
+              "stasis-macos-aarch64",
+              "stasis-macos-aarch64-act-settle-inspect-proof",
+              "stasis-linux-x86_64",
+              "stasis-linux-x86_64-act-settle-inspect-proof",
+              "stasis-runtime-manifest",
+              "stasis-typescript",
+          )
+          patterns = tuple(
+              (prefix, re.compile(rf"^{re.escape(prefix)}-attempt-([1-9][0-9]*)$"))
+              for prefix in prefixes
+          )
+          native_by_platform_attempt = {
+              "macos-aarch64": {},
+              "linux-x86_64": {},
+          }
+          for artifact in artifacts:
+              if artifact.get("expired") is True:
+                  continue
+              workflow_run = artifact.get("workflow_run")
+              if (
+                  artifact.get("expired") is not False
+                  or not isinstance(workflow_run, dict)
+                  or workflow_run.get("id") != run_id
+                  or workflow_run.get("head_sha") != head_sha
+              ):
+                  raise SystemExit("active package artifact identity is malformed")
+              name = artifact.get("name")
+              if not isinstance(name, str):
+                  raise SystemExit("active package artifact name is malformed")
+              matched = next(
+                  ((prefix, match) for prefix, pattern in patterns if (match := pattern.fullmatch(name))),
+                  None,
+              )
+              if matched is None:
+                  raise SystemExit(f"unexpected active package artifact: {name!r}")
+              attempt = int(matched[1].group(1))
+              if attempt > overall_attempt:
+                  raise SystemExit("package artifact claims a future run attempt")
+              if matched[0].startswith("stasis-macos-"):
+                  platform = "macos-aarch64"
+              elif matched[0].startswith("stasis-linux-"):
+                  platform = "linux-x86_64"
+              else:
+                  continue
+              native_by_platform_attempt[platform].setdefault(attempt, []).append(name)
+
+          producer_names = {
+              "macos-aarch64": "Package and gate macos-aarch64",
+              "linux-x86_64": "Package and gate linux-x86_64",
+          }
+          producer_jobs = {name: {} for name in producer_names.values()}
+          seen_jobs = set()
+          for job in jobs:
+              name = job.get("name")
+              if name not in producer_names.values():
+                  continue
+              attempt = job.get("run_attempt")
+              identity = (attempt, name)
+              if (
+                  type(attempt) is not int
+                  or attempt < 1
+                  or attempt > overall_attempt
+                  or job.get("run_id") != run_id
+                  or job.get("head_sha") != head_sha
+                  or identity in seen_jobs
+              ):
+                  raise SystemExit("native producer job identity is malformed or ambiguous")
+              seen_jobs.add(identity)
+              producer_jobs[name][attempt] = (job.get("status"), job.get("conclusion"))
+
+          selected = []
+          for platform in ("macos-aarch64", "linux-x86_64"):
+              prefixes_for_platform = (
+                  f"stasis-{platform}",
+                  f"stasis-{platform}-act-settle-inspect-proof",
+              )
+              producer_attempts = producer_jobs[producer_names[platform]]
+              if not producer_attempts:
+                  raise SystemExit(f"no {platform} producer job exists")
+              producer_attempt = max(producer_attempts)
+              if producer_attempts[producer_attempt] != ("completed", "success"):
+                  raise SystemExit(f"latest {platform} producer job did not succeed")
+              expected = sorted(
+                  f"{prefix}-attempt-{producer_attempt}" for prefix in prefixes_for_platform
+              )
+              if sorted(native_by_platform_attempt[platform].get(producer_attempt, [])) != expected:
+                  raise SystemExit(f"latest successful {platform} producer artifacts are unavailable")
+              if max(native_by_platform_attempt[platform], default=0) > producer_attempt:
+                  raise SystemExit(f"newer incomplete or unsuccessful {platform} artifacts exist")
+              selected.append(producer_attempt)
+          print(*selected)
+          PY
+          )
+          if [[ ! "$macos_run_attempt" =~ ^[1-9][0-9]*$ \
+            || ! "$linux_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'native producer attempts are invalid' >&2
+            exit 1
+          fi
+          {
+            echo "MACOS_RUN_ATTEMPT=$macos_run_attempt"
+            echo "LINUX_RUN_ATTEMPT=$linux_run_attempt"
+            echo "SDK_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_ENV"
+          {
+            echo "macos_run_attempt=$macos_run_attempt"
+            echo "linux_run_attempt=$linux_run_attempt"
+            echo "sdk_run_attempt=$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download the exact macOS native archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-macos-aarch64-attempt-${{ steps.producer-attempts.outputs.macos_run_attempt }}
+          path: native-inputs/stasis-macos-aarch64-attempt-${{ steps.producer-attempts.outputs.macos_run_attempt }}
+
+      - name: Download the exact macOS native gate proof
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-macos-aarch64-act-settle-inspect-proof-attempt-${{ steps.producer-attempts.outputs.macos_run_attempt }}
+          path: native-inputs/stasis-macos-aarch64-act-settle-inspect-proof-attempt-${{ steps.producer-attempts.outputs.macos_run_attempt }}
+
+      - name: Download the exact Linux native archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-linux-x86_64-attempt-${{ steps.producer-attempts.outputs.linux_run_attempt }}
+          path: native-inputs/stasis-linux-x86_64-attempt-${{ steps.producer-attempts.outputs.linux_run_attempt }}
+
+      - name: Download the exact Linux native gate proof
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-linux-x86_64-act-settle-inspect-proof-attempt-${{ steps.producer-attempts.outputs.linux_run_attempt }}
+          path: native-inputs/stasis-linux-x86_64-act-settle-inspect-proof-attempt-${{ steps.producer-attempts.outputs.linux_run_attempt }}
+
+      - name: Verify the exact native handoff and extract the macOS runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          expected=$(printf '%s\n' \
+            "stasis-linux-x86_64-act-settle-inspect-proof-attempt-$LINUX_RUN_ATTEMPT" \
+            "stasis-linux-x86_64-attempt-$LINUX_RUN_ATTEMPT" \
+            "stasis-macos-aarch64-act-settle-inspect-proof-attempt-$MACOS_RUN_ATTEMPT" \
+            "stasis-macos-aarch64-attempt-$MACOS_RUN_ATTEMPT")
+          actual=$(find native-inputs -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | LC_ALL=C sort)
+          test "$actual" = "$expected"
+          for platform in macos-aarch64 linux-x86_64; do
+            if [[ "$platform" == 'macos-aarch64' ]]; then
+              producer_attempt=$MACOS_RUN_ATTEMPT
+            else
+              producer_attempt=$LINUX_RUN_ATTEMPT
+            fi
+            asset_dir="native-inputs/stasis-${platform}-attempt-$producer_attempt"
+            proof_dir="native-inputs/stasis-${platform}-act-settle-inspect-proof-attempt-$producer_attempt"
+            if [[ "$platform" == 'macos-aarch64' ]]; then
+              python3 etc/ci/stasis/release_archive.py verify \
+                --asset-directory "$asset_dir" \
+                --version "$STASIS_VERSION" \
+                --platform "$platform" \
+                --revision "$GITHUB_SHA" \
+                --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+                --source-root . \
+                --extract-to "$RUNNER_TEMP/stasis-sdk-native"
+            else
+              python3 etc/ci/stasis/release_archive.py verify \
+                --asset-directory "$asset_dir" \
+                --version "$STASIS_VERSION" \
+                --platform "$platform" \
+                --revision "$GITHUB_SHA" \
+                --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+                --source-root .
+            fi
+            python3 etc/ci/stasis/release_archive.py verify-gate-proof \
+              --proof-directory "$proof_dir" \
+              --asset-directory "$asset_dir" \
+              --version "$STASIS_VERSION" \
+              --platform "$platform" \
+              --revision "$GITHUB_SHA" \
+              --run-id "$GITHUB_RUN_ID" \
+              --run-attempt "$producer_attempt"
+          done
+
+      - name: Set up Node for manifest generation and SDK release preflight
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "24"
           package-manager-cache: false
+
+      - name: Generate the exact public runtime distribution manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/runtime-manifest
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import tomllib
+
+          version = os.environ["STASIS_VERSION"]
+          revision = os.environ["GITHUB_SHA"]
+          native_run_attempts = {
+              "macos-aarch64": os.environ["MACOS_RUN_ATTEMPT"],
+              "linux-x86_64": os.environ["LINUX_RUN_ATTEMPT"],
+          }
+          repository = os.environ["GITHUB_REPOSITORY"]
+          if version != "0.1.0" or not re.fullmatch(r"[0-9a-f]{40}", revision):
+              raise SystemExit("runtime manifest release identity is invalid")
+          upstream = tomllib.loads(pathlib.Path("STASIS_UPSTREAM.toml").read_text(encoding="utf-8"))
+          expected_upstream_keys = {
+              "servo_repository", "servo_revision", "pliego_repository",
+              "pliego_revision", "pliego_servo_merge_base",
+          }
+          if set(upstream) != expected_upstream_keys or any(
+              not isinstance(value, str) or not value for value in upstream.values()
+          ):
+              raise SystemExit("source identity manifest changed")
+          source = {
+              **upstream,
+              "stasis_repository": "https://github.com/oxhq/stasis.git",
+              "stasis_revision": revision,
+          }
+          archive_files = [
+              "INSTALL.txt", "LICENSE", "LICENSE_WHATWG_SPECS",
+              "NATIVE-LIBRARIES.txt", "README.md", "SOURCE.txt",
+              "STASIS_UPSTREAM.toml", "THIRD_PARTY_LICENSES.html",
+              "VERSION.txt", "stasis",
+          ]
+
+          def sha256(filename):
+              digest = hashlib.sha256()
+              with filename.open("rb") as source_file:
+                  for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def checksum(filename, label):
+              match = re.fullmatch(
+                  r"([0-9a-f]{64})  " + re.escape(label) + r"\n",
+                  filename.read_text(encoding="ascii"),
+              )
+              if match is None:
+                  raise SystemExit(f"invalid checksum sidecar: {filename}")
+              return match.group(1)
+
+          artifacts = {}
+          for node_key, node_platform, node_arch, release_platform in (
+              ("darwin-arm64", "darwin", "arm64", "macos-aarch64"),
+              ("linux-x64", "linux", "x64", "linux-x86_64"),
+          ):
+              directory = pathlib.Path(
+                  f"native-inputs/stasis-{release_platform}-attempt-"
+                  f"{native_run_attempts[release_platform]}"
+              )
+              root = f"stasis-{version}-{release_platform}"
+              archive_name = f"{root}.tar.gz"
+              archive = directory / archive_name
+              archive_digest = sha256(archive)
+              if checksum(directory / f"{archive_name}.sha256", archive_name) != archive_digest:
+                  raise SystemExit(f"archive digest changed for {release_platform}")
+              executable_digest = checksum(
+                  directory / f"{root}.binary.sha256", f"{root}/stasis"
+              )
+              artifacts[node_key] = {
+                  "nodePlatform": node_platform,
+                  "nodeArch": node_arch,
+                  "releasePlatform": release_platform,
+                  "archiveUrl": (
+                      f"https://github.com/{repository}/releases/download/v{version}/{archive_name}"
+                  ),
+                  "archiveSizeBytes": archive.stat().st_size,
+                  "archiveSha256": archive_digest,
+                  "archiveRoot": root,
+                  "archiveFiles": archive_files,
+                  "executablePath": "stasis",
+                  "executableSha256": executable_digest,
+              }
+          manifest = {
+              "schema": 1,
+              "packageName": "@oxhq/stasis",
+              "sdkVersion": version,
+              "releaseTag": f"v{version}",
+              "implementation": {"name": "stasis-shell", "source": source},
+              "artifacts": artifacts,
+          }
+          output = pathlib.Path(f"dist/runtime-manifest/stasis-{version}-runtime-manifest.json")
+          output.write_text(
+              json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          node sdk/typescript/scripts/generate-runtime-manifest.mjs \
+            --input "dist/runtime-manifest/stasis-${STASIS_VERSION}-runtime-manifest.json" \
+            --output sdk/typescript/src/runtime-manifest.generated.ts
 
       - name: Install, typecheck, test, build, and pack the SDK
         shell: bash
@@ -242,7 +711,17 @@ jobs:
             echo "STASIS_SDK_PROOF=stasis-${STASIS_VERSION}-typescript-act-settle-inspect.json"
           } >> "$GITHUB_ENV"
 
-      - name: Gate the packed SDK against the extracted native artifact
+      - name: Gate the native synchronous-hang fail-stop supervisor
+        shell: bash
+        working-directory: sdk/typescript
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/stasis-sdk-native/stasis-${STASIS_VERSION}-macos-aarch64/stasis"
+          test -x "$binary"
+          STASIS_NORTH_STAR_BINARY="$binary" \
+            pnpm exec tsx --test test/native-command-timeout.test.ts
+
+      - name: Gate the packed SDK against the extracted macOS artifact
         shell: bash
         run: |
           set -euo pipefail
@@ -253,16 +732,28 @@ jobs:
             pnpm init
             pnpm add --ignore-scripts "$STASIS_SDK_TARBALL"
           )
+          bundle="stasis-${STASIS_VERSION}-macos-aarch64"
+          binary="$RUNNER_TEMP/stasis-sdk-native/$bundle/stasis"
           sdk_gate_log="$RUNNER_TEMP/stasis-sdk-act-settle-inspect.log"
           node etc/ci/stasis/verify_registry_sdk.mjs \
-            --binary "$RUNNER_TEMP/stasis-release-gate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/$STASIS_BUNDLE/stasis" \
+            --binary "$binary" \
             --fixture ports/stasis/tests/fixtures/timer_10s.html \
             --consumer-root "$consumer" \
             --package "$STASIS_SDK_TARBALL" \
             --revision "$GITHUB_SHA" \
             --version "$STASIS_VERSION" \
             2>&1 | tee "$sdk_gate_log"
-          binary_sha256=$(awk '{print $1}' "dist/$STASIS_BINARY_SHA256")
+          cp sdk/typescript/test/fixtures/public-package-north-star.mjs \
+            "$consumer/public-package-north-star.mjs"
+          cp sdk/typescript/test/fixtures/north-star.html "$consumer/north-star.html"
+          north_star_log="$RUNNER_TEMP/stasis-package-north-star.jsonl"
+          STASIS_NORTH_STAR_BINARY="$binary" \
+            node "$consumer/public-package-north-star.mjs" 2>&1 | tee "$north_star_log"
+          grep -F '"proof":"stasis-v0.1-north-star"' "$north_star_log"
+          grep -F '"runs":3' "$north_star_log"
+          cat "$north_star_log" >> "$sdk_gate_log"
+          binary_sha256=$(awk '{print $1}' \
+            "native-inputs/stasis-macos-aarch64-attempt-$MACOS_RUN_ATTEMPT/$bundle.binary.sha256")
           python3 etc/ci/stasis/npm_release.py create-proof \
             --package "$STASIS_SDK_TARBALL" \
             --gate-log "$sdk_gate_log" \
@@ -271,49 +762,41 @@ jobs:
             --revision "$GITHUB_SHA" \
             --native-binary-sha256 "$binary_sha256" \
             --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT"
+            --run-attempt "$SDK_RUN_ATTEMPT"
 
       - name: Recheck runner disk after all package gates
         shell: bash
         run: bash etc/ci/stasis/prepare_macos_runner.sh check 1048576
 
-      - name: Upload exact release assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: ${{ steps.package-names.outputs.native_artifact_name }}
-          path: |
-            dist/${{ env.STASIS_ARCHIVE }}
-            dist/${{ env.STASIS_ARCHIVE }}.sha256
-            dist/${{ env.STASIS_BINARY_SHA256 }}
-          if-no-files-found: error
-          retention-days: 90
-
-      - name: Upload artifact-bound gate proof
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: ${{ steps.package-names.outputs.native_proof_artifact_name }}
-          path: dist/${{ env.STASIS_GATE_PROOF }}
-          if-no-files-found: error
-          retention-days: 90
-
       - name: Upload the pre-gated TypeScript package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ${{ steps.package-names.outputs.sdk_artifact_name }}
+          name: stasis-typescript-attempt-${{ github.run_attempt }}
           path: |
             dist/sdk/${{ env.STASIS_SDK_TARBALL_NAME }}
             dist/sdk/${{ env.STASIS_SDK_PROOF }}
           if-no-files-found: error
           retention-days: 90
 
+      - name: Upload the exact runtime distribution manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stasis-runtime-manifest-attempt-${{ github.run_attempt }}
+          path: dist/runtime-manifest/stasis-${{ env.STASIS_VERSION }}-runtime-manifest.json
+          if-no-files-found: error
+          retention-days: 90
+
+
   attest-package:
     name: Attest exact credential-free package outputs
     needs:
       - validate-invocation
-      - package
+      - package-native
+      - package-sdk
     if: |
       needs.validate-invocation.outputs.mode == 'package'
-        && needs.package.result == 'success'
+        && needs.package-native.result == 'success'
+        && needs.package-sdk.result == 'success'
         && github.event_name == 'push'
         && github.ref == 'refs/heads/main'
         && github.repository == 'oxhq/stasis'
@@ -325,30 +808,68 @@ jobs:
       id-token: write
       attestations: write
     env:
-      PACKAGE_RUN_ATTEMPT: ${{ needs.package.outputs.package_run_attempt }}
+      LINUX_RUN_ATTEMPT: ${{ needs.package-sdk.outputs.linux_run_attempt }}
+      MACOS_RUN_ATTEMPT: ${{ needs.package-sdk.outputs.macos_run_attempt }}
+      SDK_RUN_ATTEMPT: ${{ needs.package-sdk.outputs.sdk_run_attempt }}
     steps:
-      - name: Download native files from this exact run attempt
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ${{ needs.package.outputs.native_artifact_name }}
-          path: release-assets
+      - name: Validate the exact producer attempt handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          for producer_attempt in \
+            "$MACOS_RUN_ATTEMPT" "$LINUX_RUN_ATTEMPT" "$SDK_RUN_ATTEMPT"; do
+            if [[ ! "$producer_attempt" =~ ^[1-9][0-9]*$ \
+              || "$producer_attempt" -gt "$GITHUB_RUN_ATTEMPT" ]]; then
+              echo 'package producer attempt handoff is invalid' >&2
+              exit 1
+            fi
+          done
+          if [[ "$MACOS_RUN_ATTEMPT" -gt "$SDK_RUN_ATTEMPT" \
+            || "$LINUX_RUN_ATTEMPT" -gt "$SDK_RUN_ATTEMPT" ]]; then
+            echo 'SDK producer attempt predates a selected native producer' >&2
+            exit 1
+          fi
 
-      - name: Download native gate proof from this exact run attempt
+      - name: Download macOS native files from its exact producer attempt
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: ${{ needs.package.outputs.native_proof_artifact_name }}
-          path: gate-proof
+          name: stasis-macos-aarch64-attempt-${{ needs.package-sdk.outputs.macos_run_attempt }}
+          path: release-assets/macos-aarch64
 
-      - name: Download SDK files from this exact run attempt
+      - name: Download macOS native gate proof from its exact producer attempt
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: ${{ needs.package.outputs.sdk_artifact_name }}
+          name: stasis-macos-aarch64-act-settle-inspect-proof-attempt-${{ needs.package-sdk.outputs.macos_run_attempt }}
+          path: gate-proof/macos-aarch64
+
+      - name: Download Linux native files from its exact producer attempt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-linux-x86_64-attempt-${{ needs.package-sdk.outputs.linux_run_attempt }}
+          path: release-assets/linux-x86_64
+
+      - name: Download Linux native gate proof from its exact producer attempt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-linux-x86_64-act-settle-inspect-proof-attempt-${{ needs.package-sdk.outputs.linux_run_attempt }}
+          path: gate-proof/linux-x86_64
+
+      - name: Download SDK files from its exact producer attempt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-typescript-attempt-${{ needs.package-sdk.outputs.sdk_run_attempt }}
           path: sdk-proof
+
+      - name: Download runtime manifest from its exact producer attempt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-runtime-manifest-attempt-${{ needs.package-sdk.outputs.sdk_run_attempt }}
+          path: runtime-manifest
 
       - name: Recheck exact identities and digests without repository code
         shell: bash
         env:
-          STASIS_VERSION: 0.1.0-alpha.0
+          STASIS_VERSION: 0.1.0
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -368,15 +889,15 @@ jobs:
           version = os.environ["STASIS_VERSION"]
           revision = os.environ["GITHUB_SHA"]
           run_id = os.environ["GITHUB_RUN_ID"]
-          run_attempt = os.environ["PACKAGE_RUN_ATTEMPT"]
-          platform = "macos-aarch64"
-          bundle = f"stasis-{version}-{platform}"
-          archive_name = f"{bundle}.tar.gz"
-          archive_sidecar_name = f"{archive_name}.sha256"
-          binary_sidecar_name = f"{bundle}.binary.sha256"
-          native_proof_name = f"{bundle}-act-settle-inspect.json"
+          native_run_attempts = {
+              "macos-aarch64": os.environ["MACOS_RUN_ATTEMPT"],
+              "linux-x86_64": os.environ["LINUX_RUN_ATTEMPT"],
+          }
+          sdk_run_attempt = os.environ["SDK_RUN_ATTEMPT"]
+          platforms = ("macos-aarch64", "linux-x86_64")
           sdk_name = f"oxhq-stasis-{version}.tgz"
           sdk_proof_name = f"stasis-{version}-typescript-act-settle-inspect.json"
+          runtime_manifest_name = f"stasis-{version}-runtime-manifest.json"
           source = {
               "servo_repository": "https://github.com/servo/servo.git",
               "servo_revision": "0d579bd5aab6df3764fad805427254751632a6e4",
@@ -639,7 +1160,7 @@ jobs:
                   not isinstance(publish, dict)
                   or set(publish) != {"access", "tag", "provenance"}
                   or publish.get("access") != "public"
-                  or publish.get("tag") != "alpha"
+                  or publish.get("tag") != "latest"
                   or publish.get("provenance") is not True
               ):
                   raise SystemExit("SDK package publication policy changed")
@@ -699,8 +1220,8 @@ jobs:
           native_gzip_header = bytes.fromhex("1f8b08000000000002ff")
           native_files = {
               "stasis", "INSTALL.txt", "LICENSE", "LICENSE_WHATWG_SPECS",
-              "SOURCE.txt", "STASIS_UPSTREAM.toml", "THIRD_PARTY_LICENSES.html",
-              "VERSION.txt",
+              "NATIVE-LIBRARIES.txt", "README.md", "SOURCE.txt",
+              "STASIS_UPSTREAM.toml", "THIRD_PARTY_LICENSES.html", "VERSION.txt",
           }
 
           def decompress_native_archive(archive, destination):
@@ -894,62 +1415,130 @@ jobs:
                               "native archive tar bytes are not the canonical normalized serialization"
                           )
 
-          native = exact_directory(
-              "release-assets", {archive_name, archive_sidecar_name, binary_sidecar_name}
-          )
-          gate = exact_directory("gate-proof", {native_proof_name})
-          sdk = exact_directory("sdk-proof", {sdk_name, sdk_proof_name})
-          archive = native / archive_name
-          if archive.stat().st_size <= 0 or archive.stat().st_size > native_max_compressed_bytes:
-              raise SystemExit("native archive compressed size is outside the release limit")
-          binary_label = f"{bundle}/stasis"
-          binary_digest = checksum(native / binary_sidecar_name, binary_label)
-          verify_native_archive(archive, bundle, binary_digest)
-          archive_digest = sha256(archive)
-          if checksum(native / archive_sidecar_name, archive_name) != archive_digest:
-              raise SystemExit("archive sidecar changed after the credential-free build")
+          def verify_native_target(platform):
+              bundle = f"stasis-{version}-{platform}"
+              archive_name = f"{bundle}.tar.gz"
+              archive_sidecar_name = f"{archive_name}.sha256"
+              binary_sidecar_name = f"{bundle}.binary.sha256"
+              native_proof_name = f"{bundle}-act-settle-inspect.json"
+              native = exact_directory(
+                  f"release-assets/{platform}",
+                  {archive_name, archive_sidecar_name, binary_sidecar_name},
+              )
+              gate = exact_directory(f"gate-proof/{platform}", {native_proof_name})
+              archive = native / archive_name
+              if archive.stat().st_size <= 0 or archive.stat().st_size > native_max_compressed_bytes:
+                  raise SystemExit("native archive compressed size is outside the release limit")
+              binary_label = f"{bundle}/stasis"
+              binary_digest = checksum(native / binary_sidecar_name, binary_label)
+              verify_native_archive(archive, bundle, binary_digest)
+              archive_digest = sha256(archive)
+              if checksum(native / archive_sidecar_name, archive_name) != archive_digest:
+                  raise SystemExit("archive sidecar changed after the credential-free build")
 
-          native_proof_file = gate / native_proof_name
-          if native_proof_file.stat().st_size <= 0 or native_proof_file.stat().st_size > 64 * 1024:
-              raise SystemExit("native gate proof size is outside the release limit")
-          native_proof = strict_json_loads(
-              native_proof_file.read_text(encoding="utf-8"), "native gate proof"
-          )
-          expected_native = {
-              "schema": 2,
-              "gate": "act-settle-inspect",
-              "test": "release_gate_published_binary_completes_act_settle_inspect",
-              "version": version,
-              "platform": platform,
-              "revision": revision,
-              "workflowRunId": run_id,
-              "workflowRunAttempt": run_attempt,
-              "archive": {"name": archive_name, "sha256": archive_digest},
-              "binary": {"path": binary_label, "sha256": binary_digest},
-              "source": source,
-          }
-          if (
-              not isinstance(native_proof, dict)
-              or set(native_proof) != set(expected_native) | {"gateLogSha256"}
-              or type(native_proof.get("schema")) is not int
-          ):
-              raise SystemExit("native gate proof schema changed")
-          for field, keys in (("archive", {"name", "sha256"}), ("binary", {"path", "sha256"})):
-              binding = native_proof.get(field)
+              native_proof_file = gate / native_proof_name
+              if native_proof_file.stat().st_size <= 0 or native_proof_file.stat().st_size > 64 * 1024:
+                  raise SystemExit("native gate proof size is outside the release limit")
+              native_proof = strict_json_loads(
+                  native_proof_file.read_text(encoding="utf-8"), "native gate proof"
+              )
+              expected_native = {
+                  "schema": 2,
+                  "gate": "act-settle-inspect",
+                  "test": "release_gate_published_binary_completes_act_settle_inspect",
+                  "version": version,
+                  "platform": platform,
+                  "revision": revision,
+                  "workflowRunId": run_id,
+                  "workflowRunAttempt": native_run_attempts[platform],
+                  "archive": {"name": archive_name, "sha256": archive_digest},
+                  "binary": {"path": binary_label, "sha256": binary_digest},
+                  "source": source,
+              }
               if (
-                  not isinstance(binding, dict)
-                  or set(binding) != keys
-                  or any(not isinstance(binding.get(key), str) for key in keys)
+                  not isinstance(native_proof, dict)
+                  or set(native_proof) != set(expected_native) | {"gateLogSha256"}
+                  or type(native_proof.get("schema")) is not int
               ):
-                  raise SystemExit(f"native gate proof {field} binding has invalid types")
-          if any(native_proof.get(key) != value for key, value in expected_native.items()):
-              raise SystemExit("native gate proof identity changed")
-          native_log_digest = native_proof.get("gateLogSha256")
-          if (
-              not isinstance(native_log_digest, str)
-              or re.fullmatch(r"[0-9a-f]{64}", native_log_digest) is None
+                  raise SystemExit("native gate proof schema changed")
+              for field, keys in (
+                  ("archive", {"name", "sha256"}),
+                  ("binary", {"path", "sha256"}),
+              ):
+                  binding = native_proof.get(field)
+                  if (
+                      not isinstance(binding, dict)
+                      or set(binding) != keys
+                      or any(not isinstance(binding.get(key), str) for key in keys)
+                  ):
+                      raise SystemExit(f"native gate proof {field} binding has invalid types")
+              if any(native_proof.get(key) != value for key, value in expected_native.items()):
+                  raise SystemExit("native gate proof identity changed")
+              native_log_digest = native_proof.get("gateLogSha256")
+              if (
+                  not isinstance(native_log_digest, str)
+                  or re.fullmatch(r"[0-9a-f]{64}", native_log_digest) is None
+              ):
+                  raise SystemExit("native gate proof log digest is invalid")
+              return {
+                  "archiveName": archive_name,
+                  "archiveSizeBytes": archive.stat().st_size,
+                  "archiveSha256": archive_digest,
+                  "archiveRoot": bundle,
+                  "executableSha256": binary_digest,
+              }
+
+          native_bindings = {
+              platform: verify_native_target(platform) for platform in platforms
+          }
+          sdk = exact_directory("sdk-proof", {sdk_name, sdk_proof_name})
+          manifest_directory = exact_directory(
+              "runtime-manifest", {runtime_manifest_name}
+          )
+          runtime_manifest_file = manifest_directory / runtime_manifest_name
+          if runtime_manifest_file.stat().st_size <= 0 or runtime_manifest_file.stat().st_size > 128 * 1024:
+              raise SystemExit("runtime distribution manifest size is outside the release limit")
+          runtime_manifest = strict_json_loads(
+              runtime_manifest_file.read_text(encoding="utf-8"),
+              "runtime distribution manifest",
+          )
+          expected_artifacts = {}
+          for node_key, node_platform, node_arch, platform in (
+              ("darwin-arm64", "darwin", "arm64", "macos-aarch64"),
+              ("linux-x64", "linux", "x64", "linux-x86_64"),
           ):
-              raise SystemExit("native gate proof log digest is invalid")
+              binding = native_bindings[platform]
+              expected_artifacts[node_key] = {
+                  "nodePlatform": node_platform,
+                  "nodeArch": node_arch,
+                  "releasePlatform": platform,
+                  "archiveUrl": (
+                      f"https://github.com/oxhq/stasis/releases/download/v{version}/"
+                      f"{binding['archiveName']}"
+                  ),
+                  "archiveSizeBytes": binding["archiveSizeBytes"],
+                  "archiveSha256": binding["archiveSha256"],
+                  "archiveRoot": binding["archiveRoot"],
+                  "archiveFiles": [
+                      "INSTALL.txt", "LICENSE", "LICENSE_WHATWG_SPECS",
+                      "NATIVE-LIBRARIES.txt", "README.md", "SOURCE.txt",
+                      "STASIS_UPSTREAM.toml", "THIRD_PARTY_LICENSES.html",
+                      "VERSION.txt", "stasis",
+                  ],
+                  "executablePath": "stasis",
+                  "executableSha256": binding["executableSha256"],
+              }
+          expected_manifest = {
+              "schema": 1,
+              "packageName": "@oxhq/stasis",
+              "sdkVersion": version,
+              "releaseTag": f"v{version}",
+              "implementation": {"name": "stasis-shell", "source": source},
+              "artifacts": expected_artifacts,
+          }
+          if runtime_manifest != expected_manifest:
+              raise SystemExit("runtime distribution manifest changed after SDK packing")
+          binary_digest = native_bindings["macos-aarch64"]["executableSha256"]
 
           sdk_tarball = sdk / sdk_name
           verify_sdk_tarball(sdk_tarball, version)
@@ -968,7 +1557,7 @@ jobs:
               "package": f"@oxhq/stasis@{version}",
               "revision": revision,
               "workflowRunId": run_id,
-              "workflowRunAttempt": run_attempt,
+              "workflowRunAttempt": sdk_run_attempt,
               "source": source,
               "tarball": {"name": sdk_name, "sha256": sdk_sha256, "integrity": sdk_integrity},
               "nativeBinarySha256": binary_digest,
@@ -996,16 +1585,21 @@ jobs:
               raise SystemExit("SDK gate proof log digest is invalid")
           PY
 
-      - name: Generate GitHub build provenance for all six outputs
+      - name: Generate GitHub build provenance for all eleven outputs
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: |
-            release-assets/stasis-0.1.0-alpha.0-macos-aarch64.tar.gz
-            release-assets/stasis-0.1.0-alpha.0-macos-aarch64.tar.gz.sha256
-            release-assets/stasis-0.1.0-alpha.0-macos-aarch64.binary.sha256
-            gate-proof/stasis-0.1.0-alpha.0-macos-aarch64-act-settle-inspect.json
-            sdk-proof/oxhq-stasis-0.1.0-alpha.0.tgz
-            sdk-proof/stasis-0.1.0-alpha.0-typescript-act-settle-inspect.json
+            release-assets/macos-aarch64/stasis-0.1.0-macos-aarch64.tar.gz
+            release-assets/macos-aarch64/stasis-0.1.0-macos-aarch64.tar.gz.sha256
+            release-assets/macos-aarch64/stasis-0.1.0-macos-aarch64.binary.sha256
+            gate-proof/macos-aarch64/stasis-0.1.0-macos-aarch64-act-settle-inspect.json
+            release-assets/linux-x86_64/stasis-0.1.0-linux-x86_64.tar.gz
+            release-assets/linux-x86_64/stasis-0.1.0-linux-x86_64.tar.gz.sha256
+            release-assets/linux-x86_64/stasis-0.1.0-linux-x86_64.binary.sha256
+            gate-proof/linux-x86_64/stasis-0.1.0-linux-x86_64-act-settle-inspect.json
+            runtime-manifest/stasis-0.1.0-runtime-manifest.json
+            sdk-proof/oxhq-stasis-0.1.0.tgz
+            sdk-proof/stasis-0.1.0-typescript-act-settle-inspect.json
 
   verify-promotion:
     name: Verify immutable promotion inputs
@@ -1020,7 +1614,9 @@ jobs:
     outputs:
       head_sha: ${{ steps.selected-run.outputs.head_sha }}
       head_branch: ${{ steps.selected-run.outputs.head_branch }}
-      run_attempt: ${{ steps.selected-run.outputs.run_attempt }}
+      linux_run_attempt: ${{ steps.selected-run.outputs.linux_run_attempt }}
+      macos_run_attempt: ${{ steps.selected-run.outputs.macos_run_attempt }}
+      sdk_run_attempt: ${{ steps.selected-run.outputs.sdk_run_attempt }}
       staged_gate_artifact_name: ${{ steps.stage-names.outputs.gate_artifact_name }}
       staged_release_artifact_name: ${{ steps.stage-names.outputs.release_artifact_name }}
       version: ${{ steps.selected-run.outputs.version }}
@@ -1047,8 +1643,8 @@ jobs:
             echo 'package_run_id must be a positive integer' >&2
             exit 1
           fi
-          if [[ "$TAG" != "v$STASIS_ALPHA_VERSION" ]]; then
-            echo "the first alpha promotion tag must be v$STASIS_ALPHA_VERSION" >&2
+          if [[ "$TAG" != "v$STASIS_RELEASE_VERSION" ]]; then
+            echo "the stable promotion tag must be v$STASIS_RELEASE_VERSION" >&2
             exit 1
           fi
 
@@ -1070,89 +1666,229 @@ jobs:
             exit 1
           fi
 
-          gh api "repos/$GITHUB_REPOSITORY/compare/$head_sha...$DEFAULT_BRANCH" > ancestry.json
+          current_default_sha=$(gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/commits" \
+            -f sha="$DEFAULT_BRANCH" \
+            -f per_page=1 \
+            --jq 'if length == 1 then .[0].sha else error("default branch did not resolve exactly") end')
+          if [[ ! "$current_default_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'current default branch did not resolve to an exact commit' >&2
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/compare/$head_sha...$current_default_sha" > ancestry.json
           jq -e --arg head_sha "$head_sha" '
             .merge_base_commit.sha == $head_sha
             and (.status == "ahead" or .status == "identical")
           ' ancestry.json > /dev/null
 
+          workflow_tree_sha() {
+            local commit_sha=$1
+            local root_tree_sha dot_github_tree_sha
+            root_tree_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$commit_sha" \
+              --jq '.tree.sha')
+            dot_github_tree_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/trees/$root_tree_sha" \
+              --jq '.tree | map(select(.path == ".github" and .mode == "040000" and .type == "tree")) | if length == 1 then .[0].sha else error("missing .github tree") end')
+            gh api "repos/$GITHUB_REPOSITORY/git/trees/$dot_github_tree_sha" \
+              --jq '.tree | map(select(.path == "workflows" and .mode == "040000" and .type == "tree")) | if length == 1 then .[0].sha else error("missing .github/workflows tree") end'
+          }
+          packaged_workflow_tree=$(workflow_tree_sha "$head_sha")
+          current_workflow_tree=$(workflow_tree_sha "$current_default_sha")
+          if [[ ! "$packaged_workflow_tree" =~ ^[0-9a-f]{40}$ \
+            || ! "$current_workflow_tree" =~ ^[0-9a-f]{40}$ \
+            || "$packaged_workflow_tree" != "$current_workflow_tree" ]]; then
+            echo '.github/workflows changed after the selected package commit' >&2
+            exit 1
+          fi
+
           gh api -H 'Accept: application/vnd.github.raw+json' \
             "repos/$GITHUB_REPOSITORY/contents/ports/stasis/Cargo.toml?ref=$head_sha" \
             > stasis-Cargo.toml
           version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("stasis-Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')
-          if [[ "$version" != "$STASIS_ALPHA_VERSION" || "$TAG" != "v$version" ]]; then
+          if [[ "$version" != "$STASIS_RELEASE_VERSION" || "$TAG" != "v$version" ]]; then
             echo "tag $TAG does not exactly match Stasis version $version at $head_sha" >&2
             exit 1
           fi
 
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" > artifacts.json
-          producer_attempt=$(
-            RUN_ID="$RUN_ID" OVERALL_RUN_ATTEMPT="$overall_run_attempt" python3 - <<'PY'
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            > artifact-pages.json
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?filter=all&per_page=100" \
+            > job-pages.json
+          read -r macos_run_attempt linux_run_attempt sdk_run_attempt < <(
+            RUN_ID="$RUN_ID" HEAD_SHA="$head_sha" HEAD_BRANCH="$head_branch" \
+              OVERALL_RUN_ATTEMPT="$overall_run_attempt" python3 - <<'PY'
           import json
           import os
           import re
 
           run_id = int(os.environ["RUN_ID"])
+          head_sha = os.environ["HEAD_SHA"]
+          head_branch = os.environ["HEAD_BRANCH"]
           overall_attempt = int(os.environ["OVERALL_RUN_ATTEMPT"])
-          document = json.load(open("artifacts.json", encoding="utf-8"))
-          artifacts = document.get("artifacts")
-          if not isinstance(artifacts, list) or document.get("total_count") != len(artifacts):
-              raise SystemExit("package artifact response is incomplete or malformed")
+
+          def flatten_pages(filename, key):
+              pages = json.load(open(filename, encoding="utf-8"))
+              if not isinstance(pages, list) or not pages:
+                  raise SystemExit(f"{key} pagination response is malformed")
+              entries = []
+              totals = set()
+              for page in pages:
+                  if not isinstance(page, dict) or type(page.get("total_count")) is not int:
+                      raise SystemExit(f"{key} pagination response is malformed")
+                  values = page.get(key)
+                  if not isinstance(values, list):
+                      raise SystemExit(f"{key} pagination response is malformed")
+                  totals.add(page["total_count"])
+                  entries.extend(values)
+              if len(totals) != 1 or totals.pop() != len(entries):
+                  raise SystemExit(f"{key} pagination response is incomplete")
+              identifiers = [entry.get("id") for entry in entries if isinstance(entry, dict)]
+              if len(identifiers) != len(entries) or any(type(value) is not int for value in identifiers):
+                  raise SystemExit(f"{key} identity is malformed")
+              if len(set(identifiers)) != len(identifiers):
+                  raise SystemExit(f"{key} pagination response contains duplicates")
+              return entries
+
+          artifacts = flatten_pages("artifact-pages.json", "artifacts")
+          jobs = flatten_pages("job-pages.json", "jobs")
 
           prefixes = (
               "stasis-macos-aarch64",
               "stasis-macos-aarch64-act-settle-inspect-proof",
-              "stasis-typescript-alpha",
+              "stasis-linux-x86_64",
+              "stasis-linux-x86_64-act-settle-inspect-proof",
+              "stasis-runtime-manifest",
+              "stasis-typescript",
           )
           patterns = tuple(
               (prefix, re.compile(rf"^{re.escape(prefix)}-attempt-([1-9][0-9]*)$"))
               for prefix in prefixes
           )
-          by_attempt = {}
+          prefix_groups = {
+              "stasis-macos-aarch64": "macos-aarch64",
+              "stasis-macos-aarch64-act-settle-inspect-proof": "macos-aarch64",
+              "stasis-linux-x86_64": "linux-x86_64",
+              "stasis-linux-x86_64-act-settle-inspect-proof": "linux-x86_64",
+              "stasis-runtime-manifest": "sdk",
+              "stasis-typescript": "sdk",
+          }
+          by_group_attempt = {group: {} for group in set(prefix_groups.values())}
           for artifact in artifacts:
               if artifact.get("expired") is True:
                   continue
-              if artifact.get("expired") is not False or artifact.get("workflow_run", {}).get("id") != run_id:
-                  raise SystemExit("package artifact identity is malformed")
+              workflow_run = artifact.get("workflow_run")
+              if (
+                  artifact.get("expired") is not False
+                  or not isinstance(workflow_run, dict)
+                  or workflow_run.get("id") != run_id
+                  or workflow_run.get("head_sha") != head_sha
+                  or workflow_run.get("head_branch") != head_branch
+              ):
+                  raise SystemExit("active package artifact identity is malformed")
               name = artifact.get("name")
               if not isinstance(name, str):
-                  raise SystemExit("package artifact name is malformed")
-              matched = next(((prefix, pattern.fullmatch(name)) for prefix, pattern in patterns if pattern.fullmatch(name)), None)
+                  raise SystemExit("active package artifact name is malformed")
+              matched = next(
+                  ((prefix, match) for prefix, pattern in patterns if (match := pattern.fullmatch(name))),
+                  None,
+              )
               if matched is None:
                   raise SystemExit(f"unexpected active package artifact: {name!r}")
               attempt = int(matched[1].group(1))
               if attempt > overall_attempt:
                   raise SystemExit("package artifact claims a future run attempt")
-              by_attempt.setdefault(attempt, []).append(name)
+              group = prefix_groups[matched[0]]
+              by_group_attempt[group].setdefault(attempt, []).append(name)
 
-          candidates = []
-          for attempt, names in by_attempt.items():
-              expected = sorted(f"{prefix}-attempt-{attempt}" for prefix in prefixes)
-              if sorted(names) == expected:
-                  candidates.append(attempt)
-          if not candidates:
-              raise SystemExit("no complete nonexpired package producer attempt exists")
-          print(max(candidates))
+          producer_names = {
+              "macos-aarch64": "Package and gate macos-aarch64",
+              "linux-x86_64": "Package and gate linux-x86_64",
+              "sdk": "Bind both native runtimes and gate the TypeScript package",
+          }
+          producer_jobs = {name: {} for name in producer_names.values()}
+          seen_jobs = set()
+          for job in jobs:
+              name = job.get("name")
+              if name not in producer_names.values():
+                  continue
+              attempt = job.get("run_attempt")
+              identity = (attempt, name)
+              if (
+                  type(attempt) is not int
+                  or attempt < 1
+                  or attempt > overall_attempt
+                  or job.get("run_id") != run_id
+                  or job.get("head_sha") != head_sha
+                  or identity in seen_jobs
+              ):
+                  raise SystemExit("package producer job identity is malformed or ambiguous")
+              seen_jobs.add(identity)
+              producer_jobs[name][attempt] = (job.get("status"), job.get("conclusion"))
+
+          group_prefixes = {
+              "macos-aarch64": (
+                  "stasis-macos-aarch64",
+                  "stasis-macos-aarch64-act-settle-inspect-proof",
+              ),
+              "linux-x86_64": (
+                  "stasis-linux-x86_64",
+                  "stasis-linux-x86_64-act-settle-inspect-proof",
+              ),
+              "sdk": ("stasis-runtime-manifest", "stasis-typescript"),
+          }
+          selected = {}
+          for group, expected_prefixes in group_prefixes.items():
+              producer_attempts = producer_jobs[producer_names[group]]
+              if not producer_attempts:
+                  raise SystemExit(f"no {group} producer job exists")
+              producer_attempt = max(producer_attempts)
+              if producer_attempts[producer_attempt] != ("completed", "success"):
+                  raise SystemExit(f"latest {group} producer job did not succeed")
+              expected = sorted(
+                  f"{prefix}-attempt-{producer_attempt}" for prefix in expected_prefixes
+              )
+              if sorted(by_group_attempt[group].get(producer_attempt, [])) != expected:
+                  raise SystemExit(f"latest successful {group} producer artifacts are unavailable")
+              if max(by_group_attempt[group], default=0) > producer_attempt:
+                  raise SystemExit(f"newer incomplete or unsuccessful {group} artifacts exist")
+              selected[group] = producer_attempt
+          if (
+              selected["macos-aarch64"] > selected["sdk"]
+              or selected["linux-x86_64"] > selected["sdk"]
+          ):
+              raise SystemExit("selected SDK producer predates a selected native producer")
+          print(
+              selected["macos-aarch64"],
+              selected["linux-x86_64"],
+              selected["sdk"],
+          )
           PY
           )
-          if [[ ! "$producer_attempt" =~ ^[1-9][0-9]*$ ]]; then
-            echo 'package producer attempt is invalid' >&2
+          if [[ ! "$macos_run_attempt" =~ ^[1-9][0-9]*$ \
+            || ! "$linux_run_attempt" =~ ^[1-9][0-9]*$ \
+            || ! "$sdk_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'package producer attempts are invalid' >&2
             exit 1
           fi
 
           {
             echo "HEAD_SHA=$head_sha"
             echo "HEAD_BRANCH=$head_branch"
-            echo "RUN_ATTEMPT=$producer_attempt"
+            echo "MACOS_RUN_ATTEMPT=$macos_run_attempt"
+            echo "LINUX_RUN_ATTEMPT=$linux_run_attempt"
+            echo "SDK_RUN_ATTEMPT=$sdk_run_attempt"
             echo "STASIS_VERSION=$version"
           } >> "$GITHUB_ENV"
           {
             echo "head_sha=$head_sha"
             echo "head_branch=$head_branch"
-            echo "run_attempt=$producer_attempt"
+            echo "macos_run_attempt=$macos_run_attempt"
+            echo "linux_run_attempt=$linux_run_attempt"
+            echo "sdk_run_attempt=$sdk_run_attempt"
             echo "version=$version"
           } >> "$GITHUB_OUTPUT"
-          echo "eligible package run: $RUN_ID producer attempt $producer_attempt (overall attempt $overall_run_attempt) at $head_sha"
+          echo "eligible package run: $RUN_ID native attempts $macos_run_attempt/$linux_run_attempt and SDK attempt $sdk_run_attempt (overall attempt $overall_run_attempt) at $head_sha"
 
       - name: Check out the exact packaged source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -1166,44 +1902,143 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
-          native_artifact="stasis-macos-aarch64-attempt-$RUN_ATTEMPT"
-          proof_artifact="stasis-macos-aarch64-act-settle-inspect-proof-attempt-$RUN_ATTEMPT"
-          sdk_artifact="stasis-typescript-alpha-attempt-$RUN_ATTEMPT"
-          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --name "$native_artifact" --dir release-assets
-          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --name "$proof_artifact" --dir gate-proof
+          for platform in macos-aarch64 linux-x86_64; do
+            if [[ "$platform" == 'macos-aarch64' ]]; then
+              producer_attempt=$MACOS_RUN_ATTEMPT
+            else
+              producer_attempt=$LINUX_RUN_ATTEMPT
+            fi
+            native_artifact="stasis-${platform}-attempt-$producer_attempt"
+            proof_artifact="stasis-${platform}-act-settle-inspect-proof-attempt-$producer_attempt"
+            gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+              --name "$native_artifact" --dir "release-assets/$platform"
+            gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+              --name "$proof_artifact" --dir "gate-proof/$platform"
+          done
+          sdk_artifact="stasis-typescript-attempt-$SDK_RUN_ATTEMPT"
+          manifest_artifact="stasis-runtime-manifest-attempt-$SDK_RUN_ATTEMPT"
           gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
             --name "$sdk_artifact" --dir sdk-proof
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$manifest_artifact" --dir runtime-manifest
 
       - name: Verify exact contents, checksums, gate proof, and provenance
         shell: bash
         run: |
           set -euo pipefail
-          python3 etc/ci/stasis/release_archive.py verify \
-            --asset-directory release-assets \
-            --version "$STASIS_VERSION" \
-            --platform "$STASIS_PLATFORM" \
-            --revision "$HEAD_SHA" \
-            --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-            --source-root .
-          python3 etc/ci/stasis/release_archive.py verify-gate-proof \
-            --proof-directory gate-proof \
-            --asset-directory release-assets \
-            --version "$STASIS_VERSION" \
-            --platform "$STASIS_PLATFORM" \
-            --revision "$HEAD_SHA" \
-            --run-id "$RUN_ID" \
-            --run-attempt "$RUN_ATTEMPT"
-          binary_sha256=$(awk '{print $1}' "release-assets/stasis-${STASIS_VERSION}-${STASIS_PLATFORM}.binary.sha256")
+          for platform in macos-aarch64 linux-x86_64; do
+            if [[ "$platform" == 'macos-aarch64' ]]; then
+              producer_attempt=$MACOS_RUN_ATTEMPT
+            else
+              producer_attempt=$LINUX_RUN_ATTEMPT
+            fi
+            python3 etc/ci/stasis/release_archive.py verify \
+              --asset-directory "release-assets/$platform" \
+              --version "$STASIS_VERSION" \
+              --platform "$platform" \
+              --revision "$HEAD_SHA" \
+              --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+              --source-root .
+            python3 etc/ci/stasis/release_archive.py verify-gate-proof \
+              --proof-directory "gate-proof/$platform" \
+              --asset-directory "release-assets/$platform" \
+              --version "$STASIS_VERSION" \
+              --platform "$platform" \
+              --revision "$HEAD_SHA" \
+              --run-id "$RUN_ID" \
+              --run-attempt "$producer_attempt"
+          done
+          manifest="runtime-manifest/stasis-${STASIS_VERSION}-runtime-manifest.json"
+          test -f "$manifest" && test ! -L "$manifest"
+          node sdk/typescript/scripts/generate-runtime-manifest.mjs \
+            --input "$manifest" \
+            --output "$RUNNER_TEMP/runtime-manifest.generated.ts"
+          STASIS_RUNTIME_MANIFEST="$manifest" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import tomllib
+
+          version = os.environ["STASIS_VERSION"]
+          revision = os.environ["HEAD_SHA"]
+          manifest = json.loads(
+              pathlib.Path(os.environ["STASIS_RUNTIME_MANIFEST"]).read_text(encoding="utf-8")
+          )
+          upstream = tomllib.loads(pathlib.Path("STASIS_UPSTREAM.toml").read_text(encoding="utf-8"))
+          source = {
+              **upstream,
+              "stasis_repository": "https://github.com/oxhq/stasis.git",
+              "stasis_revision": revision,
+          }
+          if (
+              set(manifest) != {
+                  "schema", "packageName", "sdkVersion", "releaseTag",
+                  "implementation", "artifacts",
+              }
+              or manifest["schema"] != 1
+              or manifest["packageName"] != "@oxhq/stasis"
+              or manifest["sdkVersion"] != version
+              or manifest["releaseTag"] != f"v{version}"
+              or manifest["implementation"] != {"name": "stasis-shell", "source": source}
+          ):
+              raise SystemExit("runtime manifest root identity changed")
+          inventory = [
+              "INSTALL.txt", "LICENSE", "LICENSE_WHATWG_SPECS",
+              "NATIVE-LIBRARIES.txt", "README.md", "SOURCE.txt",
+              "STASIS_UPSTREAM.toml", "THIRD_PARTY_LICENSES.html",
+              "VERSION.txt", "stasis",
+          ]
+          targets = (
+              ("darwin-arm64", "darwin", "arm64", "macos-aarch64"),
+              ("linux-x64", "linux", "x64", "linux-x86_64"),
+          )
+          if set(manifest["artifacts"]) != {target[0] for target in targets}:
+              raise SystemExit("runtime manifest target inventory changed")
+          for key, node_platform, node_arch, platform in targets:
+              root = f"stasis-{version}-{platform}"
+              archive_name = f"{root}.tar.gz"
+              directory = pathlib.Path("release-assets") / platform
+              archive = directory / archive_name
+              archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+              archive_sidecar = (directory / f"{archive_name}.sha256").read_text(encoding="ascii")
+              binary_sidecar = (directory / f"{root}.binary.sha256").read_text(encoding="ascii")
+              archive_match = re.fullmatch(
+                  rf"([0-9a-f]{{64}})  {re.escape(archive_name)}\n", archive_sidecar
+              )
+              binary_match = re.fullmatch(
+                  rf"([0-9a-f]{{64}})  {re.escape(root)}/stasis\n", binary_sidecar
+              )
+              if archive_match is None or archive_match.group(1) != archive_digest or binary_match is None:
+                  raise SystemExit(f"runtime manifest sidecar input changed for {platform}")
+              expected = {
+                  "nodePlatform": node_platform,
+                  "nodeArch": node_arch,
+                  "releasePlatform": platform,
+                  "archiveUrl": (
+                      f"https://github.com/oxhq/stasis/releases/download/v{version}/{archive_name}"
+                  ),
+                  "archiveSizeBytes": archive.stat().st_size,
+                  "archiveSha256": archive_digest,
+                  "archiveRoot": root,
+                  "archiveFiles": inventory,
+                  "executablePath": "stasis",
+                  "executableSha256": binary_match.group(1),
+              }
+              if manifest["artifacts"][key] != expected:
+                  raise SystemExit(f"runtime manifest binding changed for {platform}")
+          PY
+          binary_sha256=$(awk '{print $1}' \
+            "release-assets/macos-aarch64/stasis-${STASIS_VERSION}-macos-aarch64.binary.sha256")
           python3 etc/ci/stasis/npm_release.py verify-proof \
             --directory sdk-proof \
             --version "$STASIS_VERSION" \
             --revision "$HEAD_SHA" \
             --native-binary-sha256 "$binary_sha256" \
             --run-id "$RUN_ID" \
-            --run-attempt "$RUN_ATTEMPT"
-          for release_asset in release-assets/* gate-proof/* sdk-proof/*; do
+            --run-attempt "$SDK_RUN_ATTEMPT"
+          for release_asset in release-assets/*/* gate-proof/*/* runtime-manifest/* sdk-proof/*; do
             gh attestation verify "$release_asset" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
@@ -1211,6 +2046,10 @@ jobs:
               --source-ref "refs/heads/$HEAD_BRANCH" \
               --deny-self-hosted-runners
           done
+          mkdir staged-release-assets staged-gate-proof
+          cp release-assets/*/* staged-release-assets/
+          cp "$manifest" staged-release-assets/
+          cp gate-proof/*/* staged-gate-proof/
 
       - id: stage-names
         name: Resolve this promotion attempt's handoff names
@@ -1227,7 +2066,7 @@ jobs:
         with:
           name: ${{ steps.stage-names.outputs.release_artifact_name }}
           path: |
-            release-assets/*
+            staged-release-assets/*
           if-no-files-found: error
           retention-days: 90
 
@@ -1236,12 +2075,12 @@ jobs:
         with:
           name: ${{ steps.stage-names.outputs.gate_artifact_name }}
           path: |
-            gate-proof/*
+            staged-gate-proof/*
           if-no-files-found: error
           retention-days: 90
 
   promote:
-    name: Create immutable draft prerelease
+    name: Create immutable draft stable release
     needs:
       - validate-invocation
       - verify-promotion
@@ -1260,7 +2099,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       HEAD_SHA: ${{ needs.verify-promotion.outputs.head_sha }}
       HEAD_BRANCH: ${{ needs.verify-promotion.outputs.head_branch }}
-      RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.run_attempt }}
+      LINUX_RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.linux_run_attempt }}
+      MACOS_RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.macos_run_attempt }}
+      SDK_RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.sdk_run_attempt }}
       RUN_ID: ${{ inputs.package_run_id }}
       STASIS_VERSION: ${{ needs.verify-promotion.outputs.version }}
       TAG: ${{ inputs.release_tag }}
@@ -1278,11 +2119,39 @@ jobs:
             echo 'repository default branch changed after promotion verification' >&2
             exit 1
           fi
-          gh api "repos/$GITHUB_REPOSITORY/compare/$HEAD_SHA...$current_default_branch" > ancestry.json
+          current_default_sha=$(gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/commits" \
+            -f sha="$current_default_branch" \
+            -f per_page=1 \
+            --jq 'if length == 1 then .[0].sha else error("default branch did not resolve exactly") end')
+          if [[ ! "$current_default_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'current default branch did not resolve to an exact commit' >&2
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/compare/$HEAD_SHA...$current_default_sha" > ancestry.json
           jq -e --arg head_sha "$HEAD_SHA" '
             .merge_base_commit.sha == $head_sha
             and (.status == "ahead" or .status == "identical")
           ' ancestry.json > /dev/null
+
+          workflow_tree_sha() {
+            local commit_sha=$1
+            local root_tree_sha dot_github_tree_sha
+            root_tree_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$commit_sha" \
+              --jq '.tree.sha')
+            dot_github_tree_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/trees/$root_tree_sha" \
+              --jq '.tree | map(select(.path == ".github" and .mode == "040000" and .type == "tree")) | if length == 1 then .[0].sha else error("missing .github tree") end')
+            gh api "repos/$GITHUB_REPOSITORY/git/trees/$dot_github_tree_sha" \
+              --jq '.tree | map(select(.path == "workflows" and .mode == "040000" and .type == "tree")) | if length == 1 then .[0].sha else error("missing .github/workflows tree") end'
+          }
+          packaged_workflow_tree=$(workflow_tree_sha "$HEAD_SHA")
+          current_workflow_tree=$(workflow_tree_sha "$current_default_sha")
+          if [[ ! "$packaged_workflow_tree" =~ ^[0-9a-f]{40}$ \
+            || ! "$current_workflow_tree" =~ ^[0-9a-f]{40}$ \
+            || "$packaged_workflow_tree" != "$current_workflow_tree" ]]; then
+            echo '.github/workflows changed after the selected package commit' >&2
+            exit 1
+          fi
 
       - name: Download release assets verified by the read-only job
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1300,7 +2169,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export STASIS_PLATFORM
+          for producer_attempt in \
+            "$MACOS_RUN_ATTEMPT" "$LINUX_RUN_ATTEMPT" "$SDK_RUN_ATTEMPT"; do
+            if [[ ! "$producer_attempt" =~ ^[1-9][0-9]*$ ]]; then
+              echo 'staged producer attempt handoff is invalid' >&2
+              exit 1
+            fi
+          done
+          if [[ "$MACOS_RUN_ATTEMPT" -gt "$SDK_RUN_ATTEMPT" \
+            || "$LINUX_RUN_ATTEMPT" -gt "$SDK_RUN_ATTEMPT" ]]; then
+            echo 'staged SDK producer predates a native producer' >&2
+            exit 1
+          fi
           python3 - <<'PY'
           import hashlib
           import json
@@ -1310,21 +2190,33 @@ jobs:
           import re
 
           version = os.environ["STASIS_VERSION"]
-          platform = os.environ["STASIS_PLATFORM"]
           revision = os.environ["HEAD_SHA"]
           run_id = os.environ["RUN_ID"]
-          run_attempt = os.environ["RUN_ATTEMPT"]
-          bundle = f"stasis-{version}-{platform}"
-          archive_name = f"{bundle}.tar.gz"
-          binary_sidecar_name = f"{bundle}.binary.sha256"
-          proof_name = f"{bundle}-act-settle-inspect.json"
-          assets = pathlib.Path("release-assets")
-          proof_directory = pathlib.Path("gate-proof")
-          expected_assets = {archive_name, f"{archive_name}.sha256", binary_sidecar_name}
-          actual_assets = {item.name for item in assets.iterdir() if item.is_file()}
-          actual_proofs = {item.name for item in proof_directory.iterdir() if item.is_file()}
-          if actual_assets != expected_assets or actual_proofs != {proof_name}:
-              raise SystemExit("staged promotion inventory changed after read-only verification")
+          native_run_attempts = {
+              "macos-aarch64": os.environ["MACOS_RUN_ATTEMPT"],
+              "linux-x86_64": os.environ["LINUX_RUN_ATTEMPT"],
+          }
+          platforms = ("macos-aarch64", "linux-x86_64")
+          assets_root = pathlib.Path("release-assets")
+          proof_root = pathlib.Path("gate-proof")
+          manifest_name = f"stasis-{version}-runtime-manifest.json"
+          expected_release_names = {manifest_name}
+          expected_proof_names = set()
+          for platform in platforms:
+              bundle = f"stasis-{version}-{platform}"
+              archive_name = f"{bundle}.tar.gz"
+              expected_release_names.update({
+                  archive_name, f"{archive_name}.sha256", f"{bundle}.binary.sha256",
+              })
+              expected_proof_names.add(f"{bundle}-act-settle-inspect.json")
+          if {item.name for item in assets_root.iterdir()} != expected_release_names:
+              raise SystemExit("staged release inventory changed after read-only verification")
+          if {item.name for item in proof_root.iterdir()} != expected_proof_names:
+              raise SystemExit("staged proof inventory changed after read-only verification")
+          if any(item.is_symlink() or not item.is_file() for item in assets_root.iterdir()) or any(
+              item.is_symlink() or not item.is_file() for item in proof_root.iterdir()
+          ):
+              raise SystemExit("staged handoff contains a symbolic link")
 
           def strict_object(pairs):
               value = {}
@@ -1362,66 +2254,109 @@ jobs:
                   raise SystemExit(f"invalid checksum sidecar: {filename}")
               return match.group(1)
 
-          archive = assets / archive_name
-          archive_digest_state = hashlib.sha256()
-          with archive.open("rb") as archive_source:
-              for chunk in iter(lambda: archive_source.read(1024 * 1024), b""):
-                  archive_digest_state.update(chunk)
-          archive_digest = archive_digest_state.hexdigest()
-          if checksum(assets / f"{archive_name}.sha256", archive_name) != archive_digest:
-              raise SystemExit("staged archive digest changed")
-          binary_label = f"{bundle}/stasis"
-          binary_digest = checksum(assets / binary_sidecar_name, binary_label)
-          proof_file = proof_directory / proof_name
-          if proof_file.stat().st_size <= 0 or proof_file.stat().st_size > 64 * 1024:
-              raise SystemExit("staged native gate proof size is outside the release limit")
-          proof = strict_json_loads(
-              proof_file.read_text(encoding="utf-8"), "staged native gate proof"
-          )
-          expected = {
-              "schema": 2,
-              "gate": "act-settle-inspect",
-              "test": "release_gate_published_binary_completes_act_settle_inspect",
-              "version": version,
-              "platform": platform,
-              "revision": revision,
-              "workflowRunId": run_id,
-              "workflowRunAttempt": run_attempt,
-              "archive": {"name": archive_name, "sha256": archive_digest},
-              "binary": {"path": binary_label, "sha256": binary_digest},
-              "source": {
-                  "servo_repository": "https://github.com/servo/servo.git",
-                  "servo_revision": "0d579bd5aab6df3764fad805427254751632a6e4",
-                  "pliego_repository": "https://github.com/oxhq/pliego.git",
-                  "pliego_revision": "556c774242b272b11bc60999449c5debff1ad20f",
-                  "pliego_servo_merge_base": "313b6d5ecc113b08010ce434140db3ca5abcc71c",
-                  "stasis_repository": "https://github.com/oxhq/stasis.git",
-                  "stasis_revision": revision,
-              },
+          source = {
+              "servo_repository": "https://github.com/servo/servo.git",
+              "servo_revision": "0d579bd5aab6df3764fad805427254751632a6e4",
+              "pliego_repository": "https://github.com/oxhq/pliego.git",
+              "pliego_revision": "556c774242b272b11bc60999449c5debff1ad20f",
+              "pliego_servo_merge_base": "313b6d5ecc113b08010ce434140db3ca5abcc71c",
+              "stasis_repository": "https://github.com/oxhq/stasis.git",
+              "stasis_revision": revision,
           }
-          if (
-              not isinstance(proof, dict)
-              or set(proof) != set(expected) | {"gateLogSha256"}
-              or type(proof.get("schema")) is not int
-          ):
-              raise SystemExit("staged gate proof schema changed after read-only verification")
-          for field, keys in (("archive", {"name", "sha256"}), ("binary", {"path", "sha256"})):
-              binding = proof.get(field)
+          bindings = {}
+          for platform in platforms:
+              bundle = f"stasis-{version}-{platform}"
+              archive_name = f"{bundle}.tar.gz"
+              binary_sidecar_name = f"{bundle}.binary.sha256"
+              proof_name = f"{bundle}-act-settle-inspect.json"
+              archive = assets_root / archive_name
+              archive_digest_state = hashlib.sha256()
+              with archive.open("rb") as archive_source:
+                  for chunk in iter(lambda: archive_source.read(1024 * 1024), b""):
+                      archive_digest_state.update(chunk)
+              archive_digest = archive_digest_state.hexdigest()
+              if checksum(assets_root / f"{archive_name}.sha256", archive_name) != archive_digest:
+                  raise SystemExit("staged archive digest changed")
+              binary_label = f"{bundle}/stasis"
+              binary_digest = checksum(assets_root / binary_sidecar_name, binary_label)
+              proof_file = proof_root / proof_name
+              if proof_file.stat().st_size <= 0 or proof_file.stat().st_size > 64 * 1024:
+                  raise SystemExit("staged native gate proof size is outside the release limit")
+              proof = strict_json_loads(
+                  proof_file.read_text(encoding="utf-8"), "staged native gate proof"
+              )
+              expected = {
+                  "schema": 2,
+                  "gate": "act-settle-inspect",
+                  "test": "release_gate_published_binary_completes_act_settle_inspect",
+                  "version": version,
+                  "platform": platform,
+                  "revision": revision,
+                  "workflowRunId": run_id,
+                  "workflowRunAttempt": native_run_attempts[platform],
+                  "archive": {"name": archive_name, "sha256": archive_digest},
+                  "binary": {"path": binary_label, "sha256": binary_digest},
+                  "source": source,
+              }
               if (
-                  not isinstance(binding, dict)
-                  or set(binding) != keys
-                  or any(not isinstance(binding.get(key), str) for key in keys)
+                  not isinstance(proof, dict)
+                  or set(proof) != set(expected) | {"gateLogSha256"}
+                  or type(proof.get("schema")) is not int
+                  or any(proof.get(key) != value for key, value in expected.items())
+                  or re.fullmatch(r"[0-9a-f]{64}", proof.get("gateLogSha256", "")) is None
               ):
-                  raise SystemExit(f"staged gate proof {field} binding has invalid types")
-          for key, value in expected.items():
-              if proof.get(key) != value:
-                  raise SystemExit(f"staged gate proof field changed: {key}")
-          gate_log_digest = proof.get("gateLogSha256")
-          if (
-              not isinstance(gate_log_digest, str)
-              or re.fullmatch(r"[0-9a-f]{64}", gate_log_digest) is None
+                  raise SystemExit(f"staged gate proof changed for {platform}")
+              bindings[platform] = {
+                  "archiveName": archive_name,
+                  "archiveSizeBytes": archive.stat().st_size,
+                  "archiveSha256": archive_digest,
+                  "archiveRoot": bundle,
+                  "executableSha256": binary_digest,
+              }
+
+          manifest_file = assets_root / manifest_name
+          if manifest_file.stat().st_size <= 0 or manifest_file.stat().st_size > 128 * 1024:
+              raise SystemExit("staged runtime manifest size is outside the release limit")
+          manifest = strict_json_loads(
+              manifest_file.read_text(encoding="utf-8"), "staged runtime manifest"
+          )
+          inventory = [
+              "INSTALL.txt", "LICENSE", "LICENSE_WHATWG_SPECS",
+              "NATIVE-LIBRARIES.txt", "README.md", "SOURCE.txt",
+              "STASIS_UPSTREAM.toml", "THIRD_PARTY_LICENSES.html",
+              "VERSION.txt", "stasis",
+          ]
+          artifacts = {}
+          for key, node_platform, node_arch, platform in (
+              ("darwin-arm64", "darwin", "arm64", "macos-aarch64"),
+              ("linux-x64", "linux", "x64", "linux-x86_64"),
           ):
-              raise SystemExit("staged gate proof has no canonical log digest")
+              binding = bindings[platform]
+              artifacts[key] = {
+                  "nodePlatform": node_platform,
+                  "nodeArch": node_arch,
+                  "releasePlatform": platform,
+                  "archiveUrl": (
+                      f"https://github.com/oxhq/stasis/releases/download/v{version}/"
+                      f"{binding['archiveName']}"
+                  ),
+                  "archiveSizeBytes": binding["archiveSizeBytes"],
+                  "archiveSha256": binding["archiveSha256"],
+                  "archiveRoot": binding["archiveRoot"],
+                  "archiveFiles": inventory,
+                  "executablePath": "stasis",
+                  "executableSha256": binding["executableSha256"],
+              }
+          expected_manifest = {
+              "schema": 1,
+              "packageName": "@oxhq/stasis",
+              "sdkVersion": version,
+              "releaseTag": f"v{version}",
+              "implementation": {"name": "stasis-shell", "source": source},
+              "artifacts": artifacts,
+          }
+          if manifest != expected_manifest:
+              raise SystemExit("staged runtime distribution manifest changed")
           PY
           for release_asset in release-assets/* gate-proof/*; do
             gh attestation verify "$release_asset" \
@@ -1432,7 +2367,7 @@ jobs:
               --deny-self-hosted-runners
           done
 
-      - name: Verify immutable tag and release state
+      - name: Verify immutable tag and resumable draft state
         shell: bash
         run: |
           set -euo pipefail
@@ -1455,10 +2390,164 @@ jobs:
             exit "$status"
           }
 
-          if get_or_404 "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" release.json; then
-            echo "release $TAG already exists; refusing to mutate it" >&2
+          cat > release-notes.md <<EOF
+          # Stasis $TAG
+
+          First supported Stasis controlled-webapp release.
+
+          - Exact source commit: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$HEAD_SHA
+          - Package and gate run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID
+          - Native platforms: macOS Apple Silicon and Linux x86_64
+          - Linux compatibility floor: Ubuntu 22.04 / glibc 2.35
+          - macOS signing: unsigned and not Apple-notarized
+
+          Stasis 0.1 controls time and explicit settlement within the versioned
+          controlled-webapp support profile. It fails closed on work outside that profile.
+
+          This draft contains both native archives, archive and binary SHA-256 sidecars,
+          artifact-bound native gate proofs, and the exact runtime distribution manifest
+          embedded in the npm package. GitHub build provenance is available through the
+          GitHub CLI attestation verifier for every asset.
+          EOF
+
+          mkdir release-state
+          gh api --method GET --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > release-state/release-pages.json
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+
+          version = os.environ["STASIS_VERSION"]
+          tag = os.environ["TAG"]
+          revision = os.environ["HEAD_SHA"]
+          title = f"Stasis {tag}"
+          expected_names = {f"stasis-{version}-runtime-manifest.json"}
+          for platform in ("macos-aarch64", "linux-x86_64"):
+              bundle = f"stasis-{version}-{platform}"
+              archive = f"{bundle}.tar.gz"
+              expected_names.update({
+                  archive,
+                  f"{archive}.sha256",
+                  f"{bundle}.binary.sha256",
+                  f"{bundle}-act-settle-inspect.json",
+              })
+
+          files = {}
+          for directory_name in ("release-assets", "gate-proof"):
+              directory = pathlib.Path(directory_name)
+              for filename in directory.iterdir():
+                  if filename.is_symlink() or not filename.is_file():
+                      raise SystemExit("release handoff contains a non-regular asset")
+                  if filename.name in files:
+                      raise SystemExit(f"duplicate local release asset: {filename.name}")
+                  digest = hashlib.sha256()
+                  with filename.open("rb") as source:
+                      for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                          digest.update(chunk)
+                  files[filename.name] = {
+                      "path": str(filename),
+                      "size": filename.stat().st_size,
+                      "digest": f"sha256:{digest.hexdigest()}",
+                  }
+          if set(files) != expected_names:
+              raise SystemExit(
+                  "local release inventory changed before draft recovery: "
+                  f"{sorted(files)}"
+              )
+          pathlib.Path("release-state/expected-assets.json").write_text(
+              json.dumps(files, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          pages = json.loads(
+              pathlib.Path("release-state/release-pages.json").read_text(encoding="utf-8")
+          )
+          if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+              raise SystemExit("authenticated release enumeration is malformed")
+          releases = [release for page in pages for release in page]
+          matches = [
+              release for release in releases
+              if isinstance(release, dict) and release.get("tag_name") == tag
+          ]
+          if len(matches) > 1:
+              raise SystemExit(f"multiple releases use exact tag {tag}")
+
+          state = {
+              "releaseId": None,
+              "missingAssetNames": sorted(expected_names),
+              "starterAssetIds": [],
+          }
+          if matches:
+              release = matches[0]
+              release_id = release.get("id")
+              notes = pathlib.Path("release-notes.md").read_text(encoding="utf-8")
+              if (
+                  type(release_id) is not int
+                  or release_id <= 0
+                  or release.get("tag_name") != tag
+                  or release.get("target_commitish") != revision
+                  or release.get("name") != title
+                  or release.get("body") != notes
+                  or release.get("draft") is not True
+                  or release.get("prerelease") is not False
+                  or release.get("immutable") is not False
+                  or release.get("published_at") is not None
+              ):
+                  raise SystemExit(f"existing release {tag} is not the exact resumable draft")
+              assets = release.get("assets")
+              if not isinstance(assets, list):
+                  raise SystemExit("existing draft asset inventory is malformed")
+              seen = set()
+              missing = set(expected_names)
+              starter_ids = []
+              for asset in assets:
+                  if not isinstance(asset, dict):
+                      raise SystemExit("existing draft has a malformed asset")
+                  name = asset.get("name")
+                  if not isinstance(name, str) or name not in files or name in seen:
+                      raise SystemExit(f"existing draft has an unexpected or duplicate asset: {name!r}")
+                  seen.add(name)
+                  expected = files[name]
+                  asset_state = asset.get("state")
+                  if asset_state == "uploaded":
+                      if (
+                          asset.get("size") != expected["size"]
+                          or asset.get("digest") != expected["digest"]
+                      ):
+                          raise SystemExit(f"existing draft asset bytes changed: {name}")
+                      missing.remove(name)
+                  elif asset_state == "starter":
+                      asset_id = asset.get("id")
+                      if (
+                          type(asset_id) is not int
+                          or asset_id <= 0
+                          or asset.get("size") not in (0, None)
+                          or asset.get("digest") not in (None, "")
+                      ):
+                          raise SystemExit(f"existing draft starter asset is malformed: {name}")
+                      starter_ids.append(asset_id)
+                  else:
+                      raise SystemExit(f"existing draft asset is not immutable uploaded state: {name}")
+              state = {
+                  "releaseId": release_id,
+                  "missingAssetNames": sorted(missing),
+                  "starterAssetIds": sorted(starter_ids),
+              }
+          pathlib.Path("release-state/draft-state.json").write_text(
+              json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          draft_release_id=$(jq -r '.releaseId // ""' release-state/draft-state.json)
+          if [[ -n "$draft_release_id" && ! "$draft_release_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'resumable draft release ID is invalid' >&2
             exit 1
           fi
+          echo "DRAFT_RELEASE_ID=$draft_release_id" >> "$GITHUB_ENV"
 
           create_tag=true
           if get_or_404 "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" tag.json; then
@@ -1482,31 +2571,145 @@ jobs:
           test "$(jq -er '.object.type' <<< "$created")" = 'commit'
           test "$(jq -er '.object.sha' <<< "$created")" = "$HEAD_SHA"
 
-      - name: Create the draft prerelease with exact assets
+      - name: Create or resume the exact draft stable release by ID
         shell: bash
         run: |
           set -euo pipefail
-          cat > release-notes.md <<EOF
-          # Stasis $TAG
+          read -r tag_type tag_sha < <(
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+              --jq '[.object.type, .object.sha] | @tsv'
+          )
+          if [[ "$tag_type" != 'commit' || "$tag_sha" != "$HEAD_SHA" ]]; then
+            echo "$TAG changed before draft release mutation" >&2
+            exit 1
+          fi
 
-          First controlled-time Servo runtime alpha for the act-settle-inspect MVP.
+          release_id=$DRAFT_RELEASE_ID
+          if [[ -z "$release_id" ]]; then
+            jq -n \
+              --arg tag "$TAG" \
+              --arg revision "$HEAD_SHA" \
+              --arg title "Stasis $TAG" \
+              --rawfile notes release-notes.md \
+              '{
+                tag_name: $tag,
+                target_commitish: $revision,
+                name: $title,
+                body: $notes,
+                draft: true,
+                prerelease: false
+              }' > release-state/create-draft.json
+            gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+              --input release-state/create-draft.json \
+              > release-state/created-draft.json
+            jq -e \
+              --arg tag "$TAG" \
+              --arg revision "$HEAD_SHA" \
+              --arg title "Stasis $TAG" '
+                (.id | type == "number" and . > 0)
+                and .tag_name == $tag
+                and .target_commitish == $revision
+                and .name == $title
+                and .draft == true
+                and .prerelease == false
+                and .immutable == false
+                and .published_at == null
+                and (.assets | type == "array" and length == 0)
+              ' release-state/created-draft.json > /dev/null
+            release_id=$(jq -er '.id' release-state/created-draft.json)
+          fi
+          if [[ ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'draft release ID is invalid' >&2
+            exit 1
+          fi
 
-          - Exact source commit: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$HEAD_SHA
-          - Package and gate run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID
-          - Native platform: macOS Apple Silicon only
-          - Signing: unsigned and not Apple-notarized
+          while IFS= read -r starter_asset_id; do
+            if [[ ! "$starter_asset_id" =~ ^[1-9][0-9]*$ ]]; then
+              echo 'starter asset ID is invalid' >&2
+              exit 1
+            fi
+            gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$starter_asset_id" \
+              --silent
+          done < <(jq -r '.starterAssetIds[]' release-state/draft-state.json)
 
-          This alpha controls Stasis time and explicit settlement. It does not
-          virtualize live network content, ambient operating-system state, or randomness.
+          while IFS= read -r asset_name; do
+            asset_path=$(jq -er --arg name "$asset_name" '.[$name].path' \
+              release-state/expected-assets.json)
+            asset_size=$(jq -er --arg name "$asset_name" '.[$name].size' \
+              release-state/expected-assets.json)
+            asset_digest=$(jq -er --arg name "$asset_name" '.[$name].digest' \
+              release-state/expected-assets.json)
+            encoded_name=$(jq -rn --arg name "$asset_name" '$name | @uri')
+            curl --fail-with-body --silent --show-error \
+              --request POST \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Content-Type: application/octet-stream' \
+              --header 'X-GitHub-Api-Version: 2026-03-10' \
+              --data-binary "@$asset_path" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$encoded_name" \
+              > release-state/uploaded-asset.json
+            jq -e \
+              --arg name "$asset_name" \
+              --arg digest "$asset_digest" \
+              --argjson size "$asset_size" '
+                (.id | type == "number" and . > 0)
+                and .name == $name
+                and .state == "uploaded"
+                and .size == $size
+                and .digest == $digest
+              ' release-state/uploaded-asset.json > /dev/null
+          done < <(jq -r '.missingAssetNames[]' release-state/draft-state.json)
 
-          This draft contains one native archive, its archive and binary SHA-256 sidecars,
-          and the artifact-bound act-settle-inspect proof. GitHub build provenance is
-          available through the GitHub CLI attestation verifier for every asset.
-          EOF
-          gh release create "$TAG" release-assets/* gate-proof/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --draft \
-            --prerelease \
-            --verify-tag \
-            --title "Stasis $TAG" \
-            --notes-file release-notes.md
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            > release-state/final-draft.json
+          DRAFT_RELEASE_ID="$release_id" python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          tag = os.environ["TAG"]
+          revision = os.environ["HEAD_SHA"]
+          release_id = int(os.environ["DRAFT_RELEASE_ID"])
+          expected = json.loads(
+              pathlib.Path("release-state/expected-assets.json").read_text(encoding="utf-8")
+          )
+          release = json.loads(
+              pathlib.Path("release-state/final-draft.json").read_text(encoding="utf-8")
+          )
+          notes = pathlib.Path("release-notes.md").read_text(encoding="utf-8")
+          if (
+              release.get("id") != release_id
+              or release.get("tag_name") != tag
+              or release.get("target_commitish") != revision
+              or release.get("name") != f"Stasis {tag}"
+              or release.get("body") != notes
+              or release.get("draft") is not True
+              or release.get("prerelease") is not False
+              or release.get("immutable") is not False
+              or release.get("published_at") is not None
+          ):
+              raise SystemExit("final draft release identity changed")
+          assets = release.get("assets")
+          if not isinstance(assets, list) or len(assets) != len(expected):
+              raise SystemExit("final draft release asset count changed")
+          seen = set()
+          for asset in assets:
+              if not isinstance(asset, dict):
+                  raise SystemExit("final draft release has a malformed asset")
+              name = asset.get("name")
+              if name not in expected or name in seen:
+                  raise SystemExit(f"final draft has an unexpected or duplicate asset: {name!r}")
+              seen.add(name)
+              binding = expected[name]
+              if (
+                  asset.get("state") != "uploaded"
+                  or asset.get("size") != binding["size"]
+                  or asset.get("digest") != binding["digest"]
+              ):
+                  raise SystemExit(f"final draft asset bytes changed: {name}")
+          if seen != set(expected):
+              raise SystemExit("final draft release inventory is incomplete")
+          PY
+          echo "verified resumable draft release $TAG (ID $release_id) with exact assets"

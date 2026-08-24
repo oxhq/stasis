@@ -35,8 +35,8 @@ const CONTROLLED_DISABLED_BOOLEAN_PREFERENCE_COUNT: usize = 75;
 
 // Keep this inventory as a single source for policy application, diagnostics, and drift tests.
 // Every entry is written to false even when Servo currently defaults it to false: an upstream
-// default change must not silently widen the Controlled alpha. Unconditional APIs are rejected at
-// their owner boundaries instead. The exact count is asserted in the tests below.
+// default change must not silently widen the Controlled v0.1 profile. Unconditional APIs are
+// rejected at their owner boundaries instead. The exact count is asserted in the tests below.
 macro_rules! define_controlled_disabled_boolean_preferences {
     ($($field:ident),+ $(,)?) => {
         const CONTROLLED_DISABLED_BOOLEAN_PREFERENCES: &[&str] = &[
@@ -69,7 +69,7 @@ macro_rules! define_controlled_disabled_boolean_preferences {
 }
 
 define_controlled_disabled_boolean_preferences! {
-    // Background producers which are not represented in the alpha pending-state proof.
+    // Background producers which are not represented in the v0.1 pending-state proof.
     dom_allow_preloading_module_descendants,
     dom_parallel_css_parsing_enabled,
     dom_script_asynch,
@@ -583,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn controlled_alpha_has_one_exact_disabled_preference_inventory() {
+    fn controlled_runtime_has_one_exact_disabled_preference_inventory() {
         assert_eq!(
             CONTROLLED_DISABLED_BOOLEAN_PREFERENCES.len(),
             CONTROLLED_DISABLED_BOOLEAN_PREFERENCE_COUNT,

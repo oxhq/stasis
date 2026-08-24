@@ -16,6 +16,20 @@ These pages are served only from the loopback integration-test server in
 - `interval.html` leaves a repeating timer ahead of a later one-shot timer so
   settlement must report the open-ended head, preserve the one-shot as deferred
   finite work, and execute neither callback.
+- `application_navigation.html` proves that an application-initiated top-level
+  document replacement is rejected with typed unsupported-work evidence, even
+  when a same-origin navigation could otherwise reuse the controlled event loop.
+- `unsupported_websocket.html` proves a WebSocket is rejected before native
+  dispatch and retained as typed `external_subscription` evidence.
+- `xhr_mutation_observer.html` proves asynchronous XHR response delivery and a
+  resulting MutationObserver checkpoint reach quiescence, while synchronous
+  XHR is rejected before native dispatch without poisoning the session.
+- `automation_surface.html` proves generation-bound semantic fill and activate,
+  one input event per replacement, typed stale/unsupported rejections, a
+  Promise-to-timer submit path, bounded query count, and ordered text/HTML
+  extraction without page-script evaluation.
+- `fill_profile.html` admits every text-control type named by the frozen profile
+  and proves its one replacement `input` event contract.
 
 The tests inspect DOM output only through advertised protocol methods. Missing
 methods or Controlled clock support, protocol errors, shape mismatches,

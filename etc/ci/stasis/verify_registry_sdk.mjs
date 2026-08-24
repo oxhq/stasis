@@ -26,9 +26,13 @@ const REQUIRED_METHODS = [
   "session.close",
   "runtime.pending",
   "runtime.settle",
+  "action.fill",
   "action.activate",
+  "dom.query",
   "dom.text",
+  "dom.extract",
 ];
+const CONTROLLED_WEBAPP_V1_PROFILE = "controlled-webapp-v1";
 const INITIAL_VIRTUAL_TIME_NS = 1_000_000_000n;
 const TEN_SECONDS_NS = 10_000_000_000n;
 const commandDeadline = () => ({ signal: AbortSignal.timeout(30_000) });
@@ -165,7 +169,7 @@ const packageRoot = join(consumerRoot, "node_modules", "@oxhq", "stasis");
 const expectedRevision = values.revision.toLowerCase();
 const expectedVersion = values.version;
 assert.match(expectedRevision, /^[0-9a-f]{40}$/, "--revision must be a full Git commit");
-assert.match(expectedVersion, /^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$/);
+assert.equal(expectedVersion, "0.1.0", "--version must name the exact stable release");
 const expectedTarballName = `oxhq-stasis-${expectedVersion}.tgz`;
 const packageStatus = await lstat(packageTarball);
 assert.ok(packageStatus.isFile() && !packageStatus.isSymbolicLink(), "--package must be a regular file");
@@ -318,6 +322,7 @@ try {
   assert.deepEqual(runtime.info.implementation.source, expectedSource);
   assert.equal(runtime.info.capabilities.settlement, true);
   assert.ok(runtime.info.capabilities.clockModes.includes("controlled"));
+  assert.ok(runtime.info.capabilities.profiles.includes(CONTROLLED_WEBAPP_V1_PROFILE));
   for (const method of REQUIRED_METHODS) {
     assert.ok(runtime.info.capabilities.methods.includes(method), `runtime did not advertise ${method}`);
   }
@@ -332,6 +337,7 @@ try {
   });
   assert.equal(app.clockMode, "controlled");
   assert.equal(app.boundary, "controlled_ready");
+  assert.equal(app.profile, CONTROLLED_WEBAPP_V1_PROFILE);
 
   const policy = {
     persistentWork: "report",

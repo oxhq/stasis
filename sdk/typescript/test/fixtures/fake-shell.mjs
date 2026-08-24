@@ -11,7 +11,10 @@ let initializeParams = null;
 let openParams = null;
 let lastSettleParams = null;
 let lastActivateParams = null;
+let lastFillParams = null;
+let lastQueryParams = null;
 let lastTextParams = null;
+let lastExtractParams = null;
 let applicationOrdinal = 0;
 let settleOrdinal = 0;
 
@@ -22,6 +25,10 @@ const settleOutcomes = [
   "blocked_on_open_ended_work",
   "unsupported_work",
   "virtual_time_limit_exceeded",
+  "task_limit_exceeded",
+  "microtask_limit_exceeded",
+  "rendering_limit_exceeded",
+  "mutation_limit_exceeded",
   "control_turn_limit_exceeded",
   "runtime_error",
 ];
@@ -161,7 +168,13 @@ const settleResult = (outcome) => {
       maxControlTurns: "100000",
       wallIoTimeoutNs: "10000000000",
     },
-    processed: { controlTurns: "3" },
+    processed: {
+      controlTurns: "3",
+      tasks: "4",
+      microtasks: "5",
+      renderingOpportunities: "6",
+      mutations: "7",
+    },
     snapshot: pending(),
     persistentWork: [
       {
@@ -184,6 +197,16 @@ const settleResult = (outcome) => {
   }
   if (outcome === "control_turn_limit_exceeded") {
     result.limit = { kind: "control_turns", limit: "100000" };
+  }
+  const executionLimits = {
+    task_limit_exceeded: ["ordinary_tasks", "100000"],
+    microtask_limit_exceeded: ["microtasks", "1000000"],
+    rendering_limit_exceeded: ["rendering_opportunities", "10000"],
+    mutation_limit_exceeded: ["mutations", "1000000"],
+  };
+  if (Object.hasOwn(executionLimits, outcome)) {
+    const [kind, limit] = executionLimits[outcome];
+    result.limit = { kind, limit, observed: (BigInt(limit) + 1n).toString() };
   }
   if (outcome === "unsupported_work") {
     result.failure = { code: "unsupported_source" };
@@ -253,14 +276,16 @@ async function handle(request) {
             "protocol.initialize",
             "session.open",
             "dom.evaluate",
-            ...(scenario === "no-actions" ? [] : ["dom.text", "action.activate"]),
+            ...(scenario === "no-actions"
+              ? []
+              : ["dom.query", "dom.text", "dom.extract", "action.fill", "action.activate"]),
             "runtime.pending",
             "runtime.settle",
             "runtime.advance_to_next",
             "session.close",
           ],
           clockModes: ["real", "controlled"],
-          profiles: [],
+          profiles: ["controlled-webapp-v1"],
           settlement: true,
           settlementLimits: ["maxVirtualTimeNs", "maxControlTurns", "wallIoTimeoutNs"],
         },
@@ -273,17 +298,24 @@ async function handle(request) {
   if (request.method === "session.open") {
     openParams = request.params;
     sessionId = "fake-session";
+    const responseClock =
+      scenario === "clock-mismatch"
+        ? request.params.clockMode === "controlled"
+          ? "real"
+          : "controlled"
+        : request.params.clockMode ?? "real";
     await send(request, {
       sessionId,
       requestedUrl: request.params.url,
       url: request.params.url,
-      boundary: "controlled_ready",
-      clockMode:
+      boundary: responseClock === "controlled" ? "controlled_ready" : "load_complete",
+      clockMode: responseClock,
+      profile:
         scenario === "clock-mismatch"
           ? request.params.clockMode === "controlled"
-            ? "real"
-            : "controlled"
-          : request.params.clockMode ?? "real",
+            ? null
+            : "controlled-webapp-v1"
+          : request.params.profile ?? null,
     });
     return;
   }
@@ -291,11 +323,32 @@ async function handle(request) {
   applicationOrdinal += 1;
   if (request.method === "action.activate") {
     lastActivateParams = request.params;
+    if (scenario === "command-hang-mutate") return;
     await send(
       request,
       scenario === "invalid-activation-result"
         ? { stateGeneration: "01" }
         : { stateGeneration: "9007199254740996" },
+    );
+    return;
+  }
+  if (request.method === "action.fill") {
+    lastFillParams = request.params;
+    await send(
+      request,
+      scenario === "invalid-fill-result"
+        ? { stateGeneration: "01" }
+        : { stateGeneration: "9007199254740997" },
+    );
+    return;
+  }
+  if (request.method === "dom.query") {
+    lastQueryParams = request.params;
+    await send(
+      request,
+      scenario === "invalid-query-result"
+        ? { count: "01", stateGeneration: "9007199254740998" }
+        : { count: "18446744073709551616", stateGeneration: "9007199254740998" },
     );
     return;
   }
@@ -306,6 +359,35 @@ async function handle(request) {
       scenario === "invalid-text-result"
         ? { value: "ready", stateGeneration: "01" }
         : { value: "ready", stateGeneration: "9007199254740996" },
+    );
+    return;
+  }
+  if (request.method === "dom.extract") {
+    lastExtractParams = request.params;
+    await send(
+      request,
+      scenario === "invalid-extract-result"
+        ? {
+            rows: [{ fields: { first: "one" } }],
+            stateGeneration: "9007199254740999",
+          }
+        : {
+            rows: [
+              {
+                fields: [
+                  { name: "second", value: "<strong>two</strong>" },
+                  { name: "first", value: "one" },
+                ],
+              },
+              {
+                fields: [
+                  { name: "second", value: "<strong>four</strong>" },
+                  { name: "first", value: "three" },
+                ],
+              },
+            ],
+            stateGeneration: "9007199254740999",
+          },
     );
     return;
   }
@@ -332,13 +414,20 @@ async function handle(request) {
           ? lastSettleParams
           : request.params.expression === "__activateParams"
             ? lastActivateParams
+            : request.params.expression === "__fillParams"
+              ? lastFillParams
+              : request.params.expression === "__queryParams"
+                ? lastQueryParams
             : request.params.expression === "__textParams"
               ? lastTextParams
+              : request.params.expression === "__extractParams"
+                ? lastExtractParams
         : { expression: request.params.expression, ordinal: applicationOrdinal };
     await send(request, { value });
     return;
   }
   if (request.method === "runtime.pending") {
+    if (scenario === "command-hang-read") return;
     if (scenario === "malformed") {
       process.stdout.write('{"v":1\n');
       return;

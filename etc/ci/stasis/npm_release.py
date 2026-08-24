@@ -18,7 +18,12 @@ import zlib
 from pathlib import Path
 
 
-VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+")
+VERSION_RE = re.compile(
+    r"(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)"
+    r"(?:-alpha\.(?:0|[1-9][0-9]*))?"
+)
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 POSITIVE_INTEGER_RE = re.compile(r"[1-9][0-9]*")
@@ -125,6 +130,12 @@ def expected_source_identities(revision: str) -> dict[str, str]:
         "stasis_repository": REPOSITORY,
         "stasis_revision": revision,
     }
+
+
+def publish_tag(version: str) -> str:
+    """Return the one permitted npm dist-tag for a supported release version."""
+    fullmatch(VERSION_RE, version, "version")
+    return "alpha" if "-alpha." in version else "latest"
 
 
 def tarball_name(version: str) -> str:
@@ -444,10 +455,13 @@ def verify_tarball(package: Path, version: str) -> None:
         type(publish) is not dict
         or set(publish) != {"access", "tag", "provenance"}
         or require_json_string(publish.get("access"), "SDK publishConfig access") != "public"
-        or require_json_string(publish.get("tag"), "SDK publishConfig tag") != "alpha"
+        or require_json_string(publish.get("tag"), "SDK publishConfig tag")
+        != publish_tag(version)
         or publish.get("provenance") is not True
     ):
-        raise NpmReleaseError("SDK publishConfig is not the exact public alpha provenance policy")
+        raise NpmReleaseError(
+            "SDK publishConfig is not the exact public provenance and dist-tag policy"
+        )
     scripts = metadata.get("scripts", {})
     if not isinstance(scripts, dict) or INSTALL_LIFECYCLE_SCRIPTS.intersection(scripts):
         raise NpmReleaseError("SDK package must not define install lifecycle scripts")
@@ -647,7 +661,7 @@ def verify_proof(
 
 
 def self_test() -> None:
-    version = "0.1.0-alpha.0"
+    version = "0.1.0"
     revision = "2" * 40
     binary_digest = "3" * 64
 
@@ -668,7 +682,7 @@ def self_test() -> None:
             "types": "./dist/index.d.ts",
             "exports": {".": {"types": "./dist/index.d.ts", "import": "./dist/index.js"}},
             "repository": {"type": "git", "url": REPOSITORY},
-            "publishConfig": {"access": "public", "tag": "alpha", "provenance": True},
+            "publishConfig": {"access": "public", "tag": "latest", "provenance": True},
             "scripts": {"prepack": "tsc -p tsconfig.build.json"},
         }
 
@@ -748,7 +762,7 @@ def self_test() -> None:
 
         numeric_provenance_metadata = {
             **metadata,
-            "publishConfig": {"access": "public", "tag": "alpha", "provenance": 1},
+            "publishConfig": {"access": "public", "tag": "latest", "provenance": 1},
         }
         numeric_provenance_package = root / "numeric-provenance" / tarball_name(version)
         write_package(
@@ -759,6 +773,42 @@ def self_test() -> None:
             "numeric package provenance",
             lambda: verify_tarball(numeric_provenance_package, version),
         )
+
+        wrong_stable_tag_package = root / "wrong-stable-tag" / tarball_name(version)
+        write_package(
+            wrong_stable_tag_package,
+            package_metadata={
+                **metadata,
+                "publishConfig": {
+                    "access": "public",
+                    "tag": "alpha",
+                    "provenance": True,
+                },
+            },
+        )
+        expect_error(
+            "stable package using the alpha dist-tag",
+            lambda: verify_tarball(wrong_stable_tag_package, version),
+        )
+
+        alpha_version = "0.1.0-alpha.0"
+        alpha_metadata = {
+            **metadata,
+            "version": alpha_version,
+            "publishConfig": {
+                "access": "public",
+                "tag": "alpha",
+                "provenance": True,
+            },
+        }
+        alpha_package = root / "alpha" / tarball_name(alpha_version)
+        write_package(alpha_package, package_metadata=alpha_metadata)
+        verify_tarball(alpha_package, alpha_version)
+        assert publish_tag(alpha_version) == "alpha"
+        assert publish_tag(version) == "latest"
+
+        expect_error("beta prerelease", lambda: tarball_name("0.1.0-beta.1"))
+        expect_error("leading-zero version", lambda: tarball_name("00.1.0"))
 
         top_level_tag_package = root / "top-level-tag" / tarball_name(version)
         write_package(

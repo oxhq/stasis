@@ -1,6 +1,6 @@
 {
   "name": "@oxhq/stasis",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0",
   "description": "Linear TypeScript client for the Stasis controlled-time Servo runtime",
   "repository": {
     "type": "git",
@@ -26,12 +26,12 @@
   "packageManager": "pnpm@9.12.3",
   "publishConfig": {
     "access": "public",
-    "tag": "alpha",
+    "tag": "latest",
     "provenance": true
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "prepack": "tsc -p tsconfig.build.json",
+    "prepack": "node scripts/validate-package-runtime-manifest.mjs && tsc -p tsconfig.build.json",
     "test": "tsx --test test/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

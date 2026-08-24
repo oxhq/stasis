@@ -32,7 +32,7 @@ use servo_constellation_traits::{
     TargetSnapshotParams,
 };
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
-use timers::DocumentTime;
+use timers::{DocumentTime, DocumentTimeSurface};
 use url::Position;
 
 use crate::dom::bindings::codegen::Bindings::HTMLIFrameElementBinding::HTMLIFrameElementMethods;
@@ -458,6 +458,20 @@ pub(crate) fn navigate(
             let _ = sender.send(WebDriverLoadStatus::NavigationStop);
         }
         return;
+    }
+
+    // controlled-webapp-v1 owns exactly one active top-level document. Refuse an
+    // application-initiated replacement while the initiating document is still authoritative,
+    // before navigation can start a fetch or ask the constellation to create a pipeline. Keeping
+    // the current document intact lets the action response complete determinately; the sticky
+    // clock terminal is then reported by the next settlement as typed unsupported work.
+    // Same-document fragment navigation above does not replace that authority and remains valid.
+    if window_proxy.parent().is_none() {
+        let clock = window.as_global_scope().document_clock();
+        if clock.is_controlled() {
+            let _ = clock.require_surface(DocumentTimeSurface::CrossEventLoopNavigation);
+            return;
+        }
     }
 
     // Step 15. If navigable's parent is non-null, then set navigable's is delaying load events to true.
