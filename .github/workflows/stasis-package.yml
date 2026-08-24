@@ -321,6 +321,7 @@ jobs:
       contents: read
     env:
       GH_TOKEN: ${{ github.token }}
+      RUN_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       STASIS_VERSION: 0.1.0
       STASIS_REVISION: ${{ github.sha }}
     steps:
@@ -347,7 +348,7 @@ jobs:
             "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100" \
             > "$RUNNER_TEMP/native-job-pages.json"
           read -r macos_run_attempt linux_run_attempt < <(
-            RUN_ID="$GITHUB_RUN_ID" HEAD_SHA="$GITHUB_SHA" \
+            RUN_ID="$GITHUB_RUN_ID" HEAD_SHA="$RUN_HEAD_SHA" \
               OVERALL_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" python3 - <<'PY'
           import json
           import os
