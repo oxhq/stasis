@@ -280,8 +280,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Preserve the release binary's bundled-FreeType feature graph on Linux while forcing
+          # servo-net-traits' otherwise-disabled unit-test target.
           cargo test --locked --profile production-stripped \
-            -p servo-net-traits --lib controlled_network::tests \
+            -p stasis-shell -p servo-net-traits --lib controlled_network::tests \
             -- --test-threads=1 --show-output
 
       - name: Build and verify the release archive
