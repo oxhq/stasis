@@ -896,6 +896,37 @@ struct DocumentStateAuthority {
     document_epoch: u64,
     navigation_id: u64,
     history_revision: u64,
+    navigation: SessionNavigationAuthority,
+}
+
+/// Private authority retained for the sole current document-state token.
+///
+/// `runtime.settle` uses this capability to distinguish an internally progressed controlled
+/// source from an arbitrary stale or foreign token. It is deliberately not serializable or
+/// debuggable: public consumers receive only the opaque token, while the shell can recover the
+/// exact owner-attested navigation and monotonic generation which minted it.
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct CurrentDocumentStateAuthority {
+    authority: DocumentStateAuthority,
+    token: DocumentStateToken,
+}
+
+impl CurrentDocumentStateAuthority {
+    #[doc(hidden)]
+    pub fn matches_navigation(&self, navigation: &SessionNavigationAuthority) -> bool {
+        navigation == &self.authority.navigation
+    }
+
+    #[doc(hidden)]
+    pub fn target(&self) -> &PendingTargetObservation {
+        self.authority.navigation.target()
+    }
+
+    #[doc(hidden)]
+    pub const fn state_generation(&self) -> RuntimeStateGeneration {
+        self.authority.state_generation
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -917,6 +948,10 @@ pub struct WireProjectionContext {
     next_source_alias: u128,
     document_state_authority: Option<DocumentStateAuthority>,
     document_state_token: Option<DocumentStateToken>,
+    /// A strict request observed that the latest public token no longer matched the current
+    /// document state. Keep the public capability available to the one narrow `runtime.settle`
+    /// recovery path, but never let strict authorization regain authority through an ABA return.
+    document_state_strictly_invalidated: bool,
     document_token_namespace: Option<OpaqueTokenNamespace>,
     next_document_state_alias: Option<u128>,
 }
@@ -929,6 +964,7 @@ impl Default for WireProjectionContext {
             next_source_alias: 1,
             document_state_authority: None,
             document_state_token: None,
+            document_state_strictly_invalidated: false,
             document_token_namespace: None,
             next_document_state_alias: Some(1),
         }
@@ -998,8 +1034,11 @@ impl WireProjectionContext {
             document_epoch: navigation.document_epoch().get(),
             navigation_id: navigation.navigation_id().get(),
             history_revision: navigation.history_revision().get(),
+            navigation: navigation.clone(),
         };
-        if self.document_state_authority.as_ref() == Some(&authority) {
+        if self.document_state_authority.as_ref() == Some(&authority)
+            && !self.document_state_strictly_invalidated
+        {
             return Ok(self
                 .document_state_token
                 .clone()
@@ -1024,17 +1063,89 @@ impl WireProjectionContext {
         self.next_document_state_alias = alias.checked_add(1);
         self.document_state_authority = Some(authority);
         self.document_state_token = Some(token.clone());
+        self.document_state_strictly_invalidated = false;
         Ok(token)
     }
 
     /// Check supplied document authorization against a freshly observed owner snapshot.
+    ///
+    /// A foreign or superseded token is rejected before fresh authority is inspected. A mismatch
+    /// for the exact latest public token latches that token strict-stale without minting a hidden
+    /// replacement; only the narrow `runtime.settle` capability resolver may still recover it.
+    /// The latch prevents a later byte-identical ABA observation from re-authorizing the token.
     pub fn authorizes_document_state(
         &mut self,
         raw: &RawPendingSnapshot,
         navigation: &SessionNavigationAuthority,
         supplied: &DocumentStateToken,
     ) -> Result<bool, DocumentStateAuthorityError> {
-        Ok(self.document_state_token(raw, navigation)? == *supplied)
+        if self.document_state_token.as_ref() != Some(supplied) {
+            return Ok(false);
+        }
+        if self.document_state_strictly_invalidated {
+            return Ok(false);
+        }
+        if navigation.target() != &raw.target {
+            self.document_state_strictly_invalidated = true;
+            return Err(DocumentStateAuthorityError::NavigationTargetDoesNotMatchPending);
+        }
+        let observed = DocumentStateAuthority {
+            target: raw.target.clone(),
+            state_generation: raw.state_generation,
+            document_epoch: navigation.document_epoch().get(),
+            navigation_id: navigation.navigation_id().get(),
+            history_revision: navigation.history_revision().get(),
+            navigation: navigation.clone(),
+        };
+        if self.document_state_authority.as_ref() == Some(&observed) {
+            Ok(true)
+        } else {
+            self.document_state_strictly_invalidated = true;
+            Ok(false)
+        }
+    }
+
+    /// Resolve only the exact token which is still the current public document capability.
+    ///
+    /// This does not observe or rotate authority. The caller must independently bracket fresh
+    /// document and session-owner observations before using the result, and no earlier token is
+    /// retained for recovery.
+    #[doc(hidden)]
+    pub fn current_document_state_authority(
+        &self,
+        supplied: &DocumentStateToken,
+    ) -> Option<CurrentDocumentStateAuthority> {
+        if self.document_state_token.as_ref() != Some(supplied) {
+            return None;
+        }
+        let authority = self
+            .document_state_authority
+            .as_ref()
+            .expect("the current document token always has retained authority");
+        Some(CurrentDocumentStateAuthority {
+            authority: authority.clone(),
+            token: supplied.clone(),
+        })
+    }
+
+    /// Permanently make the exact current public document capability strict-stale.
+    ///
+    /// The expected private authority must still be the complete current binding. This makes a
+    /// post-resolution stale decision transactional: an intervening public projection can never
+    /// cause a newer token to be invalidated, while a byte-identical ABA return cannot revive the
+    /// capability which the settle bracket already rejected.
+    #[doc(hidden)]
+    pub fn latch_current_document_state_strictly_invalidated(
+        &mut self,
+        expected: &CurrentDocumentStateAuthority,
+    ) -> bool {
+        if self.document_state_token.as_ref() != Some(&expected.token)
+            || self.document_state_authority.as_ref() != Some(&expected.authority)
+        {
+            return false;
+        }
+        self.document_state_strictly_invalidated = true;
+        true
     }
 }
 
@@ -3894,6 +4005,158 @@ mod tests {
     }
 
     #[test]
+    fn failed_document_authorization_does_not_rotate_the_latest_public_binding() {
+        let first = pending_fixture();
+        let navigation = navigation_fixture(&first);
+        let mut context = test_projection_context();
+        let first_token = context.document_state_token(&first, &navigation).unwrap();
+
+        let mut progressed = first.clone();
+        progressed.state_generation = RuntimeStateGeneration::new(ABOVE_JS_SAFE_INTEGER + 1);
+        assert!(
+            !context
+                .authorizes_document_state(&progressed, &navigation, &first_token)
+                .unwrap()
+        );
+        let retained = context
+            .current_document_state_authority(&first_token)
+            .expect("a failed strict authorization must retain the last issued capability");
+        assert!(retained.matches_navigation(&navigation));
+        assert_eq!(retained.target(), &first.target);
+        assert_eq!(retained.state_generation(), first.state_generation);
+
+        let contradictory_navigation = SessionNavigationAuthority::new_internal(
+            Box::new(first.target.clone()),
+            navigation.document_epoch(),
+            navigation.navigation_id(),
+            navigation.history_revision(),
+            navigation.successful_document_replacements(),
+            ServoUrl::parse("https://example.test/contradictory").unwrap(),
+            navigation.terminal(),
+        );
+        assert!(!retained.matches_navigation(&contradictory_navigation));
+        assert!(
+            !context
+                .authorizes_document_state(&first, &contradictory_navigation, &first_token)
+                .unwrap()
+        );
+        assert!(
+            context
+                .current_document_state_authority(&first_token)
+                .is_some()
+        );
+
+        let foreign: DocumentStateToken =
+            serde_json::from_value(json!(test_document_token(99))).unwrap();
+        let mut contradictory_pending = first.clone();
+        contradictory_pending.target.navigation_revision = contradictory_pending
+            .target
+            .navigation_revision
+            .checked_next()
+            .unwrap();
+        assert_eq!(
+            context.authorizes_document_state(&contradictory_pending, &navigation, &foreign,),
+            Ok(false),
+            "a foreign token must fail before contradictory fresh authority is inspected",
+        );
+        assert!(
+            context
+                .current_document_state_authority(&first_token)
+                .is_some()
+        );
+
+        assert!(
+            !context
+                .authorizes_document_state(&first, &navigation, &first_token)
+                .unwrap(),
+            "a strict-stale token must not regain authority after an ABA return",
+        );
+
+        context.next_document_state_alias = None;
+        assert_eq!(
+            context.document_state_token(&progressed, &navigation),
+            Err(DocumentStateAuthorityError::TokenSpaceExhausted),
+        );
+        assert!(
+            context
+                .current_document_state_authority(&first_token)
+                .is_some(),
+            "failed fresh-token allocation must leave the settle capability intact",
+        );
+        assert!(
+            !context
+                .authorizes_document_state(&first, &navigation, &first_token)
+                .unwrap(),
+            "failed fresh-token allocation must leave strict invalidation intact",
+        );
+        context.next_document_state_alias = Some(2);
+
+        let progressed_token = context
+            .document_state_token(&progressed, &navigation)
+            .unwrap();
+        assert_eq!(progressed_token.as_str(), test_document_token(2));
+        assert!(
+            context
+                .current_document_state_authority(&first_token)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn settle_stale_latch_is_transactional_and_prevents_strict_aba_authorization() {
+        let pending = pending_fixture();
+        let navigation = navigation_fixture(&pending);
+        let mut context = test_projection_context();
+        let first_token = context.document_state_token(&pending, &navigation).unwrap();
+        let first_authority = context
+            .current_document_state_authority(&first_token)
+            .expect("the current public token retains private authority");
+
+        assert!(context.latch_current_document_state_strictly_invalidated(&first_authority));
+        assert!(
+            !context
+                .authorizes_document_state(&pending, &navigation, &first_token)
+                .unwrap(),
+            "a byte-identical ABA observation must not revive a settle-rejected token",
+        );
+
+        let mut progressed = pending.clone();
+        progressed.state_generation = RuntimeStateGeneration::new(ABOVE_JS_SAFE_INTEGER + 1);
+        let progressed_token = context
+            .document_state_token(&progressed, &navigation)
+            .unwrap();
+        let progressed_authority = context
+            .current_document_state_authority(&progressed_token)
+            .expect("the newly projected public token retains private authority");
+
+        assert!(
+            !context.latch_current_document_state_strictly_invalidated(&first_authority),
+            "an old settle capability must not invalidate a newer public binding",
+        );
+        assert!(
+            context
+                .authorizes_document_state(&progressed, &navigation, &progressed_token)
+                .unwrap(),
+            "a failed old-authority latch must leave the newer token authorized",
+        );
+        assert!(context.latch_current_document_state_strictly_invalidated(&progressed_authority));
+
+        let returned_token = context.document_state_token(&pending, &navigation).unwrap();
+        assert_ne!(returned_token, first_token);
+        assert_ne!(returned_token, progressed_token);
+        assert!(
+            !context.latch_current_document_state_strictly_invalidated(&first_authority),
+            "an old A capability must not invalidate a newer A token after an A-B-A return",
+        );
+        assert!(
+            context
+                .authorizes_document_state(&pending, &navigation, &returned_token)
+                .unwrap(),
+            "the failed token1 latch must leave byte-identical token3 authorized",
+        );
+    }
+
+    #[test]
     fn document_state_tokens_are_domain_separated_and_strict() {
         let wire = test_document_token(7);
         let token: DocumentStateToken = serde_json::from_value(json!(wire)).unwrap();
@@ -4666,6 +4929,80 @@ mod tests {
         assert_eq!(profile["targetRelease"], "0.2.0");
         assert_eq!(profile["compatibility"]["maximumOpaqueTokenBytes"], 256);
         assert_eq!(profile["documentAuthority"]["namespaceBits"], 128);
+        assert_eq!(
+            profile["documentAuthority"]["rotationLinearization"],
+            "next_successful_public_token_projection_after_a_bound_fact_change"
+        );
+        assert_eq!(
+            profile["documentAuthority"]["strictAuthorization"]["foreignOrSupersededToken"],
+            "reject_before_fresh_authority_inspection_without_changing_the_current_binding"
+        );
+        assert_eq!(
+            profile["documentAuthority"]["strictAuthorization"]["currentMismatch"],
+            "retain_latest_public_binding_but_latch_it_strict_stale_without_hidden_token_issuance"
+        );
+        assert_eq!(
+            profile["documentAuthority"]["strictAuthorization"]["abaReturn"],
+            "remains_strict_stale_until_a_fresh_public_token_is_successfully_issued"
+        );
+        assert_eq!(
+            profile["documentAuthority"]["strictAuthorization"]["failedFreshTokenAllocation"],
+            "latest_public_binding_and_strict_stale_latch_remain_unchanged"
+        );
+        let settle_continuation = &profile["documentAuthority"]["settleContinuation"];
+        assert_eq!(settle_continuation["method"], "runtime.settle");
+        assert_eq!(
+            settle_continuation["eligibleToken"],
+            "exact_latest_publicly_issued_binding_including_a_strict_stale_latch"
+        );
+        assert_eq!(
+            settle_continuation["scope"],
+            "same_document_only_no_cross_document_successor"
+        );
+        assert_eq!(
+            settle_continuation["authorizationBracket"],
+            "pump_suppressed_passive_N1_then_document_observe_D_then_pump_suppressed_passive_N2"
+        );
+        assert_eq!(
+            settle_continuation["navigationAuthority"],
+            "exact_full_N1_equals_N2_and_equals_retained_authority"
+        );
+        assert_eq!(
+            settle_continuation["runtimeStateGeneration"],
+            "D_generation_greater_than_or_equal_to_retained_generation"
+        );
+        assert_eq!(
+            settle_continuation["nearMiss"],
+            "validated_nonterminal_N1_D_or_N2_authority_mismatch_latches_the_exact_current_binding_then_stale_state_token_nonfatal_state_effect_none_before_coordinator_start"
+        );
+        assert_eq!(
+            settle_continuation["documentObservationRejection"],
+            "validated_target_changed_or_replacement_pipeline_bootstrap_required_is_a_near_miss_invalid_payload_is_fatal"
+        );
+        assert_eq!(
+            settle_continuation["terminalPrecedence"],
+            "typed_session_navigation_terminal_or_application_failure_precedes_stale_state_token_at_N1_or_N2_and_never_starts_the_coordinator"
+        );
+        assert_eq!(
+            settle_continuation["coordinatorSeed"],
+            "the_exact_completed_D_observation_through_the_normal_initial_observe_transition"
+        );
+        assert_eq!(
+            settle_continuation["knownStalePreflight"],
+            "sticky_controlled_network_failure_precedes_stale_rejection_otherwise_no_engine_work_or_pump"
+        );
+        assert_eq!(
+            profile["documentAuthority"]["recoveryMethod"],
+            "runtime.pending"
+        );
+        assert_eq!(
+            profile["automation"]["linearization"]["strictMethods"],
+            "script_owner_revalidates_exact_document_identity_and_generation_before_execution"
+        );
+        assert_eq!(
+            profile["automation"]["linearization"]["runtime.settle"],
+            "documentAuthority.settleContinuation"
+        );
         assert_eq!(profile["sessionStateAuthority"]["namespaceBits"], 128);
         assert_eq!(
             profile["sessionStateAuthority"]["successfulMutationMethods"],

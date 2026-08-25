@@ -302,6 +302,40 @@ impl SettleCoordinator {
         self.issue_command(DocumentControlCommand::Observe, None)
     }
 
+    /// Begin settlement from the exact completed Observe accepted by the shell's token-
+    /// authorization bracket.
+    ///
+    /// The shell already owns this non-mutating outcome, so issuing a second Observe would create
+    /// an unnecessary authority gap before the coordinator starts. Arm the ordinary initial
+    /// Observe internally and consume the supplied outcome through the same validation,
+    /// target/clock initialization, wall-I/O accounting, and decision path as a normally returned
+    /// command. No control turn is counted.
+    pub fn start_with_observe_outcome(
+        &mut self,
+        outcome: DocumentControlReceiveOutcome,
+        cumulative_external_io_wall_time: Duration,
+    ) -> Result<SettleProgress, SettleFailure> {
+        let result =
+            self.start_with_observe_outcome_inner(outcome, cumulative_external_io_wall_time);
+        self.guard_result(result)
+    }
+
+    fn start_with_observe_outcome_inner(
+        &mut self,
+        outcome: DocumentControlReceiveOutcome,
+        cumulative_external_io_wall_time: Duration,
+    ) -> Result<SettleProgress, SettleFailure> {
+        match self.start_inner()? {
+            SettleProgress::Command(DocumentControlCommand::Observe) => {},
+            _ => {
+                return Err(SettleFailure::InvalidCoordinatorState(
+                    "initial settlement did not arm its authoritative Observe",
+                ));
+            },
+        }
+        self.consume_receive_outcome_inner(outcome, cumulative_external_io_wall_time)
+    }
+
     /// Begin settlement after the session owner has already attested one exact pending
     /// top-level replacement. The bootstrap is lifecycle reconciliation: it must run before an
     /// ordinary Observe can describe the captured target because ScriptThread has not yet
@@ -1671,6 +1705,58 @@ mod tests {
         assert_observe(coordinator.start().unwrap());
         assert_eq!(
             coordinator.start(),
+            Err(SettleFailure::InvalidCoordinatorState(
+                "settlement has already started"
+            ))
+        );
+    }
+
+    #[test]
+    fn token_authorizing_observe_can_seed_the_same_coordinator_path_without_a_second_command() {
+        let pending = Fixture::new().snapshot(2, 1);
+
+        let mut ordinary = SettleCoordinator::new(SettlePolicy::default());
+        assert_observe(ordinary.start().unwrap());
+        let ordinary_progress = ordinary
+            .consume_receive_outcome(
+                received(DocumentControlAction::Observed, pending.clone(), None),
+                Duration::ZERO,
+            )
+            .unwrap();
+
+        let mut seeded = SettleCoordinator::new(SettlePolicy::default());
+        let seeded_progress = seeded
+            .start_with_observe_outcome(
+                received(DocumentControlAction::Observed, pending, None),
+                Duration::ZERO,
+            )
+            .unwrap();
+
+        assert_eq!(seeded_progress, ordinary_progress);
+        assert_eq!(seeded.control_turns, 0);
+        assert_eq!(seeded.initial_target, ordinary.initial_target);
+        assert_eq!(seeded.last_target, ordinary.last_target);
+        assert_eq!(seeded.initial_clock_id, ordinary.initial_clock_id);
+        assert_eq!(seeded.phase, ordinary.phase);
+        assert_eq!(
+            seeded
+                .in_flight
+                .as_ref()
+                .map(|in_flight| &in_flight.command),
+            ordinary
+                .in_flight
+                .as_ref()
+                .map(|in_flight| &in_flight.command),
+        );
+        assert_eq!(
+            seeded.start_with_observe_outcome(
+                received(
+                    DocumentControlAction::Observed,
+                    Fixture::new().snapshot(2, 1),
+                    None,
+                ),
+                Duration::ZERO,
+            ),
             Err(SettleFailure::InvalidCoordinatorState(
                 "settlement has already started"
             ))

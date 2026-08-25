@@ -146,6 +146,13 @@ session API requires a fresh document state token from `openSession()`,
 of acting on a changed document. Cookie and storage mutations use a separate
 session-state token. `query()` returns a bounded match count, never handles, and
 `extract()` returns ordered text, HTML, raw-attribute, or resolved-URL fields.
+The only relaxation is `settle()`: the sole latest-issued token may consume
+monotonic work admitted on that exact same document after the preceding result,
+which is what makes `submit()` followed immediately by `settle()` race-free.
+Valid nonterminal bracket drift latches that exact token stale; a typed
+navigation terminal keeps its typed outcome and settlement never starts.
+Actions, inspection, advancement, and explicit navigation remain exact-token
+operations, and a token can never cross into another document.
 The legacy v1 API keeps its numeric state-generation contract. Screenshot,
 replay, and time-travel methods are not part of the v0.2 surface.
 
