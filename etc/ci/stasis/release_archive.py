@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and verify the exact Stasis 0.2.0 native release archives."""
+"""Build and verify the exact Stasis 0.2.1 native release archives."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import BinaryIO, Iterable
 
 
-STABLE_VERSION = "0.2.0"
+STABLE_VERSION = "0.2.1"
 VERSION_RE = re.compile(re.escape(STABLE_VERSION))
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -1055,7 +1055,13 @@ def self_test() -> None:
         else:
             raise ReleaseError("self-test accepted Linux metadata as macOS metadata")
 
-        for invalid_version in ("0.1.0-alpha.0", "0.2.0-alpha.0", "0.2.1", "v0.2.0"):
+        for invalid_version in (
+            "0.1.0-alpha.0",
+            "0.2.0-alpha.0",
+            "0.2.0",
+            "0.2.2",
+            "v0.2.1",
+        ):
             try:
                 validate_identity(invalid_version, "macos-aarch64", revision, repository)
             except ReleaseError:

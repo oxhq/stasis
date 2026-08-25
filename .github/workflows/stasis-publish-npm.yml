@@ -9,7 +9,7 @@ on:
       release_tag:
         description: Immutable stable release tag to verify
         required: true
-        default: v0.2.0
+        default: v0.2.1
         type: string
       publication_run_id:
         description: Release-event workflow run that published the npm package
@@ -41,11 +41,11 @@ jobs:
             github.event_name == 'release'
               && github.event.release.draft == false
               && github.event.release.prerelease == false
-              && github.event.release.tag_name == 'v0.2.0'
+              && github.event.release.tag_name == 'v0.2.1'
           )
           || (
             github.event_name == 'workflow_dispatch'
-              && inputs.release_tag == 'v0.2.0'
+              && inputs.release_tag == 'v0.2.1'
           )
         )
     runs-on: macos-15
@@ -158,8 +158,8 @@ jobs:
           cargo_version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("ports/stasis/Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')
           sdk_version=$(node -p 'JSON.parse(require("node:fs").readFileSync("sdk/typescript/package.json", "utf8")).version')
           version=${TAG#v}
-          if [[ "$version" != '0.2.0' || "$cargo_version" != "$version" || "$sdk_version" != "$version" ]]; then
-            echo 'native, SDK, and release tag versions do not match stable 0.2.0' >&2
+          if [[ "$version" != '0.2.1' || "$cargo_version" != "$version" || "$sdk_version" != "$version" ]]; then
+            echo 'native, SDK, and release tag versions do not match stable 0.2.1' >&2
             exit 1
           fi
           bundle="stasis-${version}-${STASIS_PLATFORM}"
@@ -1137,7 +1137,7 @@ jobs:
           prepublish_run_attempt = os.environ["PREPUBLISH_RUN_ATTEMPT"]
           current_publish_attempt = os.environ["GITHUB_RUN_ATTEMPT"]
           binary_digest = os.environ["STASIS_NATIVE_BINARY_SHA256"]
-          if version != "0.2.0":
+          if version != "0.2.1":
               raise SystemExit("invalid staged SDK version")
           if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
               raise SystemExit("invalid staged SDK revision")

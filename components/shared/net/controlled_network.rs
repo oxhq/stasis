@@ -29,9 +29,10 @@ use crate::network_fixture::{
 pub const MAX_CONTROLLED_NETWORK_ACTIVE_OPERATIONS: usize = 512;
 
 /// Completed redirect hops whose Servo navigation replay has not begun yet. Top-level navigation
-/// redirects cross an asynchronous `FetchRedirect` boundary, so their 3xx terminal necessarily
-/// arrives before the successor request. Retaining only this opaque hop identity keeps that
-/// immediate lineage available without retaining request metadata or allowing unbounded growth.
+/// redirects cross an asynchronous `FetchRedirect` boundary, but the successor request and the
+/// predecessor terminal can arrive in either order. Retaining only this opaque hop identity keeps
+/// that immediate lineage available without retaining request metadata or allowing unbounded
+/// growth.
 const MAX_RETIRED_REDIRECT_PREDECESSORS: usize = MAX_CONTROLLED_NETWORK_ACTIVE_OPERATIONS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -134,6 +135,8 @@ pub enum ControlledNetworkCookieFailure {
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct ActiveRequest {
     request_id: NetworkRequestId,
+    // The successor has consumed this request's lineage, but its terminal evidence is still due.
+    redirect_successor_claimed: bool,
 }
 
 struct ControlledNetworkInner {
@@ -190,8 +193,8 @@ impl ControlledNetworkSession {
         inner.begin(request)
     }
 
-    /// Report a Net-owned terminal. Redirect predecessors may already have been retired when their
-    /// successor began; those late terminal notices are intentionally idempotent.
+    /// Report a Net-owned terminal. A redirect successor and its predecessor terminal may arrive
+    /// in either order; successor-first predecessors remain active until their terminal is known.
     pub fn live_terminal(&self, load_id: WebResourceLoadId, terminal: ControlledNetworkTerminal) {
         let mut inner = self.0.lock();
         let Some(active) = inner.active.remove(&load_id) else {
@@ -209,7 +212,9 @@ impl ControlledNetworkSession {
                 inner.record(NetworkEvidenceEvent::RequestCompleted {
                     request_id: active.request_id,
                 });
-                if is_redirect_status(status) {
+                if active.redirect_successor_claimed && !is_redirect_status(status) {
+                    inner.latch(ControlledNetworkFailure::LifecycleInvariant);
+                } else if is_redirect_status(status) && !active.redirect_successor_claimed {
                     inner.retain_redirect_predecessor(load_id, active.request_id);
                 }
             },
@@ -218,12 +223,18 @@ impl ControlledNetworkSession {
                     request_id: active.request_id,
                     reason: NetworkFailureReason::NetworkError,
                 });
+                if active.redirect_successor_claimed {
+                    inner.latch(ControlledNetworkFailure::LifecycleInvariant);
+                }
             },
             ControlledNetworkTerminal::CookiePolicyRejected(failure) => {
                 inner.record(NetworkEvidenceEvent::RequestFailed {
                     request_id: active.request_id,
                     reason: NetworkFailureReason::NetworkError,
                 });
+                if active.redirect_successor_claimed {
+                    inner.latch(ControlledNetworkFailure::LifecycleInvariant);
+                }
                 inner.latch(match failure {
                     ControlledNetworkCookieFailure::SameSiteContextUnsupported => {
                         ControlledNetworkFailure::CookieSameSiteContextUnsupported
@@ -426,8 +437,13 @@ impl ControlledNetworkInner {
                     request_id,
                     decision: RouteEvidenceDecision::FixtureFulfill,
                 });
-                self.active
-                    .insert(request.load_id, ActiveRequest { request_id });
+                self.active.insert(
+                    request.load_id,
+                    ActiveRequest {
+                        request_id,
+                        redirect_successor_claimed: false,
+                    },
+                );
                 ControlledNetworkAction::Fulfill { handle, response }
             },
             FixtureDecision::Abort { abort, .. } => {
@@ -463,8 +479,13 @@ impl ControlledNetworkInner {
                     request_id,
                     decision: RouteEvidenceDecision::Live,
                 });
-                self.active
-                    .insert(request.load_id, ActiveRequest { request_id });
+                self.active.insert(
+                    request.load_id,
+                    ActiveRequest {
+                        request_id,
+                        redirect_successor_claimed: false,
+                    },
+                );
                 ControlledNetworkAction::Passthrough { handle }
             },
         }
@@ -484,7 +505,8 @@ impl ControlledNetworkInner {
         &mut self,
         load_id: WebResourceLoadId,
     ) -> Option<NetworkRequestId> {
-        if let Some(active) = self.active.remove(&load_id) {
+        if let Some(active) = self.active.get_mut(&load_id) {
+            active.redirect_successor_claimed = true;
             return Some(active.request_id);
         }
         let request_id = self.retired_redirect_predecessors.remove(&load_id)?;
@@ -695,25 +717,92 @@ mod tests {
     }
 
     #[test]
-    fn redirect_successor_retires_and_links_its_stable_parent() {
+    fn redirect_successor_before_terminal_retains_and_links_its_stable_parent() {
         let session = fixture_session("live", json!([]));
         let first_url = Url::parse("https://example.test/start").unwrap();
         let next_url = Url::parse("https://example.test/next").unwrap();
-        assert!(matches!(
-            session.begin(request(5, 0, &first_url, Some(0))),
-            ControlledNetworkAction::Passthrough { .. }
-        ));
-        assert!(matches!(
-            session.begin(request(5, 1, &next_url, Some(0))),
-            ControlledNetworkAction::Passthrough { .. }
-        ));
+        let first = match session.begin(request(5, 0, &first_url, Some(0))) {
+            ControlledNetworkAction::Passthrough { handle } => handle,
+            _ => panic!("expected live predecessor"),
+        };
+        let successor = match session.begin(request(5, 1, &next_url, Some(0))) {
+            ControlledNetworkAction::Passthrough { handle } => handle,
+            _ => panic!("expected live successor"),
+        };
+        assert_eq!(session.snapshot().active_operations, 2);
+
+        session.live_terminal(
+            first.load_id(),
+            ControlledNetworkTerminal::Completed {
+                status: 302,
+                response_bytes: 0,
+            },
+        );
         assert_eq!(session.snapshot().active_operations, 1);
 
         let requests = serde_json::to_value(session.requests_page(None, 16).unwrap()).unwrap();
         assert_eq!(requests["records"][1]["redirectParentId"], "1");
-        let evidence = serde_json::to_string(&session.evidence_page(None, 16).unwrap()).unwrap();
-        assert!(evidence.contains("\"kind\":\"redirect\""));
-        assert!(evidence.contains("\"nextRequestId\":\"2\""));
+        let evidence = serde_json::to_value(session.evidence_page(None, 16).unwrap()).unwrap();
+        let records = evidence["records"].as_array().unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| { record["kind"] == "redirect" && record["nextRequestId"] == "2" })
+        );
+        assert!(records.iter().any(|record| {
+            record["kind"] == "response_headers"
+                && record["requestId"] == "1"
+                && record["status"] == 302
+        }));
+        assert!(
+            records.iter().any(|record| {
+                record["kind"] == "request_completed" && record["requestId"] == "1"
+            })
+        );
+
+        {
+            let inner = session.0.lock();
+            assert!(inner.retired_redirect_predecessors.is_empty());
+            assert!(inner.retired_redirect_order.is_empty());
+        }
+        session.live_terminal(
+            successor.load_id(),
+            ControlledNetworkTerminal::Completed {
+                status: 200,
+                response_bytes: 0,
+            },
+        );
+        assert_eq!(session.snapshot().active_operations, 0);
+    }
+
+    #[test]
+    fn redirect_successor_before_non_redirect_terminal_fails_closed() {
+        let session = fixture_session("live", json!([]));
+        let first_url = Url::parse("https://example.test/start").unwrap();
+        let next_url = Url::parse("https://example.test/next").unwrap();
+        let first = match session.begin(request(13, 0, &first_url, Some(0))) {
+            ControlledNetworkAction::Passthrough { handle } => handle,
+            _ => panic!("expected live predecessor"),
+        };
+        assert!(matches!(
+            session.begin(request(13, 1, &next_url, Some(0))),
+            ControlledNetworkAction::Passthrough { .. }
+        ));
+
+        session.live_terminal(
+            first.load_id(),
+            ControlledNetworkTerminal::Completed {
+                status: 200,
+                response_bytes: 0,
+            },
+        );
+
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.active_operations, 1);
+        assert_eq!(
+            snapshot.sticky_failure,
+            Some(ControlledNetworkFailure::LifecycleInvariant)
+        );
     }
 
     #[test]
@@ -726,8 +815,7 @@ mod tests {
             _ => panic!("expected live predecessor"),
         };
 
-        // Navigation redirects use Servo's asynchronous FetchRedirect replay. Net therefore
-        // reports the 3xx hop terminal before the next request invocation can begin.
+        // Exercise the terminal-first half of the two accepted redirect notification orders.
         session.live_terminal(
             first.load_id(),
             ControlledNetworkTerminal::Completed {

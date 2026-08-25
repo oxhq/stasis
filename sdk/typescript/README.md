@@ -10,10 +10,10 @@ single FIFO protocol lane.
 pnpm add @oxhq/stasis
 ```
 
-Select the stable release exactly with `pnpm add @oxhq/stasis@0.2.0`.
+Select the current stable patch exactly with `pnpm add @oxhq/stasis@0.2.1`.
 
-The release pairs `@oxhq/stasis@0.2.0` with native implementation
-`stasis-shell` version `0.2.0`, sourced from
+The release pairs `@oxhq/stasis@0.2.1` with native implementation
+`stasis-shell` version `0.2.1`, sourced from
 `https://github.com/oxhq/stasis.git`. Node.js 20 or newer is required. The
 SDK has no install lifecycle scripts or runtime dependencies. On the release's
 macOS Apple Silicon and Linux x86-64 targets, `launch()` downloads the exact release
