@@ -1,6 +1,10 @@
 # Stasis 0.2 release train
 
-`v0.2.0` is the controlled web-session release. It keeps the frozen
+`v0.2.1` is the current controlled web-session release. It supersedes the
+immutable `v0.2.0` bytes with one focused correction: redirect predecessors
+remain pending until their terminal callback even when the successor request
+starts first, so bounded evidence cannot omit the predecessor's response
+headers or completion. It keeps the frozen
 `controlled-webapp-v1` document contract available through the legacy API and
 adds the separately named `controlled-web-session-v1` profile. The new profile
 binds navigation and document authority, session cookies and Web Storage,
@@ -10,32 +14,32 @@ pool/crawler helpers. The stable product boundary is specified in
 `docs/stasis/session-v0.2.md` and
 `profiles/controlled-web-session-v1.json`.
 
-The release identity is exact: native `stasis-shell` version `0.2.0`, SDK
-`@oxhq/stasis@0.2.0`, and GitHub tag `v0.2.0`. The release workflows reject
+The release identity is exact: native `stasis-shell` version `0.2.1`, SDK
+`@oxhq/stasis@0.2.1`, and GitHub tag `v0.2.1`. The release workflows reject
 every other stable or prerelease identity. The native matrix remains deliberately
 bounded to Linux x86-64 and macOS arm64, with the same compatibility,
 ten-member archive, checksum, source-identity, and provenance contracts used by
-the first stable train. `etc/ci/stasis/release_archive.py` accepts only `0.2.0`
-for newly produced release archives; this does not alter or re-authorize any
-historical `0.1.x` bytes.
+the first stable train. `etc/ci/stasis/release_archive.py` accepts only `0.2.1`
+for newly produced release archives; this does not alter or re-authorize the
+historical `v0.2.0` or `0.1.x` bytes.
 
-The exact `v0.2.0` GitHub release inventory is nine assets:
+The exact `v0.2.1` GitHub release inventory is nine assets:
 
-- `stasis-0.2.0-macos-aarch64.tar.gz`
-- `stasis-0.2.0-macos-aarch64.tar.gz.sha256`
-- `stasis-0.2.0-macos-aarch64.binary.sha256`
-- `stasis-0.2.0-macos-aarch64-act-settle-inspect.json`
-- `stasis-0.2.0-linux-x86_64.tar.gz`
-- `stasis-0.2.0-linux-x86_64.tar.gz.sha256`
-- `stasis-0.2.0-linux-x86_64.binary.sha256`
-- `stasis-0.2.0-linux-x86_64-act-settle-inspect.json`
-- `stasis-0.2.0-runtime-manifest.json`
+- `stasis-0.2.1-macos-aarch64.tar.gz`
+- `stasis-0.2.1-macos-aarch64.tar.gz.sha256`
+- `stasis-0.2.1-macos-aarch64.binary.sha256`
+- `stasis-0.2.1-macos-aarch64-act-settle-inspect.json`
+- `stasis-0.2.1-linux-x86_64.tar.gz`
+- `stasis-0.2.1-linux-x86_64.tar.gz.sha256`
+- `stasis-0.2.1-linux-x86_64.binary.sha256`
+- `stasis-0.2.1-linux-x86_64-act-settle-inspect.json`
+- `stasis-0.2.1-runtime-manifest.json`
 
 The npm tarball and its SDK proof remain attempt-qualified Actions artifacts,
 not GitHub release assets. Build provenance covers all release assets and the
 SDK package/proof. The SDK's checked-in generated runtime-manifest module is an
 intentionally mismatched historical alpha placeholder: local `prepack` fails
-closed until the credential-free package job generates the exact `v0.2.0`
+closed until the credential-free package job generates the exact `v0.2.1`
 manifest from both verified native archives.
 
 ## 0.2 package and product gates
@@ -94,27 +98,36 @@ gh workflow run stasis-package.yml \
   --repo oxhq/stasis \
   --ref main \
   -f package_run_id=REPLACE_WITH_SUCCESSFUL_MAIN_PUSH_RUN_ID \
-  -f release_tag=v0.2.0
+  -f release_tag=v0.2.1
 ```
 
 After the exact draft is inspected and published as an immutable,
 non-prerelease GitHub release, the release event may publish only
-`@oxhq/stasis@0.2.0` with npm trusted publishing and provenance. The exact
+`@oxhq/stasis@0.2.1` with npm trusted publishing and provenance. The exact
 post-publication dist-tag map is:
 
 ```json
 {
   "alpha": "0.1.0-alpha.0",
-  "latest": "0.2.0"
+  "latest": "0.2.1"
 }
 ```
 
 The workflow fails if the immutable historical `alpha` tag moves, `latest`
-does not point to `0.2.0`, any unexpected dist-tag appears, public registry
+does not point to `0.2.1`, any unexpected dist-tag appears, public registry
 bytes differ from the staged tarball, provenance/signature verification fails,
 or either anonymous North Star fails. Manual npm-workflow dispatch remains
 read-only recovery tied to the original release-event run and attempt; it may
 never publish or retag.
+
+## Stasis v0.2.0 release history (immutable)
+
+`v0.2.0` first published the `controlled-web-session-v1` surface. Its GitHub
+release, native assets, npm package, provenance, and tag remain immutable. The
+initial Linux post-publication run exposed a scheduler-dependent redirect
+evidence ordering race; an exact read-only recovery run subsequently passed,
+but that rerun did not erase the defect. `v0.2.1` is the corrective stable
+package and the only 0.2 release that should remain on npm `latest`.
 
 # Stasis 0.1 release history (immutable)
 

@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       release_tag:
-        description: Exact stable Stasis release tag; v0.2.0 is the only accepted value
+        description: Exact stable Stasis release tag; v0.2.1 is the only accepted value
         required: false
         type: string
   push:
@@ -28,7 +28,7 @@ env:
   RUST_BACKTRACE: 1
   STASIS_FROZEN_V1_PROFILE_SHA256: 6e262edf0f8be11a1cece28f68f00d59fdac68b79b0a670ac891d36998720100
   STASIS_FROZEN_V2_PROFILE_SHA256: 9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a
-  STASIS_RELEASE_VERSION: 0.2.0
+  STASIS_RELEASE_VERSION: 0.2.1
 
 jobs:
   validate-invocation:
@@ -276,6 +276,16 @@ jobs:
               -p stasis-shell --test controlled_mvp \
               -- --test-threads=1 --show-output
 
+      - name: Gate controlled-network redirect ordering invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Preserve the release binary's bundled-FreeType feature graph on Linux while forcing
+          # servo-net-traits' otherwise-disabled unit-test target.
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-net-traits --lib controlled_network::tests \
+            -- --test-threads=1 --show-output
+
       - name: Build and verify the release archive
         shell: bash
         run: |
@@ -375,7 +385,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RUN_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      STASIS_VERSION: 0.2.0
+      STASIS_VERSION: 0.2.1
       STASIS_REVISION: ${{ github.sha }}
     steps:
       - name: Check out the exact event commit
@@ -662,7 +672,7 @@ jobs:
               "linux-x86_64": os.environ["LINUX_RUN_ATTEMPT"],
           }
           repository = os.environ["GITHUB_REPOSITORY"]
-          if version != "0.2.0" or not re.fullmatch(r"[0-9a-f]{40}", revision):
+          if version != "0.2.1" or not re.fullmatch(r"[0-9a-f]{40}", revision):
               raise SystemExit("runtime manifest release identity is invalid")
           upstream = tomllib.loads(pathlib.Path("STASIS_UPSTREAM.toml").read_text(encoding="utf-8"))
           expected_upstream_keys = {
@@ -952,7 +962,7 @@ jobs:
       - name: Recheck exact identities and digests without repository code
         shell: bash
         env:
-          STASIS_VERSION: 0.2.0
+          STASIS_VERSION: 0.2.1
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -1672,17 +1682,17 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: |
-            release-assets/macos-aarch64/stasis-0.2.0-macos-aarch64.tar.gz
-            release-assets/macos-aarch64/stasis-0.2.0-macos-aarch64.tar.gz.sha256
-            release-assets/macos-aarch64/stasis-0.2.0-macos-aarch64.binary.sha256
-            gate-proof/macos-aarch64/stasis-0.2.0-macos-aarch64-act-settle-inspect.json
-            release-assets/linux-x86_64/stasis-0.2.0-linux-x86_64.tar.gz
-            release-assets/linux-x86_64/stasis-0.2.0-linux-x86_64.tar.gz.sha256
-            release-assets/linux-x86_64/stasis-0.2.0-linux-x86_64.binary.sha256
-            gate-proof/linux-x86_64/stasis-0.2.0-linux-x86_64-act-settle-inspect.json
-            runtime-manifest/stasis-0.2.0-runtime-manifest.json
-            sdk-proof/oxhq-stasis-0.2.0.tgz
-            sdk-proof/stasis-0.2.0-typescript-act-settle-inspect.json
+            release-assets/macos-aarch64/stasis-0.2.1-macos-aarch64.tar.gz
+            release-assets/macos-aarch64/stasis-0.2.1-macos-aarch64.tar.gz.sha256
+            release-assets/macos-aarch64/stasis-0.2.1-macos-aarch64.binary.sha256
+            gate-proof/macos-aarch64/stasis-0.2.1-macos-aarch64-act-settle-inspect.json
+            release-assets/linux-x86_64/stasis-0.2.1-linux-x86_64.tar.gz
+            release-assets/linux-x86_64/stasis-0.2.1-linux-x86_64.tar.gz.sha256
+            release-assets/linux-x86_64/stasis-0.2.1-linux-x86_64.binary.sha256
+            gate-proof/linux-x86_64/stasis-0.2.1-linux-x86_64-act-settle-inspect.json
+            runtime-manifest/stasis-0.2.1-runtime-manifest.json
+            sdk-proof/oxhq-stasis-0.2.1.tgz
+            sdk-proof/stasis-0.2.1-typescript-act-settle-inspect.json
 
   verify-promotion:
     name: Verify immutable promotion inputs
@@ -2723,7 +2733,7 @@ jobs:
           cat > release-notes.md <<EOF
           # Stasis $TAG
 
-          First supported Stasis controlled web-session release.
+          Corrective Stasis controlled web-session release.
 
           - Exact source commit: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$HEAD_SHA
           - Package and gate run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID
@@ -2735,6 +2745,9 @@ jobs:
           Stasis 0.2 preserves the frozen controlled-webapp-v1 contract and adds
           controlled-web-session-v1 navigation, session state, network evidence, and
           crawler-grade extraction. Both profiles fail closed outside their declared surface.
+
+          This patch retains redirect predecessors until their terminal callback even when
+          a successor begins first, preserving complete response evidence in either ordering.
 
           This draft contains both native archives, archive and binary SHA-256 sidecars,
           artifact-bound native gate proofs, and the exact runtime distribution manifest

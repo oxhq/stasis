@@ -26,8 +26,8 @@ boundary.
 Current release status:
 
 - Servo base and Pliego donor revisions are pinned in `STASIS_UPSTREAM.toml`.
-- `ports/stasis` is versioned for the stable `v0.2.0` release and retains the
-  frozen `controlled-webapp-v1` surface. The separately named
+- `ports/stasis` is versioned for the corrective stable `v0.2.1` release and
+  retains the frozen `controlled-webapp-v1` surface. The separately named
   `controlled-web-session-v1` profile adds document/navigation token authority,
   checked top-level replacement and history changes, semantic forms, practical
   selectors and URL/attribute extraction, bounded cookie and Web Storage state,
@@ -38,15 +38,19 @@ Current release status:
   replacement documents on that same event loop. Unsupported or open-ended
   work is reported as a typed outcome instead of silently falling back to
   uncontrolled progress.
-- `sdk/typescript` provides the matching stable `@oxhq/stasis@0.2.0`
+- `sdk/typescript` provides the matching stable `@oxhq/stasis@0.2.1`
   client plus process-isolated session pooling and crawling helpers. The release
   workflows bind the SDK and both native archives to one source revision, retain
   the frozen v0.1 fixture gate, and add the multi-navigation/session-state North
   Star before promotion.
-- This source version is not a publication claim. `v0.2.0` becomes released
+- This source version is not a publication claim. `v0.2.1` becomes released
   only after the macOS arm64 and Linux x86-64 provenance gates, immutable GitHub
   release, npm trusted publication, anonymous managed-runtime verification, and
   both public North Stars pass.
+- The immutable `v0.2.0` artifacts remain release history. `v0.2.1` corrects
+  a redirect-evidence ordering race in which a successor request could begin
+  before its predecessor's terminal callback and omit that predecessor's
+  response evidence.
 - The owner-loop progress path contains no polling sleeps; this is not a claim
   about every shutdown path inherited from upstream Servo. The frozen v1 wire
   methods and exclusions are defined in `docs/stasis/protocol-v1.md`; the v0.2
