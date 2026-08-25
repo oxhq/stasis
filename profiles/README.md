@@ -35,3 +35,11 @@ Document state and session state are separate authorities in the session profile
 `sessionStateToken` binds cookies and Web Storage, which survive document replacement. Neither can
 substitute for the other, and exported session state is sensitive data that must not enter bounded
 diagnostic evidence.
+
+All document-targeting operations require exact current authority. `runtime.settle` has one
+explicitly frozen continuation exception: the sole latest-issued token may drain monotonic
+same-document work admitted after that token was returned, but only across a pump-suppressed
+N1/document/N2 bracket with identical full navigation authority. It never authorizes a different
+document. Valid nonterminal bracket drift transactionally latches that exact binding stale, while
+typed navigation terminals keep their typed result and never start settlement. The next
+successfully issued token revokes every earlier token.

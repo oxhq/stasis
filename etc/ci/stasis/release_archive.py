@@ -31,7 +31,7 @@ FROZEN_V1_PROFILE_SHA256 = (
 )
 FROZEN_V2_PROFILE = Path("profiles/controlled-web-session-v1.json")
 FROZEN_V2_PROFILE_SHA256 = (
-    "06ae92c6320b820bdf12bd5c8efb75f322db7bfec259fbc4b9fe1793ac296ea5"
+    "9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a"
 )
 
 BINARY_NAME = "stasis"

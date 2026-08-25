@@ -60,6 +60,9 @@
       "history_revision",
       "navigation_revision",
       "pipeline_membership_revision",
+      "current_url",
+      "successful_document_replacements",
+      "navigation_terminal_state",
       "runtime_state_generation"
     ],
     "rotatesOn": [
@@ -69,7 +72,31 @@
       "target_authority_change",
       "runtime_state_generation_change"
     ],
+    "rotationLinearization": "next_successful_public_token_projection_after_a_bound_fact_change",
     "stableAcrossEquivalentObservation": true,
+    "strictAuthorization": {
+      "foreignOrSupersededToken": "reject_before_fresh_authority_inspection_without_changing_the_current_binding",
+      "currentMismatch": "retain_latest_public_binding_but_latch_it_strict_stale_without_hidden_token_issuance",
+      "abaReturn": "remains_strict_stale_until_a_fresh_public_token_is_successfully_issued",
+      "failedFreshTokenAllocation": "latest_public_binding_and_strict_stale_latch_remain_unchanged"
+    },
+    "settleContinuation": {
+      "method": "runtime.settle",
+      "eligibleToken": "exact_latest_publicly_issued_binding_including_a_strict_stale_latch",
+      "scope": "same_document_only_no_cross_document_successor",
+      "authorizationBracket": "pump_suppressed_passive_N1_then_document_observe_D_then_pump_suppressed_passive_N2",
+      "navigationAuthority": "exact_full_N1_equals_N2_and_equals_retained_authority",
+      "documentTarget": "D_target_equals_retained_navigation_target",
+      "runtimeStateGeneration": "D_generation_greater_than_or_equal_to_retained_generation",
+      "generationRegression": "fatal_fail_stop",
+      "nearMiss": "validated_nonterminal_N1_D_or_N2_authority_mismatch_latches_the_exact_current_binding_then_stale_state_token_nonfatal_state_effect_none_before_coordinator_start",
+      "documentObservationRejection": "validated_target_changed_or_replacement_pipeline_bootstrap_required_is_a_near_miss_invalid_payload_is_fatal",
+      "terminalPrecedence": "typed_session_navigation_terminal_or_application_failure_precedes_stale_state_token_at_N1_or_N2_and_never_starts_the_coordinator",
+      "coordinatorSeed": "the_exact_completed_D_observation_through_the_normal_initial_observe_transition",
+      "controlledNetworkGate": "fresh_N2_snapshot_applied_before_the_first_coordinator_decision",
+      "successfulProjection": "issues_the_current_public_token_and_clears_the_strict_stale_latch",
+      "knownStalePreflight": "sticky_controlled_network_failure_precedes_stale_rejection_otherwise_no_engine_work_or_pump"
+    },
     "recoveryMethod": "runtime.pending",
     "staleError": {
       "code": "stale_state_token",
@@ -443,7 +470,10 @@
       "runtime.advance_to_next",
       "session.navigate"
     ],
-    "linearization": "script_owner_revalidates_document_identity_and_generation_before_execution",
+    "linearization": {
+      "strictMethods": "script_owner_revalidates_exact_document_identity_and_generation_before_execution",
+      "runtime.settle": "documentAuthority.settleContinuation"
+    },
     "actionNavigationAuthority": {
       "synchronousScriptEmission": "an_action_may_carry_only_top_level_or_same_document_authority_emitted_synchronously_during_its_controlled_turn",
       "queuedNativeDefault": "link_and_form_default_navigation_queued_for_later_execution_is_observed_by_explicit_settle_not_claimed_by_the_action_result",

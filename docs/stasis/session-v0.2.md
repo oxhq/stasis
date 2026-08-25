@@ -58,7 +58,9 @@ opaque `expectedStateToken`. Successful results expose the authoritative
 - the owned WebView and controlled Script event loop;
 - the active top-level document and checked `documentEpoch`;
 - checked `navigationId` and `historyRevision`;
-- navigation and pipeline-membership revisions; and
+- navigation and pipeline-membership revisions;
+- the current URL, successful-document-replacement count, and navigation
+  terminal state; and
 - the complete runtime state generation.
 
 The wire spelling is canonical and tightly bounded:
@@ -79,16 +81,44 @@ native syntax.
 The shell retains only the current binding. Equivalent passive observations
 reuse it. Navigation admission, document activation, same-document history
 change, target-authority change, or complete-state generation change rotates
-it. A token from an earlier state or document fails before DOM access with
-`stale_state_token`, `fatal: false`, and `stateEffect: none`.
+it when the next public projection succeeds. A strict request presenting the
+exact latest public token after internal state has progressed latches that token
+strict-stale without minting a hidden replacement. A failed fresh-token
+allocation leaves both that latch and the latest public binding unchanged, so a
+byte-identical ABA return cannot re-authorize it. Foreign and superseded tokens
+are rejected before fresh authority is inspected. A token from an earlier
+public state or document fails before DOM access with `stale_state_token`,
+`fatal: false`, and `stateEffect: none`.
 
 `runtime.pending` is the read-only recovery operation: it reports the current
-snapshot and token without requiring an expected token. `runtime.settle`,
+snapshot and token without requiring an expected token. `runtime.settle` also
+has one narrower continuation rule for the request-acceptance handoff: the
+exact latest publicly issued token, including one latched strict-stale, may
+authorize monotonic generation progress on the same document only. The shell
+captures pump-suppressed passive session authority N1, holds one document
+observation D, then captures pump-suppressed passive N2. It requires the full N1
+and N2 authority (including URL, history, replacement count, terminal state, and
+target) to equal the retained binding, requires D's target to match, and rejects
+generation regression terminally. It never accepts a cross-document successor.
+Any validated nonterminal authority or D-target near miss permanently latches the
+exact retained public binding strict-stale before returning `stale_state_token`;
+that transactional latch cannot invalidate a newer binding. A validated D
+`TargetChanged` or replacement-bootstrap-required rejection is such a near miss,
+while a malformed rejection is a fatal internal outcome. A typed session-navigation
+terminal or other application failure at N1 or N2 keeps its typed code and effect,
+takes precedence over stale matching, and never starts the coordinator.
+Only then does it seed the ordinary settlement coordinator with that exact D
+observation, after refreshing controlled-network foreground state. A
+known-stale token is rejected without engine submission or pumping, after any
+sticky controlled-network failure is given precedence.
+
 `runtime.advance_to_next`, `session.navigate`, all semantic actions, `query`,
-`text`, and `extract` require the current token. Mutations return a replacement
-token; passive operations echo the still-current binding. The Script owner
-revalidates the private document identity and generation at the operation's
-execution linearization point.
+`text`, and `extract` remain strict: they require the current token and exact
+generation. Mutations return a replacement token; passive operations echo the
+still-current binding. Any successful public token projection clears the
+strict-stale latch and makes the prior token ineligible even for the narrow
+settle continuation. The Script owner revalidates private authority at each
+operation's execution linearization point.
 
 ## Session-state authority
 
