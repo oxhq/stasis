@@ -1597,32 +1597,32 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     return Ok((true, None));
                 }
                 if active.profile == Some(SessionProfile::ControlledWebSessionV1)
+                    && completion.disposition == ControlOutcomeDisposition::Completed
                     && let DocumentControlCommand::AdvanceTo(token) = &command
+                    && receive_outcome_virtual_time_ns(&completion.outcome)
+                        != Some(token.deadline().deadline.as_nanos())
                 {
-                    let requested_virtual_time_ns = token.deadline().deadline.as_nanos();
-                    if completion.disposition != ControlOutcomeDisposition::Completed
-                        || receive_outcome_virtual_time_ns(&completion.outcome)
-                            != Some(requested_virtual_time_ns)
-                    {
-                        self.apply_active_transition(
-                            active,
-                            ActiveTransition::Fail(ActiveFailure {
-                                error: fatal_operation(
-                                    "controlled_network_time_authority_diverged",
-                                    "the document did not attest the virtual time staged for its network evidence",
-                                    "indeterminate",
-                                ),
-                                fail_stop: true,
-                            }),
-                        )?;
-                        return Ok((true, None));
-                    }
+                    self.apply_active_transition(
+                        active,
+                        ActiveTransition::Fail(ActiveFailure {
+                            error: fatal_operation(
+                                "controlled_network_time_authority_diverged",
+                                "the completed document advance did not attest the virtual time authorized for its network evidence",
+                                "indeterminate",
+                            ),
+                            fail_stop: true,
+                        }),
+                    )?;
+                    return Ok((true, None));
                 }
                 if completion.disposition == ControlOutcomeDisposition::Completed
                     && command_is_mutating(&command)
                 {
                     active.state_effect = RequestStateEffect::Partial;
                 }
+                // Never stage v2 network time from command intent. A rejected advance must
+                // reobserve at the old clock; a completed advance reaches this point with its
+                // exact deadline attested, before a later controlled Drive can run page work.
                 if let Some(virtual_time_ns) = receive_outcome_virtual_time_ns(&completion.outcome)
                     && let Err(mut error) = self
                         .engine
@@ -2152,27 +2152,6 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             ActiveTransition::Submit(command) => {
                 let controlled_open =
                     matches!(&active.operation, ActiveOperation::ControlledOpen(_));
-                if active.profile == Some(SessionProfile::ControlledWebSessionV1)
-                    && let DocumentControlCommand::AdvanceTo(token) = &command
-                {
-                    let requested_virtual_time_ns = token.deadline().deadline.as_nanos();
-                    if let Err(mut error) = self
-                        .engine
-                        .as_ref()
-                        .expect("a v2 advance has an engine")
-                        .set_controlled_network_virtual_time_ns(requested_virtual_time_ns)
-                    {
-                        error.fatal = true;
-                        error.state_effect = active.state_effect.as_protocol_str();
-                        return self.apply_active_transition(
-                            active,
-                            ActiveTransition::Fail(ActiveFailure {
-                                error,
-                                fail_stop: true,
-                            }),
-                        );
-                    }
-                }
                 let timeout = if let ActiveOperation::ControlledOpen(state) = &active.operation {
                     let v2 = state.profile == SessionProfile::ControlledWebSessionV1;
                     let Some(remaining) = state.deadline.checked_duration_since(Instant::now())
@@ -6803,6 +6782,12 @@ mod tests {
         format!("session:{TEST_TOKEN_NAMESPACE_HEX}:{alias}")
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    enum FakeControlEvent {
+        Submit(DocumentControlCommand),
+        NetworkTime(u128),
+    }
+
     struct FakeEngine {
         clock_mode: EngineClockMode,
         document_control_profile: DocumentControlProfile,
@@ -6816,6 +6801,7 @@ mod tests {
         navigation_polls: VecDeque<EnginePortNavigationPoll>,
         network_snapshot: Option<ControlledNetworkSnapshot>,
         network_virtual_times: RefCell<Vec<u128>>,
+        control_events: Rc<RefCell<Vec<FakeControlEvent>>>,
         evidence: Rc<RefCell<Vec<(&'static str, u64)>>>,
     }
 
@@ -6834,6 +6820,7 @@ mod tests {
                 navigation_polls: VecDeque::new(),
                 network_snapshot: None,
                 network_virtual_times: RefCell::new(Vec::new()),
+                control_events: Rc::new(RefCell::new(Vec::new())),
                 evidence: Rc::new(RefCell::new(Vec::new())),
             }
         }
@@ -6864,6 +6851,7 @@ mod tests {
                 navigation_polls: VecDeque::new(),
                 network_snapshot: None,
                 network_virtual_times: RefCell::new(Vec::new()),
+                control_events: Rc::new(RefCell::new(Vec::new())),
                 evidence: Rc::new(RefCell::new(Vec::new())),
             })
         }
@@ -6893,6 +6881,9 @@ mod tests {
             command: DocumentControlCommand,
             _timeout: Duration,
         ) -> Result<(), ProtocolError> {
+            self.control_events
+                .borrow_mut()
+                .push(FakeControlEvent::Submit(command.clone()));
             self.submitted.push(command);
             Ok(())
         }
@@ -6945,6 +6936,9 @@ mod tests {
             &self,
             virtual_time_ns: u128,
         ) -> Result<(), ProtocolError> {
+            self.control_events
+                .borrow_mut()
+                .push(FakeControlEvent::NetworkTime(virtual_time_ns));
             self.network_virtual_times
                 .borrow_mut()
                 .push(virtual_time_ns);
@@ -7305,14 +7299,182 @@ mod tests {
     fn observed_outcome(
         pending: servo::document_pending::RawPendingSnapshot,
     ) -> DocumentControlReceiveOutcome {
+        observed_outcome_with_advance_token(pending, None)
+    }
+
+    fn observed_outcome_with_advance_token(
+        pending: servo::document_pending::RawPendingSnapshot,
+        advance_token: Option<servo::document_control::DocumentAdvanceToken>,
+    ) -> DocumentControlReceiveOutcome {
         DocumentControlReceiveOutcome::CommandOutcome(DocumentControlOutcome::Completed(Box::new(
             servo::document_control::DocumentControlObservation::new_internal(
                 DocumentControlAction::Observed,
                 Box::new(pending),
-                None,
+                advance_token,
             )
             .unwrap(),
         )))
+    }
+
+    fn pending_with_finite_timer_for_authority(
+        authority: &SessionNavigationAuthority,
+        state_generation: u64,
+    ) -> (
+        servo::document_pending::RawPendingSnapshot,
+        servo::document_control::DocumentAdvanceToken,
+    ) {
+        use embedder_traits::document_control::DocumentAdvanceTokenId;
+        use embedder_traits::document_pending::{
+            PendingClockMode, PendingClockObservation, PendingLogicalTimerKind,
+            PendingLogicalTimerObservation, PendingLogicalTimerSnapshot,
+            PendingLogicalTimerStableId, PendingMicrotaskCheckpoint, PendingProducerObservation,
+            PendingProducerPriorEmptyQualification, PendingProducerStability,
+            PendingSchedulerObservation, PendingSourceDisposition, PendingSourceEpoch,
+            PendingSourceId, PendingSourceKind, PendingSourceObservation, PendingSourceSnapshot,
+        };
+        use timers::{
+            DocumentClock, DocumentClockConfiguration, DocumentProducerCheckpoint,
+            DocumentProducerFence, DocumentUnixTime, TimerEventRequest, TimerScheduler,
+        };
+
+        let mut pending = pending_for_authority(authority, state_generation);
+        let clock = DocumentClock::new(DocumentClockConfiguration::Controlled {
+            initial_time_ns: 5,
+            unix_time_origin_ns: DocumentUnixTime::from_nanos(1_000_000),
+        });
+        let mut scheduler = TimerScheduler::with_clock(clock.clone());
+        scheduler.schedule_timer(TimerEventRequest {
+            callback: Box::new(|| {}),
+            duration: Duration::from_nanos(20),
+        });
+        let deadline = scheduler
+            .finite_deadline_snapshot()
+            .unwrap()
+            .expect("the test scheduler has one finite deadline");
+        pending.clock = PendingClockObservation {
+            clock_id: clock.id(),
+            mode: PendingClockMode::Controlled,
+            now: clock.now(),
+            unsupported_surface: None,
+        };
+        pending.scheduler = PendingSchedulerObservation {
+            scheduler_id: scheduler.id(),
+            next_deadline: Some(deadline),
+        };
+        pending
+            .execution
+            .as_mut()
+            .expect("the test pending snapshot has execution authority")
+            .clock_id = clock.id();
+
+        let fence = DocumentProducerFence::default();
+        let fence_snapshot = fence.snapshot();
+        let prior_checkpoint = DocumentProducerCheckpoint::ZERO.checked_next().unwrap();
+        let checkpoint = prior_checkpoint.checked_next().unwrap();
+        let microtask_checkpoint = PendingMicrotaskCheckpoint::new(2);
+        pending.microtasks.completed_checkpoint = microtask_checkpoint;
+        pending.producers = PendingProducerObservation::new(
+            authority.target().event_loop_id,
+            microtask_checkpoint,
+            checkpoint,
+            fence_snapshot,
+            PendingProducerStability::StableEmpty,
+            Some(PendingProducerPriorEmptyQualification {
+                microtask_checkpoint: PendingMicrotaskCheckpoint::new(1),
+                checkpoint: prior_checkpoint,
+                snapshot_revision: fence_snapshot.revision(),
+            }),
+        )
+        .unwrap();
+
+        let source_id = PendingSourceId::new(1);
+        let pipeline_id = authority
+            .target()
+            .active_top_level
+            .expect("the test authority has an active document")
+            .pipeline_id;
+        pending.sources = PendingSourceSnapshot::new(
+            PendingSourceEpoch::new(1),
+            vec![PendingSourceObservation {
+                id: source_id,
+                kind: PendingSourceKind::Timer,
+                disposition: PendingSourceDisposition::FiniteDeadline(deadline.deadline),
+            }],
+        )
+        .unwrap();
+        pending.logical_timers =
+            PendingLogicalTimerSnapshot::new(vec![PendingLogicalTimerObservation {
+                source_id,
+                pipeline_id,
+                stable_id: PendingLogicalTimerStableId::JavaScriptHandle(1),
+                creation_sequence: 1,
+                kind: PendingLogicalTimerKind::JavaScriptOneShot,
+                logical_deadline: deadline.deadline,
+                suspended: false,
+                eligible_in_controlled_turn: true,
+                is_ordering_head: true,
+                delivery_ready: false,
+                outer_wake: Some(deadline),
+            }])
+            .unwrap();
+        pending.validate().unwrap();
+        let token = servo::document_control::DocumentAdvanceToken::new_internal(
+            DocumentAdvanceTokenId::new(17),
+            &pending,
+        )
+        .unwrap();
+        (pending, token)
+    }
+
+    fn advance_settle_active(
+        source: &SessionNavigationAuthority,
+    ) -> (
+        ActiveRequest,
+        servo::document_pending::RawPendingSnapshot,
+        servo::document_control::DocumentAdvanceToken,
+    ) {
+        let effective_policy = default_resolved_settle_policy();
+        let (pending, token) = pending_with_finite_timer_for_authority(source, 7);
+        let mut coordinator = settle::SettleCoordinator::new(effective_policy.engine);
+        assert_eq!(
+            coordinator.start(),
+            Ok(settle::SettleProgress::Command(
+                DocumentControlCommand::Observe
+            ))
+        );
+        assert_eq!(
+            coordinator.consume_receive_outcome(
+                observed_outcome_with_advance_token(pending.clone(), Some(token.clone())),
+                Duration::ZERO,
+            ),
+            Ok(settle::SettleProgress::Command(
+                DocumentControlCommand::AdvanceTo(Box::new(token.clone()))
+            ))
+        );
+        let active = ActiveRequest {
+            request: request("runtime.settle", Some(SESSION_ID)),
+            profile: Some(SessionProfile::ControlledWebSessionV1),
+            operation: ActiveOperation::Settle(SettleState {
+                profile: SessionProfile::ControlledWebSessionV1,
+                authorizing_document_state: None,
+                authorizing_observation: None,
+                authorizing_navigation: Some(source.clone()),
+                replacement: None,
+                authority_bound_command: None,
+                latest_pending_target: Some(Box::new(source.target().clone())),
+                response: SettleResponse::Runtime,
+                coordinator,
+                effective_policy,
+                cumulative_external_io_wall_time: Duration::ZERO,
+                waiting: None,
+            }),
+            started_at: Instant::now(),
+            in_flight: None,
+            control_turn_observed: None,
+            needs_initial_pump: false,
+            state_effect: RequestStateEffect::None,
+        };
+        (active, pending, token)
     }
 
     fn token_authorizing_settle_active(
@@ -7995,6 +8157,7 @@ mod tests {
                 navigation_polls: VecDeque::new(),
                 network_snapshot: None,
                 network_virtual_times: RefCell::new(Vec::new()),
+                control_events: Rc::new(RefCell::new(Vec::new())),
                 evidence: Rc::new(RefCell::new(Vec::new())),
             };
             let mut shell = shell(&mut bytes, ShellState::Open, Some(real));
@@ -8571,6 +8734,275 @@ mod tests {
             Some(SessionProfile::ControlledWebappV1),
             1,
         ));
+    }
+
+    #[test]
+    fn rejected_v2_advance_reobserves_without_staging_network_time() {
+        let source = session_authority(1, 0, 0, 0);
+        let (active, pending, token) = advance_settle_active(&source);
+        let advance = DocumentControlCommand::AdvanceTo(Box::new(token));
+        let mut bytes = Vec::new();
+        let mut shell = shell(
+            &mut bytes,
+            ShellState::Open,
+            Some(FakeEngine::controlled_session()),
+        );
+
+        shell
+            .apply_active_transition(active, ActiveTransition::Submit(advance.clone()))
+            .unwrap();
+        let engine = shell.engine.as_ref().unwrap();
+        assert_eq!(engine.submitted, vec![advance.clone()]);
+        assert!(engine.network_virtual_times.borrow().is_empty());
+        assert_eq!(
+            *engine.control_events.borrow(),
+            vec![FakeControlEvent::Submit(advance.clone())]
+        );
+
+        shell
+            .engine
+            .as_mut()
+            .unwrap()
+            .polls
+            .push_back(EnginePortPoll::Complete(EnginePortCompletion {
+                disposition: ControlOutcomeDisposition::DefinitiveFailure,
+                outcome: DocumentControlReceiveOutcome::CommandOutcome(
+                    DocumentControlOutcome::Rejected(DocumentControlError::AdvancePrecondition(
+                        servo::document_control::DocumentAdvanceTokenInvariantError::StateGenerationChanged {
+                            expected: pending.state_generation,
+                            observed: servo::document_pending::RuntimeStateGeneration::new(8),
+                        },
+                    )),
+                ),
+            }));
+
+        assert_eq!(shell.poll_active_control().unwrap(), (true, None));
+        let engine = shell.engine.as_ref().unwrap();
+        assert_eq!(
+            engine.submitted,
+            vec![advance.clone(), DocumentControlCommand::Observe]
+        );
+        assert!(engine.network_virtual_times.borrow().is_empty());
+        assert_eq!(
+            *engine.control_events.borrow(),
+            vec![
+                FakeControlEvent::Submit(advance),
+                FakeControlEvent::Submit(DocumentControlCommand::Observe),
+            ]
+        );
+        assert!(matches!(
+            shell
+                .active
+                .as_ref()
+                .and_then(|active| active.in_flight.as_ref()),
+            Some(DocumentControlCommand::Observe)
+        ));
+    }
+
+    #[test]
+    fn completed_v2_advance_syncs_network_time_from_authoritative_observation_once() {
+        let source = session_authority(1, 0, 0, 0);
+        let (active, mut completed_pending, token) = advance_settle_active(&source);
+        let deadline = token.deadline();
+        let advance = DocumentControlCommand::AdvanceTo(Box::new(token));
+        completed_pending.state_generation =
+            servo::document_pending::RuntimeStateGeneration::new(8);
+        completed_pending.clock.now = deadline.deadline;
+        completed_pending.scheduler.next_deadline = None;
+        completed_pending.logical_timers =
+            servo::document_pending::PendingLogicalTimerSnapshot::default();
+        completed_pending.sources = servo::document_pending::PendingSourceSnapshot::default();
+        completed_pending.validate().unwrap();
+        let outcome = DocumentControlReceiveOutcome::CommandOutcome(
+            DocumentControlOutcome::Completed(Box::new(
+                servo::document_control::DocumentControlObservation::new_internal(
+                    DocumentControlAction::TimerActivated(deadline),
+                    Box::new(completed_pending),
+                    None,
+                )
+                .unwrap(),
+            )),
+        );
+        let mut bytes = Vec::new();
+        let mut shell = shell(
+            &mut bytes,
+            ShellState::Open,
+            Some(FakeEngine::controlled_session()),
+        );
+
+        shell
+            .apply_active_transition(active, ActiveTransition::Submit(advance.clone()))
+            .unwrap();
+        assert!(
+            shell
+                .engine
+                .as_ref()
+                .unwrap()
+                .network_virtual_times
+                .borrow()
+                .is_empty()
+        );
+        shell
+            .engine
+            .as_mut()
+            .unwrap()
+            .polls
+            .push_back(EnginePortPoll::Complete(EnginePortCompletion {
+                disposition: ControlOutcomeDisposition::Completed,
+                outcome,
+            }));
+
+        assert_eq!(shell.poll_active_control().unwrap(), (true, None));
+        assert_eq!(
+            *shell
+                .engine
+                .as_ref()
+                .unwrap()
+                .network_virtual_times
+                .borrow(),
+            vec![deadline.deadline.as_nanos()]
+        );
+        assert_eq!(
+            *shell.engine.as_ref().unwrap().control_events.borrow(),
+            vec![
+                FakeControlEvent::Submit(advance.clone()),
+                FakeControlEvent::NetworkTime(deadline.deadline.as_nanos()),
+            ]
+        );
+
+        shell.engine.as_mut().unwrap().navigation_polls.push_back(
+            EnginePortNavigationPoll::Complete(NavigationOperationCompletion::test_response(
+                NavigationOperationKind::Observe,
+                Ok(source),
+            )),
+        );
+        assert_eq!(shell.poll_active_navigation().unwrap(), (true, None));
+        assert_eq!(
+            *shell.engine.as_ref().unwrap().control_events.borrow(),
+            vec![
+                FakeControlEvent::Submit(advance),
+                FakeControlEvent::NetworkTime(deadline.deadline.as_nanos()),
+                FakeControlEvent::Submit(DocumentControlCommand::DriveOneTurn),
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_completed_v2_advance_fails_before_network_time_sync() {
+        let source = session_authority(1, 0, 0, 0);
+        let (active, mut malformed_pending, token) = advance_settle_active(&source);
+        let deadline = token.deadline();
+        let advance = DocumentControlCommand::AdvanceTo(Box::new(token));
+        malformed_pending.state_generation =
+            servo::document_pending::RuntimeStateGeneration::new(8);
+        malformed_pending.scheduler.next_deadline = None;
+        malformed_pending.logical_timers =
+            servo::document_pending::PendingLogicalTimerSnapshot::default();
+        malformed_pending.sources = servo::document_pending::PendingSourceSnapshot::default();
+        malformed_pending.validate().unwrap();
+        let outcome = DocumentControlReceiveOutcome::CommandOutcome(
+            DocumentControlOutcome::Completed(Box::new(
+                servo::document_control::DocumentControlObservation::new_internal(
+                    DocumentControlAction::TimerActivated(deadline),
+                    Box::new(malformed_pending),
+                    None,
+                )
+                .unwrap(),
+            )),
+        );
+        let mut bytes = Vec::new();
+        let control_events;
+        {
+            let mut shell = shell(
+                &mut bytes,
+                ShellState::Open,
+                Some(FakeEngine::controlled_session()),
+            );
+            shell
+                .apply_active_transition(active, ActiveTransition::Submit(advance.clone()))
+                .unwrap();
+            control_events = shell.engine.as_ref().unwrap().control_events.clone();
+            shell
+                .engine
+                .as_mut()
+                .unwrap()
+                .polls
+                .push_back(EnginePortPoll::Complete(EnginePortCompletion {
+                    disposition: ControlOutcomeDisposition::Completed,
+                    outcome,
+                }));
+
+            assert_eq!(
+                shell.poll_active_control().unwrap_err(),
+                "runtime outcome is indeterminate; session was fail-stopped"
+            );
+            assert!(shell.active.is_none());
+            assert!(shell.engine.is_none());
+        }
+        assert_eq!(
+            *control_events.borrow(),
+            vec![FakeControlEvent::Submit(advance)]
+        );
+        let response = frames(&bytes).pop().unwrap();
+        assert_eq!(
+            response["error"]["code"],
+            "controlled_network_time_authority_diverged"
+        );
+        assert_eq!(response["error"]["stateEffect"], "indeterminate");
+        assert_eq!(response["error"]["fatal"], true);
+    }
+
+    #[test]
+    fn indeterminate_v2_advance_remains_fatal_without_sync_or_replay() {
+        let source = session_authority(1, 0, 0, 0);
+        let (active, _, token) = advance_settle_active(&source);
+        let token_id = token.id();
+        let target = Box::new(token.target().clone());
+        let deadline = token.deadline();
+        let advance = DocumentControlCommand::AdvanceTo(Box::new(token));
+        let mut bytes = Vec::new();
+        let control_events;
+        {
+            let mut shell = shell(
+                &mut bytes,
+                ShellState::Open,
+                Some(FakeEngine::controlled_session()),
+            );
+            shell
+                .apply_active_transition(active, ActiveTransition::Submit(advance.clone()))
+                .unwrap();
+            control_events = shell.engine.as_ref().unwrap().control_events.clone();
+            shell
+                .engine
+                .as_mut()
+                .unwrap()
+                .polls
+                .push_back(EnginePortPoll::Complete(EnginePortCompletion {
+                    disposition: ControlOutcomeDisposition::Indeterminate,
+                    outcome: DocumentControlReceiveOutcome::CommandOutcome(
+                        DocumentControlOutcome::AdvanceOutcomeIndeterminate {
+                            token_id,
+                            target,
+                            deadline,
+                        },
+                    ),
+                }));
+
+            assert_eq!(
+                shell.poll_active_control().unwrap_err(),
+                "runtime outcome is indeterminate; session was fail-stopped"
+            );
+            assert!(shell.active.is_none());
+            assert!(shell.engine.is_none());
+        }
+        assert_eq!(
+            *control_events.borrow(),
+            vec![FakeControlEvent::Submit(advance)]
+        );
+        let response = frames(&bytes).pop().unwrap();
+        assert_eq!(response["error"]["code"], "outcome_indeterminate");
+        assert_eq!(response["error"]["stateEffect"], "indeterminate");
+        assert_eq!(response["error"]["fatal"], true);
     }
 
     #[test]
