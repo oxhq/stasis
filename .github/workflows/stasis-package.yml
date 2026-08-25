@@ -363,6 +363,601 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  package-windows-ci:
+    name: Build and gate Windows x86-64 CI bundle
+    needs:
+      - validate-invocation
+      - archive-contract
+    if: |
+      needs.validate-invocation.outputs.mode == 'package'
+        && needs.archive-contract.result == 'success'
+    runs-on: windows-2022
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TARGET_DIR: C:\a\stasis\stasis\target
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+      RUSTUP_WINDOWS_PATH_ADD_BIN: 1
+      STASIS_REVISION: ${{ github.sha }}
+      STASIS_WINDOWS_PLATFORM: windows-x86_64
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Set up pinned Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+
+      - name: Set up pinned uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.16"
+          enable-cache: false
+
+      - id: windows-names
+        name: Resolve the exact Windows CI identity
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_ARCH -cne 'X64' -or -not [Environment]::Is64BitProcess) {
+            throw "the Windows CI bundle requires an x86-64 runner, observed $env:RUNNER_ARCH"
+          }
+          $head = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA) {
+            throw "checkout HEAD $head does not equal event SHA $env:GITHUB_SHA"
+          }
+          if ($env:STASIS_REVISION -cne $env:GITHUB_SHA) {
+            throw 'the configured Stasis revision does not equal the event SHA'
+          }
+          $versionMatch = Select-String `
+            -LiteralPath 'ports/stasis/Cargo.toml' `
+            -Pattern '^version = "([^"]+)"$' `
+            | Select-Object -First 1
+          if ($null -eq $versionMatch) {
+            throw 'could not read the stasis-shell package version'
+          }
+          $version = $versionMatch.Matches[0].Groups[1].Value
+          if ($version -cne $env:STASIS_RELEASE_VERSION) {
+            throw "stasis-shell version $version does not equal $env:STASIS_RELEASE_VERSION"
+          }
+          $bundle = "stasis-$version-$env:STASIS_WINDOWS_PLATFORM-ci"
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist-windows-ci'
+          $artifacts = Join-Path $dist 'artifacts'
+          $logs = Join-Path $dist 'logs'
+          $binary = Join-Path $env:CARGO_TARGET_DIR 'production-stripped\stasis.exe'
+          New-Item -ItemType Directory -Force -Path $artifacts, $logs | Out-Null
+          @(
+            "STASIS_WINDOWS_VERSION=$version"
+            "STASIS_WINDOWS_BUNDLE=$bundle"
+            "STASIS_WINDOWS_BINARY=$binary"
+            "STASIS_WINDOWS_DIST=$dist"
+            "STASIS_WINDOWS_ARTIFACTS=$artifacts"
+            "STASIS_WINDOWS_LOGS=$logs"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          @(
+            "bundle_artifact_name=stasis-windows-x86_64-ci-attempt-$env:GITHUB_RUN_ATTEMPT"
+            "log_artifact_name=stasis-windows-x86_64-ci-logs-attempt-$env:GITHUB_RUN_ATTEMPT"
+          ) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Bootstrap the Windows build environment
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lldLink = Join-Path $env:LIBCLANG_PATH 'lld-link.exe'
+          if (-not (Test-Path -LiteralPath $lldLink -PathType Leaf)) {
+            throw "LLVM linker is missing: $lldLink"
+          }
+          $env:LIBCLANG_PATH | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & .\mach.ps1 fetch
+          if ($LASTEXITCODE -ne 0) {
+            throw "mach fetch failed with exit code $LASTEXITCODE"
+          }
+          & .\mach.ps1 bootstrap-gstreamer
+          if ($LASTEXITCODE -ne 0) {
+            throw "mach bootstrap-gstreamer failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Build the exact-SHA production-stripped Stasis executable
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((& git rev-parse HEAD).Trim() -cne $env:GITHUB_SHA) {
+            throw 'the checkout changed after Windows bootstrap'
+          }
+          $rustVersion = (& .\mach.ps1 exec -- rustc -vV | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "rustc identity failed with exit code $LASTEXITCODE"
+          }
+          if ($rustVersion -notmatch '(?m)^host: x86_64-pc-windows-msvc\s*$') {
+            throw "unexpected Windows Rust host:`n$rustVersion"
+          }
+          & .\mach.ps1 exec -- cargo build --locked -p stasis-shell --profile production-stripped
+          if ($LASTEXITCODE -ne 0) {
+            throw "Stasis Windows build failed with exit code $LASTEXITCODE"
+          }
+          if (-not (Test-Path -LiteralPath $env:STASIS_WINDOWS_BINARY -PathType Leaf)) {
+            throw "production-stripped Stasis executable is missing: $env:STASIS_WINDOWS_BINARY"
+          }
+          if ((Get-Item -LiteralPath $env:STASIS_WINDOWS_BINARY).Length -lt 1) {
+            throw 'production-stripped Stasis executable is empty'
+          }
+
+      - name: Stage the required ANGLE runtime beside Stasis
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $profileDirectory = Split-Path -Parent $env:STASIS_WINDOWS_BINARY
+          $buildDirectory = Join-Path $profileDirectory 'build'
+          if (-not (Test-Path -LiteralPath $buildDirectory -PathType Container)) {
+            throw "Cargo build output is missing: $buildDirectory"
+          }
+          foreach ($dllName in @('libEGL.dll', 'libGLESv2.dll')) {
+            $candidates = @(Get-ChildItem -LiteralPath $buildDirectory -Recurse -File `
+              -Filter $dllName | Sort-Object FullName)
+            if ($candidates.Count -lt 1) {
+              throw "the servo/no-wgl build did not produce $dllName"
+            }
+            $candidateHashes = @($candidates `
+              | ForEach-Object { (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash } `
+              | Sort-Object -Unique)
+            if ($candidateHashes.Count -ne 1) {
+              throw "the servo/no-wgl build produced conflicting copies of $dllName"
+            }
+            Copy-Item -LiteralPath $candidates[0].FullName `
+              -Destination (Join-Path $profileDirectory $dllName) -Force
+          }
+          $profileDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Set up Node for the Windows v0.2 gate
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Build the TypeScript SDK harness
+        working-directory: sdk/typescript
+        run: |
+          $ErrorActionPreference = 'Stop'
+          corepack enable
+          if ($LASTEXITCODE -ne 0) { throw 'corepack enable failed' }
+          corepack prepare pnpm@9.12.3 --activate
+          if ($LASTEXITCODE -ne 0) { throw 'could not activate pnpm 9.12.3' }
+          if ((pnpm --version).Trim() -cne '9.12.3') {
+            throw 'the active pnpm version is not 9.12.3'
+          }
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw 'pnpm install failed' }
+          pnpm build
+          if ($LASTEXITCODE -ne 0) { throw 'the TypeScript SDK build failed' }
+
+      - name: Gate the v0.2 session North Star with the explicit executable
+        working-directory: sdk/typescript
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runtimeCache = Join-Path $env:RUNNER_TEMP `
+            "stasis-windows-explicit-runtime-cache-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $runtimeCache | Out-Null
+          $env:STASIS_SESSION_NORTH_STAR_BINARY = $env:STASIS_WINDOWS_BINARY
+          $env:STASIS_SESSION_NORTH_STAR_RUNTIME_CACHE = $runtimeCache
+          $log = Join-Path $env:STASIS_WINDOWS_LOGS 'session-north-star.jsonl'
+          & node test/fixtures/public-package-session-north-star.mjs 2>&1 `
+            | Tee-Object -FilePath $log
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            throw "the Windows v0.2 session North Star failed with exit code $exitCode"
+          }
+          $proof = Get-Content -LiteralPath $log -Raw
+          foreach ($required in @(
+            '"proof":"stasis-v0.2-session-north-star"',
+            '"runs":3',
+            '"sessions":6',
+            '"runtimeAcquisition":"explicit-executable-override-cache-bypassed"'
+          )) {
+            if (-not $proof.Contains($required)) {
+              throw "the Windows North Star log omitted $required"
+            }
+          }
+
+      - name: Gate the automation and bounded-settlement fixture matrix
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = Join-Path $env:STASIS_WINDOWS_LOGS 'controlled-mvp.log'
+          $testCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell ' +
+            '--test controlled_mvp -- --test-threads=1 --show-output; exit $LASTEXITCODE'
+          & .\mach.ps1 exec -- pwsh -NoProfile -Command $testCommand 2>&1 `
+            | Tee-Object -FilePath $log
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            throw "the Windows controlled_mvp gate failed with exit code $exitCode"
+          }
+
+      - name: Gate controlled-network redirect ordering invariants
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = Join-Path $env:STASIS_WINDOWS_LOGS 'redirect-order.log'
+          $testCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell ' +
+            '-p servo-net-traits --lib controlled_network::tests -- --test-threads=1 ' +
+            '--show-output; exit $LASTEXITCODE'
+          & .\mach.ps1 exec -- pwsh -NoProfile -Command $testCommand 2>&1 `
+            | Tee-Object -FilePath $log
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            throw "the Windows redirect-order gate failed with exit code $exitCode"
+          }
+
+      - name: Gate Windows stdio protocol isolation
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = Join-Path $env:STASIS_WINDOWS_LOGS 'stdio-isolation.log'
+          $testCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell ' +
+            '--lib stdio::platform::tests -- --test-threads=1 --show-output; ' +
+            'exit $LASTEXITCODE'
+          & .\mach.ps1 exec -- pwsh -NoProfile -Command $testCommand 2>&1 `
+            | Tee-Object -FilePath $log
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            throw "the Windows stdio isolation gate failed with exit code $exitCode"
+          }
+
+      - name: Create the Windows CI-only bundle and checksums
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundleRoot = Join-Path $env:STASIS_WINDOWS_DIST $env:STASIS_WINDOWS_BUNDLE
+          New-Item -ItemType Directory -Path $bundleRoot | Out-Null
+          $copyMap = [ordered]@{
+            'LICENSE' = 'LICENSE'
+            'LICENSE_WHATWG_SPECS' = 'LICENSE_WHATWG_SPECS'
+            'README.md' = 'README.md'
+            'STASIS.md' = 'STASIS.md'
+            'STASIS_UPSTREAM.toml' = 'STASIS_UPSTREAM.toml'
+            'docs/stasis/releases.md' = 'RELEASES.md'
+            'resources/resource_protocol/license.html' = 'THIRD_PARTY_LICENSES.html'
+          }
+          foreach ($entry in $copyMap.GetEnumerator()) {
+            Copy-Item -LiteralPath $entry.Key -Destination (Join-Path $bundleRoot $entry.Value)
+          }
+          Copy-Item -LiteralPath $env:STASIS_WINDOWS_BINARY `
+            -Destination (Join-Path $bundleRoot 'stasis.exe')
+
+          $profileDirectory = Split-Path -Parent $env:STASIS_WINDOWS_BINARY
+          $angleDllNames = @('libEGL.dll', 'libGLESv2.dll')
+          foreach ($dllName in $angleDllNames) {
+            $source = Join-Path $profileDirectory $dllName
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+              throw "the staged ANGLE runtime is missing: $source"
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $bundleRoot $dllName)
+          }
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "vswhere is missing: $vswhere"
+          }
+          $vsInstall = (& $vswhere -latest -products '*' `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath).Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vsInstall)) {
+            throw 'could not resolve the Visual Studio C++ toolchain'
+          }
+          $vcToolsVersion = (Get-Content -LiteralPath `
+            (Join-Path $vsInstall 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt') `
+            -Raw).Trim()
+          $dumpbin = Join-Path $vsInstall `
+            "VC\Tools\MSVC\$vcToolsVersion\bin\Hostx64\x64\dumpbin.exe"
+          if (-not (Test-Path -LiteralPath $dumpbin -PathType Leaf)) {
+            throw "dumpbin is missing: $dumpbin"
+          }
+          $redistRoot = Join-Path $vsInstall 'VC\Redist\MSVC'
+          $redistVersion = Get-ChildItem -LiteralPath $redistRoot -Directory `
+            | Where-Object Name -Match '^[0-9]+\.[0-9]+\.[0-9]+$' `
+            | Sort-Object { [version]$_.Name } -Descending `
+            | Select-Object -First 1
+          if ($null -eq $redistVersion) {
+            throw "the MSVC redistribution root is empty: $redistRoot"
+          }
+          $crtDirectory = Get-ChildItem `
+            -LiteralPath (Join-Path $redistVersion.FullName 'x64') -Directory `
+            | Where-Object Name -Match '^Microsoft\.VC[0-9]+\.CRT$' `
+            | Sort-Object Name -Descending `
+            | Select-Object -First 1
+          if ($null -eq $crtDirectory) {
+            throw 'the x86-64 app-local MSVC runtime directory is missing'
+          }
+          $crtByName = @{}
+          foreach ($file in Get-ChildItem -LiteralPath $crtDirectory.FullName -File -Filter '*.dll') {
+            $crtByName[$file.Name.ToLowerInvariant()] = $file.FullName
+          }
+
+          function Get-ImportedDllNames([string] $path) {
+            $output = & $dumpbin /nologo /dependents $path 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              throw "dumpbin failed for $path with exit code $LASTEXITCODE"
+            }
+            return @($output | ForEach-Object {
+              if ("$_" -match '^\s+([A-Za-z0-9._-]+\.dll)\s*$') {
+                $Matches[1]
+              }
+            } | Sort-Object -Unique)
+          }
+
+          $pending = [Collections.Generic.Queue[string]]::new()
+          $pending.Enqueue((Join-Path $bundleRoot 'stasis.exe'))
+          foreach ($file in Get-ChildItem -LiteralPath $bundleRoot -File -Filter '*.dll') {
+            $pending.Enqueue($file.FullName)
+          }
+          $visited = @{}
+          $copied = @{}
+          while ($pending.Count -gt 0) {
+            $current = $pending.Dequeue()
+            if ($visited.ContainsKey($current)) { continue }
+            $visited[$current] = $true
+            foreach ($dependency in Get-ImportedDllNames $current) {
+              $key = $dependency.ToLowerInvariant()
+              if ($crtByName.ContainsKey($key)) {
+                if (-not $copied.ContainsKey($key)) {
+                  $destination = Join-Path $bundleRoot $dependency
+                  Copy-Item -LiteralPath $crtByName[$key] -Destination $destination
+                  $copied[$key] = $destination
+                  $pending.Enqueue($destination)
+                }
+              } elseif ($angleDllNames -contains $dependency) {
+                if (-not (Test-Path -LiteralPath (Join-Path $bundleRoot $dependency) -PathType Leaf)) {
+                  throw "required app-local ANGLE DLL is unavailable: $dependency"
+                }
+              } elseif ($dependency -match '^(?i:(?:msvcp|vcruntime|concrt)[0-9].*\.dll)$') {
+                throw "required app-local MSVC runtime DLL is unavailable: $dependency"
+              }
+            }
+          }
+          if ($copied.Count -lt 1) {
+            throw 'the Windows executable did not resolve any app-local MSVC runtime DLLs'
+          }
+
+          $runtimeLines = foreach ($name in @($copied.Keys | Sort-Object)) {
+            $file = $copied[$name]
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
+            "$hash  $([IO.Path]::GetFileName($file))"
+          }
+          @(
+            'App-local MSVC runtime closure determined from PE imports with dumpbin.'
+            $runtimeLines
+          ) | Set-Content -LiteralPath (Join-Path $bundleRoot 'MSVC-RUNTIME.txt') `
+            -Encoding utf8NoBOM
+
+          $upstream = (Get-Content -LiteralPath 'STASIS_UPSTREAM.toml' -Raw).TrimEnd()
+          @"
+          $upstream
+          stasis_repository = "https://github.com/oxhq/stasis.git"
+          stasis_revision = "$env:GITHUB_SHA"
+          "@ | Set-Content -LiteralPath (Join-Path $bundleRoot 'SOURCE.txt') -Encoding utf8NoBOM
+          "$env:STASIS_WINDOWS_VERSION`n" `
+            | Set-Content -LiteralPath (Join-Path $bundleRoot 'VERSION.txt') -Encoding utf8NoBOM
+          @"
+          Unzip the complete directory before running stasis.exe.
+          Use @oxhq/stasis with an explicit executablePath that names this stasis.exe.
+          The app-local ANGLE and MSVC runtime DLLs must remain beside the executable.
+
+          This unsigned Windows x86-64 bundle is a CI proof artifact. It is not a GitHub
+          release asset and is not available through managed npm runtime acquisition.
+          "@ | Set-Content -LiteralPath (Join-Path $bundleRoot 'INSTALL.txt') -Encoding utf8NoBOM
+          @"
+          Stasis Windows x86-64 CI-only artifact
+
+          Version: $env:STASIS_WINDOWS_VERSION
+          Revision: $env:GITHUB_SHA
+          Run: $env:GITHUB_RUN_ID
+          Attempt: $env:GITHUB_RUN_ATTEMPT
+          Build: mach.ps1 exec -- cargo build --locked -p stasis-shell --profile production-stripped
+
+          Proof boundary: exact-SHA Windows build, explicit-executable TypeScript session
+          North Star, native fixture and redirect-order tests, ANGLE rendering backend,
+          app-local MSVC runtime closure, fresh ZIP extraction, and extracted-binary
+          act-settle-inspect. This artifact is outside the stable macOS/Linux release,
+          promotion, provenance, runtime-manifest, and npm managed-runtime inventories.
+          "@ | Set-Content -LiteralPath (Join-Path $bundleRoot 'WINDOWS-CI-ARTIFACT.txt') `
+            -Encoding utf8NoBOM
+
+          $manifestLines = foreach ($file in Get-ChildItem -LiteralPath $bundleRoot -File `
+            | Sort-Object Name) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
+            "$hash  $env:STASIS_WINDOWS_BUNDLE/$($file.Name)"
+          }
+          $manifestLines | Set-Content -LiteralPath (Join-Path $bundleRoot 'SHA256SUMS.txt') `
+            -Encoding ascii
+
+          $archive = Join-Path $env:STASIS_WINDOWS_ARTIFACTS `
+            "$env:STASIS_WINDOWS_BUNDLE.zip"
+          Compress-Archive -LiteralPath $bundleRoot -DestinationPath $archive `
+            -CompressionLevel Optimal
+          $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          $binaryHash = (Get-FileHash -Algorithm SHA256 `
+            -LiteralPath (Join-Path $bundleRoot 'stasis.exe')).Hash.ToLowerInvariant()
+          "$archiveHash  $([IO.Path]::GetFileName($archive))" `
+            | Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
+          "$binaryHash  $env:STASIS_WINDOWS_BUNDLE/stasis.exe" `
+            | Set-Content -LiteralPath `
+              (Join-Path $env:STASIS_WINDOWS_ARTIFACTS `
+                "$env:STASIS_WINDOWS_BUNDLE.binary.sha256") `
+              -Encoding ascii
+          Get-ChildItem -LiteralPath $bundleRoot -File `
+            | Sort-Object Name `
+            | Select-Object Name, Length `
+            | Format-Table -AutoSize `
+            | Out-String `
+            | Set-Content -LiteralPath `
+              (Join-Path $env:STASIS_WINDOWS_LOGS 'bundle-inventory.txt') `
+              -Encoding utf8NoBOM
+
+      - name: Extract and gate the Windows CI bundle
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:STASIS_WINDOWS_ARTIFACTS `
+            "$env:STASIS_WINDOWS_BUNDLE.zip"
+          $archiveSidecar = "$archive.sha256"
+          $binarySidecar = Join-Path $env:STASIS_WINDOWS_ARTIFACTS `
+            "$env:STASIS_WINDOWS_BUNDLE.binary.sha256"
+          foreach ($path in @($archive, $archiveSidecar, $binarySidecar)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Windows CI artifact component is missing: $path"
+            }
+          }
+          $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          $archiveRecord = (Get-Content -LiteralPath $archiveSidecar -Raw).Trim()
+          if ($archiveRecord -cne "$archiveHash  $([IO.Path]::GetFileName($archive))") {
+            throw 'the Windows ZIP checksum sidecar does not match the archive'
+          }
+
+          $extractTo = Join-Path $env:RUNNER_TEMP `
+            "stasis-windows-artifact-gate-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $extractTo | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $extractTo
+          $sourceRoot = Join-Path $env:STASIS_WINDOWS_DIST $env:STASIS_WINDOWS_BUNDLE
+          $extractedRoot = Join-Path $extractTo $env:STASIS_WINDOWS_BUNDLE
+          if (-not (Test-Path -LiteralPath $extractedRoot -PathType Container)) {
+            throw 'the Windows ZIP omitted its single normalized root directory'
+          }
+          $sourceNames = @(Get-ChildItem -LiteralPath $sourceRoot -File `
+            | ForEach-Object Name | Sort-Object)
+          $extractedNames = @(Get-ChildItem -LiteralPath $extractedRoot -File `
+            | ForEach-Object Name | Sort-Object)
+          $inventoryDifference = Compare-Object $sourceNames $extractedNames
+          if ($null -ne $inventoryDifference) {
+            throw "fresh extraction inventory differs:`n$($inventoryDifference | Out-String)"
+          }
+          foreach ($name in $sourceNames) {
+            $expected = (Get-FileHash -Algorithm SHA256 `
+              -LiteralPath (Join-Path $sourceRoot $name)).Hash
+            $actual = (Get-FileHash -Algorithm SHA256 `
+              -LiteralPath (Join-Path $extractedRoot $name)).Hash
+            if ($actual -cne $expected) {
+              throw "fresh extraction changed $name"
+            }
+          }
+          foreach ($line in Get-Content -LiteralPath `
+            (Join-Path $extractedRoot 'SHA256SUMS.txt')) {
+            if ($line -notmatch '^([0-9a-f]{64})  ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)$') {
+              throw "invalid inner checksum record: $line"
+            }
+            $expectedHash = $Matches[1]
+            $portablePath = $Matches[2]
+            $prefix = "$env:STASIS_WINDOWS_BUNDLE/"
+            if (-not $portablePath.StartsWith($prefix, [StringComparison]::Ordinal)) {
+              throw "inner checksum escaped the bundle root: $portablePath"
+            }
+            $name = $portablePath.Substring($prefix.Length)
+            $actualHash = (Get-FileHash -Algorithm SHA256 `
+              -LiteralPath (Join-Path $extractedRoot $name)).Hash.ToLowerInvariant()
+            if ($actualHash -cne $expectedHash) {
+              throw "inner checksum differs for $portablePath"
+            }
+          }
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsInstall = (& $vswhere -latest -products '*' `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath).Trim()
+          $vcToolsVersion = (Get-Content -LiteralPath `
+            (Join-Path $vsInstall 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt') `
+            -Raw).Trim()
+          $dumpbin = Join-Path $vsInstall `
+            "VC\Tools\MSVC\$vcToolsVersion\bin\Hostx64\x64\dumpbin.exe"
+          $extractedBinary = Join-Path $extractedRoot 'stasis.exe'
+          $headers = (& $dumpbin /nologo /headers $extractedBinary 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $headers -notmatch '(?im)^\s*8664 machine \(x64\)\s*$') {
+            throw 'the extracted Stasis executable is not PE x86-64'
+          }
+          $runtimeDlls = @(Get-ChildItem -LiteralPath $extractedRoot -File -Filter '*.dll')
+          if ($runtimeDlls.Count -lt 1) {
+            throw 'the extracted bundle has no app-local native runtime DLLs'
+          }
+          foreach ($dllName in @('libEGL.dll', 'libGLESv2.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $extractedRoot $dllName) -PathType Leaf)) {
+              throw "the extracted bundle omitted required ANGLE runtime $dllName"
+            }
+          }
+          foreach ($file in @((Get-Item -LiteralPath $extractedBinary)) + $runtimeDlls) {
+            $dependencies = & $dumpbin /nologo /dependents $file.FullName 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              throw "dumpbin failed for extracted file $($file.Name)"
+            }
+            foreach ($dependency in $dependencies) {
+              if ("$dependency" -match '^\s+((?i:(?:msvcp|vcruntime|concrt)[0-9].*\.dll))\s*$') {
+                if (-not (Test-Path -LiteralPath (Join-Path $extractedRoot $Matches[1]) -PathType Leaf)) {
+                  throw "the extracted app-local MSVC runtime closure omitted $($Matches[1])"
+                }
+              }
+            }
+          }
+
+          $binaryHash = (Get-FileHash -Algorithm SHA256 `
+            -LiteralPath $extractedBinary).Hash.ToLowerInvariant()
+          $binaryRecord = (Get-Content -LiteralPath $binarySidecar -Raw).Trim()
+          if ($binaryRecord -cne "$binaryHash  $env:STASIS_WINDOWS_BUNDLE/stasis.exe") {
+            throw 'the Windows executable checksum sidecar does not match fresh extraction'
+          }
+          $env:STASIS_RELEASE_BINARY = $extractedBinary
+          $env:STASIS_RELEASE_ARCHIVE = $archive
+          $env:STASIS_RELEASE_REVISION = $env:GITHUB_SHA
+          $env:STASIS_RELEASE_SHA256 = $binaryHash
+          $gateLog = Join-Path $env:STASIS_WINDOWS_LOGS 'artifact-gate.log'
+          $testCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell ' +
+            '--test controlled_mvp release_gate_published_binary_completes_act_settle_inspect ' +
+            '-- --ignored --exact --test-threads=1 --show-output; exit $LASTEXITCODE'
+          & .\mach.ps1 exec -- pwsh -NoProfile -Command $testCommand 2>&1 `
+            | Tee-Object -FilePath $gateLog
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            throw "the extracted Windows artifact gate failed with exit code $exitCode"
+          }
+          $gateText = Get-Content -LiteralPath $gateLog -Raw
+          if (-not $gateText.Contains('test release_gate_published_binary_completes_act_settle_inspect ... ok') `
+            -or -not $gateText.Contains('[RELEASE ARTIFACT]')) {
+            throw 'the extracted Windows artifact gate log lacks its success evidence'
+          }
+          @"
+          schema=1
+          boundary=windows_ci_only_not_managed_release
+          revision=$env:GITHUB_SHA
+          run_id=$env:GITHUB_RUN_ID
+          run_attempt=$env:GITHUB_RUN_ATTEMPT
+          archive=$([IO.Path]::GetFileName($archive))
+          archive_sha256=$archiveHash
+          binary_sha256=$binaryHash
+          runtime_dll_count=$($runtimeDlls.Count)
+          artifact_gate=passed
+          "@ | Set-Content -LiteralPath `
+            (Join-Path $env:STASIS_WINDOWS_LOGS 'bundle-verification.txt') `
+            -Encoding utf8NoBOM
+
+      - name: Upload the attempt-qualified Windows CI bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.windows-names.outputs.bundle_artifact_name }}
+          path: |
+            dist-windows-ci/artifacts/*.zip
+            dist-windows-ci/artifacts/*.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload the attempt-qualified Windows gate logs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.windows-names.outputs.log_artifact_name }}
+          path: dist-windows-ci/logs/*
+          if-no-files-found: error
+          retention-days: 90
+
   package-sdk:
     name: Bind both native runtimes and gate the TypeScript package
     needs:
@@ -885,10 +1480,12 @@ jobs:
     needs:
       - validate-invocation
       - package-native
+      - package-windows-ci
       - package-sdk
     if: |
       needs.validate-invocation.outputs.mode == 'package'
         && needs.package-native.result == 'success'
+        && needs.package-windows-ci.result == 'success'
         && needs.package-sdk.result == 'success'
         && github.event_name == 'push'
         && github.ref == 'refs/heads/main'

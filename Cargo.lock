@@ -9798,6 +9798,7 @@ name = "stasis-shell"
 version = "0.2.1"
 dependencies = [
  "dpi",
+ "libc",
  "rand 0.10.2",
  "rustls",
  "serde",
@@ -9808,7 +9809,9 @@ dependencies = [
  "servo-net-traits",
  "servo-storage-traits",
  "servo-timers",
+ "sha2 0.11.0",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

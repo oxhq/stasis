@@ -23,6 +23,34 @@ the first stable train. `etc/ci/stasis/release_archive.py` accepts only `0.2.1`
 for newly produced release archives; this does not alter or re-authorize the
 historical `v0.2.0` or `0.1.x` bytes.
 
+## Windows x86-64 CI-only proof artifact
+
+Package-mode runs also execute a separate `package-windows-ci` job on the
+GitHub-hosted `windows-2022` x86-64 runner. This job is deliberately outside the
+stable macOS/Linux native release matrix. It builds the exact event SHA with
+`mach.ps1 exec -- cargo build --locked -p stasis-shell --profile
+production-stripped`, runs the v0.2 TypeScript session North Star through an
+explicit `stasis.exe`, and runs the native `controlled_mvp` and controlled-network
+redirect-order gates plus the Windows stdio protocol-isolation tests.
+
+The job creates an unsigned, attempt-qualified Windows CI ZIP. The ZIP has one
+root directory containing `stasis.exe`, the ANGLE `libEGL.dll` and
+`libGLESv2.dll` rendering runtime, the source and license documents, and the
+app-local x86-64 MSVC runtime DLL closure derived from the native files' PE
+imports. The job writes archive and executable SHA-256 sidecars, extracts the
+ZIP into a fresh directory, verifies every extracted member, and runs the
+ignored `release_gate_published_binary_completes_act_settle_inspect` fixture
+against that extracted executable. The bundle and its logs are retained as
+separate Actions artifacts for the producing run attempt.
+
+This proves only that the checked-out revision builds, bundles, and passes the
+declared native and explicit-SDK gates on that Windows runner. The ZIP is not a
+GitHub release asset, is not covered by the stable eleven-subject provenance
+statement, and is not admitted to promotion, the checked-in/generated runtime
+manifest, npm package inventory, or managed runtime acquisition. Windows users
+must provide the extracted executable explicitly through `executablePath`.
+The stable supported distribution surface remains macOS arm64 and Linux x86-64.
+
 The exact `v0.2.1` GitHub release inventory is nine assets:
 
 - `stasis-0.2.1-macos-aarch64.tar.gz`
@@ -79,6 +107,10 @@ binary on its own macOS arm64 or Linux x64 producer before any release artifact
 is uploaded. This makes native platform correctness a prepublication gate,
 rather than relying on post-publication registry verification to discover a
 Linux-only failure.
+
+On package runs, the independent Windows CI-only job must also succeed before
+the main-push package outputs can be attested. Its ZIP and logs remain
+diagnostic CI artifacts and are not inputs to the stable release attestation.
 
 Both fixture runners and the entire session fixture directory are copied beside
 the installed tarball before execution. Credential-free package gating uses the

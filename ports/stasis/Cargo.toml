@@ -26,3 +26,15 @@ servo-base = { workspace = true }
 storage_traits = { workspace = true }
 timers = { workspace = true }
 url = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+libc = { workspace = true }
+servo = { workspace = true, default-features = false, features = ["no-wgl"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+sha2 = { workspace = true }

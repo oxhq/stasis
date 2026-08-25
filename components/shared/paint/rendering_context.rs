@@ -136,6 +136,13 @@ impl SurfmanRenderingContext {
                 print_diagnostics_information_on_context_creation_failure(&device, gl_api, version)
             })?;
 
+        // Windows surfman backends can leave the new context non-current after creation. `glow`
+        // queries GL_VERSION while loading, so make it current on surfman's hidden window before
+        // constructing either GL API wrapper. A real surface is bound immediately after this
+        // constructor returns.
+        #[cfg(target_os = "windows")]
+        device.make_context_current(&context)?;
+
         #[expect(unsafe_code)]
         let gleam_gl = {
             match gl_api {

@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const BOUNDED_STRESS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -1003,32 +1005,27 @@ fn parse_expected_source_identities() -> BTreeMap<String, String> {
 }
 
 fn release_artifact_sha256(artifact: &Path) -> String {
-    for (program, arguments) in [
-        ("sha256sum", &[][..]),
-        ("shasum", &["-a", "256"][..]),
-        ("openssl", &["dgst", "-sha256"][..]),
-    ] {
-        let Ok(output) = Command::new(program).args(arguments).arg(artifact).output() else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
+    let mut file = File::open(artifact).unwrap_or_else(|error| {
+        panic!("could not open {} for SHA-256: {error}", artifact.display())
+    });
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .unwrap_or_else(|error| panic!("could not hash {}: {error}", artifact.display()));
+        if read == 0 {
+            break;
         }
-        let stdout = String::from_utf8(output.stdout)
-            .unwrap_or_else(|error| panic!("{program} emitted non-UTF-8 output: {error}"));
-        if let Some(digest) = stdout
-            .split_ascii_whitespace()
-            .find(|field| field.len() == 64 && field.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        {
-            let digest = digest.to_ascii_lowercase();
-            assert_sha256(&digest, program);
-            return digest;
-        }
+        hasher.update(&buffer[..read]);
     }
-    panic!(
-        "could not calculate SHA-256 for {}; install sha256sum, shasum, or openssl",
-        artifact.display()
-    )
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_sha256(&digest, "Rust SHA-256");
+    digest
 }
 
 fn assert_sha256(digest: &str, field: &str) {
