@@ -3993,6 +3993,35 @@ fn transition_from_navigation_completion(
             else {
                 unreachable!("the replacement admission phase was matched above")
             };
+            if classify_same_document_session_transition(&source, &navigation).is_some() {
+                let progress = state
+                    .coordinator
+                    .consume_drive_one_turn_stable_authority_boundary(
+                        drive_outcome,
+                        state.cumulative_external_io_wall_time,
+                    );
+                return match progress {
+                    Ok(settle::SettleProgress::Command(DocumentControlCommand::Observe)) => {
+                        state.latest_pending_target = Some(Box::new(navigation.target().clone()));
+                        state.authorizing_navigation = Some(navigation);
+                        ActiveTransition::Submit(DocumentControlCommand::Observe)
+                    },
+                    Ok(_) => ActiveTransition::Fail(ActiveFailure {
+                        error: fatal_operation(
+                            "internal_runtime_failure",
+                            "stable authority boundary did not issue an Observe command",
+                            active.state_effect.as_protocol_str(),
+                        ),
+                        fail_stop: true,
+                    }),
+                    Err(error) => ActiveTransition::Fail(settle_failure_for_response(
+                        error,
+                        active.state_effect,
+                        None,
+                        &state.response,
+                    )),
+                };
+            }
             let Some(admission) = exact_replacement_admission(&source, &navigation) else {
                 return navigation_activation_failure(active.state_effect, true);
             };
@@ -7209,6 +7238,7 @@ mod tests {
                 .map(|pipeline_id| PendingPipelineRenderingObservation {
                     pipeline_id: *pipeline_id,
                     activity: PendingRenderingPipelineActivity::FullyActive,
+                    render_blocking_elements: 0,
                     retained_animation_frame_callbacks: 0,
                     runnable_animation_frame_callbacks: 0,
                     document_update_required: false,
@@ -7317,6 +7347,56 @@ mod tests {
             control_turn_observed: None,
             needs_initial_pump: false,
             state_effect: RequestStateEffect::None,
+        }
+    }
+
+    fn indeterminate_drive_settle_active(source: &SessionNavigationAuthority) -> ActiveRequest {
+        let effective_policy = default_resolved_settle_policy();
+        let mut coordinator = settle::SettleCoordinator::new(effective_policy.engine);
+        assert_eq!(
+            coordinator.start(),
+            Ok(settle::SettleProgress::Command(
+                DocumentControlCommand::Observe
+            ))
+        );
+        assert_eq!(
+            coordinator.consume_receive_outcome(
+                observed_outcome(pending_for_authority(source, 7)),
+                Duration::ZERO,
+            ),
+            Ok(settle::SettleProgress::Command(
+                DocumentControlCommand::DriveOneTurn
+            ))
+        );
+        ActiveRequest {
+            request: request("runtime.settle", Some(SESSION_ID)),
+            profile: Some(SessionProfile::ControlledWebSessionV1),
+            operation: ActiveOperation::Settle(SettleState {
+                profile: SessionProfile::ControlledWebSessionV1,
+                authorizing_document_state: None,
+                authorizing_observation: None,
+                authorizing_navigation: Some(source.clone()),
+                replacement: Some(SettleReplacementPhase::AwaitingAdmission {
+                    source: source.clone(),
+                    drive_outcome: DocumentControlReceiveOutcome::CommandOutcome(
+                        DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate {
+                            target: Box::new(source.target().clone()),
+                        },
+                    ),
+                }),
+                authority_bound_command: None,
+                latest_pending_target: Some(Box::new(source.target().clone())),
+                response: SettleResponse::Runtime,
+                coordinator,
+                effective_policy,
+                cumulative_external_io_wall_time: Duration::ZERO,
+                waiting: None,
+            }),
+            started_at: Instant::now(),
+            in_flight: None,
+            control_turn_observed: None,
+            needs_initial_pump: false,
+            state_effect: RequestStateEffect::Partial,
         }
     }
 
@@ -9274,6 +9354,144 @@ mod tests {
         };
         assert_eq!(state.authorizing_navigation.as_ref(), Some(&observed));
         assert!(state.authority_bound_command.is_none());
+    }
+
+    #[test]
+    fn indeterminate_drive_with_stable_authority_is_counted_once_and_reobserved() {
+        let source = session_authority(1, 0, 0, 0);
+        let mut active = indeterminate_drive_settle_active(&source);
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x72; 16]),
+        );
+
+        assert!(matches!(
+            transition_from_navigation_completion(
+                &mut active,
+                NavigationOperationCompletion::test_response(
+                    NavigationOperationKind::Observe,
+                    Ok(source.clone()),
+                ),
+                &mut projection,
+                0,
+            ),
+            ActiveTransition::Submit(DocumentControlCommand::Observe)
+        ));
+        let ActiveOperation::Settle(state) = &active.operation else {
+            panic!("stable authority recovery lost settlement state");
+        };
+        assert!(state.replacement.is_none());
+        assert_eq!(state.authorizing_navigation.as_ref(), Some(&source));
+        assert_eq!(
+            state.latest_pending_target.as_deref(),
+            Some(source.target())
+        );
+    }
+
+    #[test]
+    fn indeterminate_drive_with_same_document_history_change_is_reobserved() {
+        let source = session_authority(1, 0, 0, 0);
+        let changed = SessionNavigationAuthority::new_internal(
+            Box::new(source.target().clone()),
+            source.document_epoch(),
+            source.navigation_id(),
+            embedder_traits::document_session::HistoryRevision::new(1),
+            source.successful_document_replacements(),
+            servo::ServoUrl::parse("https://example.test/#changed").unwrap(),
+            None,
+        );
+        let mut active = indeterminate_drive_settle_active(&source);
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x75; 16]),
+        );
+
+        assert!(matches!(
+            transition_from_navigation_completion(
+                &mut active,
+                NavigationOperationCompletion::test_response(
+                    NavigationOperationKind::Observe,
+                    Ok(changed.clone()),
+                ),
+                &mut projection,
+                0,
+            ),
+            ActiveTransition::Submit(DocumentControlCommand::Observe)
+        ));
+        let ActiveOperation::Settle(state) = &active.operation else {
+            panic!("same-document recovery lost settlement state");
+        };
+        assert_eq!(state.authorizing_navigation.as_ref(), Some(&changed));
+    }
+
+    #[test]
+    fn indeterminate_drive_with_exact_replacement_still_bootstraps() {
+        let source = session_authority(1, 0, 0, 0);
+        let admitted = replacement_admission_authority(&source);
+        let mut active = indeterminate_drive_settle_active(&source);
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x73; 16]),
+        );
+        let bootstrap = DocumentControlCommand::BootstrapReplacementPipeline {
+            source_pipeline_id: source.target().active_top_level.unwrap().pipeline_id,
+            pipeline_id: admitted.target().pending_top_level_pipelines()[0],
+        };
+
+        assert!(matches!(
+            transition_from_navigation_completion(
+                &mut active,
+                NavigationOperationCompletion::test_response(
+                    NavigationOperationKind::Observe,
+                    Ok(admitted.clone()),
+                ),
+                &mut projection,
+                0,
+            ),
+            ActiveTransition::Submit(command) if command == bootstrap
+        ));
+        let ActiveOperation::Settle(state) = &active.operation else {
+            panic!("replacement recovery lost settlement state");
+        };
+        assert!(matches!(
+            state.replacement.as_ref(),
+            Some(SettleReplacementPhase::Bootstrapping {
+                source: actual_source,
+                admitted: actual_admitted,
+                command,
+            }) if actual_source == &source && actual_admitted == &admitted && command == &bootstrap
+        ));
+    }
+
+    #[test]
+    fn indeterminate_drive_authority_near_miss_remains_fatal() {
+        let source = session_authority(1, 0, 0, 0);
+        let admitted = replacement_admission_authority(&source);
+        let near_miss = SessionNavigationAuthority::new_internal(
+            Box::new(admitted.target().clone()),
+            admitted.document_epoch(),
+            SessionNavigationId::new(source.navigation_id().get() + 2),
+            admitted.history_revision(),
+            admitted.successful_document_replacements(),
+            admitted.url().clone(),
+            None,
+        );
+        let mut active = indeterminate_drive_settle_active(&source);
+        let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+            stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x74; 16]),
+        );
+
+        let ActiveTransition::Fail(failure) = transition_from_navigation_completion(
+            &mut active,
+            NavigationOperationCompletion::test_response(
+                NavigationOperationKind::Observe,
+                Ok(near_miss),
+            ),
+            &mut projection,
+            0,
+        ) else {
+            panic!("an owner-authority near miss recovered an indeterminate Drive");
+        };
+        assert!(failure.fail_stop);
+        assert!(failure.error.fatal);
+        assert_eq!(failure.error.code, "navigation_authority_changed");
     }
 
     #[test]

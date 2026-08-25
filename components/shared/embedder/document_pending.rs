@@ -1872,6 +1872,8 @@ pub struct PendingPipelineRenderingObservation {
     pub pipeline_id: PipelineId,
     /// Mechanical target activity observed with these document facts.
     pub activity: PendingRenderingPipelineActivity,
+    /// Elements that still block this document's first rendering opportunity.
+    pub render_blocking_elements: u64,
     /// requestAnimationFrame slots retained in the document list, including canceled tombstones.
     pub retained_animation_frame_callbacks: u64,
     /// Retained requestAnimationFrame slots which still contain runnable callbacks.
@@ -1991,6 +1993,7 @@ impl PendingRenderingObservation {
                 let canvas = observation.canvas;
                 observation.retained_animation_frame_callbacks != 0
                     || observation.runnable_animation_frame_callbacks != 0
+                    || observation.render_blocking_elements != 0
                     || observation.document_update_required
                     || observation.pending_animation_events != 0
                     || observation.finite_animations != 0
@@ -3486,6 +3489,7 @@ mod tests {
             vec![PendingPipelineRenderingObservation {
                 pipeline_id,
                 activity: PendingRenderingPipelineActivity::FullyActive,
+                render_blocking_elements: 0,
                 retained_animation_frame_callbacks: 2,
                 runnable_animation_frame_callbacks: 1,
                 document_update_required: true,

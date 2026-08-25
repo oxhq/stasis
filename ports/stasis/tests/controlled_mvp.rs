@@ -37,8 +37,10 @@ const MAX_STDERR_TAIL_BYTES: usize = 64 * 1024;
 const EXPECTED_SOURCE_IDENTITIES: &str = include_str!("../../../STASIS_UPSTREAM.toml");
 const EXPECTED_STASIS_REPOSITORY: &str = "https://github.com/oxhq/stasis.git";
 const CONTROLLED_WEBAPP_V1_PROFILE: &str = "controlled-webapp-v1";
+const CONTROLLED_WEB_SESSION_V1_PROFILE: &str = "controlled-web-session-v1";
 
 const STATIC_FIXTURE: &[u8] = include_bytes!("fixtures/static.html");
+const INITIAL_STYLESHEET_FIXTURE: &[u8] = include_bytes!("fixtures/initial_stylesheet.html");
 const TIMER_10S_FIXTURE: &[u8] = include_bytes!("fixtures/timer_10s.html");
 const TIMER_MICROTASK_FIXTURE: &[u8] = include_bytes!("fixtures/timer_microtask_order.html");
 const RAF_FIXTURE: &[u8] = include_bytes!("fixtures/raf_correlation.html");
@@ -154,6 +156,23 @@ fn static_page_settles_and_is_inspected_with_protocol_only_stdout() {
         "stable_empty"
     );
     assert_eq!(shell.text("#result", &state_generation(&settled)), "ready");
+    shell.close_cleanly();
+}
+
+#[test]
+fn controlled_session_with_initial_stylesheet_opens_at_controlled_ready_boundary() {
+    let _serial = process_test_guard();
+    let server = FixtureServer::start(INITIAL_STYLESHEET_FIXTURE, false);
+    let mut shell = TestShell::spawn();
+    let capabilities = shell.initialize();
+    assert_capabilities(&capabilities, &[], true);
+    assert!(
+        capabilities.supports_profile(CONTROLLED_WEB_SESSION_V1_PROFILE),
+        "runtime does not advertise {CONTROLLED_WEB_SESSION_V1_PROFILE}"
+    );
+
+    let opened = shell.open_controlled_profile(server.url(), CONTROLLED_WEB_SESSION_V1_PROFILE);
+    assert_eq!(opened["boundary"], "controlled_ready");
     shell.close_cleanly();
 }
 
@@ -1170,7 +1189,7 @@ impl Requests {
         )
     }
 
-    fn open_controlled(id: String, url: &str) -> Value {
+    fn open_controlled(id: String, url: &str, profile: &str) -> Value {
         Self::envelope(
             id,
             None,
@@ -1178,7 +1197,7 @@ impl Requests {
             json!({
                 "url": url,
                 "clockMode": "controlled",
-                "profile": CONTROLLED_WEBAPP_V1_PROFILE,
+                "profile": profile,
                 "initialVirtualTimeNs": INITIAL_VIRTUAL_TIME_NS,
                 "unixTimeOriginNs": "0",
             }),
@@ -1384,12 +1403,18 @@ impl TestShell {
     }
 
     fn open_controlled(&mut self, url: &str) -> Value {
+        self.open_controlled_profile(url, CONTROLLED_WEBAPP_V1_PROFILE)
+    }
+
+    fn open_controlled_profile(&mut self, url: &str, profile: &str) -> Value {
         let id = self.next_id("open");
-        let response = self.call(Requests::open_controlled(id, url));
+        let response = self.call(Requests::open_controlled(id, url, profile));
         let envelope_session_id = response
             .get("sessionId")
             .and_then(Value::as_str)
-            .expect("successful session.open response must carry sessionId")
+            .unwrap_or_else(|| {
+                panic!("successful session.open response must carry sessionId: {response}")
+            })
             .to_owned();
         let result = expect_result(response);
         let session_id = result["sessionId"]
@@ -1399,7 +1424,7 @@ impl TestShell {
         assert_eq!(envelope_session_id, session_id);
         assert_eq!(result["clockMode"], "controlled");
         assert_eq!(result["boundary"], "controlled_ready");
-        assert_eq!(result["profile"], CONTROLLED_WEBAPP_V1_PROFILE);
+        assert_eq!(result["profile"], profile);
         self.session_id = Some(session_id);
         result
     }
@@ -2099,6 +2124,12 @@ fn serve_fixture_request(mut stream: TcpStream, fixture: &'static [u8], stall: O
             "200 OK",
             "text/plain; charset=utf-8",
             b"xhr complete",
+        ),
+        "/style.css" => write_http_response(
+            &mut stream,
+            "200 OK",
+            "text/css; charset=utf-8",
+            b"body { color: red; }",
         ),
         _ => write_http_response(&mut stream, "404 Not Found", "text/plain", b"not found"),
     }

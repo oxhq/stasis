@@ -374,7 +374,9 @@ fn authoritative_ready_work(pending: &RawPendingSnapshot) -> Option<DocumentAdva
         .pipelines()
         .iter()
         .copied()
-        .find(|pipeline| pipeline.document_update_required)
+        .find(|pipeline| {
+            pipeline.render_blocking_elements == 0 && pipeline.document_update_required
+        })
         .map(|pipeline| DocumentAdvanceReadyWork::RenderingRequired(Box::new(pipeline)))
 }
 
@@ -2051,6 +2053,7 @@ mod tests {
             vec![PendingPipelineRenderingObservation {
                 pipeline_id: TEST_PIPELINE_ID,
                 activity: PendingRenderingPipelineActivity::FullyActive,
+                render_blocking_elements: 0,
                 retained_animation_frame_callbacks: 0,
                 runnable_animation_frame_callbacks: 0,
                 document_update_required: false,
@@ -3042,6 +3045,14 @@ mod tests {
                 DocumentAdvanceReadyWork::RenderingRequired(observed)
             )) if observed.pipeline_id == TEST_PIPELINE_ID
         ));
+
+        let mut pending = eligible_pending();
+        let mut pipeline = pending.rendering.pipelines()[0];
+        pipeline.render_blocking_elements = 1;
+        pipeline.document_update_required = true;
+        pending.rendering = PendingRenderingObservation::new(None, false, vec![pipeline]).unwrap();
+        assert!(DocumentAdvanceToken::new_internal(DocumentAdvanceTokenId::new(1), &pending)
+            .is_ok());
     }
 
     #[test]

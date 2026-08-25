@@ -219,6 +219,43 @@ enum CoordinatorPhase {
     Failed,
 }
 
+#[derive(Clone, Copy)]
+enum DriveOneTurnBoundaryKind {
+    StableAuthority,
+    Replacement,
+}
+
+impl DriveOneTurnBoundaryKind {
+    fn in_flight_command_error(self) -> &'static str {
+        match self {
+            Self::StableAuthority => "stable authority boundary requires an in-flight DriveOneTurn",
+            Self::Replacement => "document replacement boundary requires an in-flight DriveOneTurn",
+        }
+    }
+
+    fn outcome_error(self) -> &'static str {
+        match self {
+            Self::StableAuthority => {
+                "stable authority boundary requires an exact typed drive outcome"
+            },
+            Self::Replacement => {
+                "document replacement boundary requires an exact typed drive outcome"
+            },
+        }
+    }
+
+    fn target_error(self) -> &'static str {
+        match self {
+            Self::StableAuthority => {
+                "stable authority boundary did not bind the last observed target"
+            },
+            Self::Replacement => {
+                "document replacement boundary did not bind the last observed target"
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WaitKind {
     ForegroundExternalIo,
@@ -409,6 +446,65 @@ impl SettleCoordinator {
         cumulative_external_io_wall_time: Duration,
         bootstrap: DocumentControlCommand,
     ) -> Result<SettleProgress, SettleFailure> {
+        if !matches!(
+            bootstrap,
+            DocumentControlCommand::BootstrapReplacementPipeline { .. }
+        ) {
+            return Err(SettleFailure::InvalidCoordinatorState(
+                "document replacement boundary requires BootstrapReplacementPipeline",
+            ));
+        }
+        self.consume_drive_one_turn_boundary_inner(
+            outcome,
+            cumulative_external_io_wall_time,
+            DriveOneTurnBoundaryKind::Replacement,
+        )?;
+
+        // Admission ran the source turn even though the resulting target transition prevented a
+        // post-turn observation. Never retry it; reconcile only the owner-attested replacement
+        // lifecycle event. An ordinary Observe is invalid until that event reconciles local
+        // ScriptThread membership with the already-captured Constellation target.
+        self.issue_command(bootstrap, None)
+    }
+
+    /// Consume a typed indeterminate controlled turn after the session owner has independently
+    /// proved that document authority remained on the same document.
+    ///
+    /// The turn is counted exactly once and never retried. Its source-bound quiet candidate is
+    /// discarded, the existing virtual-time and wall-I/O accounting is preserved, and a fresh
+    /// authoritative Observe is requested. Callers must prove the same-document authority before
+    /// using this continuation.
+    pub fn consume_drive_one_turn_stable_authority_boundary(
+        &mut self,
+        outcome: DocumentControlReceiveOutcome,
+        cumulative_external_io_wall_time: Duration,
+    ) -> Result<SettleProgress, SettleFailure> {
+        let result = self.consume_drive_one_turn_stable_authority_boundary_inner(
+            outcome,
+            cumulative_external_io_wall_time,
+        );
+        self.guard_result(result)
+    }
+
+    fn consume_drive_one_turn_stable_authority_boundary_inner(
+        &mut self,
+        outcome: DocumentControlReceiveOutcome,
+        cumulative_external_io_wall_time: Duration,
+    ) -> Result<SettleProgress, SettleFailure> {
+        self.consume_drive_one_turn_boundary_inner(
+            outcome,
+            cumulative_external_io_wall_time,
+            DriveOneTurnBoundaryKind::StableAuthority,
+        )?;
+        self.issue_command(DocumentControlCommand::Observe, None)
+    }
+
+    fn consume_drive_one_turn_boundary_inner(
+        &mut self,
+        outcome: DocumentControlReceiveOutcome,
+        cumulative_external_io_wall_time: Duration,
+        kind: DriveOneTurnBoundaryKind,
+    ) -> Result<(), SettleFailure> {
         self.observe_external_io_wall_time(cumulative_external_io_wall_time)?;
         if self.phase != CoordinatorPhase::InFlight {
             return Err(SettleFailure::InvalidCoordinatorState(
@@ -425,15 +521,7 @@ impl SettleCoordinator {
 
         if in_flight.command != DocumentControlCommand::DriveOneTurn {
             return Err(SettleFailure::InvalidCoordinatorState(
-                "document replacement boundary requires an in-flight DriveOneTurn",
-            ));
-        }
-        if !matches!(
-            bootstrap,
-            DocumentControlCommand::BootstrapReplacementPipeline { .. }
-        ) {
-            return Err(SettleFailure::InvalidCoordinatorState(
-                "document replacement boundary requires BootstrapReplacementPipeline",
+                kind.in_flight_command_error(),
             ));
         }
 
@@ -445,9 +533,7 @@ impl SettleCoordinator {
                 return Err(SettleFailure::DriveOneTurnOutcomeIndeterminate(failure));
             },
             _ => {
-                return Err(SettleFailure::InvalidCoordinatorState(
-                    "document replacement boundary requires an exact typed drive outcome",
-                ));
+                return Err(SettleFailure::InvalidCoordinatorState(kind.outcome_error()));
             },
         };
         runtime_outcome
@@ -458,22 +544,18 @@ impl SettleCoordinator {
             unreachable!("the exact typed drive outcome was matched above");
         };
         if self.last_target.as_ref() != Some(target.as_ref()) {
-            return Err(SettleFailure::InvalidCoordinatorState(
-                "document replacement boundary did not bind the last observed target",
-            ));
+            return Err(SettleFailure::InvalidCoordinatorState(kind.target_error()));
         }
 
-        // Admission ran the source turn even though the resulting target transition prevented a
-        // post-turn observation. Count it once, never retry it, and deliberately drop the
-        // in-flight quiet candidate before admitting only the owner-attested replacement
-        // lifecycle event. An ordinary Observe is invalid until that event reconciles local
-        // ScriptThread membership with the already-captured Constellation target.
+        // The turn crossed its linearization point but could not return a post-turn snapshot.
+        // Count it once, never retry it, and drop the source-bound quiet candidate before the
+        // independently-authorized continuation.
         self.control_turns = self
             .control_turns
             .checked_add(1)
             .ok_or(SettleFailure::ControlTurnCounterOverflow)?;
         drop(in_flight.quiet_candidate);
-        self.issue_command(bootstrap, None)
+        Ok(())
     }
 
     /// Replace a coordinator-issued `DriveOneTurn` which the shell has not submitted with the
@@ -1167,6 +1249,7 @@ fn rendering_ready(pending: &RawPendingSnapshot) -> bool {
     pending.rendering.opportunity_ready
         || pending.rendering.pipelines().iter().any(|rendering| {
             rendering.activity == PendingRenderingPipelineActivity::FullyActive
+                && rendering.render_blocking_elements == 0
                 && (rendering.pending_animation_events != 0
                     || rendering.animated_images.update_ready
                     || (rendering_opportunity_is_unscheduled
@@ -1178,6 +1261,7 @@ fn rendering_ready(pending: &RawPendingSnapshot) -> bool {
 
 fn has_finite_rendering_demand(rendering: &PendingPipelineRenderingObservation) -> bool {
     rendering.activity == PendingRenderingPipelineActivity::FullyActive
+        && rendering.render_blocking_elements == 0
         && (rendering.runnable_animation_frame_callbacks != 0
             || rendering.document_update_required
             || rendering.finite_animations != 0
@@ -1207,7 +1291,8 @@ fn unsupported_rendering(pending: &RawPendingSnapshot) -> Option<SettleRuntimeFa
                 || rendering.canvas.dirty_contexts != 0
                 || rendering.pending_fonts != 0
                 || rendering.pending_images != 0);
-        if rendering.unsupported_animations != 0
+        if rendering.render_blocking_elements != 0
+            || rendering.unsupported_animations != 0
             || unsupported_images
             || unsupported_canvas
             || inactive_work
@@ -1534,6 +1619,7 @@ mod tests {
             vec![PendingPipelineRenderingObservation {
                 pipeline_id: TEST_PIPELINE_ID,
                 activity: PendingRenderingPipelineActivity::FullyActive,
+                render_blocking_elements: 0,
                 retained_animation_frame_callbacks: 0,
                 runnable_animation_frame_callbacks: 0,
                 document_update_required: false,
@@ -2800,6 +2886,138 @@ mod tests {
     }
 
     #[test]
+    fn typed_drive_stable_authority_boundary_counts_once_and_reobserves() {
+        let fixture = Fixture::new();
+        let pending = fixture.snapshot(2, 1);
+        let mut coordinator = SettleCoordinator::new(SettlePolicy {
+            max_control_turns: 1,
+            ..SettlePolicy::default()
+        });
+        assert_observe(coordinator.start().unwrap());
+        assert!(matches!(
+            observe(&mut coordinator, pending.clone(), None).unwrap(),
+            SettleProgress::Command(DocumentControlCommand::DriveOneTurn)
+        ));
+
+        assert_eq!(
+            coordinator
+                .consume_drive_one_turn_stable_authority_boundary(
+                    DocumentControlReceiveOutcome::CommandOutcome(
+                        DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate {
+                            target: Box::new(pending.target.clone()),
+                        },
+                    ),
+                    Duration::from_millis(7),
+                )
+                .unwrap(),
+            SettleProgress::Command(DocumentControlCommand::Observe)
+        );
+
+        assert!(matches!(
+            coordinator
+                .consume_receive_outcome(
+                    received(
+                        DocumentControlAction::Observed,
+                        fixture.snapshot(3, 2),
+                        None,
+                    ),
+                    Duration::from_millis(7),
+                )
+                .unwrap(),
+            SettleProgress::Complete(SettleCompletion::ControlTurnLimitExceeded {
+                limit: 1,
+                control_turns: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn typed_drive_stable_authority_boundary_rejects_transport_and_target_drift() {
+        let fixture = Fixture::new();
+        let pending = fixture.snapshot(2, 1);
+
+        let mut transport = SettleCoordinator::new(SettlePolicy::default());
+        assert_observe(transport.start().unwrap());
+        assert!(matches!(
+            observe(&mut transport, pending.clone(), None).unwrap(),
+            SettleProgress::Command(DocumentControlCommand::DriveOneTurn)
+        ));
+        assert_eq!(
+            transport.consume_drive_one_turn_stable_authority_boundary(
+                DocumentControlReceiveOutcome::DriveOneTurnOutcomeIndeterminate(
+                    DocumentControlTransportFailure::Disconnected,
+                ),
+                Duration::ZERO,
+            ),
+            Err(SettleFailure::DriveOneTurnOutcomeIndeterminate(
+                DocumentControlTransportFailure::Disconnected,
+            ))
+        );
+
+        let mut mismatched = SettleCoordinator::new(SettlePolicy::default());
+        assert_observe(mismatched.start().unwrap());
+        assert!(matches!(
+            observe(&mut mismatched, pending, None).unwrap(),
+            SettleProgress::Command(DocumentControlCommand::DriveOneTurn)
+        ));
+        let mut wrong_target = target();
+        wrong_target.navigation_revision = wrong_target.navigation_revision.checked_next().unwrap();
+        assert_eq!(
+            mismatched.consume_drive_one_turn_stable_authority_boundary(
+                DocumentControlReceiveOutcome::CommandOutcome(
+                    DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate {
+                        target: Box::new(wrong_target),
+                    },
+                ),
+                Duration::ZERO,
+            ),
+            Err(SettleFailure::InvalidCoordinatorState(
+                "stable authority boundary did not bind the last observed target",
+            ))
+        );
+    }
+
+    #[test]
+    fn typed_drive_stable_authority_boundary_preserves_cumulative_wall_io_time() {
+        let fixture = Fixture::new();
+        let pending = fixture.snapshot(2, 1);
+        let mut coordinator = SettleCoordinator::new(SettlePolicy::default());
+        assert_observe(coordinator.start().unwrap());
+        assert!(matches!(
+            observe(&mut coordinator, pending.clone(), None).unwrap(),
+            SettleProgress::Command(DocumentControlCommand::DriveOneTurn)
+        ));
+        assert_observe(
+            coordinator
+                .consume_drive_one_turn_stable_authority_boundary(
+                    DocumentControlReceiveOutcome::CommandOutcome(
+                        DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate {
+                            target: Box::new(pending.target),
+                        },
+                    ),
+                    Duration::from_millis(7),
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(
+            coordinator.consume_receive_outcome(
+                received(
+                    DocumentControlAction::Observed,
+                    fixture.snapshot(3, 2),
+                    None,
+                ),
+                Duration::from_millis(6),
+            ),
+            Err(SettleFailure::ExternalIoWallTimeRegressed {
+                previous: Duration::from_millis(7),
+                observed: Duration::from_millis(6),
+            })
+        );
+    }
+
+    #[test]
     fn unsubmitted_drive_rearm_drops_source_quiet_candidate_without_counting_the_drive() {
         let fixture = Fixture::new();
         let pending = fixture.snapshot(2, 1);
@@ -2981,6 +3199,88 @@ mod tests {
         assert!(matches!(
             observe(&mut coordinator, pending, None).unwrap(),
             SettleProgress::Command(DocumentControlCommand::DriveOneTurn)
+        ));
+    }
+
+    #[test]
+    fn render_blockers_wait_for_accounted_io_and_fail_closed_when_orphaned() {
+        let fixture = Fixture::new();
+        let mut waiting = fixture.snapshot(2, 1);
+        let mut rendering = waiting.rendering.pipelines()[0];
+        rendering.render_blocking_elements = 1;
+        waiting.rendering =
+            PendingRenderingObservation::new(None, false, vec![rendering]).unwrap();
+        let source_id = PendingSourceId::new(3);
+        let evidence = PendingExternalIoEvidence {
+            owner: PendingExternalIoOwner::RenderingResource,
+            load_blocking: PendingExternalIoLoadBlocking::Blocking,
+        };
+        let operation = PendingExternalIoObservation {
+            source_id,
+            pipeline_id: TEST_PIPELINE_ID,
+            kind: PendingNetworkKind::Stylesheet,
+            phase: PendingExternalIoPhase::AwaitingResponse,
+            evidence,
+            started_at: waiting.clock.now,
+        };
+        waiting.network = PendingNetworkObservation::new(vec![operation]).unwrap();
+        waiting.sources = PendingSourceSnapshot::new(
+            PendingSourceEpoch::new(1),
+            vec![PendingSourceObservation {
+                id: source_id,
+                kind: PendingSourceKind::Network,
+                disposition: PendingSourceDisposition::AwaitingExternalIo(evidence),
+            }],
+        )
+        .unwrap();
+        waiting.validate().unwrap();
+
+        let mut coordinator = SettleCoordinator::new(SettlePolicy::default());
+        assert_observe(coordinator.start().unwrap());
+        assert!(matches!(
+            observe(&mut coordinator, waiting, None).unwrap(),
+            SettleProgress::Wait(SettleWait::ForegroundExternalIo { .. })
+        ));
+
+        let mut producing = fixture.snapshot(2, 1);
+        let producer = fixture
+            .fence
+            .begin(DocumentProducerKind::ExternalCallback)
+            .unwrap();
+        rendering.document_update_required = true;
+        producing.rendering =
+            PendingRenderingObservation::new(None, false, vec![rendering]).unwrap();
+        producing.producers = PendingProducerObservation::new(
+            TEST_SCRIPT_EVENT_LOOP_ID,
+            producing.microtasks.completed_checkpoint,
+            checkpoint(2),
+            fixture.fence.snapshot(),
+            PendingProducerStability::Busy,
+            None,
+        )
+        .unwrap();
+        producing.validate().unwrap();
+        let mut coordinator = SettleCoordinator::new(SettlePolicy::default());
+        assert_observe(coordinator.start().unwrap());
+        assert!(matches!(
+            observe(&mut coordinator, producing, None).unwrap(),
+            SettleProgress::Wait(SettleWait::ProducerHandoff { .. })
+        ));
+        drop(producer);
+
+        let mut orphaned = fixture.snapshot(2, 1);
+        rendering.document_update_required = false;
+        orphaned.rendering =
+            PendingRenderingObservation::new(None, false, vec![rendering]).unwrap();
+        orphaned.validate().unwrap();
+        let mut coordinator = SettleCoordinator::new(SettlePolicy::default());
+        assert_observe(coordinator.start().unwrap());
+        assert!(matches!(
+            observe(&mut coordinator, orphaned, None).unwrap(),
+            SettleProgress::Complete(SettleCompletion::RuntimeError {
+                failure: SettleRuntimeFailure::UnsupportedRendering(observation),
+                ..
+            }) if observation.render_blocking_elements == 1
         ));
     }
 

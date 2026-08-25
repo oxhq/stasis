@@ -1692,6 +1692,7 @@ pub enum UnsupportedReason {
     CanvasUpload,
     FontLoad,
     ImageLoad,
+    RenderBlockingElement,
     InactiveRendering,
     ThrottledRendering,
     IneligibleLogicalTimer,
@@ -3086,6 +3087,11 @@ fn project_unsupported_rendering(
         UnsupportedReason::CanvasUpload,
     );
     push(
+        u128::from(rendering.render_blocking_elements),
+        SourceKind::RenderingUpdate,
+        UnsupportedReason::RenderBlockingElement,
+    );
+    push(
         u128::from(rendering.pending_fonts),
         SourceKind::TrackedPresence,
         UnsupportedReason::FontLoad,
@@ -3175,7 +3181,8 @@ fn rendering_is_unsupported(rendering: &PendingPipelineRenderingObservation) -> 
             || rendering.canvas.dirty_contexts != 0
             || rendering.pending_fonts != 0
             || rendering.pending_images != 0);
-    rendering.unsupported_animations != 0
+    rendering.render_blocking_elements != 0
+        || rendering.unsupported_animations != 0
         || unsupported_images
         || unsupported_canvas
         || inactive_work
@@ -4475,6 +4482,37 @@ mod tests {
             serde_json::to_value(kind).unwrap(),
             "unclassified_producer_io"
         );
+    }
+
+    #[test]
+    fn render_blockers_project_as_exact_unsupported_work() {
+        let pipeline_id = PipelineId {
+            namespace_id: PipelineNamespaceId(82),
+            index: Index::<PipelineIndex>::new(1).unwrap(),
+        };
+        let rendering = PendingPipelineRenderingObservation {
+            pipeline_id,
+            activity: PendingRenderingPipelineActivity::FullyActive,
+            render_blocking_elements: 2,
+            retained_animation_frame_callbacks: 0,
+            runnable_animation_frame_callbacks: 0,
+            document_update_required: false,
+            pending_animation_events: 0,
+            finite_animations: 0,
+            infinite_animations: 0,
+            unsupported_animations: 0,
+            animated_images: Default::default(),
+            canvas: Default::default(),
+            pending_fonts: 0,
+            pending_images: 0,
+        };
+
+        let projected = project_unsupported_rendering(&rendering);
+        assert_eq!(projected.len(), 1);
+        let projected = serde_json::to_value(&projected[0]).unwrap();
+        assert_eq!(projected["kind"], "rendering_update");
+        assert_eq!(projected["count"], "2");
+        assert_eq!(projected["reason"], "render_blocking_element");
     }
 
     #[test]

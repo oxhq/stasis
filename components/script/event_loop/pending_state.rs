@@ -2213,6 +2213,7 @@ mod tests {
             vec![PendingPipelineRenderingObservation {
                 pipeline_id,
                 activity: PendingRenderingPipelineActivity::FullyActive,
+                render_blocking_elements: 0,
                 retained_animation_frame_callbacks: 0,
                 runnable_animation_frame_callbacks: 0,
                 document_update_required: false,

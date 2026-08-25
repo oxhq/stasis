@@ -490,6 +490,8 @@ pub(crate) struct DocumentImagePendingObservation {
 pub(crate) struct DocumentRenderingPendingObservation {
     pub(crate) animation_frames: AnimationFramePendingObservation,
     pub(crate) eligibility: DocumentRenderingEligibilityObservation,
+    /// Exact count of elements that currently block the document's first rendering opportunity.
+    pub(crate) render_blocking_elements: u32,
     /// The exact predicate used by ScriptThread to decide whether document state
     /// independently requires an update-the-rendering opportunity.
     pub(crate) needs_rendering_update: bool,
@@ -3530,6 +3532,7 @@ impl Document {
                 render_blocked,
                 waiting_on_canvas_image_updates,
             ),
+            render_blocking_elements: self.render_blocking_element_count(),
             needs_rendering_update,
             css_animations,
             canvas,

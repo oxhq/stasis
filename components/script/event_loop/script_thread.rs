@@ -3577,6 +3577,7 @@ impl ScriptThread {
             let eligibility = rendering.eligibility;
             if rendering.animation_frames.callbacks_running
                 || eligibility.render_blocked
+                    != (rendering.render_blocking_elements != 0)
                 || eligibility.fully_active && eligibility.throttled
                 || eligibility.animation_tick_eligible
                     != (eligibility.fully_active && !eligibility.throttled)
@@ -3675,6 +3676,7 @@ impl ScriptThread {
             pipelines.push(PendingPipelineRenderingObservation {
                 pipeline_id,
                 activity,
+                render_blocking_elements: u64::from(rendering.render_blocking_elements),
                 retained_animation_frame_callbacks: checked_pending_count(
                     rendering.animation_frames.retained_slots,
                 )?,
