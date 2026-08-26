@@ -1216,7 +1216,7 @@ try {
   assert.equal(v2CssSettled.snapshot.producers.terminal, false);
   assert.equal(v2CssSettled.snapshot.rendering.pendingAnimationEvents, 0n);
   assert.equal(v2CssSettled.snapshot.rendering.finiteAnimations, 0n);
-  assert.equal(v2CssSettled.snapshot.rendering.infiniteAnimations, 0n);
+  assert.equal(v2CssSettled.snapshot.rendering.persistentAnimations, 0n);
   assert.equal(v2CssSettled.snapshot.rendering.unsupportedAnimations, 0n);
   assert.ok(v2CssSettled.processed.renderingOpportunities > 0n);
   const v2CssControlledTraceResult = await v2CssSession.text(
@@ -1337,7 +1337,7 @@ try {
     controlledExternalIo: String(v2CssSettled.externalIo.length),
     pendingAnimationEvents: String(v2CssSettled.snapshot.rendering.pendingAnimationEvents),
     finiteAnimations: String(v2CssSettled.snapshot.rendering.finiteAnimations),
-    infiniteAnimations: String(v2CssSettled.snapshot.rendering.infiniteAnimations),
+    infiniteAnimations: String(v2CssSettled.snapshot.rendering.persistentAnimations),
     unsupportedAnimations: String(v2CssSettled.snapshot.rendering.unsupportedAnimations),
     producerPending: String(v2CssSettled.snapshot.producers.pending),
     producerTerminal: v2CssSettled.snapshot.producers.terminal,
