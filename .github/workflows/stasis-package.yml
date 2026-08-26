@@ -229,6 +229,16 @@ jobs:
           sudo apt-get install --yes xvfb
           ./mach bootstrap --yes --skip-lints --skip-nextest
 
+      - name: Prepare Linux teardown diagnostics
+        if: matrix.release_platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          diagnostics="$RUNNER_TEMP/stasis-linux-crash-attempt-$GITHUB_RUN_ATTEMPT"
+          test ! -e "$diagnostics"
+          mkdir -p "$diagnostics/logs"
+          echo "STASIS_LINUX_CRASH_DIR=$diagnostics" >> "$GITHUB_ENV"
+
       - name: Build the exact-SHA Stasis executable
         shell: bash
         run: |
@@ -327,17 +337,92 @@ jobs:
               -- --test-threads=1 --show-output
 
       - name: Gate the full baseline protocol matrix
+        id: baseline_protocol_gate
         shell: bash
         run: |
           set -euo pipefail
           test_runner=(env)
           if [[ "$STASIS_PLATFORM" == 'linux-x86_64' ]]; then
             test_runner=(xvfb-run -a env)
+            "${test_runner[@]}" \
+              cargo test --locked --profile production-stripped \
+                -p stasis-shell --test baseline_protocol \
+                -- --test-threads=1 --show-output \
+              2>&1 | tee "$STASIS_LINUX_CRASH_DIR/logs/baseline.raw.log"
+          else
+            "${test_runner[@]}" \
+              cargo test --locked --profile production-stripped \
+                -p stasis-shell --test baseline_protocol \
+                -- --test-threads=1 --show-output
           fi
-          "${test_runner[@]}" \
-            cargo test --locked --profile production-stripped \
-              -p stasis-shell --test baseline_protocol \
-              -- --test-threads=1 --show-output
+
+      - name: Collect Linux baseline crash diagnostics
+        if: >-
+          failure()
+          && steps.baseline_protocol_gate.outcome == 'failure'
+          && matrix.release_platform == 'linux-x86_64'
+          && env.STASIS_LINUX_CRASH_DIR != ''
+        shell: bash
+        run: |
+          set +e
+          diagnostics="$STASIS_LINUX_CRASH_DIR"
+          binary='target/production-stripped/stasis'
+          status_file="$diagnostics/collection-status.txt"
+          if [[ ! -d "$diagnostics" ]]; then
+            echo 'the Linux crash diagnostics directory was not prepared' >&2
+            exit 0
+          fi
+          : > "$status_file"
+          if [[ -f "$diagnostics/logs/baseline.raw.log" ]]; then
+            if tail -c 1048576 "$diagnostics/logs/baseline.raw.log" \
+                > "$diagnostics/logs/baseline.tail.log"; then
+              echo 'baseline_tail=ok' >> "$status_file"
+            else
+              echo 'baseline_tail=failed' >> "$status_file"
+            fi
+          else
+            echo 'baseline_tail=source_missing' >> "$status_file"
+          fi
+          if [[ -f "$binary" ]]; then
+            if cp "$binary" "$diagnostics/stasis-exact"; then
+              echo 'binary_copy=ok' >> "$status_file"
+            else
+              echo 'binary_copy=failed' >> "$status_file"
+            fi
+          else
+            echo 'binary_copy=source_missing' >> "$status_file"
+          fi
+          if {
+            echo "revision=$GITHUB_SHA"
+            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
+            uname -a
+            LC_ALL=C getconf GNU_LIBC_VERSION
+            if [[ -f "$diagnostics/stasis-exact" ]]; then
+              sha256sum "$diagnostics/stasis-exact"
+            fi
+          } > "$diagnostics/metadata.txt" 2>&1; then
+            echo 'metadata=ok' >> "$status_file"
+          else
+            echo 'metadata=failed' >> "$status_file"
+          fi
+          exit 0
+
+      - name: Upload Linux baseline crash diagnostics
+        if: >-
+          failure()
+          && steps.baseline_protocol_gate.outcome == 'failure'
+          && matrix.release_platform == 'linux-x86_64'
+          && env.STASIS_LINUX_CRASH_DIR != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stasis-linux-crash-diagnostics-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ env.STASIS_LINUX_CRASH_DIR }}/logs/baseline.tail.log
+            ${{ env.STASIS_LINUX_CRASH_DIR }}/collection-status.txt
+            ${{ env.STASIS_LINUX_CRASH_DIR }}/metadata.txt
+            ${{ env.STASIS_LINUX_CRASH_DIR }}/stasis-exact
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Gate controlled-network redirect ordering invariants
         shell: bash
@@ -1433,16 +1518,19 @@ jobs:
               "stasis-linux-x86_64-act-settle-inspect-proof",
               "stasis-runtime-manifest",
               "stasis-typescript",
-              # Windows is a CI-only proof boundary. Its exact artifacts may already exist when
-              # this concurrent SDK job inspects the run, but they are not native SDK inputs.
+              # These are CI-only proof/diagnostic boundaries. Their exact artifacts may already
+              # exist when this concurrent SDK job inspects the run, but they are not native SDK
+              # inputs.
               "stasis-windows-x86_64-ci",
               "stasis-windows-x86_64-ci-logs",
+              "stasis-linux-crash-diagnostics",
           )
           permitted_non_native_prefixes = {
               "stasis-runtime-manifest",
               "stasis-typescript",
               "stasis-windows-x86_64-ci",
               "stasis-windows-x86_64-ci-logs",
+              "stasis-linux-crash-diagnostics",
           }
           native_prefixes = set(prefixes) - permitted_non_native_prefixes
           if (
@@ -1487,12 +1575,12 @@ jobs:
               attempt = int(matched[1].group(1))
               if attempt > overall_attempt:
                   raise SystemExit("package artifact claims a future run attempt")
+              if matched[0] in permitted_non_native_prefixes:
+                  continue
               if matched[0].startswith("stasis-macos-"):
                   platform = "macos-aarch64"
               elif matched[0].startswith("stasis-linux-"):
                   platform = "linux-x86_64"
-              elif matched[0] in permitted_non_native_prefixes:
-                  continue
               else:
                   raise SystemExit("package SDK artifact classifier accepted an unknown prefix")
               native_by_platform_attempt[platform].setdefault(attempt, []).append(name)
@@ -1526,16 +1614,24 @@ jobs:
               producer_attempts = producer_jobs[producer_names[platform]]
               if not producer_attempts:
                   raise SystemExit(f"no {platform} producer job exists")
-              producer_attempt = max(producer_attempts)
-              if producer_attempts[producer_attempt] != ("completed", "success"):
-                  raise SystemExit(f"latest {platform} producer job did not succeed")
+              artifact_attempts = native_by_platform_attempt[platform]
+              if not artifact_attempts:
+                  raise SystemExit(f"no {platform} producer artifacts exist")
+              # A rerun-failed operation carries untouched successful jobs into the new attempt
+              # without rerunning them or renaming their immutable artifacts. Older failed upload
+              # attempts are non-authoritative; the newest artifact-bearing attempt must be both
+              # complete and bound to its exact successful producer.
+              producer_attempt = max(artifact_attempts)
               expected = sorted(
-                  f"{prefix}-attempt-{producer_attempt}" for prefix in prefixes_for_platform
+                  f"{prefix}-attempt-{producer_attempt}"
+                  for prefix in prefixes_for_platform
               )
-              if sorted(native_by_platform_attempt[platform].get(producer_attempt, [])) != expected:
-                  raise SystemExit(f"latest successful {platform} producer artifacts are unavailable")
-              if max(native_by_platform_attempt[platform], default=0) > producer_attempt:
-                  raise SystemExit(f"newer incomplete or unsuccessful {platform} artifacts exist")
+              if sorted(artifact_attempts[producer_attempt]) != expected:
+                  raise SystemExit(f"{platform} producer artifacts are incomplete")
+              if producer_attempts.get(producer_attempt) != ("completed", "success"):
+                  raise SystemExit(
+                      f"{platform} artifacts do not have an exact successful producer"
+                  )
               selected.append(producer_attempt)
           print(*selected)
           PY
@@ -3131,9 +3227,11 @@ jobs:
               "stasis-runtime-manifest",
               "stasis-typescript",
               # Windows artifacts prove the CI-only platform boundary and never become release,
-              # provenance, runtime-manifest, or managed npm inputs.
+              # provenance, runtime-manifest, or managed npm inputs. Linux crash diagnostics are
+              # likewise evidence-only and never promotion inputs.
               "stasis-windows-x86_64-ci",
               "stasis-windows-x86_64-ci-logs",
+              "stasis-linux-crash-diagnostics",
           )
           patterns = tuple(
               (prefix, re.compile(rf"^{re.escape(prefix)}-attempt-([1-9][0-9]*)$"))
@@ -3150,6 +3248,7 @@ jobs:
           permitted_ci_only_prefixes = {
               "stasis-windows-x86_64-ci",
               "stasis-windows-x86_64-ci-logs",
+              "stasis-linux-crash-diagnostics",
           }
           if (
               len(prefixes) != len(set(prefixes))
@@ -3225,16 +3324,19 @@ jobs:
               producer_attempts = producer_jobs[producer_names[group]]
               if not producer_attempts:
                   raise SystemExit(f"no {group} producer job exists")
-              producer_attempt = max(producer_attempts)
-              if producer_attempts[producer_attempt] != ("completed", "success"):
-                  raise SystemExit(f"latest {group} producer job did not succeed")
+              artifact_attempts = by_group_attempt[group]
+              if not artifact_attempts:
+                  raise SystemExit(f"no {group} producer artifacts exist")
+              producer_attempt = max(artifact_attempts)
               expected = sorted(
                   f"{prefix}-attempt-{producer_attempt}" for prefix in expected_prefixes
               )
-              if sorted(by_group_attempt[group].get(producer_attempt, [])) != expected:
-                  raise SystemExit(f"latest successful {group} producer artifacts are unavailable")
-              if max(by_group_attempt[group], default=0) > producer_attempt:
-                  raise SystemExit(f"newer incomplete or unsuccessful {group} artifacts exist")
+              if sorted(artifact_attempts[producer_attempt]) != expected:
+                  raise SystemExit(f"{group} producer artifacts are incomplete")
+              if producer_attempts.get(producer_attempt) != ("completed", "success"):
+                  raise SystemExit(
+                      f"{group} artifacts do not have an exact successful producer"
+                  )
               selected[group] = producer_attempt
           if (
               selected["macos-aarch64"] > selected["sdk"]

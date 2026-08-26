@@ -414,9 +414,11 @@ jobs:
               "stasis-runtime-manifest",
               "stasis-typescript",
               # Windows artifacts prove the CI-only platform boundary and never become release,
-              # provenance, runtime-manifest, or managed npm inputs.
+              # provenance, runtime-manifest, or managed npm inputs. Linux crash diagnostics are
+              # likewise evidence-only and never publication inputs.
               "stasis-windows-x86_64-ci",
               "stasis-windows-x86_64-ci-logs",
+              "stasis-linux-crash-diagnostics",
           )
           patterns = tuple(
               (prefix, re.compile(rf"^{re.escape(prefix)}-attempt-([1-9][0-9]*)$"))
@@ -433,6 +435,7 @@ jobs:
           permitted_ci_only_prefixes = {
               "stasis-windows-x86_64-ci",
               "stasis-windows-x86_64-ci-logs",
+              "stasis-linux-crash-diagnostics",
           }
           if (
               len(prefixes) != len(set(prefixes))
@@ -517,16 +520,23 @@ jobs:
               attempts = producer_jobs[producer_names[group]]
               if not attempts:
                   raise SystemExit(f"no {group} producer job exists")
-              producer_attempt = max(attempts)
-              if attempts[producer_attempt] != ("completed", "success"):
-                  raise SystemExit(f"latest {group} producer job did not succeed")
+              artifact_attempts = by_group_attempt[group]
+              if not artifact_attempts:
+                  raise SystemExit(f"no {group} producer artifacts exist")
+              # A rerun-failed operation can carry a successful job into the new attempt without
+              # rerunning it or renaming its immutable artifacts. Older failed upload attempts are
+              # non-authoritative; the newest artifact-bearing attempt must be both complete and
+              # bound to its exact successful producer.
+              producer_attempt = max(artifact_attempts)
               expected = sorted(
                   f"{prefix}-attempt-{producer_attempt}" for prefix in expected_prefixes
               )
-              if sorted(by_group_attempt[group].get(producer_attempt, [])) != expected:
-                  raise SystemExit(f"latest successful {group} producer artifacts are unavailable")
-              if max(by_group_attempt[group], default=0) > producer_attempt:
-                  raise SystemExit(f"newer incomplete or unsuccessful {group} artifacts exist")
+              if sorted(artifact_attempts[producer_attempt]) != expected:
+                  raise SystemExit(f"{group} producer artifacts are incomplete")
+              if attempts.get(producer_attempt) != ("completed", "success"):
+                  raise SystemExit(
+                      f"{group} artifacts do not have an exact successful producer"
+                  )
               selected[group] = producer_attempt
 
           for platform, claimed_attempt in claimed_attempts.items():
