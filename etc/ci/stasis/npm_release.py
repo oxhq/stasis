@@ -721,6 +721,7 @@ def require_v2_automation_event_timestamps_proof(
         "profile",
         "navigationBoundary",
         "initialOutcome",
+        "initialVirtualTimeNs",
         "advancedVirtualTimeNs",
         "dispatchedVirtualTimeNs",
         "controlledEventCount",
@@ -745,8 +746,6 @@ def require_v2_automation_event_timestamps_proof(
         "profile": "controlled-web-session-v2",
         "navigationBoundary": "controlled_ready",
         "initialOutcome": "quiescent",
-        "advancedVirtualTimeNs": "5000000",
-        "dispatchedVirtualTimeNs": "5000000",
         "controlledEventCount": "11",
         "controlledTrace": V2_AUTOMATION_CONTROLLED_TRACE,
         "browserEventCountAfterScriptProbe": "12",
@@ -763,6 +762,27 @@ def require_v2_automation_event_timestamps_proof(
     for field, expected in expected_values.items():
         if require_json_string(value.get(field), f"{description} {field}") != expected:
             raise NpmReleaseError(f"{description} field does not match: {field}")
+    for field in (
+        "initialVirtualTimeNs",
+        "advancedVirtualTimeNs",
+        "dispatchedVirtualTimeNs",
+    ):
+        fullmatch(
+            CANONICAL_NONNEGATIVE_INTEGER_RE,
+            require_json_string(value.get(field), f"{description} {field}"),
+            f"{description} {field}",
+        )
+    initial_virtual_time_ns = int(value["initialVirtualTimeNs"])
+    advanced_virtual_time_ns = int(value["advancedVirtualTimeNs"])
+    dispatched_virtual_time_ns = int(value["dispatchedVirtualTimeNs"])
+    if advanced_virtual_time_ns != initial_virtual_time_ns + 5_000_000:
+        raise NpmReleaseError(
+            f"{description} did not advance exactly five milliseconds from its session baseline"
+        )
+    if dispatched_virtual_time_ns != advanced_virtual_time_ns:
+        raise NpmReleaseError(
+            f"{description} dispatch settle changed the advanced virtual time"
+        )
     for field in (
         "sameControlledSession",
         "exactBinaryLaunch",
@@ -1262,8 +1282,9 @@ def self_test() -> None:
                 "profile": "controlled-web-session-v2",
                 "navigationBoundary": "controlled_ready",
                 "initialOutcome": "quiescent",
-                "advancedVirtualTimeNs": "5000000",
-                "dispatchedVirtualTimeNs": "5000000",
+                "initialVirtualTimeNs": "140000000",
+                "advancedVirtualTimeNs": "145000000",
+                "dispatchedVirtualTimeNs": "145000000",
                 "controlledEventCount": "11",
                 "controlledTrace": V2_AUTOMATION_CONTROLLED_TRACE,
                 "browserEventCountAfterScriptProbe": "12",
@@ -1744,19 +1765,44 @@ def self_test() -> None:
                     ),
                     ("nonquiescent automation initial outcome", "initialOutcome", "pending"),
                     (
+                        "wrong automation initial virtual time",
+                        "initialVirtualTimeNs",
+                        "139999999",
+                    ),
+                    (
+                        "numeric automation initial virtual time",
+                        "initialVirtualTimeNs",
+                        140000000,
+                    ),
+                    (
+                        "noncanonical automation initial virtual time",
+                        "initialVirtualTimeNs",
+                        "0140000000",
+                    ),
+                    (
+                        "negative automation initial virtual time",
+                        "initialVirtualTimeNs",
+                        "-1",
+                    ),
+                    (
                         "wrong automation advanced virtual time",
                         "advancedVirtualTimeNs",
-                        "0",
+                        "140000000",
                     ),
                     (
                         "numeric automation advanced virtual time",
                         "advancedVirtualTimeNs",
-                        5000000,
+                        145000000,
+                    ),
+                    (
+                        "noncanonical automation advanced virtual time",
+                        "advancedVirtualTimeNs",
+                        "0145000000",
                     ),
                     (
                         "wrong automation dispatch virtual time",
                         "dispatchedVirtualTimeNs",
-                        "0",
+                        "140000000",
                     ),
                     ("wrong controlled automation event count", "controlledEventCount", "10"),
                     ("numeric controlled automation event count", "controlledEventCount", 11),

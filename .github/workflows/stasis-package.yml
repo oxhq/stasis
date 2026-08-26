@@ -580,7 +580,7 @@ jobs:
             throw "stasis-shell version $version does not equal $env:STASIS_RELEASE_VERSION"
           }
           $bundle = "stasis-$version-$env:STASIS_WINDOWS_PLATFORM-ci"
-          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist-windows-ci'
+          $dist = Join-Path $env:RUNNER_TEMP 'stasis-windows-ci'
           $artifacts = Join-Path $dist 'artifacts'
           $logs = Join-Path $dist 'logs'
           $binary = Join-Path $env:CARGO_TARGET_DIR 'production-stripped\stasis.exe'
@@ -1308,8 +1308,8 @@ jobs:
         with:
           name: ${{ steps.windows-names.outputs.bundle_artifact_name }}
           path: |
-            dist-windows-ci/artifacts/*.zip
-            dist-windows-ci/artifacts/*.sha256
+            ${{ runner.temp }}/stasis-windows-ci/artifacts/*.zip
+            ${{ runner.temp }}/stasis-windows-ci/artifacts/*.sha256
           if-no-files-found: error
           retention-days: 90
 
@@ -1317,7 +1317,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ steps.windows-names.outputs.log_artifact_name }}
-          path: dist-windows-ci/logs/*
+          path: ${{ runner.temp }}/stasis-windows-ci/logs/*
           if-no-files-found: error
           retention-days: 90
 
@@ -2110,8 +2110,9 @@ jobs:
                       "profile": "controlled-web-session-v2",
                       "navigationBoundary": "controlled_ready",
                       "initialOutcome": "quiescent",
-                      "advancedVirtualTimeNs": "5000000",
-                      "dispatchedVirtualTimeNs": "5000000",
+                      "initialVirtualTimeNs": "140000000",
+                      "advancedVirtualTimeNs": "145000000",
+                      "dispatchedVirtualTimeNs": "145000000",
                       "controlledEventCount": "11",
                       "controlledTrace": (
                           "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>"

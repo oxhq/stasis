@@ -845,6 +845,7 @@ try {
   assert.deepEqual(v2AutomationInitial.unsupportedWork, []);
   assert.deepEqual(v2AutomationInitial.externalIo, []);
   assert.deepEqual(v2AutomationInitial.snapshot.runtimeFailures, []);
+  const v2AutomationBaselineVirtualTimeNs = v2AutomationInitial.virtualTimeNs;
 
   const v2AutomationScheduled = await v2Session.activate(
     "#start",
@@ -856,19 +857,28 @@ try {
     { maxVirtualTimeNs: 0n },
     commandDeadline(),
   );
-  assert.equal(v2AutomationQualified.virtualTimeNs, 0n);
+  assert.equal(
+    v2AutomationQualified.virtualTimeNs,
+    v2AutomationBaselineVirtualTimeNs,
+  );
   const v2AutomationAdvanced = await v2Session.advanceToNext(
     v2AutomationQualified.stateToken,
     commandDeadline(),
   );
   assert.equal(v2AutomationAdvanced.outcome, "advanced");
-  assert.equal(v2AutomationAdvanced.virtualTimeNs, 5_000_000n);
+  assert.equal(
+    v2AutomationAdvanced.virtualTimeNs,
+    v2AutomationBaselineVirtualTimeNs + 5_000_000n,
+  );
   const v2AutomationDispatched = await v2Session.settle(
     v2AutomationAdvanced.stateToken,
     { maxVirtualTimeNs: 0n },
     commandDeadline(),
   );
-  assert.equal(v2AutomationDispatched.virtualTimeNs, 5_000_000n);
+  assert.equal(
+    v2AutomationDispatched.virtualTimeNs,
+    v2AutomationBaselineVirtualTimeNs + 5_000_000n,
+  );
 
   const v2AutomationFilled = await v2Session.fill(
     "#fill",
@@ -1050,6 +1060,7 @@ try {
     profile: v2Session.profile,
     navigationBoundary: v2AutomationNavigation.boundary,
     initialOutcome: v2AutomationInitial.outcome,
+    initialVirtualTimeNs: String(v2AutomationInitial.virtualTimeNs),
     advancedVirtualTimeNs: String(v2AutomationAdvanced.virtualTimeNs),
     dispatchedVirtualTimeNs: String(v2AutomationDispatched.virtualTimeNs),
     controlledEventCount: String(v2AutomationControlledEvents.length),

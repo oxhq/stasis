@@ -984,8 +984,9 @@ jobs:
                       "profile": "controlled-web-session-v2",
                       "navigationBoundary": "controlled_ready",
                       "initialOutcome": "quiescent",
-                      "advancedVirtualTimeNs": "5000000",
-                      "dispatchedVirtualTimeNs": "5000000",
+                      "initialVirtualTimeNs": "140000000",
+                      "advancedVirtualTimeNs": "145000000",
+                      "dispatchedVirtualTimeNs": "145000000",
                       "controlledEventCount": "11",
                       "controlledTrace": (
                           "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>"
