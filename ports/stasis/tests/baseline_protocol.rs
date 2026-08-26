@@ -1767,7 +1767,7 @@ fn controlled_session_v2_form_automation_events_share_the_advanced_document_time
     );
     assert_eq!(
         browser_events["result"]["value"],
-        "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>check:input:5>check:change:5>select:input:5>select:change:5>invalid:invalid:5>submit:submit:5>submit:formdata:5|not-read",
+        "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>check:input:5>check:change:5>select:input:5>select:change:5>invalid:invalid:5>submit:submit:5>submit:formdata:5|not-read|0",
         "representative engine-created events, including a derived reset beyond the basic form-event seams, must share the owning action's sampled document Performance timestamp: {browser_events:#}",
     );
     assert_eq!(
@@ -1794,7 +1794,7 @@ fn controlled_session_v2_form_automation_events_share_the_advanced_document_time
     );
     assert_eq!(
         script_events["result"]["value"],
-        "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>check:input:5>check:change:5>select:input:5>select:change:5>invalid:invalid:5>submit:submit:5>submit:formdata:5>script-trigger:click:5|0,0,0,0,0",
+        "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>check:input:5>check:change:5>select:input:5>select:change:5>invalid:invalid:5>submit:submit:5>submit:formdata:5>script-trigger:click:5|0,0,0,0,0|0",
         "script-created Event constructors must retain their rejected host timestamps: {script_events:#}",
     );
     token = state_token(&script_events, "script-created form timestamp inspection");

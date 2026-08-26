@@ -922,18 +922,50 @@ try {
     v2AutomationValidSubmitted.stateToken,
     commandDeadline(),
   );
+  const v2AutomationControlledTraceParts =
+    v2AutomationControlledTraceResult.value.split("|");
+  assert.equal(v2AutomationControlledTraceParts.length, 4);
+  const [v2AutomationControlledSampleMs, , , v2AutomationBaselineSampleMs] =
+    v2AutomationControlledTraceParts;
+  assert.match(v2AutomationControlledSampleMs, /^(?:0|[1-9][0-9]*)$/u);
+  assert.match(v2AutomationBaselineSampleMs, /^(?:0|[1-9][0-9]*)$/u);
+  const v2AutomationControlledSampleNs = BigInt(v2AutomationControlledSampleMs) * 1_000_000n;
+  const v2AutomationBaselineSampleNs = BigInt(v2AutomationBaselineSampleMs) * 1_000_000n;
+  assert.equal(
+    v2AutomationControlledSampleNs,
+    v2AutomationBaselineSampleNs + 5_000_000n,
+    "the document clock did not advance exactly five milliseconds",
+  );
+  assert.ok(
+    v2AutomationBaselineSampleNs < v2AutomationBaselineVirtualTimeNs,
+    "the reused document clock was conflated with the session-global clock",
+  );
+  const v2AutomationControlledEventKinds = [
+    "fill:input",
+    "activate:click",
+    "reset:reset",
+    "check:click",
+    "check:input",
+    "check:change",
+    "select:input",
+    "select:change",
+    "invalid:invalid",
+    "submit:submit",
+    "submit:formdata",
+  ];
+  const expectedV2AutomationControlledEvents = v2AutomationControlledEventKinds.map(
+    (entry) => `${entry}:${v2AutomationControlledSampleMs}`,
+  );
   const expectedV2AutomationControlledTrace =
-    "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>check:input:5>" +
-    "check:change:5>" +
-    "select:input:5>select:change:5>invalid:invalid:5>submit:submit:5>" +
-    "submit:formdata:5|not-read";
+    `${v2AutomationControlledSampleMs}|${expectedV2AutomationControlledEvents.join(">")}|not-read|${v2AutomationBaselineSampleMs}`;
   assert.equal(v2AutomationControlledTraceResult.value, expectedV2AutomationControlledTrace);
-  const v2AutomationControlledEvents =
-    v2AutomationControlledTraceResult.value.split("|")[1]?.split(">") ?? [];
+  const v2AutomationControlledEvents = v2AutomationControlledTraceParts[1]?.split(">") ?? [];
   assert.equal(v2AutomationControlledEvents.length, 11);
   assert.ok(
-    v2AutomationControlledEvents.every((entry) => entry.endsWith(":5")),
-    "an engine-generated synchronous automation event escaped the 5 ms document sample",
+    v2AutomationControlledEvents.every((entry) =>
+      entry.endsWith(`:${v2AutomationControlledSampleMs}`),
+    ),
+    "an engine-generated synchronous automation event escaped the document-clock sample",
   );
 
   const v2AutomationScriptTriggered = await v2Session.activate(
@@ -947,10 +979,10 @@ try {
     commandDeadline(),
   );
   const expectedV2AutomationScriptTrace =
-    "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>check:input:5>" +
-    "check:change:5>" +
-    "select:input:5>select:change:5>invalid:invalid:5>submit:submit:5>" +
-    "submit:formdata:5>script-trigger:click:5|0,0,0,0,0";
+    `${v2AutomationControlledSampleMs}|${[
+      ...expectedV2AutomationControlledEvents,
+      `script-trigger:click:${v2AutomationControlledSampleMs}`,
+    ].join(">")}|0,0,0,0,0|${v2AutomationBaselineSampleMs}`;
   assert.equal(v2AutomationScriptTraceResult.value, expectedV2AutomationScriptTrace);
   const v2AutomationScriptTraceParts = v2AutomationScriptTraceResult.value.split("|");
   assert.equal(v2AutomationScriptTraceParts[1]?.split(">").length, 12);

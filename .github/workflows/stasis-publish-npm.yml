@@ -989,9 +989,9 @@ jobs:
                       "dispatchedVirtualTimeNs": "145000000",
                       "controlledEventCount": "11",
                       "controlledTrace": (
-                          "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>"
-                          "check:input:5>check:change:5>select:input:5>select:change:5>invalid:invalid:5>"
-                          "submit:submit:5>submit:formdata:5|not-read"
+                          "25|fill:input:25>activate:click:25>reset:reset:25>check:click:25>"
+                          "check:input:25>check:change:25>select:input:25>select:change:25>"
+                          "invalid:invalid:25>submit:submit:25>submit:formdata:25|not-read|20"
                       ),
                       "browserEventCountAfterScriptProbe": "12",
                       "scriptCreatedConstructorCount": "5",

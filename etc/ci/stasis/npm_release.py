@@ -60,18 +60,30 @@ UPSTREAM_IDENTITIES = {
     "pliego_revision": "556c774242b272b11bc60999449c5debff1ad20f",
     "pliego_servo_merge_base": "313b6d5ecc113b08010ce434140db3ca5abcc71c",
 }
-V2_AUTOMATION_CONTROLLED_TRACE = (
-    "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>check:input:5>"
-    "check:change:5>"
-    "select:input:5>select:change:5>invalid:invalid:5>submit:submit:5>"
-    "submit:formdata:5|not-read"
+V2_AUTOMATION_CONTROLLED_EVENT_KINDS = (
+    "fill:input",
+    "activate:click",
+    "reset:reset",
+    "check:click",
+    "check:input",
+    "check:change",
+    "select:input",
+    "select:change",
+    "invalid:invalid",
+    "submit:submit",
+    "submit:formdata",
 )
-V2_AUTOMATION_SCRIPT_TRACE = (
-    "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>check:input:5>"
-    "check:change:5>"
-    "select:input:5>select:change:5>invalid:invalid:5>submit:submit:5>"
-    "submit:formdata:5>script-trigger:click:5|0,0,0,0,0"
-)
+
+
+def v2_automation_controlled_trace(
+    event_time_ms: int, baseline_time_ms: int
+) -> str:
+    timestamp = str(event_time_ms)
+    events = ">".join(
+        f"{event_kind}:{timestamp}"
+        for event_kind in V2_AUTOMATION_CONTROLLED_EVENT_KINDS
+    )
+    return f"{timestamp}|{events}|not-read|{baseline_time_ms}"
 
 
 class NpmReleaseError(RuntimeError):
@@ -747,7 +759,6 @@ def require_v2_automation_event_timestamps_proof(
         "navigationBoundary": "controlled_ready",
         "initialOutcome": "quiescent",
         "controlledEventCount": "11",
-        "controlledTrace": V2_AUTOMATION_CONTROLLED_TRACE,
         "browserEventCountAfterScriptProbe": "12",
         "scriptCreatedConstructorCount": "5",
         "scriptCreatedTrace": "0,0,0,0,0",
@@ -782,6 +793,40 @@ def require_v2_automation_event_timestamps_proof(
     if dispatched_virtual_time_ns != advanced_virtual_time_ns:
         raise NpmReleaseError(
             f"{description} dispatch settle changed the advanced virtual time"
+        )
+    controlled_trace = require_json_string(
+        value.get("controlledTrace"), f"{description} controlledTrace"
+    )
+    controlled_trace_parts = controlled_trace.split("|")
+    if len(controlled_trace_parts) != 4 or controlled_trace_parts[2] != "not-read":
+        raise NpmReleaseError(f"{description} controlled trace is not canonical")
+    controlled_event_time_ms_raw = controlled_trace_parts[0]
+    controlled_baseline_time_ms_raw = controlled_trace_parts[3]
+    fullmatch(
+        CANONICAL_NONNEGATIVE_INTEGER_RE,
+        controlled_event_time_ms_raw,
+        f"{description} controlled document-clock sample",
+    )
+    fullmatch(
+        CANONICAL_NONNEGATIVE_INTEGER_RE,
+        controlled_baseline_time_ms_raw,
+        f"{description} controlled document-clock baseline",
+    )
+    controlled_event_time_ms = int(controlled_event_time_ms_raw)
+    controlled_baseline_time_ms = int(controlled_baseline_time_ms_raw)
+    if controlled_event_time_ms != controlled_baseline_time_ms + 5:
+        raise NpmReleaseError(
+            f"{description} controlled document clock did not advance exactly five milliseconds"
+        )
+    if controlled_baseline_time_ms * 1_000_000 >= initial_virtual_time_ns:
+        raise NpmReleaseError(
+            f"{description} reused document clock was conflated with the session-global clock"
+        )
+    if controlled_trace != v2_automation_controlled_trace(
+        controlled_event_time_ms, controlled_baseline_time_ms
+    ):
+        raise NpmReleaseError(
+            f"{description} controlled events do not match their document-clock sample"
         )
     for field in (
         "sameControlledSession",
@@ -1286,7 +1331,7 @@ def self_test() -> None:
                 "advancedVirtualTimeNs": "145000000",
                 "dispatchedVirtualTimeNs": "145000000",
                 "controlledEventCount": "11",
-                "controlledTrace": V2_AUTOMATION_CONTROLLED_TRACE,
+                "controlledTrace": v2_automation_controlled_trace(25, 20),
                 "browserEventCountAfterScriptProbe": "12",
                 "scriptCreatedConstructorCount": "5",
                 "scriptCreatedTrace": "0,0,0,0,0",
@@ -1807,6 +1852,37 @@ def self_test() -> None:
                     ("wrong controlled automation event count", "controlledEventCount", "10"),
                     ("numeric controlled automation event count", "controlledEventCount", 11),
                     ("wrong controlled automation trace", "controlledTrace", "5|not-owned"),
+                    (
+                        "controlled automation event escaped its document-clock sample",
+                        "controlledTrace",
+                        v2_automation_controlled_trace(25, 20).replace(
+                            "fill:input:25", "fill:input:5", 1
+                        ),
+                    ),
+                    (
+                        "noncanonical controlled automation document-clock sample",
+                        "controlledTrace",
+                        v2_automation_controlled_trace(25, 20).replace(
+                            "25|", "025|", 1
+                        ),
+                    ),
+                    (
+                        "noncanonical controlled automation document-clock baseline",
+                        "controlledTrace",
+                        v2_automation_controlled_trace(25, 20).replace(
+                            "|20", "|020", 1
+                        ),
+                    ),
+                    (
+                        "wrong controlled automation document-clock delta",
+                        "controlledTrace",
+                        v2_automation_controlled_trace(26, 20),
+                    ),
+                    (
+                        "controlled automation document clock conflated with session clock",
+                        "controlledTrace",
+                        v2_automation_controlled_trace(145, 140),
+                    ),
                     (
                         "wrong browser event count after script probe",
                         "browserEventCountAfterScriptProbe",

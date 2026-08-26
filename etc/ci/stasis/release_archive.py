@@ -1564,8 +1564,8 @@ def verify_controlled_automation_event_timestamp_source(
             '"action.check"',
             '"action.select"',
             '"action.submit"',
-            '"5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>check:input:5>check:change:5>select:input:5>select:change:5>invalid:invalid:5>submit:submit:5>submit:formdata:5|not-read"',
-            '"5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>check:input:5>check:change:5>select:input:5>select:change:5>invalid:invalid:5>submit:submit:5>submit:formdata:5>script-trigger:click:5|0,0,0,0,0"',
+            '"5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>check:input:5>check:change:5>select:input:5>select:change:5>invalid:invalid:5>submit:submit:5>submit:formdata:5|not-read|0"',
+            '"5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>check:input:5>check:change:5>select:input:5>select:change:5>invalid:invalid:5>submit:submit:5>submit:formdata:5>script-trigger:click:5|0,0,0,0,0|0"',
             'rejected["result"]["failure"]["code"]',
             '"unsupported_clock_surface"',
             '"timeSurface": "host_timestamp"',
@@ -1575,6 +1575,7 @@ def verify_controlled_automation_event_timestamp_source(
     require_source_fragments_in_order(
         fixture_source,
         (
+            'scheduledAt = String(performance.now())',
             "setTimeout(() => document.body.dataset.advanced = \"yes\", 5)",
             'addEventListener("input", record("fill"))',
             'addEventListener("click", record("activate"))',

@@ -27,12 +27,14 @@
   const result = document.querySelector("#result");
   const browserTrace = [];
   let scriptTrace = "not-read";
+  let scheduledAt = "not-scheduled";
 
   function render() {
     result.textContent = [
       String(performance.now()),
       browserTrace.join(">"),
       scriptTrace,
+      scheduledAt,
     ].join("|");
   }
 
@@ -44,6 +46,7 @@
   }
 
   document.querySelector("#start").onclick = () => {
+    scheduledAt = String(performance.now());
     setTimeout(() => document.body.dataset.advanced = "yes", 5);
   };
   document.querySelector("#fill").addEventListener("input", record("fill"));
