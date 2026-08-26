@@ -12,6 +12,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_STDERR_TAIL_BYTES: usize = 256 * 1024;
 const FIXTURE: &[u8] = include_bytes!("../../../fixtures/baseline/index.html");
 const GLOBAL_SCOPE_MESSAGE_PORT_SOURCE: &str =
     include_str!("../../../components/script/dom/globalscope/globalscope.rs");
@@ -247,7 +248,6 @@ fn embedded_baseline_survives_a_bad_close_and_reports_the_final_url() {
     assert_eq!(closed["id"], "close-1");
     assert_eq!(closed["sessionId"], "s-1");
     assert_eq!(closed["result"]["state"], "closed");
-    drop(input);
 
     let (status_sender, status_receiver) = sync_channel(1);
     thread::spawn(move || {
@@ -258,6 +258,9 @@ fn embedded_baseline_survives_a_bad_close_and_reports_the_final_url() {
         .expect("stasis did not exit after session.close")
         .expect("failed to wait for stasis");
     assert!(status.success());
+    // The terminal close contract ends the process; it must not wait for a cooperative stdin EOF
+    // from a client which is itself waiting for process exit.
+    drop(input);
     fixture_thread.join().expect("fixture server panicked");
 }
 
@@ -3658,11 +3661,13 @@ fn exercise_post_open_rejected_message_channel_fixture(
     let mut child = Command::new(env!("CARGO_BIN_EXE_stasis"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn stasis");
     let mut input = child.stdin.take().expect("missing child stdin");
     let responses = spawn_response_reader(child.stdout.take().expect("missing child stdout"));
+    let stderr_tail =
+        spawn_stderr_tail_reader(child.stderr.take().expect("missing child stderr"));
 
     send(
         &mut input,
@@ -3866,10 +3871,15 @@ fn exercise_post_open_rejected_message_channel_fixture(
     let status = child
         .wait()
         .expect("failed to wait for rejected MessageChannel process");
-    assert!(
-        status.success(),
-        "post-open rejection fixture should remain closable: {status}",
-    );
+    if !status.success() {
+        let stderr_tail = stderr_tail
+            .recv_timeout(Duration::from_secs(1))
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_else(|_| "<stderr unavailable>".to_owned());
+        panic!(
+            "post-open rejection fixture should remain closable: {status}; stderr tail: {stderr_tail}"
+        );
+    }
 }
 
 fn exercise_replacement_message_channel_profile(profile: &str, supported: bool) {
@@ -5533,6 +5543,36 @@ fn spawn_response_reader(stdout: impl Read + Send + 'static) -> Receiver<String>
                 return;
             }
         }
+    });
+    receiver
+}
+
+fn spawn_stderr_tail_reader(mut stderr: impl Read + Send + 'static) -> Receiver<Vec<u8>> {
+    let (sender, receiver) = sync_channel(1);
+    thread::spawn(move || {
+        let mut tail = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    tail.extend_from_slice(&chunk[..read]);
+                    if tail.len() > MAX_STDERR_TAIL_BYTES {
+                        let excess = tail.len() - MAX_STDERR_TAIL_BYTES;
+                        tail.drain(..excess);
+                    }
+                },
+                Err(error) => {
+                    tail.extend_from_slice(format!("\n<stderr read failed: {error}>").as_bytes());
+                    if tail.len() > MAX_STDERR_TAIL_BYTES {
+                        let excess = tail.len() - MAX_STDERR_TAIL_BYTES;
+                        tail.drain(..excess);
+                    }
+                    break;
+                },
+            }
+        }
+        sender.send(tail).ok();
     });
     receiver
 }

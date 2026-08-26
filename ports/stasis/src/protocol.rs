@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::io::{self, BufRead, Write};
-use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
@@ -50,8 +50,31 @@ fn empty_object() -> Value {
 #[derive(Debug)]
 pub enum ReaderMessage {
     Request(Request),
+    CloseRequest {
+        request: Request,
+        barrier: ReaderCloseBarrier,
+    },
     Fatal(ProtocolError),
     Eof,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReaderCloseDisposition {
+    Resume,
+    Stop,
+}
+
+#[derive(Debug)]
+pub struct ReaderCloseBarrier {
+    disposition: SyncSender<ReaderCloseDisposition>,
+}
+
+impl ReaderCloseBarrier {
+    pub fn resolve(self, disposition: ReaderCloseDisposition) {
+        // If the reader receiver is already gone, clean shutdown's join observes any panic. In
+        // the inverse race, dropping an unresolved barrier is treated as Stop by the reader.
+        self.disposition.send(disposition).ok();
+    }
 }
 
 #[derive(Debug)]
@@ -64,6 +87,17 @@ impl SequencedReaderMessage {
     fn request(request: Request, ingress_seq: u128) -> Self {
         Self {
             message: ReaderMessage::Request(request),
+            ingress_seq: Some(ingress_seq),
+        }
+    }
+
+    fn close_request(
+        request: Request,
+        ingress_seq: u128,
+        barrier: ReaderCloseBarrier,
+    ) -> Self {
+        Self {
+            message: ReaderMessage::CloseRequest { request, barrier },
             ingress_seq: Some(ingress_seq),
         }
     }
@@ -101,7 +135,11 @@ impl ReaderMessage {
     }
 
     fn is_control_lane(&self) -> bool {
-        matches!(self, Self::Request(request) if request.is_control_lane())
+        match self {
+            Self::Request(request) => request.is_control_lane(),
+            Self::CloseRequest { .. } => true,
+            Self::Fatal(_) | Self::Eof => false,
+        }
     }
 }
 
@@ -440,26 +478,57 @@ pub(crate) fn spawn_reader(sender: ReaderSender, waker: ShellWaker) -> std::thre
         .spawn(move || {
             let stdin = io::stdin();
             let input = stdin.lock();
-            let mut reader = ProtocolReader::new(input);
-            loop {
-                let message = match reader.next_request() {
-                    Ok(Some(request)) => {
-                        SequencedReaderMessage::request(request, reader.ingress_seq)
-                    },
-                    Ok(None) => SequencedReaderMessage::transport(ReaderMessage::Eof),
-                    Err(error) => SequencedReaderMessage::transport(ReaderMessage::Fatal(error)),
-                };
-                match sender.enqueue(message) {
-                    SendOutcome::Continue => waker.notify_protocol_input(),
-                    SendOutcome::Stop => {
-                        waker.notify_protocol_input();
-                        return;
-                    },
-                    SendOutcome::Disconnected => return,
-                }
-            }
+            read_protocol_input(input, sender, waker);
         })
         .expect("failed to spawn protocol reader")
+}
+
+fn read_protocol_input(input: impl BufRead, sender: ReaderSender, waker: ShellWaker) {
+    let mut reader = ProtocolReader::new(input);
+    loop {
+        let (message, close_disposition): (_, Option<Receiver<ReaderCloseDisposition>>) =
+            match reader.next_request() {
+                Ok(Some(request)) if request.method == "session.close" => {
+                    let (disposition, receiver) = sync_channel(1);
+                    (
+                        SequencedReaderMessage::close_request(
+                            request,
+                            reader.ingress_seq,
+                            ReaderCloseBarrier { disposition },
+                        ),
+                        Some(receiver),
+                    )
+                },
+                Ok(Some(request)) => (
+                    SequencedReaderMessage::request(request, reader.ingress_seq),
+                    None,
+                ),
+                Ok(None) => (
+                    SequencedReaderMessage::transport(ReaderMessage::Eof),
+                    None,
+                ),
+                Err(error) => (
+                    SequencedReaderMessage::transport(ReaderMessage::Fatal(error)),
+                    None,
+                ),
+            };
+        match sender.enqueue(message) {
+            SendOutcome::Continue => {
+                waker.notify_protocol_input();
+                if let Some(disposition) = close_disposition {
+                    match disposition.recv() {
+                        Ok(ReaderCloseDisposition::Resume) => {},
+                        Ok(ReaderCloseDisposition::Stop) | Err(_) => return,
+                    }
+                }
+            },
+            SendOutcome::Stop => {
+                waker.notify_protocol_input();
+                return;
+            },
+            SendOutcome::Disconnected => return,
+        }
+    }
 }
 
 pub fn read_request(input: &mut impl BufRead) -> Result<Option<Request>, ProtocolError> {
@@ -822,6 +891,7 @@ fn sequence_exhausted_error() -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::io::{BufReader, Cursor, Read};
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -855,6 +925,21 @@ mod tests {
         }
         frame.push(b'\n');
         frame
+    }
+
+    fn close_then_ordinary_input() -> Cursor<Vec<u8>> {
+        Cursor::new(
+            br#"{"v":1,"type":"request","id":"close","method":"session.close","params":{}}
+{"v":1,"type":"request","id":"later","method":"dom.query","params":{}}
+"#
+            .to_vec(),
+        )
+    }
+
+    fn wait_for_reader_wake(waker: &ShellWaker, observed: crate::wake::WakeGeneration) {
+        waker
+            .wait_for_change_checked(observed, Instant::now() + Duration::from_secs(1))
+            .expect("protocol reader did not wake the owner");
     }
 
     struct ChunkedReader {
@@ -1096,6 +1181,62 @@ mod tests {
             reader.next_request().unwrap_err().code,
             "ingress_sequence_exhausted"
         );
+    }
+
+    #[test]
+    fn accepted_close_stops_input_before_later_frames_and_allows_join() {
+        let (sender, inbox) = reader_channel(2);
+        let waker = ShellWaker::default();
+        let observed = waker.snapshot_checked().unwrap();
+        let reader_waker = waker.clone();
+        let reader = std::thread::spawn(move || {
+            read_protocol_input(close_then_ordinary_input(), sender, reader_waker)
+        });
+
+        wait_for_reader_wake(&waker, observed);
+        let close = inbox.try_recv().unwrap();
+        let ReaderMessage::CloseRequest { request, barrier } = close else {
+            panic!("reader did not preserve the close barrier: {close:?}");
+        };
+        assert_eq!(request.method, "session.close");
+        barrier.resolve(ReaderCloseDisposition::Stop);
+        reader.join().expect("protocol reader did not stop cleanly");
+        assert!(matches!(
+            inbox.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn rejected_close_resumes_input_without_reordering_later_frames() {
+        let (sender, inbox) = reader_channel(2);
+        let waker = ShellWaker::default();
+        let observed = waker.snapshot_checked().unwrap();
+        let reader_waker = waker.clone();
+        let reader = std::thread::spawn(move || {
+            read_protocol_input(close_then_ordinary_input(), sender, reader_waker)
+        });
+
+        wait_for_reader_wake(&waker, observed);
+        let close = inbox.try_recv().unwrap();
+        let ReaderMessage::CloseRequest { request, barrier } = close else {
+            panic!("reader did not preserve the close barrier: {close:?}");
+        };
+        assert_eq!(request.method, "session.close");
+        let observed = waker.snapshot_checked().unwrap();
+        barrier.resolve(ReaderCloseDisposition::Resume);
+        wait_for_reader_wake(&waker, observed);
+        reader.join().expect("protocol reader did not resume cleanly");
+
+        assert!(matches!(inbox.try_recv().unwrap(), ReaderMessage::Eof));
+        assert!(matches!(
+            inbox.try_recv().unwrap(),
+            ReaderMessage::Request(request) if request.id == "later"
+        ));
+        assert!(matches!(
+            inbox.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
     }
 
     #[test]

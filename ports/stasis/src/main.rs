@@ -42,7 +42,7 @@ use crate::engine::{
 };
 use crate::protocol::{
     DEFAULT_ORDINARY_LANE_CAPACITY, OrdinaryRequestRemoval, ProtocolError, ProtocolWriter,
-    ReaderInbox, ReaderMessage, Request, reader_channel, spawn_reader,
+    ReaderCloseDisposition, ReaderInbox, ReaderMessage, Request, reader_channel, spawn_reader,
 };
 use crate::wake::{ShellWaker, WakeGeneration, WakeWaitError};
 
@@ -122,7 +122,7 @@ fn main() {
         .expect("fresh shell wake generations are available");
     let servo_cursor = wake_cursor;
     let (sender, inbox) = reader_channel(DEFAULT_ORDINARY_LANE_CAPACITY);
-    let _reader = spawn_reader(sender, waker.clone());
+    let reader = spawn_reader(sender, waker.clone());
     let mut shell: Shell<_, EngineSession> = Shell {
         state: ShellState::Spawned,
         engine: None,
@@ -137,9 +137,17 @@ fn main() {
         last_navigation_authority: None,
     };
 
-    if let Err(error) = shell.run() {
-        eprintln!("stasis shell fatal error: {error}");
-        std::process::exit(70);
+    match shell.run() {
+        Ok(()) => {
+            if reader.join().is_err() {
+                eprintln!("stasis shell fatal error: protocol reader panicked during shutdown");
+                std::process::exit(70);
+            }
+        },
+        Err(error) => {
+            eprintln!("stasis shell fatal error: {error}");
+            std::process::exit(70);
+        },
     }
 }
 
@@ -1003,6 +1011,17 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
     fn handle_reader_message(&mut self, message: ReaderMessage) -> Result<bool, String> {
         match message {
             ReaderMessage::Request(request) => self.handle(request),
+            ReaderMessage::CloseRequest { request, barrier } => {
+                let result = self.handle(request);
+                let disposition = match &result {
+                    Ok(true) | Err(_) => ReaderCloseDisposition::Stop,
+                    Ok(false) => ReaderCloseDisposition::Resume,
+                };
+                // `handle` has already flushed the accepted or rejected close response. The
+                // reader may now either continue decoding or exit before the owner joins it.
+                barrier.resolve(disposition);
+                result
+            },
             ReaderMessage::Fatal(error) => {
                 self.writer
                     .error(None, self.session_id(), &error)
@@ -2746,6 +2765,17 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                             "none",
                         )),
                     )?,
+                    ReaderMessage::CloseRequest { request, barrier } => {
+                        self.write_method_result(
+                            &request,
+                            Err(ProtocolError::operation(
+                                "session_closing",
+                                "session closed before the request started",
+                                "none",
+                            )),
+                        )?;
+                        barrier.resolve(ReaderCloseDisposition::Stop);
+                    },
                     ReaderMessage::Fatal(error) => {
                         self.writer
                             .error(None, self.session_id(), &error)
