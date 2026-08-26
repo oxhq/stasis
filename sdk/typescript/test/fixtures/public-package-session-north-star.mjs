@@ -157,6 +157,8 @@ function sessionNetwork(server) {
   };
 }
 
+assertRequestEvidenceLifecycleRegression();
+
 const server = await startSessionNorthStarServer();
 const fingerprints = [];
 try {
@@ -208,8 +210,8 @@ try {
     "the deterministic /api/profile fixture unexpectedly reached the live server",
   );
   assert.deepEqual(
-    fingerprints.slice(1),
-    Array.from({ length: RUNS - 1 }, () => fingerprints[0]),
+    fingerprints.slice(1).map((run) => run.semantic),
+    Array.from({ length: RUNS - 1 }, () => fingerprints[0].semantic),
     "fresh controlled-session runs produced different semantic fingerprints",
   );
   const crawler = await proveReferenceCrawler(server);
@@ -224,29 +226,26 @@ try {
     negativeSessions: 1,
     profile: CONTROLLED_WEB_SESSION_V1_PROFILE,
     boundary: "controlled_ready",
-    outcome: first.outcome,
-    restoredOutcome: first.restoredOutcome,
+    outcome: first.semantic.outcome,
+    restoredOutcome: first.semantic.restoredOutcome,
     staleTokenError: "stale_state_token",
     fixtureMissError: "network_fixture_miss",
     cleanClose: true,
     runtimeAcquisition,
     crawler,
-    interaction: first.interaction,
-    navigation: first.navigation,
+    interaction: first.semantic.interaction,
+    navigation: first.semantic.navigation,
     audit: {
       schemaVersion: 2,
-      requestCount: first.requests.length,
-      evidenceCount: first.evidenceKinds.length,
-      redirectEvents: first.evidenceKinds.filter((kind) => kind === "redirect").length,
-      sameDocumentHistoryEvents: first.evidenceKinds.filter(
-        (kind) => kind === "same_document_history_changed",
-      ).length,
-      settlementEvents: first.evidenceKinds.filter(
-        (kind) => kind === "settlement_terminal",
-      ).length,
+      requestCount: first.audit.requestCount,
+      evidenceCount: first.audit.evidenceCount,
+      redirectEvents: first.audit.evidenceKindCounts.redirect ?? 0,
+      sameDocumentHistoryEvents:
+        first.audit.evidenceKindCounts.same_document_history_changed ?? 0,
+      settlementEvents: first.audit.evidenceKindCounts.settlement_terminal ?? 0,
       redacted: true,
     },
-    state: { ...first.stateShape, restored: true },
+    state: { ...first.semantic.stateShape, restored: true },
   };
   assertProofRedacted(JSON.stringify(proof));
   process.stdout.write(`${JSON.stringify(proof)}\n`);
@@ -429,17 +428,22 @@ async function executeRun(server) {
   const primary = await executePrimarySession(server);
   const restored = await executeRestoredSession(server, primary.state);
   return {
-    outcome: primary.outcome,
-    restoredOutcome: restored.outcome,
-    navigation: primary.navigation,
-    interaction: primary.interaction,
-    dashboardTrace: primary.dashboardTrace,
-    secondStatus: primary.secondStatus,
-    restoredStatus: restored.status,
-    requests: primary.requests.map(projectRequest),
-    restoredRequests: restored.requests.map(projectRequest),
-    evidenceKinds: primary.evidence.map((record) => record.kind),
-    stateShape: primary.stateShape,
+    semantic: {
+      outcome: primary.outcome,
+      restoredOutcome: restored.outcome,
+      navigation: primary.navigation,
+      interaction: primary.interaction,
+      dashboardTrace: primary.dashboardTrace,
+      secondStatus: primary.secondStatus,
+      restoredStatus: restored.status,
+      stateShape: primary.stateShape,
+    },
+    audit: {
+      requestCount: primary.requests.length,
+      restoredRequestCount: restored.requests.length,
+      evidenceCount: primary.evidence.length,
+      evidenceKindCounts: countEvidenceKinds(primary.evidence),
+    },
   };
 }
 
@@ -897,6 +901,7 @@ async function executeRestoredSession(server, state) {
     assert.equal(restoredExport.sessionStateToken, storage.sessionStateToken);
     assertExportedState(restoredExport.state, server.origin);
     const requests = await collectRequests(session, settled.stateToken);
+    assert.equal(requests.length, 1, "restored session recorded an unexpected request");
     const restoredRequest = requests.find((request) => request.url.path === "/restored");
     assert.ok(restoredRequest);
     assert.deepEqual(restoredRequest.url.queryKeys, ["proof"]);
@@ -1180,6 +1185,8 @@ function assertRequestProof(records, origin) {
 }
 
 function assertEvidenceProof(records, requests) {
+  assertRequestEvidenceLifecycles(records, requests);
+
   const kinds = new Set(records.map((record) => record.kind));
   for (const kind of [
     "request_started",
@@ -1200,26 +1207,6 @@ function assertEvidenceProof(records, requests) {
     ),
     "session evidence did not classify loopback traffic as live",
   );
-  const requestIds = new Set(requests.map((request) => request.requestId));
-  assert.equal(
-    requestIds.size,
-    requests.length,
-    "request audit reused an opaque request ID",
-  );
-  for (const record of records) {
-    if (
-      record.kind === "request_started" ||
-      record.kind === "route_decided" ||
-      record.kind === "response_headers" ||
-      record.kind === "request_completed" ||
-      record.kind === "request_failed"
-    ) {
-      assert.ok(
-        requestIds.has(record.requestId),
-        `evidence referenced unknown request ID ${record.requestId}`,
-      );
-    }
-  }
 
   const request = (method, path) => {
     const matches = requests.filter(
@@ -1239,24 +1226,53 @@ function assertEvidenceProof(records, requests) {
     ["GET", "/second", 200],
     ["GET", "/api/details", 200],
   ];
+  assert.equal(
+    requests.length,
+    expectedResponses.length,
+    "request audit recorded an unexpected primary-session request",
+  );
   for (const [method, path, status] of expectedResponses) {
     const expectedRequest = request(method, path);
-    assert.ok(
-      records.some(
+    const responseHeaders = records.filter(
+      (record) =>
+        record.kind === "response_headers" && record.requestId === expectedRequest.requestId,
+    );
+    assert.equal(
+      responseHeaders.length,
+      1,
+      `evidence did not contain exactly one response for ${method} ${path}`,
+    );
+    assert.equal(
+      responseHeaders[0].status,
+      status,
+      `evidence recorded the wrong response status for ${method} ${path}`,
+    );
+    assert.equal(
+      records.filter(
         (record) =>
-          record.kind === "response_headers" &&
-          record.requestId === expectedRequest.requestId &&
-          record.status === status,
-      ),
-      `evidence omitted ${status} response headers for ${method} ${path}`,
+          record.kind === "request_completed" && record.requestId === expectedRequest.requestId,
+      ).length,
+      1,
+      `evidence did not complete ${method} ${path} exactly once`,
     );
   }
 
-  for (const [parentMethod, parentPath, childMethod, childPath] of [
+  const expectedRedirects = [
     ["GET", "/start", "GET", "/login"],
     ["GET", "/handoff", "GET", "/dashboard"],
     ["GET", "/redirect-next", "GET", "/second"],
-  ]) {
+  ];
+  assert.equal(
+    requests.filter((record) => record.redirectParentId !== undefined).length,
+    expectedRedirects.length,
+    "request audit recorded an unexpected redirect-parent cardinality",
+  );
+  assert.equal(
+    records.filter((record) => record.kind === "redirect").length,
+    expectedRedirects.length,
+    "session evidence recorded an unexpected redirect cardinality",
+  );
+  for (const [parentMethod, parentPath, childMethod, childPath] of expectedRedirects) {
     const parent = request(parentMethod, parentPath);
     const child = request(childMethod, childPath);
     assert.equal(
@@ -1264,13 +1280,14 @@ function assertEvidenceProof(records, requests) {
       parent.requestId,
       `${childMethod} ${childPath} did not retain its redirect parent`,
     );
-    assert.ok(
-      records.some(
+    assert.equal(
+      records.filter(
         (record) =>
           record.kind === "redirect" &&
           record.requestId === parent.requestId &&
           record.nextRequestId === child.requestId,
-      ),
+      ).length,
+      1,
       `evidence did not correlate ${parentPath} -> ${childPath}`,
     );
   }
@@ -1286,61 +1303,276 @@ function assertEvidenceProof(records, requests) {
     "session evidence did not bind deterministic fixture fulfillment to /api/profile",
   );
 
+  const expectedNavigationIds = [0n, 1n, 2n];
+  assert.deepEqual(
+    new Set(
+      records
+        .filter((record) => record.kind === "settlement_terminal")
+        .map((record) => record.navigationId),
+    ),
+    new Set(expectedNavigationIds),
+    "settlement evidence referenced an unexpected navigation",
+  );
+  assert.equal(
+    records.filter((record) => record.kind === "navigation_failed").length,
+    0,
+    "session evidence recorded an unexpected navigation failure",
+  );
   assert.deepEqual(
     new Set(
       records
         .filter((record) => record.kind === "navigation_started")
         .map((record) => record.navigationId),
     ),
-    new Set([0n, 1n, 2n]),
+    new Set(expectedNavigationIds),
     "navigation-start evidence did not cover the exact document sequence",
   );
-  assert.deepEqual(
-    new Set(
-      records
-        .filter((record) => record.kind === "navigation_committed")
-        .map((record) => record.navigationId),
-    ),
-    new Set([0n, 1n, 2n]),
-    "navigation-commit evidence did not cover the exact document sequence",
+  assert.equal(
+    records.filter((record) => record.kind === "navigation_committed").length,
+    expectedNavigationIds.length,
+    "navigation-commit evidence had the wrong cardinality",
   );
-  assert.deepEqual(
-    new Set(
-      records
-        .filter((record) => record.kind === "same_document_history_changed")
-        .map((record) => record.navigationId),
-    ),
-    new Set([1n, 2n]),
-    "history evidence did not bind pushState and replaceState to their documents",
-  );
-  const settlementNavigationIds = new Set(
-    records
-      .filter((record) => record.kind === "settlement_terminal")
-      .map((record) => record.navigationId),
-  );
-  for (const navigationId of [0n, 1n, 2n]) {
+  for (const navigationId of expectedNavigationIds) {
+    const started = records.filter(
+      (record) =>
+        record.kind === "navigation_started" && record.navigationId === navigationId,
+    );
+    const committed = records.filter(
+      (record) =>
+        record.kind === "navigation_committed" && record.navigationId === navigationId,
+    );
+    const settlements = records.filter(
+      (record) =>
+        record.kind === "settlement_terminal" && record.navigationId === navigationId,
+    );
     assert.ok(
-      settlementNavigationIds.has(navigationId),
+      started.length >= 1,
+      `navigation ${navigationId} did not start`,
+    );
+    assert.equal(
+      committed.length,
+      1,
+      `navigation ${navigationId} did not commit exactly once`,
+    );
+    assert.ok(
+      started.every((record) => record.seq < committed[0].seq),
+      `navigation ${navigationId} committed before every start was observed`,
+    );
+    assert.ok(
+      settlements.length >= 1,
       `session evidence omitted terminal settlement for navigation ${navigationId}`,
     );
+    assert.ok(
+      settlements.every((record) => committed[0].seq < record.seq),
+      `navigation ${navigationId} settled before it committed`,
+    );
   }
+  for (const navigationId of [1n, 2n]) {
+    const history = records.filter(
+      (record) =>
+        record.kind === "same_document_history_changed" &&
+        record.navigationId === navigationId,
+    );
+    assert.equal(
+      history.length,
+      1,
+      `history evidence did not bind exactly one change to navigation ${navigationId}`,
+    );
+    const committed = records.find(
+      (record) =>
+        record.kind === "navigation_committed" && record.navigationId === navigationId,
+    );
+    assert.ok(
+      committed.seq < history[0].seq,
+      `navigation ${navigationId} changed history before it committed`,
+    );
+    assert.ok(
+      records.some(
+        (record) =>
+          record.kind === "settlement_terminal" &&
+          record.navigationId === navigationId &&
+          history[0].seq < record.seq,
+      ),
+      `navigation ${navigationId} did not settle after its history change`,
+    );
+  }
+  assert.equal(
+    records.filter((record) => record.kind === "same_document_history_changed").length,
+    2,
+    "history evidence had the wrong cardinality",
+  );
   assert.ok(
     records.filter((record) => record.kind === "settlement_terminal").length >= 3,
     "session evidence omitted a terminal settlement",
   );
 }
 
-function projectRequest(record) {
-  return {
-    seq: record.seq.toString(),
-    method: record.method,
-    path: record.url.path,
-    queryKeys: record.url.queryKeys,
-    resourceKind: record.resourceKind,
-    mainFrame: record.mainFrame,
-    headerNames: record.headerNames,
-    bodyBytes: record.bodyBytes.toString(),
-  };
+function assertRequestEvidenceLifecycles(records, requests) {
+  const requestById = new Map(requests.map((request) => [request.requestId, request]));
+  assert.equal(requestById.size, requests.length, "request audit reused an opaque request ID");
+
+  for (let index = 1; index < requests.length; index += 1) {
+    assert.ok(
+      requests[index].seq > requests[index - 1].seq,
+      "request audit sequence was not strictly monotonic",
+    );
+  }
+
+  for (let index = 1; index < records.length; index += 1) {
+    assert.ok(
+      records[index].seq > records[index - 1].seq,
+      "session evidence sequence was not strictly monotonic",
+    );
+  }
+
+  for (const record of records) {
+    if ("requestId" in record) {
+      assert.ok(
+        requestById.has(record.requestId),
+        `evidence referenced unknown request ID ${record.requestId}`,
+      );
+    }
+    if ("nextRequestId" in record) {
+      assert.ok(
+        requestById.has(record.nextRequestId),
+        `redirect evidence referenced unknown successor request ID ${record.nextRequestId}`,
+      );
+    }
+  }
+
+  for (const request of requests) {
+    const one = (kind) => {
+      const matches = records.filter(
+        (record) => record.kind === kind && record.requestId === request.requestId,
+      );
+      assert.equal(
+        matches.length,
+        1,
+        `request ${request.requestId} did not have exactly one ${kind} event`,
+      );
+      return matches[0];
+    };
+    const started = one("request_started");
+    const routed = one("route_decided");
+    const headers = one("response_headers");
+    const completed = one("request_completed");
+    assert.equal(
+      request.seq,
+      started.seq,
+      `request ${request.requestId} did not retain its request_started sequence`,
+    );
+    assert.ok(
+      started.seq < routed.seq && routed.seq < headers.seq && headers.seq < completed.seq,
+      `request ${request.requestId} had a non-monotonic lifecycle`,
+    );
+  }
+  assert.equal(
+    records.filter((record) => record.kind === "request_failed").length,
+    0,
+    "session evidence recorded an unexpected request failure",
+  );
+
+  const expectedRedirects = requests
+    .filter((request) => request.redirectParentId !== undefined)
+    .map((request) => ({
+      requestId: request.redirectParentId,
+      nextRequestId: request.requestId,
+    }));
+  for (const redirect of expectedRedirects)
+    assert.ok(requestById.has(redirect.requestId), "request audit used an unknown redirect parent");
+  const observedRedirects = records.filter((record) => record.kind === "redirect");
+  assert.equal(
+    observedRedirects.length,
+    expectedRedirects.length,
+    "redirect evidence cardinality did not match request parentage",
+  );
+  for (const expected of expectedRedirects) {
+    const matches = observedRedirects.filter(
+      (record) =>
+        record.requestId === expected.requestId &&
+        record.nextRequestId === expected.nextRequestId,
+    );
+    assert.equal(
+      matches.length,
+      1,
+      `redirect evidence did not link ${expected.requestId} -> ${expected.nextRequestId} exactly once`,
+    );
+    const parentRoute = records.find(
+      (record) => record.kind === "route_decided" && record.requestId === expected.requestId,
+    );
+    const successorStart = records.find(
+      (record) => record.kind === "request_started" && record.requestId === expected.nextRequestId,
+    );
+    assert.ok(
+      parentRoute.seq < matches[0].seq && matches[0].seq < successorStart.seq,
+      `redirect ${expected.requestId} -> ${expected.nextRequestId} violated route-before-successor order`,
+    );
+  }
+}
+
+function countEvidenceKinds(records) {
+  const counts = {};
+  for (const record of records) counts[record.kind] = (counts[record.kind] ?? 0) + 1;
+  return counts;
+}
+
+function assertRequestEvidenceLifecycleRegression() {
+  const requestsForChildStart = (childSeq) => [
+    { seq: 1n, requestId: "parent" },
+    { seq: childSeq, requestId: "child", redirectParentId: "parent" },
+  ];
+  const terminalFirstRequests = requestsForChildStart(6n);
+  const successorFirstRequests = requestsForChildStart(4n);
+  const evidence = (seq, event) => ({ seq: BigInt(seq), ...event });
+  const terminalFirst = [
+    evidence(1, { kind: "request_started", requestId: "parent" }),
+    evidence(2, { kind: "route_decided", requestId: "parent", decision: "live" }),
+    evidence(3, { kind: "response_headers", requestId: "parent", status: 302 }),
+    evidence(4, { kind: "request_completed", requestId: "parent" }),
+    evidence(5, { kind: "redirect", requestId: "parent", nextRequestId: "child" }),
+    evidence(6, { kind: "request_started", requestId: "child" }),
+    evidence(7, { kind: "route_decided", requestId: "child", decision: "live" }),
+    evidence(8, { kind: "response_headers", requestId: "child", status: 200 }),
+    evidence(9, { kind: "request_completed", requestId: "child" }),
+  ];
+  const successorFirst = [
+    evidence(1, { kind: "request_started", requestId: "parent" }),
+    evidence(2, { kind: "route_decided", requestId: "parent", decision: "live" }),
+    evidence(3, { kind: "redirect", requestId: "parent", nextRequestId: "child" }),
+    evidence(4, { kind: "request_started", requestId: "child" }),
+    evidence(5, { kind: "route_decided", requestId: "child", decision: "live" }),
+    evidence(6, { kind: "response_headers", requestId: "child", status: 200 }),
+    evidence(7, { kind: "request_completed", requestId: "child" }),
+    evidence(8, { kind: "response_headers", requestId: "parent", status: 302 }),
+    evidence(9, { kind: "request_completed", requestId: "parent" }),
+  ];
+
+  assert.doesNotThrow(
+    () => assertRequestEvidenceLifecycles(terminalFirst, terminalFirstRequests),
+    "request evidence rejected a legal predecessor-terminal-first redirect",
+  );
+  assert.doesNotThrow(
+    () => assertRequestEvidenceLifecycles(successorFirst, successorFirstRequests),
+    "request evidence rejected a legal successor-first redirect",
+  );
+  assert.throws(
+    () => assertRequestEvidenceLifecycles(terminalFirst, requestsForChildStart(4n)),
+    /did not retain its request_started sequence/u,
+    "request evidence accepted a request record with the wrong start sequence",
+  );
+  const redirectBeforeRoute = [
+    terminalFirst[0],
+    { ...terminalFirst[4], seq: 2n },
+    { ...terminalFirst[1], seq: 3n },
+    { ...terminalFirst[2], seq: 4n },
+    { ...terminalFirst[3], seq: 5n },
+    ...terminalFirst.slice(5),
+  ];
+  assert.throws(
+    () => assertRequestEvidenceLifecycles(redirectBeforeRoute, terminalFirstRequests),
+    /violated route-before-successor order/u,
+    "request evidence accepted a redirect before its parent route decision",
+  );
 }
 
 function assertAuditRedaction(requests, evidence) {
