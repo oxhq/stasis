@@ -460,15 +460,13 @@ unsafe fn try_transfer<T: Transferable + IDLInterface>(
     sc_writer: &mut StructuredDataWriter,
     tag: *mut u32,
     ownership: *mut TransferableOwnership,
+    content: *mut *mut raw::c_void,
     extra_data: *mut u64,
 ) -> Result<(), OperationError> {
     let object = unsafe { root_from_object::<T>(cx, *obj) };
     let Ok(object) = object else {
         return Err(OperationError::InterfaceDoesNotMatch);
     };
-
-    unsafe { *tag = StructuredCloneTags::from(interface) as u32 };
-    unsafe { *ownership = TransferableOwnership::SCTAG_TMO_CUSTOM };
 
     let (id, object) = object.transfer(cx).map_err(OperationError::Exception)?;
 
@@ -487,9 +485,36 @@ unsafe fn try_transfer<T: Transferable + IDLInterface>(
     left.copy_from_slice(&name_space);
     right.copy_from_slice(&index);
 
-    // 3. Return a u64 representation of the key where the object is stored.
-    unsafe { *extra_data = u64::from_ne_bytes(big) };
+    // 3. Commit every SpiderMonkey transfer output together, and only after the object has been
+    // transferred and stored successfully. SpiderMonkey consumes these outputs when the callback
+    // succeeds; Servo's custom transfers do not use a separately allocated content pointer.
+    unsafe {
+        commit_custom_transfer_outputs(
+            tag,
+            ownership,
+            content,
+            extra_data,
+            interface,
+            u64::from_ne_bytes(big),
+        );
+    }
     Ok(())
+}
+
+unsafe fn commit_custom_transfer_outputs(
+    tag: *mut u32,
+    ownership: *mut TransferableOwnership,
+    content: *mut *mut raw::c_void,
+    extra_data: *mut u64,
+    interface: TransferrableInterface,
+    serialized_key: u64,
+) {
+    unsafe {
+        *tag = StructuredCloneTags::from(interface) as u32;
+        *ownership = TransferableOwnership::SCTAG_TMO_CUSTOM;
+        *content = ptr::null_mut();
+        *extra_data = serialized_key;
+    }
 }
 
 type TransferOperation = unsafe fn(
@@ -499,6 +524,7 @@ type TransferOperation = unsafe fn(
     &mut StructuredDataWriter,
     *mut u32,
     *mut TransferableOwnership,
+    *mut *mut raw::c_void,
     *mut u64,
 ) -> Result<(), OperationError>;
 
@@ -520,7 +546,7 @@ unsafe extern "C" fn write_transfer_callback(
     closure: *mut raw::c_void,
     tag: *mut u32,
     ownership: *mut TransferableOwnership,
-    _content: *mut *mut raw::c_void,
+    content: *mut *mut raw::c_void,
     extra_data: *mut u64,
 ) -> bool {
     let sc_writer = unsafe { &mut *(closure as *mut StructuredDataWriter) };
@@ -541,6 +567,7 @@ unsafe extern "C" fn write_transfer_callback(
                 sc_writer,
                 tag,
                 ownership,
+                content,
                 extra_data,
             )
         };
@@ -1034,6 +1061,35 @@ mod tests {
     use servo_base::id::{MessagePortIndex, PipelineNamespaceId};
 
     use super::*;
+
+    #[test]
+    fn successful_custom_transfer_outputs_match_mozjs_abi() {
+        let _: js::jsapi::TransferStructuredCloneOp = Some(write_transfer_callback);
+
+        let mut tag = 0;
+        let mut ownership = TransferableOwnership::SCTAG_TMO_UNFILLED;
+        let mut content_sentinel = 0_u8;
+        let mut content = (&mut content_sentinel as *mut u8).cast::<raw::c_void>();
+        let mut extra_data = 0;
+        let expected_extra_data = 0x0102_0304_0506_0708;
+
+        assert!(!content.is_null());
+        unsafe {
+            commit_custom_transfer_outputs(
+                &mut tag,
+                &mut ownership,
+                &mut content,
+                &mut extra_data,
+                TransferrableInterface::MessagePort,
+                expected_extra_data,
+            );
+        }
+
+        assert_eq!(tag, StructuredCloneTags::MessagePort as u32);
+        assert_eq!(ownership, TransferableOwnership::SCTAG_TMO_CUSTOM);
+        assert!(content.is_null());
+        assert_eq!(extra_data, expected_extra_data);
+    }
 
     #[test]
     fn late_port_backed_transfer_rejection_precedes_every_transfer_step() {
