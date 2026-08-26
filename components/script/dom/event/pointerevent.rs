@@ -11,6 +11,7 @@ use js::context::JSContext;
 use js::rust::HandleObject;
 use keyboard_types::Modifiers;
 use script_bindings::cell::DomRefCell;
+use script_bindings::inheritance::Castable;
 use script_bindings::reflector::reflect_dom_object_with_proto;
 use script_traits::MouseButtons;
 use style::Atom;
@@ -23,7 +24,7 @@ use crate::dom::bindings::codegen::Bindings::PointerEventBinding::{
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
-use crate::dom::event::{EventBubbles, EventCancelable};
+use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::mouseevent::MouseEvent;
 use crate::dom::window::Window;
@@ -115,7 +116,7 @@ impl PointerEvent {
         coalesced_events: Vec<DomRoot<PointerEvent>>,
         predicted_events: Vec<DomRoot<PointerEvent>>,
     ) -> DomRoot<PointerEvent> {
-        Self::new_with_proto(
+        let event = Self::new_with_proto(
             cx,
             window,
             None,
@@ -146,7 +147,11 @@ impl PointerEvent {
             is_primary,
             coalesced_events,
             predicted_events,
-        )
+        );
+        if let Some(time_stamp) = window.synchronous_automation_event_time() {
+            event.upcast::<Event>().set_creation_time_stamp(time_stamp);
+        }
+        event
     }
 
     #[expect(clippy::too_many_arguments)]

@@ -26,6 +26,7 @@ use crate::dom::animationevent::AnimationEvent;
 use crate::dom::bindings::codegen::Bindings::AnimationEventBinding::AnimationEventInit;
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventInit;
 use crate::dom::bindings::codegen::Bindings::TransitionEventBinding::TransitionEventInit;
+use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::root::{Dom, DomRoot};
@@ -33,8 +34,10 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::trace::NoTrace;
 use crate::dom::event::Event;
 use crate::dom::node::{Node, NodeDamage, NodeTraits, from_untrusted_node_address};
+use crate::dom::performance::performanceentry::PerformanceEntryTime;
 use crate::dom::transitionevent::TransitionEvent;
 use crate::dom::window::Window;
+use crate::event_loop::script_thread::ScriptThread;
 
 /// An active CSS animation or transition shape whose terminal behavior cannot be
 /// classified from the retained style animation state.
@@ -77,15 +80,11 @@ impl CssAnimationUnsupportedCounts {
 
     pub(crate) fn count(self, class: CssAnimationUnsupportedClass) -> usize {
         match class {
-            CssAnimationUnsupportedClass::InvalidAnimationTiming => {
-                self.invalid_animation_timing
-            },
+            CssAnimationUnsupportedClass::InvalidAnimationTiming => self.invalid_animation_timing,
             CssAnimationUnsupportedClass::InvalidAnimationIteration => {
                 self.invalid_animation_iteration
             },
-            CssAnimationUnsupportedClass::InvalidTransitionTiming => {
-                self.invalid_transition_timing
-            },
+            CssAnimationUnsupportedClass::InvalidTransitionTiming => self.invalid_transition_timing,
         }
     }
 
@@ -123,9 +122,7 @@ enum CssAnimationPendingClass {
 impl CssAnimationPendingObservation {
     fn record(&mut self, class: CssAnimationPendingClass) {
         let count = match class {
-            CssAnimationPendingClass::FinitePendingOrRunning => {
-                &mut self.finite_pending_or_running
-            },
+            CssAnimationPendingClass::FinitePendingOrRunning => &mut self.finite_pending_or_running,
             CssAnimationPendingClass::InfinitePendingOrRunning => {
                 &mut self.infinite_pending_or_running
             },
@@ -161,9 +158,7 @@ fn classify_css_animation(
         KeyframesIterationState::Infinite(_) if !requires_ticks => {
             CssAnimationPendingClass::InfiniteInert
         },
-        KeyframesIterationState::Finite(_, _) if !requires_ticks => {
-            CssAnimationPendingClass::Inert
-        },
+        KeyframesIterationState::Finite(_, _) if !requires_ticks => CssAnimationPendingClass::Inert,
         _ if !valid_animation_timing(started_at, duration) => {
             CssAnimationPendingClass::Unsupported(
                 CssAnimationUnsupportedClass::InvalidAnimationTiming,
@@ -176,10 +171,7 @@ fn classify_css_animation(
             CssAnimationUnsupportedClass::InvalidAnimationIteration,
         ),
         KeyframesIterationState::Finite(current, maximum)
-            if current.is_finite() &&
-                maximum.is_finite() &&
-                *current >= 0.0 &&
-                *maximum >= 0.0 =>
+            if current.is_finite() && maximum.is_finite() && *current >= 0.0 && *maximum >= 0.0 =>
         {
             CssAnimationPendingClass::FinitePendingOrRunning
         },
@@ -200,9 +192,7 @@ fn classify_css_transition(
     if start_time.is_finite() && duration.is_finite() && duration >= 0.0 {
         CssAnimationPendingClass::FinitePendingOrRunning
     } else {
-        CssAnimationPendingClass::Unsupported(
-            CssAnimationUnsupportedClass::InvalidTransitionTiming,
-        )
+        CssAnimationPendingClass::Unsupported(CssAnimationUnsupportedClass::InvalidTransitionTiming)
     }
 }
 
@@ -563,8 +553,8 @@ impl Animations {
                 continue;
             }
 
-            if set.animations.iter().any(|animation| animation.is_new) ||
-                set.transitions.iter().any(|transition| transition.is_new)
+            if set.animations.iter().any(|animation| animation.is_new)
+                || set.transitions.iter().any(|transition| transition.is_new)
             {
                 let address = UntrustedNodeAddress(opaque_node.0 as *const c_void);
                 unsafe {
@@ -597,8 +587,8 @@ impl Animations {
         // Calculate the `elapsed-time` property of the event and take the absolute
         // value to prevent -0 values.
         let elapsed_time = match event_type {
-            TransitionOrAnimationEventType::TransitionRun |
-            TransitionOrAnimationEventType::TransitionStart => transition
+            TransitionOrAnimationEventType::TransitionRun
+            | TransitionOrAnimationEventType::TransitionStart => transition
                 .property_animation
                 .duration
                 .min((-transition.delay).max(0.)),
@@ -635,8 +625,8 @@ impl Animations {
         pipeline_id: PipelineId,
     ) {
         let iteration_index = match animation.iteration_state {
-            KeyframesIterationState::Finite(current, _) |
-            KeyframesIterationState::Infinite(current) => current,
+            KeyframesIterationState::Finite(current, _)
+            | KeyframesIterationState::Infinite(current) => current,
         };
 
         let active_duration = match animation.iteration_state {
@@ -678,6 +668,29 @@ impl Animations {
     /// An implementation of the final steps of
     /// <https://drafts.csswg.org/web-animations-1/#update-animations-and-send-events>.
     pub(crate) fn send_pending_events(&self, window: &Window, cx: &mut js::context::JSContext) {
+        if self.pending_events.borrow().is_empty() {
+            return;
+        }
+
+        let controlled_v2_batch_time =
+            if ScriptThread::current_controlled_top_level_target_matches(window) {
+                let document = window.Document();
+                if !document.is_fully_active() || !std::ptr::eq(self, document.animations()) {
+                    None
+                } else {
+                    let Ok(time_stamp @ PerformanceEntryTime::Document(_)) =
+                        window.sample_controlled_v2_document_performance_time()
+                    else {
+                        // The sampler latches the exact clock terminal. Preserve the queue so a
+                        // failed controlled sample cannot silently become a host-timestamped event.
+                        return;
+                    };
+                    Some(time_stamp)
+                }
+            } else {
+                None
+            };
+
         // > 4. Let events to dispatch be a copy of doc’s pending animation event queue.
         // > 5. Clear doc’s pending animation event queue.
         //
@@ -735,7 +748,18 @@ impl Animations {
                     DOMString::from(pseudo_element.to_css_string())
                 });
             let elapsed_time = Finite::new(event.elapsed_time as f32).unwrap();
-            let window = node.owner_window();
+            let owner_window = node.owner_window();
+            let controlled_v2_event_time = controlled_v2_batch_time.filter(|_| {
+                let owner_document = node.owner_document();
+                ScriptThread::current_controlled_top_level_target_matches(&owner_window)
+                    && event.pipeline_id == window.pipeline_id()
+                    && owner_window.pipeline_id() == window.pipeline_id()
+                    && owner_document.is_fully_active()
+                    && owner_window.is_top_level()
+                    && std::ptr::eq(owner_document.window(), window)
+                    && std::ptr::eq(&*owner_window, window)
+                    && std::ptr::eq(self, owner_document.animations())
+            });
 
             if event.event_type.is_transition_event() {
                 let event_init = TransitionEventInit {
@@ -744,9 +768,11 @@ impl Animations {
                     elapsedTime: elapsed_time,
                     pseudoElement: pseudo_element,
                 };
-                TransitionEvent::new(cx, &window, event_atom, &event_init)
-                    .upcast::<Event>()
-                    .fire(cx, node.upcast());
+                let event = TransitionEvent::new(cx, &owner_window, event_atom, &event_init);
+                if let Some(time_stamp) = controlled_v2_event_time {
+                    event.upcast::<Event>().set_creation_time_stamp(time_stamp);
+                }
+                event.upcast::<Event>().fire(cx, node.upcast());
             } else {
                 let event_init = AnimationEventInit {
                     parent,
@@ -754,9 +780,11 @@ impl Animations {
                     elapsedTime: elapsed_time,
                     pseudoElement: pseudo_element,
                 };
-                AnimationEvent::new(cx, &window, event_atom, &event_init)
-                    .upcast::<Event>()
-                    .fire(cx, node.upcast());
+                let event = AnimationEvent::new(cx, &owner_window, event_atom, &event_init);
+                if let Some(time_stamp) = controlled_v2_event_time {
+                    event.upcast::<Event>().set_creation_time_stamp(time_stamp);
+                }
+                event.upcast::<Event>().fire(cx, node.upcast());
             }
         }
 
@@ -798,14 +826,14 @@ impl TransitionOrAnimationEventType {
     /// Whether or not this event is a transition-related event.
     pub(crate) fn is_transition_event(&self) -> bool {
         match *self {
-            Self::TransitionRun |
-            Self::TransitionEnd |
-            Self::TransitionCancel |
-            Self::TransitionStart => true,
-            Self::AnimationEnd |
-            Self::AnimationIteration |
-            Self::AnimationStart |
-            Self::AnimationCancel => false,
+            Self::TransitionRun
+            | Self::TransitionEnd
+            | Self::TransitionCancel
+            | Self::TransitionStart => true,
+            Self::AnimationEnd
+            | Self::AnimationIteration
+            | Self::AnimationStart
+            | Self::AnimationCancel => false,
         }
     }
 }
@@ -862,12 +890,7 @@ mod pending_observation_tests {
             AnimationState::Canceled,
         ] {
             assert_eq!(
-                classify_css_animation(
-                    &state,
-                    &KeyframesIterationState::Infinite(4.0),
-                    10.0,
-                    20.0,
-                ),
+                classify_css_animation(&state, &KeyframesIterationState::Infinite(4.0), 10.0, 20.0,),
                 CssAnimationPendingClass::InfiniteInert
             );
         }
@@ -914,9 +937,7 @@ mod pending_observation_tests {
             1
         );
         assert_eq!(
-            observation
-                .unsupported_pending_or_running
-                .checked_total(),
+            observation.unsupported_pending_or_running.checked_total(),
             Some(3)
         );
     }

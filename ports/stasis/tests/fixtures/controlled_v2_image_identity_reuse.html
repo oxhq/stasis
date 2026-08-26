@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled v2 image identity capacity reuse</title>
+<img id="image" alt="sequential controlled data SVG">
+<output id="result">waiting</output>
+<script>
+  const image = document.querySelector("#image");
+  const result = document.querySelector("#result");
+  const target = 520;
+  let completed = 0;
+  let exactTime = true;
+
+  function source(sequence) {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><title>${sequence}</title><rect width="1" height="1"/></svg>`;
+    return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+  }
+
+  image.addEventListener("load", (event) => {
+    exactTime = exactTime && event.timeStamp === 0 && performance.now() === 0;
+    completed += 1;
+    if (completed === target) {
+      result.textContent = `completed:${completed}|exact-time:${exactTime}`;
+      return;
+    }
+    image.src = source(completed);
+  });
+  image.addEventListener("error", (event) => {
+    result.textContent = `unexpected-error:${completed}:${event.timeStamp}`;
+  });
+
+  image.src = source(0);
+</script>

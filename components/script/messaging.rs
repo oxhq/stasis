@@ -54,10 +54,30 @@ pub(crate) enum MixedMessage {
     FromConstellation(ScriptThreadMessage),
     FromScript(MainThreadScriptMsg),
     FromDevtools(DevtoolScriptControlMsg),
-    FromImageCache(ImageCacheResponseMessage),
+    FromImageCache(ImageCacheMessage),
     #[cfg(feature = "webgpu")]
     FromWebGPUServer(WebGPUMsg),
     TimerFired,
+}
+
+/// Internal image-cache transport selected when a listener is registered.
+///
+/// Baseline preserves Servo's ordinary channel behavior. `ControlledV2` is created only by an
+/// explicitly admitted same-document listener and keeps its Image producer lease alive through
+/// ScriptThread handling.
+#[derive(Debug)]
+pub(crate) enum ImageCacheMessage {
+    Baseline(ImageCacheResponseMessage),
+    ControlledV2(DocumentProducerEnvelope<ImageCacheResponseMessage>),
+}
+
+impl ImageCacheMessage {
+    fn response(&self) -> &ImageCacheResponseMessage {
+        match self {
+            Self::Baseline(response) => response,
+            Self::ControlledV2(envelope) => &envelope.message,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -152,7 +172,7 @@ impl MixedMessage {
                     ..,
                 ) => Some(control_id.pipeline_id),
             },
-            MixedMessage::FromImageCache(response) => match response {
+            MixedMessage::FromImageCache(transport) => match transport.response() {
                 ImageCacheResponseMessage::NotifyPendingImageLoadStatus(response) => {
                     Some(response.pipeline_id)
                 },
@@ -499,9 +519,9 @@ impl QueuedTaskConversion for MainThreadScriptMsg {
             MainThreadScriptMsg::ForwardEmbedderControlResponseFromFileManager(control_id, ..) => {
                 Some(control_id.pipeline_id)
             },
-            MainThreadScriptMsg::Common(CommonScriptMsg::CollectReports(_)) |
-            MainThreadScriptMsg::Inactive |
-            MainThreadScriptMsg::WakeUp => None,
+            MainThreadScriptMsg::Common(CommonScriptMsg::CollectReports(_))
+            | MainThreadScriptMsg::Inactive
+            | MainThreadScriptMsg::WakeUp => None,
         }
     }
 
@@ -1399,7 +1419,7 @@ pub(crate) struct ScriptThreadSenders {
     /// The shared [`Sender`] which is sent to the `ImageCache` when requesting an image.
     /// Messages on this channel are sent to [`ScriptThreadReceivers::image_cache_receiver`].
     #[no_trace]
-    pub(crate) image_cache_sender: Sender<ImageCacheResponseMessage>,
+    pub(crate) image_cache_sender: Sender<ImageCacheMessage>,
 
     /// For providing contact with the time profiler.
     #[no_trace]
@@ -1429,7 +1449,7 @@ pub(crate) struct ScriptThreadReceivers {
 
     /// The [`Receiver`] which receives incoming messages from the `ImageCache`.
     #[no_trace]
-    pub(crate) image_cache_receiver: Receiver<ImageCacheResponseMessage>,
+    pub(crate) image_cache_receiver: Receiver<ImageCacheMessage>,
 
     /// For receiving commands from an optional devtools server. Will be ignored if no such server
     /// exists. When devtools are not active this will be [`crossbeam_channel::never()`].

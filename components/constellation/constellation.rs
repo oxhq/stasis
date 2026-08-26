@@ -1194,13 +1194,19 @@ where
         } else {
             DocumentTimeSurface::CrossEventLoopNavigation
         };
-        let (document_clock, document_control_profile, controlled_event_loop_id) = self
+        let (
+            document_clock,
+            document_control_profile,
+            document_execution_profile,
+            controlled_event_loop_id,
+        ) = self
             .webviews
             .get(&webview_id)
             .map(|webview| {
                 (
                     webview.document_clock(),
                     webview.document_control_profile(),
+                    webview.document_execution_profile(),
                     webview.controlled_event_loop_id(),
                 )
             })
@@ -1238,6 +1244,7 @@ where
         {
             if event_loop.document_clock() != document_clock
                 || event_loop.document_control_profile() != document_control_profile
+                || event_loop.document_execution_profile() != document_execution_profile
             {
                 if let Some(webview) = self.webviews.get_mut(&webview_id) {
                     webview.fail_document_time(DocumentTimeSurface::CrossEventLoopNavigation);
@@ -1269,6 +1276,7 @@ where
         ) {
             if event_loop.document_clock() != document_clock
                 || event_loop.document_control_profile() != document_control_profile
+                || event_loop.document_execution_profile() != document_execution_profile
             {
                 if let Some(webview) = self.webviews.get_mut(&webview_id) {
                     webview.fail_document_time(unsupported_event_loop_surface);
@@ -1299,8 +1307,13 @@ where
             ));
         }
 
-        let event_loop =
-            EventLoop::spawn(self, is_private, document_clock, document_control_profile)?;
+        let event_loop = EventLoop::spawn(
+            self,
+            is_private,
+            document_clock,
+            document_control_profile,
+            document_execution_profile,
+        )?;
         if let Some(webview) = self.webviews.get_mut(&webview_id) {
             webview
                 .bind_controlled_event_loop(event_loop.id(), unsupported_event_loop_surface)
@@ -4638,6 +4651,7 @@ where
             user_content_manager_id,
             document_clock,
             document_control_profile,
+            document_execution_profile,
         }: NewWebViewDetails,
     ) {
         let pipeline_id = PipelineId::new();
@@ -4654,6 +4668,7 @@ where
             user_content_manager_id,
             document_clock,
             document_control_profile,
+            document_execution_profile,
         );
         self.webviews.insert(webview_id, new_webview);
 
@@ -5080,6 +5095,7 @@ where
             user_content_manager_id,
             document_clock,
             document_control_profile,
+            document_execution_profile,
         } = match webview_id_receiver.recv() {
             Ok(Some(new_webview_details)) => new_webview_details,
             Ok(None) | Err(_) => {
@@ -5101,6 +5117,7 @@ where
             };
         if script_sender.document_clock() != document_clock
             || script_sender.document_control_profile() != document_control_profile
+            || script_sender.document_execution_profile() != document_execution_profile
         {
             if let Some(opener_webview) = self.webviews.get_mut(&opener_webview_id) {
                 opener_webview.fail_document_time(DocumentTimeSurface::AuxiliaryWebView);
@@ -5128,6 +5145,7 @@ where
             user_content_manager_id,
             document_clock,
             document_control_profile,
+            document_execution_profile,
         );
         if let Err(surface) = new_webview
             .bind_controlled_event_loop(script_sender.id(), DocumentTimeSurface::AuxiliaryWebView)

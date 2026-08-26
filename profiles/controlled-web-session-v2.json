@@ -1,0 +1,1468 @@
+{
+  "schemaVersion": 1,
+  "id": "controlled-web-session-v2",
+  "releaseStatus": "candidate_contract",
+  "targetRelease": "0.3.0",
+  "clockMode": "controlled",
+  "compatibility": {
+    "protocolEnvelopeVersion": 1,
+    "predecessor": "controlled-web-session-v1",
+    "predecessorProfileSha256": "9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a",
+    "predecessorContractUnchanged": true,
+    "legacyOpenDefault": "controlled-webapp-v1",
+    "maximumOpaqueTokenBytes": 256,
+    "selection": "explicit",
+    "sessionOpenDefault": "controlled-web-session-v1",
+    "stateArtifactProfile": "controlled-web-session-v1",
+    "profileExpansion": "execution_and_headless_presentation_surfaces_only"
+  },
+  "sessionScope": {
+    "processesPerSession": 1,
+    "sessionsPerProcess": 1,
+    "webViews": 1,
+    "activeTopLevelDocuments": 1,
+    "controlledScriptEventLoops": 1,
+    "childBrowsingContexts": "unsupported",
+    "auxiliaryWebViews": "unsupported",
+    "persistentDomHandles": false
+  },
+  "lifecycle": {
+    "openMethod": "session.open",
+    "closeMethod": "session.close",
+    "closeEffect": "terminal_response_then_process_exit",
+    "processReuse": false,
+    "runtimeCloseContract": false,
+    "sessionId": "one_process_local_id",
+    "requestsAfterClose": "transport_eof",
+    "abortedOrIndeterminateSession": "fail_stop_process"
+  },
+  "documentAuthority": {
+    "kind": "opaque_state_token",
+    "requestField": "expectedStateToken",
+    "resultField": "stateToken",
+    "scope": "current_active_top_level_document",
+    "sessionLocal": true,
+    "persistent": false,
+    "wireSyntax": "document:<32_lowercase_hex_namespace>:<canonical_nonzero_u128_decimal_alias>",
+    "maximumBytes": 81,
+    "namespaceBits": 128,
+    "namespaceSource": "operating_system_csprng_fail_closed",
+    "entropyFailure": {
+      "code": "runtime_error",
+      "fatal": true,
+      "processEffect": "fail_stop"
+    },
+    "crossSessionToken": "well_formed_but_stale",
+    "debugRepresentation": "redacted",
+    "maximumRetainedBindings": 1,
+    "boundFacts": [
+      "web_view",
+      "script_event_loop",
+      "active_top_level_document",
+      "document_epoch",
+      "navigation_id",
+      "history_revision",
+      "navigation_revision",
+      "pipeline_membership_revision",
+      "current_url",
+      "successful_document_replacements",
+      "navigation_terminal_state",
+      "runtime_state_generation"
+    ],
+    "rotatesOn": [
+      "navigation_start",
+      "document_activation",
+      "same_document_history_change",
+      "target_authority_change",
+      "runtime_state_generation_change"
+    ],
+    "rotationLinearization": "next_successful_public_token_projection_after_a_bound_fact_change",
+    "stableAcrossEquivalentObservation": true,
+    "strictAuthorization": {
+      "foreignOrSupersededToken": "reject_before_fresh_authority_inspection_without_changing_the_current_binding",
+      "currentMismatch": "retain_latest_public_binding_but_latch_it_strict_stale_without_hidden_token_issuance",
+      "abaReturn": "remains_strict_stale_until_a_fresh_public_token_is_successfully_issued",
+      "failedFreshTokenAllocation": "latest_public_binding_and_strict_stale_latch_remain_unchanged"
+    },
+    "settleContinuation": {
+      "method": "runtime.settle",
+      "eligibleToken": "exact_latest_publicly_issued_binding_including_a_strict_stale_latch",
+      "scope": "same_document_only_no_cross_document_successor",
+      "authorizationBracket": "pump_suppressed_passive_N1_then_document_observe_D_then_pump_suppressed_passive_N2",
+      "navigationAuthority": "exact_full_N1_equals_N2_and_equals_retained_authority",
+      "documentTarget": "D_target_equals_retained_navigation_target",
+      "runtimeStateGeneration": "D_generation_greater_than_or_equal_to_retained_generation",
+      "generationRegression": "fatal_fail_stop",
+      "nearMiss": "validated_nonterminal_N1_D_or_N2_authority_mismatch_latches_the_exact_current_binding_then_stale_state_token_nonfatal_state_effect_none_before_coordinator_start",
+      "documentObservationRejection": "validated_target_changed_or_replacement_pipeline_bootstrap_required_is_a_near_miss_invalid_payload_is_fatal",
+      "terminalPrecedence": "typed_session_navigation_terminal_or_application_failure_precedes_stale_state_token_at_N1_or_N2_and_never_starts_the_coordinator",
+      "coordinatorSeed": "the_exact_completed_D_observation_through_the_normal_initial_observe_transition",
+      "controlledNetworkGate": "fresh_N2_snapshot_applied_before_the_first_coordinator_decision",
+      "successfulProjection": "issues_the_current_public_token_and_clears_the_strict_stale_latch",
+      "knownStalePreflight": "sticky_controlled_network_failure_precedes_stale_rejection_otherwise_no_engine_work_or_pump"
+    },
+    "recoveryMethod": "runtime.pending",
+    "staleError": {
+      "code": "stale_state_token",
+      "fatal": false,
+      "stateEffect": "none"
+    },
+    "legacyExpectedGenerationAccepted": false
+  },
+  "sessionStateAuthority": {
+    "kind": "opaque_session_state_token",
+    "requestField": "expectedSessionStateToken",
+    "resultField": "sessionStateToken",
+    "separateFromDocumentAuthority": true,
+    "sessionLocal": true,
+    "persistent": false,
+    "wireSyntax": "session:<32_lowercase_hex_namespace>:<canonical_nonzero_u64_decimal_alias>",
+    "maximumBytes": 61,
+    "namespaceBits": 128,
+    "namespaceSource": "independent_operating_system_csprng_fail_closed",
+    "entropyFailure": {
+      "code": "session_state_token_entropy_unavailable",
+      "fatal": true,
+      "liveMutationStateEffect": "indeterminate",
+      "processEffect": "fail_stop"
+    },
+    "crossSessionToken": "well_formed_but_stale",
+    "debugRepresentation": "redacted",
+    "boundFacts": [
+      "cookie_revision",
+      "web_storage_revision"
+    ],
+    "backendRevisions": "combined_and_hidden_by_shell",
+    "mutationRevalidation": "all_bound_revisions_immediately_before_mutation",
+    "rotatesOn": [
+      "cookie_mutation",
+      "local_storage_mutation",
+      "session_storage_mutation",
+      "state_import"
+    ],
+    "readMethods": [
+      "session.cookies.get",
+      "session.storage.get",
+      "session.state.export"
+    ],
+    "successfulMutationMethods": [
+      "session.cookies.set",
+      "session.storage.set"
+    ],
+    "successfulMutationsRequireExpectedSessionStateToken": true,
+    "backendMutationAtomicity": "one_backend_method_at_a_time",
+    "initialToken": "established_in_unpublished_session_builder_before_optional_import",
+    "initialImport": {
+      "method": "session.open.state",
+      "onlySuccessfulEntryPoint": true,
+      "phase": "unpublished_pre_navigation_only",
+      "requiresCallerExpectedSessionStateToken": false,
+      "authorization": "unpublished_builder_hidden_current_token",
+      "validation": "complete_before_any_backend_mutation",
+      "effect": "atomic_construction_before_session_publication",
+      "boundary": "navigation_and_network_start_revision_zero",
+      "requiredSeam": "pre_navigation_session_builder"
+    },
+    "postPublicationImport": {
+      "method": "session.state.import",
+      "successfulMutation": false,
+      "requestPayloadInspected": false,
+      "closedPhaseError": {
+        "code": "session_state_import_phase_closed",
+        "fatal": false,
+        "stateEffect": "none"
+      }
+    },
+    "staleError": {
+      "code": "stale_session_state_token",
+      "fatal": false,
+      "stateEffect": "none"
+    },
+    "artifactProfile": "controlled-web-session-v1"
+  },
+  "navigation": {
+    "initial": {
+      "schemes": [
+        "http",
+        "https"
+      ],
+      "fetchBacked": true,
+      "navigationId": "0",
+      "boundary": "controlled_ready"
+    },
+    "explicit": {
+      "method": "session.navigate",
+      "schemes": [
+        "http",
+        "https"
+      ],
+      "requiresExpectedStateToken": true,
+      "replacesTopLevelDocument": true,
+      "resultFields": [
+        "requestedUrl",
+        "url",
+        "stateGeneration",
+        "domEpoch",
+        "documentEpoch",
+        "navigationId",
+        "historyRevision",
+        "stateToken"
+      ],
+      "boundary": "controlled_ready"
+    },
+    "applicationTopLevel": {
+      "sameOriginHttpHttps": "supported_when_existing_controlled_event_loop_is_preserved",
+      "crossOriginHttpHttps": "supported_when_existing_controlled_event_loop_is_preserved",
+      "nonHttpHttps": "rejected_before_navigation_admission_pipeline_creation_or_network_start",
+      "crossEventLoop": "unsupported",
+      "formSubmission": "subject_to_same_top_level_rules"
+    },
+    "preAdmissionRejectionEffects": {
+      "appliesTo": [
+        "unsupported_navigation_scheme",
+        "document_transition_limit_exceeded",
+        "history_limit_exceeded"
+      ],
+      "explicit_pre_admission_or_observation_before_request_work": {
+        "fatal": false,
+        "stateEffect": "none",
+        "processEffect": "continue"
+      },
+      "application_initiated_observation_after_enclosing_request_work": {
+        "fatal": true,
+        "stateEffect": "partial",
+        "processEffect": "fail_stop"
+      }
+    },
+    "sameDocument": {
+      "hashNavigation": "supported",
+      "historyPushState": "supported",
+      "historyReplaceState": "supported",
+      "historyTraversal": "unsupported",
+      "historyTraversalBoundary": {
+        "profile": "controlled-web-session-v1_and_v2",
+        "script": "throws_NotSupportedError_before_constellation_send_and_latches_history_traversal",
+        "alternateIngress": "constellation_latches_target_owned_history_traversal_before_ignore",
+        "settlementOutcome": "unsupported_work",
+        "timeSurface": "history_traversal",
+        "controlledWebappV1": "unchanged"
+      },
+      "historyRevision": "checked_u64_session_monotonic_initial_zero_increment_every_admitted_change_never_reset_on_replacement",
+      "replaceStatePreventsAbaByIncrementing": true,
+      "maximumRevisions": 10000,
+      "limitError": {
+        "code": "history_limit_exceeded",
+        "effectContract": "navigation.preAdmissionRejectionEffects",
+        "fields": [
+          "limit",
+          "observed",
+          "navigationId",
+          "historyRevision"
+        ]
+      }
+    },
+    "replacementDocuments": {
+      "documentEpoch": "checked_u64_initial_activation_one_increment_on_successful_replacement_activation",
+      "navigationId": "checked_u64_initial_navigation_zero_replacements_reserve_one_and_up_at_admission_never_reused",
+      "redirectsShareNavigationId": true,
+      "residentDocumentPolicy": "one_live_active_document_old_pipeline_converted_to_reloadable_history_and_closed_before_replacement_authority_completes",
+      "bfcache": "unsupported",
+      "pagehideUnloadFidelityOnReplacement": "unsupported_exit_lifecycle_is_prioritized_for_authority_reconciliation",
+      "turnAdmissionHandoff": {
+        "sourceTurnReplay": false,
+        "sourceTurnCount": "exactly_once",
+        "proof": "typed_in_process_drive_boundary_plus_passive_no_pump_exact_session_authority_transition",
+        "bootstrap": "sole_exact_owner_queued_http_https_top_level_spawn_pipeline_selected_ahead_only_of_retained_ordinary_backlog",
+        "settlementRearm": "each_independently_verified_activation_rebinds_authority_and_rearms_the_same_settle_for_another_replacement",
+        "transportLoss": "fatal_indeterminate",
+        "budgetContinuity": "original_virtual_time_control_turn_and_cumulative_wall_io_ledgers"
+      },
+      "maximumSuccessfulReplacements": 1000,
+      "initialActivationCountsAgainstLimit": false,
+      "limitError": {
+        "code": "document_transition_limit_exceeded",
+        "effectContract": "navigation.preAdmissionRejectionEffects",
+        "fields": [
+          "limit",
+          "observed",
+          "nextNavigationId"
+        ]
+      }
+    },
+    "redirects": {
+      "httpHttps": "subject_to_controlled_event_loop_rule",
+      "maximumFollowedHops": 20,
+      "overflow": {
+        "code": "redirect_limit_exceeded",
+        "fatal": true,
+        "stateEffect": "partial",
+        "processEffect": "fail_stop",
+        "fields": [
+          "limit",
+          "observed",
+          "navigationId"
+        ]
+      }
+    },
+    "counterOverflow": "runtime_error_and_fail_stop",
+    "reload": "use_explicit_navigate",
+    "downloads": "unsupported"
+  },
+  "selectors": {
+    "grammar": "practical_selector_v2",
+    "supportedComponents": [
+      "type",
+      "universal",
+      "id",
+      "class",
+      "attribute_presence",
+      "attribute_equality"
+    ],
+    "attributeSelectors": {
+      "namespace": "no_namespace_only",
+      "supportedOperators": [
+        "exists",
+        "equal"
+      ],
+      "unsupportedOperators": [
+        "includes",
+        "dash_match",
+        "prefix",
+        "substring",
+        "suffix"
+      ],
+      "attributeEntryScans": "precharged_for_candidate_and_structurally_considered_ancestors",
+      "attributeValueScans": "exact_equality_precharges_relevant_candidate_and_ancestor_serialized_value_byte_upper_bounds",
+      "lazyDeclarationEquality": "unsupported_before_match_unless_serialization_already_exists"
+    },
+    "commaSeparatedLists": true,
+    "supportedCombinators": [
+      "descendant",
+      "child"
+    ],
+    "unsupportedCombinators": [
+      "adjacent_sibling",
+      "general_sibling",
+      "column"
+    ],
+    "pseudoClasses": {
+      "supported": [],
+      "admissionRule": "explicitly_enumerated_only_after_bounded_work_audit",
+      "currentlyUnsupported": [
+        "has",
+        "lang",
+        "dynamic_state",
+        "all_other_pseudo_classes"
+      ]
+    },
+    "pseudoElements": false,
+    "namedNamespacePrefixes": false,
+    "candidateCost": "(local_units+attribute_entries*attribute_components+relevant_attribute_value_bytes*equality_components)*(child_combinators+1)*(ancestor_depth+1)^descendant_combinators",
+    "persistentHandles": false
+  },
+  "automation": {
+    "fill": {
+      "method": "action.fill",
+      "elements": [
+        "input:text",
+        "input:search",
+        "input:url",
+        "input:tel",
+        "input:email",
+        "input:password",
+        "textarea"
+      ],
+      "effect": "replace_value_then_one_input_event",
+      "inputType": "insertReplacementText",
+      "inputEventBubbles": true,
+      "inputEventComposed": true,
+      "inputEventCancelable": false,
+      "focus": false,
+      "keyboardEvents": false,
+      "changeEvent": false
+    },
+    "activate": {
+      "method": "action.activate",
+      "effect": "html_element_click",
+      "formSubmission": "supported_within_navigation_contract",
+      "layoutHitTesting": false,
+      "pointerEvents": false
+    },
+    "focus": {
+      "method": "action.focus",
+      "elements": "html_elements",
+      "effect": "focus_with_prevent_scroll_true",
+      "result": [
+        "focused"
+      ],
+      "focusedFalse": "successful_observation_for_non_focusable_html_element"
+    },
+    "check": {
+      "method": "action.check",
+      "elements": [
+        "mutable_checkbox",
+        "mutable_radio"
+      ],
+      "effect": "html_element_click_when_state_differs",
+      "result": [
+        "changed",
+        "checked"
+      ]
+    },
+    "uncheck": {
+      "method": "action.uncheck",
+      "elements": [
+        "mutable_checkbox"
+      ],
+      "effect": "html_element_click_when_state_differs",
+      "result": [
+        "changed",
+        "checked"
+      ]
+    },
+    "select": {
+      "method": "action.select",
+      "elements": [
+        "mutable_select"
+      ],
+      "validation": "unique_requested_values_prevalidated_atomically_against_enabled_options",
+      "singleSelectRequestedValues": 1,
+      "mutationImplementation": "bulk_selectedness_then_one_precharged_validity_refresh",
+      "optionTreeWork": "every_inspected_direct_select_child_optgroup_child_option_attribute_entry_and_option_text_node_charged",
+      "validityPropagationWork": "precharge_one_document_walk_plus_three_full_document_passes_for_form_controls_fieldset_ancestor_and_fieldset_subtree_before_mutation",
+      "uaShadowWork": "128_fixed_units_reserved_before_mutation_for_fixed_tree_creation_set_data_observer_and_version_walks",
+      "resultOrder": "current_post_event_dom_option_order",
+      "postEventObservationFailure": {
+        "code": "outcome_indeterminate",
+        "fatal": true,
+        "stateEffect": "indeterminate",
+        "processEffect": "fail_stop"
+      },
+      "eventsWhenChanged": [
+        "bubbling_composed_input",
+        "bubbling_change"
+      ],
+      "eventsWhenUnchanged": [],
+      "result": [
+        "changed",
+        "values"
+      ]
+    },
+    "submit": {
+      "method": "action.submit",
+      "elements": [
+        "form"
+      ],
+      "effect": "request_submit_null",
+      "result": [
+        "submitted"
+      ],
+      "submittedMeaning": "request_submit_invocation_succeeded_not_validation_or_navigation_guarantee",
+      "navigation": "subject_to_top_level_navigation_contract"
+    },
+    "documentMethodsRequireExpectedStateToken": [
+      "action.fill",
+      "action.activate",
+      "action.focus",
+      "action.check",
+      "action.uncheck",
+      "action.select",
+      "action.submit",
+      "dom.query",
+      "dom.text",
+      "dom.extract",
+      "runtime.settle",
+      "runtime.advance_to_next",
+      "session.navigate"
+    ],
+    "linearization": {
+      "strictMethods": "script_owner_revalidates_exact_document_identity_and_generation_before_execution",
+      "runtime.settle": "documentAuthority.settleContinuation"
+    },
+    "actionNavigationAuthority": {
+      "synchronousScriptEmission": "an_action_may_carry_only_top_level_or_same_document_authority_emitted_synchronously_during_its_controlled_turn",
+      "queuedNativeDefault": "link_and_form_default_navigation_queued_for_later_execution_is_observed_by_explicit_settle_not_claimed_by_the_action_result",
+      "laterAsyncWork": "timer_fetch_and_other_later_navigation_is_observed_by_explicit_settle",
+      "unprovenPostActionDrift": "fatal_partial_or_indeterminate_fail_stop_never_definitive_none"
+    },
+    "nativeHiddenWork": {
+      "scope": "target_specific_native_path_observed_before_mutation",
+      "fixedUnits": 256,
+      "eventPath": {
+        "P": "exact_composed_node_path_following_shadow_root_host_else_assigned_slot_else_parent",
+        "R": "sum_of_shadow_including_ancestor_depths_for_each_node_in_P",
+        "D": "target_shadow_including_ancestor_depth",
+        "H": "shadow_root_retarget_hops_in_P",
+        "eventUnits": "(1+H_related)*R_target+H_related*D_target+4*P_target+32"
+      },
+      "relevantValidity": {
+        "C": "owned_control_count_of_the_target_control_form_or_zero",
+        "A": "target_control_light_dom_ancestor_count",
+        "F": "node_count_of_the_nearest_fieldset_light_subtree_or_zero"
+      },
+      "radio": {
+        "Rroot": "node_count_of_the_actual_light_tree_root",
+        "G": "exact_same_owner_same_name_radio_group_members_in_Rroot",
+        "reservationUnits": "6*(Rroot+G*Rroot+sum_over_group(C_i+A_i+F_i))+3*event(target,null)+256"
+      },
+      "focus": {
+        "transitionUnits": "2*event(old,new)+2*event(new,old)+256",
+        "delegatedFocus": "8*(relevant_shadow_nodes+attribute_entries+ancestor_steps+ancestor_attribute_entries)",
+        "editingHost": "8*(relevant_shadow_including_subtree_nodes+attribute_entries)"
+      },
+      "forms": {
+        "scope": "only_controls_owned_by_the_actual_submit_or_reset_form",
+        "chargedWork": "control_snapshot_invalid_event_paths_datalist_ancestor_paths_option_and_version_paths_validity_form_fieldset_and_radio_passes",
+        "submitValidityUnits": "sum_over_owned_controls(C_i+A_i+F_i)+radio_root_group_reservations+2*sum_over_owned_selects(inspected_option_tree_nodes)",
+        "submitValidityOrder": "reserve_exact_C*C_owned_control_scan_before_entry_output_then_reserve_each_target_specific_ancestor_fieldset_radio_and_select_term_before_requestSubmit",
+        "submissionEntryBound": "E=2*C+sum(max(selected_file_entries_i-1,0))+sum(max(selected_option_entries_i-1,0))+sum(max(element_internals_entries_i-1,0))",
+        "submissionCardinalityOrder": "reserve_2*C_before_control_content_then_each_O1_or_bounded_counted_fanout_excess_before_iterating_its_entries",
+        "submissionEntryWorkUnits": "E",
+        "submissionEntryRawScratchBytes": "E_plus_page_controlled_source_bytes_with_each_repeated_file_or_select_control_name_charged_per_entry",
+        "submissionEntryDerivedBytes": "135*E+53_plus_6*page_controlled_string_bytes_plus_file_body_bytes",
+        "submissionFixedEnvelope": "135_bytes_per_entry_covers_max_47_byte_boundary_and_file_header_trailer_with_text_plain_fallback;53_bytes_covers_final_closing_boundary",
+        "submissionFileStrings": "control_name_per_entry_filename_and_blob_type",
+        "submissionElementInternalsStrings": "each_FormData_datum_name_value_or_filename_and_blob_type",
+        "submissionStrings": "only_actual_form_form_controls_selected_options_selected_files_and_form_associated_custom_element_data"
+      },
+      "select": {
+        "validityOptionTreeUnits": "2*inspected_option_tree_nodes_before_changed_selectedness_or_submit_validation",
+        "changedEventUnits": "2*event(target,null)_for_input_and_change",
+        "changedEventScratch": "exact_composed_path_attributes_share_the_cumulative_action_scratch_budget"
+      },
+      "activate": {
+        "classification": "first_activatable_element_on_exact_composed_click_path",
+        "label": "charge_only_actual_label_control_resolution_root_then_recursively_classify_resolved_control",
+        "simpleLinkButtonSummary": "event_path_and_target_default_action_only_without_unrelated_form_or_document_scan"
+      },
+      "unrelatedDomInvariant": "ordinary_shallow_link_plain_button_and_focus_do_not_scale_with_unrelated_document_nodes_or_forms",
+      "workLimit": "cumulative_automationLimits.maxDomNodesVisited_including_selector_preflight_and_reservation",
+      "stringScratchSources": "target_attributes_and_private_state_plus_only_action_relevant_form_controls_options_files_contenteditable_or_delegated_focus_subtrees_and_element_internals_form_data",
+      "stringScratchLimit": "automationLimits.maxOutputBytes",
+      "derivedStringExpansionMultiplier": 6,
+      "failureBoundary": "work_or_scratch_failure_is_nonfatal_stateEffect_none_before_event_or_mutation",
+      "synchronousHandlerBoundary": "page_handler_work_or_handler_created_dom_after_preflight_is_bounded_by_command_wall_time_and_any_unprovable_post_action_result_is_fatal_outcome_indeterminate"
+    }
+  },
+  "inspection": {
+    "tokenBound": true,
+    "operations": [
+      "query_count",
+      "text",
+      "extract_text",
+      "extract_html",
+      "extract_attribute",
+      "extract_resolved_url"
+    ],
+    "attributeExtraction": {
+      "rawRead": "attribute",
+      "urlRead": "resolved_url",
+      "source": "content_attribute",
+      "missing": null,
+      "unresolvableUrl": null,
+      "urlResolutionBase": "current_document_base_url_including_first_valid_base_href",
+      "attributeNameRequiredFor": [
+        "attribute",
+        "resolved_url"
+      ],
+      "attributeNameValidation": "nonempty_no_ascii_whitespace_or_control",
+      "attributeLookupWork": "every_element_attribute_entry_precharged_before_vector_lookup"
+    },
+    "fieldTarget": {
+      "nonemptySelector": "exact_one_descendant_match_relative_to_row_root",
+      "emptySelector": "row_root_itself",
+      "emptySelectorProfileScope": "controlled_web_session_v1_and_v2",
+      "emptySelectorWorkAccounting": "one_explicit_row_root_visit_before_read"
+    },
+    "rootOrder": "document_order",
+    "fieldOrder": "request_order",
+    "persistentHandles": false
+  },
+  "forms": {
+    "supported": [
+      "semantic_text_fill",
+      "html_element_activation",
+      "semantic_focus",
+      "semantic_check",
+      "semantic_uncheck",
+      "semantic_select",
+      "semantic_request_submit",
+      "top_level_http_https_form_submission_when_controlled_event_loop_is_preserved"
+    ],
+    "deferred": [
+      "keyboard_input",
+      "file_upload",
+      "form_data_introspection"
+    ]
+  },
+  "execution": {
+    "tasks": true,
+    "microtasks": true,
+    "mutationObserver": true,
+    "oneShotTimers": "controlled",
+    "intervals": "persistent_work",
+    "finiteRendering": true,
+    "animationFrame": true,
+    "date": true,
+    "performance": true,
+    "portBackedStructuredCloneTransferPreflight": {
+      "scope": "complete_transfer_list_in_selected_controlled_global",
+      "ordering": "transfer_list_order_first_failure_stops_before_any_javascript_transfer_step",
+      "interfaces": [
+        "MessagePort",
+        "ReadableStream",
+        "WritableStream",
+        "TransformStream"
+      ],
+      "otherwiseValidEntryFailure": "synchronous_NotSupportedError_and_sticky_external_subscription_before_any_javascript_transfer_step",
+      "platformValidationPrecedence": "per_checked_entry_detached_MessagePort_or_locked_stream_DataCloneError_before_stasis_boundary",
+      "earlierTransferEntriesOnBoundaryRejection": "remain_undetached",
+      "notClaimed": [
+        "transferable_stream_support",
+        "general_transactional_rollback_for_other_transfer_failures"
+      ]
+    },
+    "controlledInputMethodFocus": {
+      "scope": "exact_public_controlled_non_auxiliary_top_level_WebView_document_global",
+      "request": "page_driven_InputMethod_Text_nonmultiline_allowVirtualKeyboard_false_only",
+      "trigger": "page_driven_programmatic_DOM_focus_including_React_autoFocus",
+      "semanticAutomation": "preexisting_profile_independent_suppression_unchanged",
+      "domSemantics": "focus_events_value_and_selection_preserved",
+      "embedderPresentation": "suppressed_before_time_surface_admission",
+      "visibleOwner": "not_published",
+      "embedderRequest": "not_sent",
+      "callback": "not_created_or_awaited",
+      "pendingAuthority": "no_external_work_created",
+      "otherEmbedderControls": "unchanged_unsupported_boundaries",
+      "predecessorBehavior": "controlled_web_session_v1_unchanged"
+    },
+    "controlledFocusEventTimestamp": {
+      "scope": "exact_public_controlled_non_auxiliary_top_level_WebView_document_global",
+      "events": [
+        "focus",
+        "blur",
+        "focusin",
+        "focusout"
+      ],
+      "creation": "engine_generated_document_focus_transition_only",
+      "clock": "document_performance_clock_sampled_at_event_creation",
+      "observableValue": "Event_timeStamp_equals_document_relative_performance_time",
+      "hostValue": "sampled_implementation_value_is_overwritten_and_not_observable",
+      "scriptCreatedFocusEvent": "host_timestamp",
+      "otherEventsOutsideControlledAutomationScope": "host_timestamp",
+      "predecessorBehavior": "controlled_web_session_v1_unchanged",
+      "realtimeBehavior": "unchanged"
+    },
+    "controlledAutomationEventTimestamps": {
+      "scope": "active_controlled_top_level_document_global",
+      "automationScope": "synchronous_public_mutating_automation_action_only",
+      "clock": "document_performance_clock_sampled_once_before_mutation",
+      "lifetime": "RAII_scope_restored_before_action_response",
+      "coverage": "every_browser_created_event_constructed_synchronously_during_the_admitted_action",
+      "implementationSeams": {
+        "fillInputEvent": "explicit_internal_fill_InputEvent_stamp",
+        "internalPointerEvent": "internal_PointerEvent_new_stamp",
+        "genericEventTargetFire": "browser_created_simple_Event_stamp",
+        "internalSubmitEvent": "internal_SubmitEvent_new_stamp",
+        "internalFormDataEvent": "internal_FormDataEvent_new_stamp"
+      },
+      "representativeProofEvents": "fill_input_activate_click_reset_check_click_input_change_select_input_change_invalid_submit_formdata",
+      "observableValue": "all_browser_created_events_synchronously_constructed_during_one_admitted_action_share_its_document_relative_timestamp",
+      "samplingFailure": "reject_action_before_mutation_without_host_fallback",
+      "scriptCreatedConstructors": "Event_InputEvent_PointerEvent_SubmitEvent_FormDataEvent_remain_host_timestamp",
+      "genericEventConstructor": "Event_new_inherited_unchanged",
+      "predecessorBehavior": "controlled_web_session_v1_unchanged",
+      "nestedAndRealtimeBehavior": "unchanged"
+    },
+  "controlledCssAnimationEventTimestamps": {
+      "scope": "exact_public_controlled_non_auxiliary_top_level_WebView_document_global",
+      "source": "nonempty_Animations_pending_event_dispatch_batch_already_retained_by_document_rendering_authority",
+      "eventKinds": [
+        "animationstart",
+        "animationiteration",
+        "animationend",
+        "animationcancel",
+        "transitionrun",
+        "transitionstart",
+        "transitionend",
+        "transitioncancel"
+      ],
+      "clock": "document_performance_clock_sampled_once_before_pending_queue_take",
+      "targetAdmission": "ScriptThread_current_controlled_top_level_target_matches_conservative_singleton_reconstruction_with_undiscarded_non_auxiliary_WindowProxy",
+      "recordAdmission": "queued_pipeline_and_rooted_node_owner_match_exact_public_controlled_non_auxiliary_top_level_target_and_fully_active_Document",
+      "construction": "internal_AnimationEvent_and_TransitionEvent_timestamp_overwrite_immediately_before_fire",
+      "observableValue": "every_admitted_internal_event_in_one_nonempty_dispatch_batch_shares_its_document_relative_timestamp",
+      "samplingFailure": "latch_controlled_clock_terminal_and_leave_batch_undispatched_without_host_fallback",
+      "pendingAuthority": "existing_pending_event_and_finite_infinite_unsupported_animation_rendering_facts_unchanged",
+      "settlementScheduling": {
+        "scheduledPendingEventBatch": "finite_rendering_demand_advanced_to_exact_retained_scheduler_head_including_deadline_equal_to_now",
+        "driveReadiness": "pending_animation_events_are_Drive_ready_only_without_a_live_scheduled_opportunity",
+        "reason": "Drive_cannot_detach_a_controlled_scheduler_entry",
+        "surfaceEffect": "liveness_correction_only_no_new_producer_task_source_or_execution_limit"
+      },
+      "executionLimit": "existing_10000_rendering_opportunity_limit",
+      "representativeExecutableProof": "instant_finite_animationstart_and_animationend_only",
+      "transitionSettlementCompatibility": "not_claimed_timestamp_adapter_applies_only_if_an_existing_owned_transition_record_reaches_pending_dispatch",
+      "scriptCreatedConstructors": "AnimationEvent_and_TransitionEvent_remain_host_timestamp",
+      "auxiliaryStaleMismatchedNestedAndRealtime": "host_timestamp_predecessor_behavior",
+      "semanticBoundary": "timestamp_only_event_order_cardinality_elapsedTime_and_CSS_animation_semantics_unchanged",
+      "predecessorBehavior": "controlled_web_session_v1_unchanged"
+    },
+    "controlledImageElement": {
+      "mode": "controlled_top_level_direct_data_svg",
+      "selection": {
+        "interface": "HTMLImageElement",
+        "scope": "exact_public_controlled_non_auxiliary_top_level_WebView_document_global",
+        "source": "direct_src_selected_without_srcset_picture_or_environment_change",
+        "parser": "canonical_DataUrl",
+        "mimeType": "image/svg+xml",
+        "maximumSerializedUrlBytes": 65536,
+        "requestProvenance": "captured_at_selection_and_carried_with_request_generation",
+        "retainedVectorAuthority": "controlled_cache_id_stored_on_request_only_after_successful_registration_or_synchronous_exact_owner_retain",
+        "executionDomain": "same_ScriptThread_and_ImageCache"
+      },
+      "retention": {
+        "maximumRetainedControlledOwnershipRecordsPerWindow": 512,
+        "recordKinds": [
+          "pending_callback",
+          "exact_cache_id_DOM_owner_identity",
+          "vector_rasterization_key"
+        ],
+        "reservationUnit": "one_record_per_controlled_pending_callback_exact_cache_id_DOM_owner_identity_or_vector_rasterization_key",
+        "overflow": "sticky_Image_producer_admission_limit_terminal_without_baseline_fallback",
+        "decodeRequestAdmission": "ReadyForRequest_callback_and_identity_reservations_succeed_before_cache_request_issue",
+        "teardown": "callback_identity_layout_and_raster_collections_cleared_together_releasing_all_records"
+      },
+      "completion": {
+        "synchronousCacheHit": "admitted_provenance_bound_current_turn_without_async_producer_lease",
+        "asyncCacheDecode": "Image_producer_fenced_through_ScriptThread_handoff",
+        "callbackRetirement": "cache_owned_callback_drop_before_protocol_terminal_is_owned_cancellation_completed_without_producer_terminal",
+        "retiredTargetDelivery": "dequeued_after_navigation_with_closed_pipeline_tombstone_and_without_live_Window_is_owned_cancellation_completed_without_producer_terminal",
+        "retainedHandlerRejection": "normal_handler_Err_preserves_rejected_key_or_owner_in_Window_pending_collections_completes_scoped_message_guard_and_settles_as_unsupported_rendering_image_load",
+        "handlerUnwind": "ControlledImageMessageCompletion_abandons_during_unwind_and_completes_every_normal_handler_return",
+        "explicitAbandonment": "message_admission_failure_enqueue_rejection_producer_callback_panic_ScriptThread_handler_unwind_missing_untombstoned_or_live_tombstoned_target_prehandler_profile_or_exact_public_target_mismatch_clock_sampling_failure_or_guarded_transport_loss_latches_sticky_Image_producer_terminal",
+        "leaseClassMatch": "completion_and_abandonment_require_exact_fence_sequence_and_registered_Image_kind_before_terminal_or_watermark_mutation",
+        "vectorRasterization": "fenced_only_when_joined_from_a_retained_exact_cache_id_DOM_owner_identity",
+        "vectorRasterizationStart": "may_begin_in_layout_before_post_reflow_exact_key_reservation",
+        "vectorRasterizationAdmission": "post_reflow_exact_key_reservation_and_fenced_listener_install_before_next_ScriptThread_pending_snapshot_publish_or_observe",
+        "vectorRasterizationCapacityFailure": "sticky_Image_producer_terminal_without_baseline_fallback_even_if_task_already_started",
+        "terminalResponses": [
+          "loaded",
+          "failed_to_load_or_decode",
+          "vector_rasterization_complete"
+        ],
+        "queuedDomCallback": "ordinary_task_after_guarded_handoff_with_request_generation_check",
+        "preHandlerMismatchOrAbandonment": "sticky_producer_terminal_without_baseline_fallback",
+        "requestAuthorityLifecycle": "pending_to_current_move_preserves_exact_cache_id_and_abort_replace_or_different_id_releases_exact_owner",
+        "sameIdAbaProtection": "stale_generation_releases_only_when_neither_request_slot_owns_exact_cache_id",
+        "decoderResourceBudget": "not_claimed_existing_wall_task_and_rendering_limits_only"
+      },
+      "pending": {
+        "logicalIdentity": "union_of_callback_and_layout_PendingImageId_plus_exact_image_id_size_rasterization_keys",
+        "layoutOwnerProvenance": "captured_per_exact_cache_id_DOM_owner_at_first_post_reflow_retention",
+        "controlledClassification": "image_id_controlled_only_when_every_retained_callback_is_controlled_and_no_retained_layout_owner_is_baseline",
+        "mixedLayoutOwnership": "baseline_layout_owner_globally_downgrades_cache_id_and_live_raster_keys_and_delivery_mismatch_rejects_before_any_callback_while_retained_as_unsupported_rendering",
+        "mixedMissingOrBaseline": "unsupported_pending_rendering_image_load",
+        "controlledProjection": "Image_producer_fence_not_pending_rendering_image_load",
+        "reservationReconciliation": "live_controlled_records_equal_retained_controlled_callbacks_plus_exact_cache_id_DOM_owner_identities_plus_controlled_rasterization_keys",
+        "producerReconciliation": "pending_Image_producers_greater_than_or_equal_to_controlled_logical_work_absent_terminal"
+      },
+      "eventTimestamp": {
+        "events": [
+          "load",
+          "error",
+          "loadend"
+        ],
+        "creation": "engine_generated_HTMLImageElement_completion_only",
+        "clock": "document_performance_clock_sampled_once_per_completion",
+        "observableValue": "every_event_emitted_for_one_completion_shares_the_document_relative_timestamp",
+        "ordinaryTerminalCardinality": "load_then_loadend_or_error_then_loadend",
+        "existingCacheHitCardinality": "load_only",
+        "cacheHit": "sampled_before_queued_DOM_manipulation_task_and_carried_with_request_generation",
+        "async": "sampled_at_guarded_ScriptThread_delivery_and_carried_through_queued_callback",
+        "hostFallback": "forbidden_for_admitted_work",
+        "predecessorBehavior": "controlled_web_session_v1_unchanged"
+      },
+      "unsupported": {
+        "httpHttpsBlobFileAndNonSvgDataUrls": "not_admitted_baseline_image_authorities_unchanged",
+        "oversizeUrl": "not_admitted_baseline_image_authorities_unchanged",
+        "srcsetPictureAndEnvironmentChange": "not_admitted_baseline_image_authorities_unchanged",
+        "cssBackgroundListStyleAndContent": "not_admitted_unless_joining_a_retained_exact_cache_id_DOM_owner_identity",
+        "faviconAndVideoPoster": "not_admitted_baseline_image_authorities_unchanged",
+        "imageBitmapAndCanvasUpload": "not_admitted_baseline_image_authorities_unchanged",
+        "animatedImages": "not_admitted_by_this_slice_existing_rendering_authority_unchanged",
+        "iframeWorkerWorkletAndCrossLoop": "not_admitted_existing_context_boundaries_unchanged",
+        "unadmittedSharedVectorCacheIdentity": "remove_all_controlled_owners_and_downgrade_live_raster_keys_to_baseline",
+        "nestedOrExternalSvgResources": "not_content_inspected_not_proven_by_this_slice"
+      }
+    },
+    "controlledInlineSvgRendering": {
+      "mode": "controlled_top_level_internal_serialized_data_svg",
+      "admission": {
+        "interface": "SVGSVGElement",
+        "scope": "exact_public_controlled_non_auxiliary_top_level_WebView_document_global",
+        "source": "internally_serialized_inline_svg_subtree_only",
+        "requestKind": "InternalRequest_Yes",
+        "cachedUrlIdentity": "candidate_exactly_equals_element_cached_serialized_data_url",
+        "parser": "canonical_DataUrl",
+        "mimeType": "image/svg+xml",
+        "maximumSerializedUrlBytes": 65536,
+        "executionDomain": "same_ScriptThread_and_ImageCache"
+      },
+      "ownership": {
+        "cacheIdJoin": "exact_PendingImageId_DOM_owner_identity_required",
+        "retentionBudget": "shared_512_record_controlled_image_ownership_limit",
+        "mixedOwnership": "baseline_owner_globally_downgrades_shared_cache_id_and_live_raster_keys",
+        "hostFallback": "forbidden_for_admitted_work"
+      },
+      "completion": {
+        "asyncCacheDecode": "Image_producer_fenced_through_ScriptThread_handoff",
+        "vectorRasterization": "fenced_only_from_exact_retained_inline_svg_cache_id_DOM_owner_identity",
+        "pendingProjection": "Image_producer_fence_not_pending_rendering_image_load",
+        "domLoadEvent": "not_emitted_by_internal_inline_svg_rendering_completion"
+      },
+      "unsupported": {
+        "baselineAndV1": "unchanged",
+        "generalSvgRendering": "not_admitted_by_this_slice",
+        "nestedOrExternalResources": "not_admitted_or_proven_existing_resource_authority_unchanged",
+        "nonInternalOrMismatchedUrl": "baseline_image_authorities_unchanged",
+        "iframeWorkerWorkletAndCrossLoop": "not_admitted_existing_context_boundaries_unchanged"
+      }
+    },
+    "messageChannel": {
+      "mode": "controlled_same_global_untransferred",
+      "construction": {
+        "interface": "MessageChannel",
+        "scope": "active_controlled_top_level_document_global",
+        "provenance": "constructor_created_controlled_local_pair",
+        "targetAdmission": "ScriptThread_current_controlled_top_level_target_matches_before_pair_publication",
+        "incumbentAdmission": "incumbent_global_required_and_exact_owner_global_pipeline_WebView_identity_before_pair_publication",
+        "borrowedOrMissingIncumbentFailure": "synchronous_NotSupportedError_and_sticky_external_subscription_before_pair_publication",
+        "routerOwnership": "controlled_local_only_no_router_id_or_constellation_registration",
+        "mixedProvenance": "rejected_and_sticky_external_subscription_never_cohabits_controlled_managed_map",
+        "maximumRetainedNativePortEntriesPerGlobal": 32,
+        "capacityUnit": "retained_native_port_entry",
+        "completePairCapacityFromEmptyGlobal": 16,
+        "completePairCapacityCondition": "no_one_ended_terminal_identities_retained",
+        "oneEndedTerminalIdentityCapacity": "each_retained_identity_consumes_one_of_32_entries_and_reduces_available_complete_pair_capacity",
+        "closedEntryCapacity": "retained_until_dom_garbage_collection_checkpoint_pruning_and_while_any_controlled_local_message_reservation_remains",
+        "overflow": "synchronous_NotSupportedError_and_sticky_external_subscription_before_pair_publication"
+      },
+      "postMessage": {
+        "transferList": "must_be_empty",
+        "incumbentAdmission": "resolved_before_structured_clone_and_exact_owner_global_pipeline_WebView_identity_required",
+        "incumbentFailure": "synchronous_NotSupportedError_and_sticky_external_subscription_before_serialization_detachment_reservation_or_dispatch",
+        "maximumSerializedPayloadBytes": 65536,
+        "structuredCloneSidecars": "all_absent_or_empty",
+        "rejectedSidecars": [
+          "blob",
+          "file",
+          "file_list",
+          "geometry",
+          "exceptions",
+          "quota",
+          "message_ports",
+          "streams",
+          "image_bitmaps",
+          "offscreen_canvas",
+          "image_data",
+          "crypto_keys"
+        ],
+        "maximumRetainedMessagesPerGlobal": 1024,
+        "retainedMessageInventory": "queued_port_message_tasks_plus_unstarted_port_buffers",
+        "nonemptyTransferListFailure": "synchronous_NotSupportedError_and_sticky_external_subscription_before_serialization_detach_or_dispatch",
+        "serializedPayloadOrSidecarFailure": "synchronous_NotSupportedError_and_sticky_external_subscription_after_serialization_before_retention_or_dispatch"
+      },
+      "delivery": {
+        "taskSource": "port_message",
+        "eventLoop": "same_controlled_script_event_loop",
+        "ordering": "fifo_per_entangled_pair",
+        "internalProvenanceAccounting": "port_message_source_enforced_internally",
+        "ordinaryTaskAccounting": "one_dispatched_message_event_consumes_one_executionLimits.ordinaryTasks",
+        "publicDispatchedCallbackAccounting": "aggregate_settle_result_processed.tasks_only",
+        "publicPerSourceDispatchCounters": "not_exposed_in_0.3.0",
+        "publicRetainedPresence": "queued_or_buffered_work_sources_kind_tracked_presence_openEnded_reason_message_port",
+        "retainedWorkProjection": {
+          "reservationIdentity": "exact_destination_port_before_retention_in_ordinary_task_queue_or_native_disabled_port_buffer",
+          "accountingReconciliation": "global_retained_equals_sum_per_destination_queued_plus_sum_native_buffered",
+          "reciprocalPairWithOwnedWork": "one_deterministic_minimum_port_identity_per_pair",
+          "zeroRetainedMessages": "does_not_make_idle_open_pair_pending",
+          "invalidMissingOrZeroDestinationAssociation": "pending_observation_failure"
+        },
+        "recursivePosting": "no_private_drain_uses_same_cumulative_ordinary_task_and_control_turn_limits",
+        "microtaskCheckpoint": "after_each_dispatched_message_task"
+      },
+      "quiescence": {
+        "idleReciprocalPair": "inert_not_persistent_work",
+        "provenLocallyDisentangledTerminalPort": "inert_not_persistent_work",
+        "idleRequires": [
+          "both_dom_and_impl_peer_ids_agree",
+          "reciprocal_peer_exists_with_controlled_local_provenance",
+          "neither_port_pending_detached_or_in_transfer",
+          "neither_port_retains_buffered_messages",
+          "no_queued_port_message_task"
+        ],
+        "terminalIdleRequires": [
+          "local_disentanglement_was_synchronously_proven_and_recorded",
+          "dom_peer_id_absent",
+          "implementation_peer_id_absent",
+          "port_not_pending_detached_in_transfer_or_buffered"
+        ],
+        "queuedOrBufferedMessages": "owned_pending_work_prevents_quiescence",
+        "missingMalformedOrNonreciprocalPeerWithoutLocalTerminalProof": "pending_not_quiescent"
+      },
+      "unsupported": {
+        "nonemptyTransferList": "external_subscription",
+        "otherwiseValidPortTransferAttempt": "external_subscription",
+        "detachedPortTransferAttempt": "platform_DataCloneError_before_stasis_boundary",
+        "detachedPortPostMessage": "platform_noop_before_stasis_boundary",
+        "missingOrBorrowedIncumbentConstructor": "external_subscription_before_pair_publication",
+        "missingOrBorrowedIncumbentPostMessage": "external_subscription_before_structured_clone_or_detachment",
+        "replacedDiscardedOrAuxiliaryOwner": "external_subscription_before_controlled_local_authority_is_borrowed",
+        "otherwiseReachedCrossGlobalPortIncludingNestedWindow": "external_subscription",
+        "nestedWindowCreation": "same_event_loop_iframe",
+        "crossEventLoopIframeClassification": "conservative_alternate_ingress_fence_not_ordinary_child_creation_outcome",
+        "otherwiseReachedCrossEventLoopPort": "external_subscription",
+        "workerCreation": "worker_before_worker_global_or_port_exists",
+        "workerGlobalMessageChannel": "unreachable_not_independently_admitted_or_evidenced",
+        "constellationOrExternallyRoutedPort": "external_subscription",
+        "sidecarBearingStructuredClone": "external_subscription",
+        "unexpectedAsyncIngress": "impossible_router_or_external_ingress_backstop_sticky_external_subscription_drop_without_dispatch"
+      }
+    }
+  },
+  "executionLimits": {
+    "ordinaryTasks": 100000,
+    "microtasks": 1000000,
+    "renderingOpportunities": 10000,
+    "mutations": 1000000
+  },
+  "settlementOutcomes": [
+    "quiescent",
+    "quiescent_with_persistent_work",
+    "blocked_on_external_io",
+    "blocked_on_open_ended_work",
+    "unsupported_work",
+    "virtual_time_limit_exceeded",
+    "task_limit_exceeded",
+    "microtask_limit_exceeded",
+    "rendering_limit_exceeded",
+    "mutation_limit_exceeded",
+    "control_turn_limit_exceeded",
+    "runtime_error"
+  ],
+  "network": {
+    "fetch": "asynchronous",
+    "xmlHttpRequest": "asynchronous",
+    "synchronousXmlHttpRequest": "rejected_before_start",
+    "externalIoTimeout": "typed_blocker",
+    "configurationField": "session.open.network",
+    "configurationLifetime": "immutable_before_first_request",
+    "modes": {
+      "fixtures_only": "deterministic_when_all_other_profile_inputs_are_controlled",
+      "mixed": "nondeterministic_no_cross_run_digest_claim",
+      "live": "nondeterministic_no_cross_run_digest_claim"
+    },
+    "routes": {
+      "order": "first_match_wins",
+      "consumption": "never",
+      "match": {
+        "method": "ascii_http_token_case_insensitive",
+        "urlKinds": [
+          "exact",
+          "prefix",
+          "glob"
+        ],
+        "globSemantics": "simple_star_only"
+      },
+      "actions": [
+        "fulfill",
+        "abort"
+      ],
+      "fulfill": {
+        "status": "integer_200_through_599",
+        "headers": "ordered_name_value_pairs",
+        "body": "bounded_utf8_or_canonical_base64"
+      },
+      "abortReasons": [
+        "blocked_by_fixture",
+        "connection_reset",
+        "network_error"
+      ],
+      "callbacks": false,
+      "regularExpressions": false,
+      "hostDelays": false
+    },
+    "fixturesOnlyMiss": {
+      "code": "network_fixture_miss",
+      "sticky": true,
+      "liveFallback": false
+    },
+    "reachableStickyFailures": {
+      "stateEffect": "partial_after_request_admission",
+      "initialOpen": {
+        "fatal": true,
+        "processEffect": "fail_stop"
+      },
+      "postOpen": {
+        "fatal": false,
+        "processEffect": "continue",
+        "sticky": true
+      },
+      "activeOperationLimit": {
+        "code": "controlled_network_active_operation_limit_exceeded",
+        "limit": 512,
+        "details": [
+          "limit",
+          "observed"
+        ]
+      },
+      "unknownRequestBodyLength": {
+        "code": "unsupported_network_request_body_length",
+        "boundary": "before_request_body_or_route_fallback"
+      },
+      "rejectedRequestMetadata": {
+        "code": "unsupported_network_request_metadata",
+        "boundary": "before_unbounded_or_unredactable_request_metadata_is_retained"
+      }
+    },
+    "fixtureValidation": {
+      "rejectUrlCredentials": true,
+      "rejectUrlFragments": true,
+      "rejectHeaderCrLf": true,
+      "rejectResponseHeaders": [
+        "hop_by_hop",
+        "content_length",
+        "authorization",
+        "cookie"
+      ]
+    },
+    "limits": {
+      "maximumRoutes": 256,
+      "maximumMethodBytes": 32,
+      "maximumUrlOrPatternBytes": 4096,
+      "maximumResponseHeaders": 64,
+      "maximumResponseHeaderBytes": 16384,
+      "maximumResponseBodyBytes": 262144,
+      "maximumAggregateFixtureBytes": 327680,
+      "maximumEncodedRouteTableBytes": 393216,
+      "requestFrameRelationship": "encoded_route_table_plus_optional_state_and_open_envelope_must_fit_the_frozen_1048576_byte_request_frame",
+      "maximumActiveOperations": 512
+    },
+    "webSocket": "unsupported",
+    "serverSentEvents": "unsupported",
+    "serviceWorker": "unsupported"
+  },
+  "requestRecords": {
+    "method": "session.requests",
+    "parameters": [
+      "afterSeq",
+      "limit"
+    ],
+    "source": "bounded_session_event_ledger",
+    "sharesSequenceAndRetentionWith": "session.evidence",
+    "records": "redacted_request_lifecycle_projection_without_header_values_or_bodies",
+    "urlProjection": [
+      "origin",
+      "path",
+      "sorted_query_keys"
+    ],
+    "cursorFields": [
+      "firstRetainedSeq",
+      "nextAfterSeq",
+      "latestSeq",
+      "complete",
+      "hasMore",
+      "droppedThroughSeq"
+    ],
+    "completeFalseOnlyWhenRequestedHistoryEvicted": true
+  },
+  "settlementEvidence": {
+    "schemaVersion": 2,
+    "completeness": "terminal_snapshot",
+    "maximumItems": 32,
+    "documentStateTokenBinding": "included",
+    "sessionStateToken": "excluded",
+    "selectedExecutionProfileBinding": "sdk_private_binding_from_runtime_produced_settle_result",
+    "boundStandaloneAndSessionProjection": "preserve_selected_execution_profile",
+    "contradictoryExplicitProfile": "rejected",
+    "unboundOrManuallyConstructedResultProfileFallback": "controlled-web-session-v1",
+    "redactedFields": [
+      "selectors",
+      "fill_values",
+      "urls",
+      "headers",
+      "bodies",
+      "cookies",
+      "web_storage"
+    ]
+  },
+  "sessionEvidence": {
+    "method": "session.evidence",
+    "schemaVersion": 2,
+    "authority": "diagnostic_only_never_settlement_authority",
+    "sequence": "checked_monotonic_session_local_shared_with_request_records",
+    "time": "exact_virtual_time_nanoseconds",
+    "causalIds": "explicit_request_redirect_and_navigation_ids_only_unknown_relationships_omitted",
+    "applicationNavigationGranularity": "terminal_observation_delta_coalesced_multiple_unobserved_same_document_changes_are_not_reconstructed",
+    "parameters": [
+      "afterSeq",
+      "limit"
+    ],
+    "cursorFields": [
+      "firstRetainedSeq",
+      "nextAfterSeq",
+      "latestSeq",
+      "complete",
+      "hasMore",
+      "droppedThroughSeq"
+    ],
+    "completeFalseOnlyWhenRequestedHistoryEvicted": true,
+    "eventTypes": [
+      "request_started",
+      "route_decided",
+      "response_headers",
+      "redirect",
+      "request_completed",
+      "request_failed",
+      "navigation_started",
+      "navigation_committed",
+      "navigation_failed",
+      "same_document_history_changed",
+      "settlement_terminal"
+    ],
+    "urlProjection": {
+      "owner": "session.requests",
+      "evidenceEvents": "cross_reference_request_id_only"
+    },
+    "navigationCorrelation": {
+      "sameDocumentHistoryChangedRequiresNavigationId": true,
+      "settlementTerminalRequiresNavigationId": true,
+      "historyRevisionMayAdvanceByMoreThanOnePerEvidenceRecord": true
+    },
+    "neverRetained": [
+      "url_credentials",
+      "url_fragments",
+      "query_values",
+      "header_values",
+      "request_bodies",
+      "response_bodies",
+      "cookie_values",
+      "authorization_values",
+      "session_state_token"
+    ],
+    "bounds": {
+      "defaultMaximumRecords": 1024,
+      "hardMaximumRecords": 4096,
+      "defaultMaximumMetadataBytes": 1048576,
+      "hardMaximumMetadataBytes": 8388608,
+      "defaultMaximumPageItems": 256,
+      "hardMaximumPageItems": 1024,
+      "maximumMethodBytes": 32,
+      "maximumOriginBytes": 512,
+      "maximumPathBytes": 2048,
+      "maximumQueryBytes": 16384,
+      "maximumNonEmptyRawQueryComponents": 64,
+      "maximumQueryKeys": 64,
+      "maximumQueryKeyBytes": 128,
+      "maximumRawHeaderNames": 64,
+      "maximumHeaderNames": 64,
+      "maximumHeaderNameBytes": 256
+    }
+  },
+  "sessionState": {
+    "cookies": {
+      "supported": true,
+      "persistence": "session_only",
+      "partitioning": "unpartitioned_only",
+      "domain": {
+        "form": "canonical_host",
+        "ipv6": "unbracketed",
+        "leadingDot": "invalid",
+        "trailingDot": "invalid",
+        "port": "invalid",
+        "credentials": "invalid",
+        "publicSuffixValidation": "native_authoritative",
+        "nonHostOnlyPublicSuffix": "invalid"
+      },
+      "namePrefixes": {
+        "secure": "case_insensitive_requires_secure",
+        "host": "case_insensitive_requires_secure_host_only_root_path"
+      },
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": {
+        "metadataRoundTrip": true,
+        "topLevelNavigationContext": "target_url",
+        "none": "requires_secure",
+        "strict": "schemeful_same_site_requests_only",
+        "lax": "schemeful_same_site_requests_only",
+        "crossSiteOrIndeterminate": {
+          "code": "unsupported_cookie_same_site_context",
+          "boundary": "before_network_start_and_state_mutation"
+        }
+      },
+      "unsupportedSetCookie": {
+        "expiresOrMaxAge": "unsupported_persistent_cookie",
+        "partitioned": "unsupported_partitioned_cookie",
+        "invalid": "invalid_controlled_cookie",
+        "boundary": "before_cookie_jar_mutation"
+      },
+      "invalidPortableState": {
+        "boundary": "before_operation_entry_and_cookie_jar_mutation",
+        "stateEffect": "none"
+      },
+      "pageApi": {
+        "documentCookie": {
+          "get": "supported_deterministic_controlled_order",
+          "set": "supported_atomic_controlled_policy"
+        },
+        "cookieStore": {
+          "set": {
+            "supported": true,
+            "policy": "supported_atomic_controlled_policy",
+            "persistentError": "unsupported_persistent_cookie",
+            "partitionedError": "unsupported_partitioned_cookie",
+            "invalidError": "invalid_controlled_cookie"
+          },
+          "get": {
+            "supported": false,
+            "code": "controlled_cookie_store_read_delete_unsupported"
+          },
+          "getAll": {
+            "supported": false,
+            "code": "controlled_cookie_store_read_delete_unsupported"
+          },
+          "delete": {
+            "supported": false,
+            "code": "controlled_cookie_store_read_delete_unsupported"
+          }
+        },
+        "ordinaryResourceThreadPaths": "forbidden"
+      }
+    },
+    "localStorage": "supported",
+    "sessionStorage": "supported",
+    "indexedDb": "unsupported",
+    "cacheStorage": "unsupported",
+    "serviceWorkerRegistrations": "unsupported",
+    "exportIsSensitive": true,
+    "excludedFromDiagnostics": true,
+    "artifactProfile": "controlled-web-session-v1",
+    "compatibleSelectedProfiles": [
+      "controlled-web-session-v1",
+      "controlled-web-session-v2"
+    ]
+  },
+  "stateLimits": {
+    "maximumSerializedBytes": 524288,
+    "combinedArtifactEnforcement": "shell_and_backends_validate_static_encoded_partition_before_mutation",
+    "encodedBudgetPartition": {
+      "cookiesArrayBytes": 256000,
+      "originsArrayBytes": 256000,
+      "envelopeAndSlackBytes": 12288,
+      "fixedV1EnvelopeBytes": 147,
+      "remainingSlackBytes": 12141,
+      "fragmentsInclude": "array_brackets_commas_field_names_json_escaping_and_decimal_sequence_strings"
+    },
+    "successfulControlledPageMutationInvariant": "session_state_export_remains_within_public_bounds",
+    "controlledWebStorageLimitError": {
+      "domName": "QuotaExceededError",
+      "boundary": "before_web_storage_state_or_revision_mutation"
+    },
+    "maximumCookies": 512,
+    "maximumCookiesPerRegistrableHost": 150,
+    "registrableHostDefinition": "Servo_native_public_suffix_registrable_suffix_or_canonical_ip",
+    "perRegistrableHostCookieLimitError": {
+      "code": "too_many_session_cookies_per_registrable_host",
+      "boundary": "native_shell_validation_before_unpublished_backend_replacement_or_live_compare_replace",
+      "fatal": false,
+      "stateEffect": "none",
+      "processEffect": "continue"
+    },
+    "maximumCookieBytes": 4096,
+    "maximumTotalCookieBytes": 524288,
+    "cookieSequenceFields": {
+      "wireSyntax": "canonical_decimal_u64_string",
+      "maximum": "18446744073709551615",
+      "creationSequenceUniqueWithinCookies": true,
+      "lastAccessSequenceUniqueWithinCookies": true
+    },
+    "maximumRawControlledCookieBytes": 8192,
+    "maximumControlledCookieBatchValues": 512,
+    "maximumCookieArrayEncodedBytes": 256000,
+    "maximumOriginsArrayEncodedBytes": 256000,
+    "maximumOrigins": 64,
+    "maximumLocalStorageEntriesPerOrigin": 1024,
+    "maximumSessionStorageEntriesPerOrigin": 1024,
+    "maximumStorageKeyBytes": 4096,
+    "maximumStorageValueBytes": 131072,
+    "maximumTotalStorageBytesPerOrigin": 524288
+  },
+  "automationLimits": {
+    "maxSelectorBytes": 4096,
+    "maxFillValueBytes": 131072,
+    "maxFieldNameBytes": 256,
+    "maxAttributeNameBytes": 256,
+    "maxExtractionFields": 16,
+    "maxSelectValues": 16,
+    "maxSelectValueBytesTotal": 131072,
+    "maxMatches": 128,
+    "maxDomNodesVisited": 1000000,
+    "maxOutputBytes": 131072
+  },
+  "sdkProcessPool": {
+    "processOwnership": "owned_child_processes_only",
+    "leaseUnit": "one_process_per_active_session",
+    "maximumActiveSessionsPerProcess": 1,
+    "processReuse": false,
+    "scheduling": "fifo",
+    "processLimit": "required_positive_finite_integer",
+    "queueLimit": "required_non_negative_finite_integer",
+    "queueOverflow": "reject_before_enqueue",
+    "queuedCancellation": "remove_without_spawning_or_opening_session",
+    "healthyRelease": "terminal_session_close_then_discard_exited_process",
+    "poisonedRelease": "terminate_and_discard_process",
+    "nextLease": "spawn_fresh_process",
+    "automaticMutationRetries": false,
+    "retryAfterWrittenCommand": "never"
+  },
+  "referenceCrawler": {
+    "profile": "caller_selected_session_profile",
+    "defaultProfile": "controlled-web-session-v1",
+    "candidateSelection": "controlled-web-session-v2_requires_explicit_profile_option",
+    "originPolicyDefault": "same_origin",
+    "crossOriginPolicy": "explicit_http_https_allowlist_only",
+    "linkDiscovery": {
+      "operation": "dom.extract",
+      "read": "resolved_url",
+      "attribute": "href",
+      "resolutionBase": "current_document_base_url",
+      "acceptedSchemes": [
+        "http",
+        "https"
+      ]
+    },
+    "stateImport": "fresh_process_initialization_before_first_request",
+    "deduplication": "canonical_resolved_url_without_fragment",
+    "redirects": "final_url_rechecked_against_origin_policy",
+    "bounds": {
+      "maximumDepth": "required_non_negative_finite_integer",
+      "maximumPages": "required_positive_finite_integer",
+      "maximumConcurrency": "required_positive_finite_integer_not_exceeding_pool_process_limit",
+      "maximumQueuedUrls": "never_exceeds_maximum_pages"
+    },
+    "activePageLease": "one_fresh_pool_process_and_one_session",
+    "wallClockSleeps": false,
+    "automaticRetryAfterWrittenNavigation": false
+  },
+  "unsupportedRetention": "first_per_authority",
+  "unsupportedClasses": {
+    "iframe": [
+      "same_event_loop_iframe",
+      "cross_event_loop_iframe"
+    ],
+    "crossEventLoopNavigation": "cross_event_loop_navigation",
+    "worker": "worker",
+    "worklet": "worklet",
+    "auxiliaryWebView": "auxiliary_web_view",
+    "webSocketAndServerSentEvents": "external_subscription",
+    "externalChannels": {
+      "broadcastChannel": "external_subscription",
+      "messagePortTransfer": "external_subscription",
+      "crossGlobalMessagePort": "external_subscription",
+      "crossEventLoopMessagePort": "external_subscription",
+      "constellationOrExternallyRoutedMessagePort": "external_subscription"
+    },
+    "untrackedResourceIo": "resource_thread_io",
+    "media": "native_media",
+    "embedderControls": {
+      "controlledTopLevelSingleLineTextInputMethodPresentationWithoutVirtualKeyboard": "suppressed_without_external_work",
+      "selectElementColorPickerFilePickerContextMenuAndOtherControls": "embedder_control"
+    },
+    "hostTimestamp": {
+      "controlledTopLevelEngineGeneratedFocusTransitionInV2": "document_clock_timestamp",
+      "controlledTopLevelAdmittedImageCompletionEventsInV2": "shared_document_clock_timestamp",
+      "controlledTopLevelSynchronousPublicAutomationEventsInV2": "one_document_clock_timestamp_per_mutating_action",
+      "controlledPublicNonAuxiliaryTopLevelInternalCssAnimationAndTransitionEventsInV2": "one_document_clock_timestamp_per_nonempty_pending_event_dispatch_batch",
+      "scriptCreatedEventConstructorsAndAllUnlistedHostTimestampSurfaces": "host_timestamp"
+    },
+    "imageElement": {
+      "admittedDirectDataSvg": "owned_bounded_Image_producer_work",
+      "baselineMixedOrUnownedRetainedWork": "unsupported_rendering_image_load",
+      "excludedSynchronousCacheHit": "predecessor_behavior_no_universal_new_typed_rejection",
+      "nestedOrExternalSvgResources": "not_proven"
+    },
+    "inlineSvgRendering": {
+      "admittedInternalSerializedDataSvg": "owned_bounded_Image_producer_work",
+      "domCompletionEvent": "not_created",
+      "generalSvgAndResources": "predecessor_authorities_unchanged"
+    },
+    "historyTraversal": "history_traversal"
+  },
+  "supportedProductSurface": [
+    "one_terminal_session_per_owned_process",
+    "explicit_and_application_top_level_navigation",
+    "checked_document_navigation_and_history_authority",
+    "document_scoped_state_tokens",
+    "session_state_export_and_initialization_only_import",
+    "practical_selector_v2_descendant_and_child_combinators",
+    "semantic_fill_activate_focus_check_uncheck_select_and_submit",
+    "bounded_query_text_html_raw_attribute_and_resolved_url_extraction",
+    "immutable_declarative_network_routes",
+    "bounded_public_request_records",
+    "bounded_redacted_navigation_and_network_evidence",
+    "controlled_settlement",
+    "bounded_redacted_terminal_settlement_evidence",
+    "fresh_process_sdk_pool",
+    "bounded_reference_crawler_with_same_origin_default",
+    "controlled_same_global_untransferred_message_channel",
+    "controlled_top_level_single_line_text_input_method_presentation_suppression_without_virtual_keyboard",
+    "controlled_top_level_engine_focus_event_timestamp_from_document_clock",
+    "controlled_top_level_synchronous_public_automation_event_timestamps_from_document_clock",
+    "controlled_public_non_auxiliary_top_level_internal_CSS_animation_event_timestamps_from_document_clock",
+    "bounded_controlled_top_level_direct_data_svg_HTMLImageElement_completion",
+    "bounded_controlled_top_level_internal_serialized_data_svg_inline_rendering"
+  ],
+  "deferredProductSurface": [
+    "iframes",
+    "workers",
+    "multiple_tabs",
+    "dialogs",
+    "permissions",
+    "geolocation",
+    "downloads",
+    "file_upload",
+    "websocket_settlement",
+    "server_sent_event_settlement",
+    "service_workers",
+    "cross_event_loop_document_control",
+    "sibling_selector_combinators",
+    "selector_pseudo_classes",
+    "selector_pseudo_elements",
+    "history_traversal",
+    "bfcache",
+    "pagehide_unload_replacement_fidelity",
+    "layout_backed_click",
+    "hit_testing",
+    "screenshots",
+    "complete_causal_journal",
+    "replay",
+    "time_travel",
+    "persistent_daemon",
+    "distributed_crawling",
+    "stealth_or_anti_bot",
+    "message_port_transfer",
+    "cross_global_message_ports",
+    "external_message_channels",
+    "general_image_source_ownership",
+    "srcset_picture_and_environment_change_image_ownership",
+    "nested_or_external_svg_resource_ownership"
+  ],
+  "determinismExcludes": [
+    "mixed_network",
+    "live_network",
+    "uncontrolled_randomness",
+    "ambient_system_state"
+  ]
+}

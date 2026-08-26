@@ -27,6 +27,8 @@ export {
 export {
   CONTROLLED_WEBAPP_V1_PROFILE,
   CONTROLLED_WEB_SESSION_V1_PROFILE,
+  CONTROLLED_WEB_SESSION_V2_PROFILE,
+  SESSION_SUPPORT_PROFILES,
 } from "./profile.js";
 export type {
   ProtocolErrorDetails,
@@ -50,6 +52,7 @@ export type {
 export type {
   AnySupportProfile,
   LegacySupportProfile,
+  SelectableSessionProfile,
   SessionSupportProfile,
   SupportProfile,
 } from "./profile.js";

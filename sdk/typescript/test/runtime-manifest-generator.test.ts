@@ -24,11 +24,13 @@ const archiveFiles = [
   "STASIS_UPSTREAM.toml",
   "THIRD_PARTY_LICENSES.html",
   "VERSION.txt",
+  "controlled-web-session-v2.json",
+  "session-v0.3-candidate.md",
   "stasis",
 ];
 
 function manifest(): Record<string, unknown> {
-  const version = "0.2.0";
+  const version = "0.3.0";
   const artifact = (nodePlatform: string, nodeArch: string, releasePlatform: string) => {
     const root = `stasis-${version}-${releasePlatform}`;
     return {
@@ -91,7 +93,7 @@ test("runtime manifest generator is strict and deterministic", async (context) =
   );
 });
 
-test("prepack validator binds the canonical manifest to the exact stable package", async (context) => {
+test("prepack validator binds the canonical manifest to the exact release package", async (context) => {
   const directory = await mkdtemp(join(tmpdir(), "stasis-manifest-prepack-test-"));
   context.after(() => rm(directory, { recursive: true, force: true }));
   const input = join(directory, "manifest.json");
@@ -101,7 +103,7 @@ test("prepack validator binds the canonical manifest to the exact stable package
   await execFileAsync(process.execPath, [generator, "--input", input, "--output", generated]);
   await writeFile(
     packageFile,
-    `${JSON.stringify({ name: "@oxhq/stasis", version: "0.2.0" }, null, 2)}\n`,
+    `${JSON.stringify({ name: "@oxhq/stasis", version: "0.3.0" }, null, 2)}\n`,
     "utf8",
   );
 
@@ -112,7 +114,7 @@ test("prepack validator binds the canonical manifest to the exact stable package
     "--manifest",
     generated,
   ]);
-  assert.equal(result.stdout, "validated @oxhq/stasis@0.2.0 runtime manifest\n");
+  assert.equal(result.stdout, "validated @oxhq/stasis@0.3.0 runtime manifest\n");
 
   await writeFile(
     packageFile,
@@ -132,7 +134,7 @@ test("prepack validator binds the canonical manifest to the exact stable package
 
   await writeFile(
     packageFile,
-    `${JSON.stringify({ name: "@oxhq/stasis", version: "0.2.0-alpha.1" }, null, 2)}\n`,
+    `${JSON.stringify({ name: "@oxhq/stasis", version: "0.3.0-alpha.1" }, null, 2)}\n`,
     "utf8",
   );
   await assert.rejects(
@@ -147,14 +149,14 @@ test("prepack validator binds the canonical manifest to the exact stable package
   );
 });
 
-test("prepack validator requires both stable artifacts and the ten-file inventory", async (context) => {
+test("prepack validator requires both release artifacts and the twelve-file inventory", async (context) => {
   const directory = await mkdtemp(join(tmpdir(), "stasis-manifest-shape-test-"));
   context.after(() => rm(directory, { recursive: true, force: true }));
   const packageFile = join(directory, "package.json");
   const generated = join(directory, "runtime-manifest.generated.ts");
   await writeFile(
     packageFile,
-    `${JSON.stringify({ name: "@oxhq/stasis", version: "0.2.0" }, null, 2)}\n`,
+    `${JSON.stringify({ name: "@oxhq/stasis", version: "0.3.0" }, null, 2)}\n`,
     "utf8",
   );
 
@@ -185,6 +187,6 @@ test("prepack validator requires both stable artifacts and the ten-file inventor
       "--manifest",
       generated,
     ]),
-    /darwin-arm64 must bind the exact stable archive inventory/u,
+    /darwin-arm64 must bind the exact release archive inventory/u,
   );
 });

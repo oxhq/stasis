@@ -34,6 +34,10 @@ use crate::dom::bindings::utils::set_dictionary_property;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 
+fn mark_detached_for_close(detached: &Cell<bool>) -> bool {
+    !detached.replace(true)
+}
+
 #[dom_struct]
 /// The MessagePort used in the DOM.
 pub(crate) struct MessagePort {
@@ -107,6 +111,30 @@ impl MessagePort {
         &self.message_port_id
     }
 
+    pub(crate) fn entangled_port_id(&self) -> Option<MessagePortId> {
+        *self.entangled_port.borrow()
+    }
+
+    pub(crate) fn detached(&self) -> bool {
+        self.detached.get()
+    }
+
+    /// Preflight this port as a member of an arbitrary structured-clone transfer list.
+    ///
+    /// SpiderMonkey validates the complete list before running transfer steps, but a checked
+    /// Stasis rejection is produced by our MessagePort transfer step. Without an earlier scan, a
+    /// transferable which precedes this port in the list can already be detached by the time that
+    /// rejection is reached.
+    pub(crate) fn require_transfer_admission(&self) -> Fallible<()> {
+        // Preserve the platform's existing error precedence: a detached port is invalid before
+        // Stasis considers whether the otherwise-valid transfer would cross its control boundary.
+        if self.detached.get() {
+            return Err(Error::DataClone(None));
+        }
+
+        self.global().require_external_subscription()
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>
     fn set_onmessage(&self, cx: &mut JSContext, listener: Option<Rc<EventHandlerNonNull>>) {
         let eventtarget = self.upcast::<EventTarget>();
@@ -125,6 +153,20 @@ impl MessagePort {
             return Ok(());
         }
 
+        // Resolve the caller before structured serialization. A same-origin foreign realm can
+        // hold a reference to this wrapper, but it cannot borrow the owning Window's controlled
+        // task authority or detach anything in a rejected transfer list.
+        let incumbent = GlobalScope::incumbent();
+
+        // A controlled-local port admits only the no-transfer, exact-owner form. Perform this
+        // check before structured serialization so an earlier transferable cannot be detached
+        // before a later MessagePort reveals that the operation crosses the controlled boundary.
+        self.global().require_message_port_post(
+            self.message_port_id,
+            transfer.is_empty(),
+            incumbent.as_deref(),
+        )?;
+
         // Step 1 is the transfer argument.
 
         let target_port = self.entangled_port.borrow();
@@ -142,8 +184,8 @@ impl MessagePort {
             }
 
             // Step 4
-            if let Some(target_id) = target_port.as_ref() &&
-                port.message_port_id() == target_id
+            if let Some(target_id) = target_port.as_ref()
+                && port.message_port_id() == target_id
             {
                 doomed = true;
             }
@@ -151,6 +193,8 @@ impl MessagePort {
 
         // Step 5
         let data = structuredclone::write(cx, message, Some(transfer))?;
+        self.global()
+            .require_message_port_payload(self.message_port_id, &data)?;
 
         if doomed {
             // TODO: The spec says to optionally report such a case to a dev console.
@@ -159,7 +203,7 @@ impl MessagePort {
 
         // Step 6, done in MessagePortImpl.
 
-        let incumbent = match GlobalScope::incumbent() {
+        let incumbent = match incumbent {
             None => unreachable!("postMessage called with no incumbent global"),
             Some(incumbent) => incumbent,
         };
@@ -172,7 +216,7 @@ impl MessagePort {
 
         // Have the global proxy this call to the corresponding MessagePortImpl.
         self.global()
-            .post_messageport_msg(*self.message_port_id(), task);
+            .post_messageport_msg(*self.message_port_id(), task)?;
         Ok(())
     }
 
@@ -258,7 +302,7 @@ impl Transferable for MessagePort {
             return Err(Error::DataClone(None));
         }
 
-        self.global().require_external_subscription()?;
+        self.require_transfer_admission()?;
 
         self.detached.set(true);
         let id = self.message_port_id();
@@ -445,9 +489,14 @@ impl MessagePortMethods<crate::DomTypeHolder> for MessagePort {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-messageport-close>
     fn Close(&self, cx: &mut JSContext) {
-        // Set this's [[Detached]] internal slot value to true.
-        self.detached.set(true);
+        // Close is idempotent. In particular, a later task can retain the DOM wrapper after a GC
+        // checkpoint prunes the explicitly-closed native entry; it must not look that entry up a
+        // second time and panic.
+        if !mark_detached_for_close(&self.detached) {
+            return;
+        }
 
+        // Set this's [[Detached]] internal slot value to true.
         let global = self.global();
         global.close_message_port(self.message_port_id());
 
@@ -479,4 +528,20 @@ impl MessagePortMethods<crate::DomTypeHolder> for MessagePort {
 
     // <https://html.spec.whatwg.org/multipage/#handler-messageport-onclose>
     event_handler!(close, GetOnclose, SetOnclose);
+}
+
+#[cfg(test)]
+mod close_tests {
+    use std::cell::Cell;
+
+    use super::mark_detached_for_close;
+
+    #[test]
+    fn close_detaches_once_and_later_calls_return_early() {
+        let detached = Cell::new(false);
+        assert!(mark_detached_for_close(&detached));
+        assert!(detached.get());
+        assert!(!mark_detached_for_close(&detached));
+        assert!(detached.get());
+    }
 }

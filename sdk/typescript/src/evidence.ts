@@ -12,14 +12,21 @@ import type {
 import {
   CONTROLLED_WEBAPP_V1_PROFILE,
   CONTROLLED_WEB_SESSION_V1_PROFILE,
+  CONTROLLED_WEB_SESSION_V2_PROFILE,
+  isSelectableSessionProfile,
+  type SelectableSessionProfile,
+  type SessionSupportProfile,
 } from "./profile.js";
 
 export {
   CONTROLLED_WEBAPP_V1_PROFILE,
   CONTROLLED_WEB_SESSION_V1_PROFILE,
+  CONTROLLED_WEB_SESSION_V2_PROFILE,
 } from "./profile.js";
 
 export const SETTLEMENT_EVIDENCE_MAX_ITEMS = 32 as const;
+
+const runtimeSessionSettleProfiles = new WeakMap<object, SelectableSessionProfile>();
 
 export type SettlementEvidenceReason =
   | { readonly kind: "quiescent" }
@@ -63,11 +70,13 @@ export interface SettlementEvidenceV1 {
   };
 }
 
-/** A bounded v0.2 terminal snapshot bound to one exact controlled-session document state. */
-export interface SettlementEvidenceV2 {
+/** A bounded session terminal snapshot bound to one exact document and selected session profile. */
+export interface SettlementEvidenceV2<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+> {
   readonly schemaVersion: 2;
   readonly completeness: "terminal_snapshot";
-  readonly profile: typeof CONTROLLED_WEB_SESSION_V1_PROFILE;
+  readonly profile: Profile;
   readonly stateToken: DocumentStateToken;
   readonly outcome: SettleOutcome;
   readonly virtualTimeNs: bigint;
@@ -79,19 +88,52 @@ export interface SettlementEvidenceV2 {
   };
 }
 
-/** Build a bounded, redacted terminal-settlement explanation without mutating the result. */
-export function settlementEvidence(result: SessionSettleResult): SettlementEvidenceV2;
-export function settlementEvidence(result: SettleResult): SettlementEvidenceV1;
+/** Build session evidence using the result's SDK-bound profile, or v1 for a manual legacy result. */
+export function settlementEvidence<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+>(result: SessionSettleResult<Profile>): SettlementEvidenceV2<Profile>;
+/** A structurally copied or manual session result has only the legacy-v1 identity. */
 export function settlementEvidence(
-  result: SettleResult | SessionSettleResult,
-): SettlementEvidenceV1 | SettlementEvidenceV2 {
+  result: SessionSettleResult,
+): SettlementEvidenceV2<SessionSupportProfile>;
+/** Build session evidence bound to an explicitly selected session profile. */
+export function settlementEvidence<Profile extends SelectableSessionProfile>(
+  result: SessionSettleResult<Profile>,
+  profile: NoInfer<Profile>,
+): SettlementEvidenceV2<Profile>;
+export function settlementEvidence(
+  result: SettleResult & { readonly stateToken?: never },
+): SettlementEvidenceV1;
+export function settlementEvidence(
+  result: SettleResult | SessionSettleResult<SelectableSessionProfile>,
+  profile?: SelectableSessionProfile,
+): SettlementEvidenceV1 | SettlementEvidenceV2<SelectableSessionProfile> {
   const stateToken = sessionDocumentStateToken(result);
   const reason = settlementEvidenceReason(result);
   if (stateToken !== null) {
+    if (profile !== undefined && !isSelectableSessionProfile(profile)) {
+      throw new TypeError("Session settlement evidence requires a supported session profile");
+    }
+    const runtimeProfile = runtimeSessionSettleProfiles.get(result);
+    if (
+      runtimeProfile === undefined &&
+      profile !== undefined &&
+      profile !== CONTROLLED_WEB_SESSION_V1_PROFILE
+    ) {
+      throw new TypeError(
+        `Unbound session settle results can only produce ${CONTROLLED_WEB_SESSION_V1_PROFILE} evidence`,
+      );
+    }
+    if (runtimeProfile !== undefined && profile !== undefined && runtimeProfile !== profile) {
+      throw new TypeError(
+        `Session settlement evidence profile ${profile} does not match runtime-bound profile ${runtimeProfile}`,
+      );
+    }
+    const selectedProfile = runtimeProfile ?? profile ?? CONTROLLED_WEB_SESSION_V1_PROFILE;
     return {
       schemaVersion: 2,
       completeness: "terminal_snapshot",
-      profile: CONTROLLED_WEB_SESSION_V1_PROFILE,
+      profile: selectedProfile,
       stateToken,
       outcome: result.outcome,
       virtualTimeNs: result.virtualTimeNs,
@@ -100,6 +142,10 @@ export function settlementEvidence(
       reason,
       bounds: { maxItems: SETTLEMENT_EVIDENCE_MAX_ITEMS },
     };
+  }
+
+  if (profile !== undefined) {
+    throw new TypeError("Legacy settlement evidence cannot carry a session profile");
   }
 
   const base = {
@@ -187,6 +233,18 @@ function boundedCopy<Input, Output>(
     items: retained.map(copy),
     omitted: Math.max(0, values.length - retained.length),
   };
+}
+
+/** @internal Bind a decoded SDK result to its selected session without mutating wire evidence. */
+export function bindSessionSettleResultProfile<Profile extends SelectableSessionProfile>(
+  result: SessionSettleResult<SelectableSessionProfile>,
+  profile: Profile,
+): SessionSettleResult<Profile> {
+  if (!isSelectableSessionProfile(profile)) {
+    throw new TypeError("Session settle result requires a supported session profile");
+  }
+  runtimeSessionSettleProfiles.set(result, profile);
+  return result as SessionSettleResult<Profile>;
 }
 
 function copyPersistentWork(work: PersistentWork): PersistentWork {

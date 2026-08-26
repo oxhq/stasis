@@ -5,12 +5,19 @@ import {
   StasisProcessError,
   StasisStateError,
 } from "./errors.js";
+import {
+  bindSessionSettleResultProfile,
+  settlementEvidence as buildSettlementEvidence,
+  type SettlementEvidenceV2,
+} from "./evidence.js";
 import { ProtocolClient } from "./protocol.js";
 import { assertManagedRuntimeIdentity, resolveRuntimeExecutable } from "./runtime-resolver.js";
 import {
   CONTROLLED_WEBAPP_V1_PROFILE,
   CONTROLLED_WEB_SESSION_V1_PROFILE,
   type LegacySupportProfile,
+  type SelectableSessionProfile,
+  type SessionSupportProfile,
 } from "./profile.js";
 import {
   METHOD,
@@ -259,11 +266,20 @@ export class Runtime {
     }
   }
 
-  /** Open the additive controlled-web-session-v1 surface without changing legacy open(). */
+  /** Open a controlled session using the stable v1 profile when selection is omitted. */
   async openSession(
     url: string | URL,
-    options: SessionOpenOptions = {},
-  ): Promise<Session> {
+    options?: SessionOpenOptions<SessionSupportProfile>,
+  ): Promise<Session<SessionSupportProfile>>;
+  /** Open a controlled session using an explicitly selected advertised profile. */
+  async openSession<Profile extends SelectableSessionProfile>(
+    url: string | URL,
+    options: SessionOpenOptions<Profile> & { readonly profile: Profile },
+  ): Promise<Session<Profile>>;
+  async openSession(
+    url: string | URL,
+    options: SessionOpenOptions<SelectableSessionProfile> = {},
+  ): Promise<Session<SelectableSessionProfile>> {
     if (this.#state !== "ready") {
       throw new StasisStateError(
         "Runtime.openSession() may be called exactly once",
@@ -272,15 +288,17 @@ export class Runtime {
     }
     this.#state = "opening";
     try {
-      if (!this.info.capabilities.profiles.includes(CONTROLLED_WEB_SESSION_V1_PROFILE)) {
+      const params = encodeSessionOpenParams(url, options);
+      const expectedProfile = params.profile;
+      if (!this.info.capabilities.profiles.includes(expectedProfile)) {
         throw new StasisStateError(
-          `The Stasis runtime did not advertise profile ${CONTROLLED_WEB_SESSION_V1_PROFILE}`,
+          `The Stasis runtime did not advertise profile ${expectedProfile}`,
           this.stderrTail,
         );
       }
       const response = await this.#client.request(
         METHOD.open,
-        encodeSessionOpenParams(url, options),
+        params,
         {
           sessionId: null,
           expectedResponseSessionId: "<open>",
@@ -290,7 +308,7 @@ export class Runtime {
             : { timeoutMs: boundedTimeoutMs(options.timeoutMs, "timeoutMs") }),
           ...(options.signal === undefined ? {} : { signal: options.signal }),
         },
-        decodeSessionOpenResult,
+        (value, sessionId) => decodeSessionOpenResult(value, sessionId, expectedProfile),
       );
       this.#state = "open";
       return Session.create(this, this.#client, response.result);
@@ -542,10 +560,10 @@ export class App {
 }
 
 /**
- * Additive controlled-web-session-v1 API. Document and session-state authorities are opaque and
- * intentionally cannot be substituted for legacy generations or for each other.
+ * Controlled session API. Document and session-state authorities are opaque and intentionally
+ * cannot be substituted for legacy generations or for each other.
  */
-export class Session {
+export class Session<Profile extends SelectableSessionProfile = SessionSupportProfile> {
   readonly #runtime: Runtime;
   readonly #client: ProtocolClient;
   readonly #sessionId: string;
@@ -555,13 +573,13 @@ export class Session {
   readonly url: string;
   readonly boundary: "controlled_ready";
   readonly clockMode: "controlled";
-  readonly profile: typeof CONTROLLED_WEB_SESSION_V1_PROFILE;
+  readonly profile: Profile;
   /** Initial document authority returned by session.open. Later operations return replacements. */
   readonly stateToken: DocumentStateToken;
   /** Initial state authority returned by session.open. State operations return replacements. */
   readonly sessionStateToken: SessionStateToken;
 
-  private constructor(runtime: Runtime, client: ProtocolClient, open: SessionOpenResult) {
+  private constructor(runtime: Runtime, client: ProtocolClient, open: SessionOpenResult<Profile>) {
     this.#runtime = runtime;
     this.#client = client;
     this.#sessionId = open.sessionId;
@@ -575,7 +593,11 @@ export class Session {
   }
 
   /** @internal */
-  static create(runtime: Runtime, client: ProtocolClient, open: SessionOpenResult): Session {
+  static create<Profile extends SelectableSessionProfile>(
+    runtime: Runtime,
+    client: ProtocolClient,
+    open: SessionOpenResult<Profile>,
+  ): Session<Profile> {
     return new Session(runtime, client, open);
   }
 
@@ -762,7 +784,7 @@ export class Session {
     expectedStateToken: DocumentStateToken,
     policy: SettlePolicy = {},
     options: CommandOptions = {},
-  ): Promise<SessionSettleResult> {
+  ): Promise<SessionSettleResult<Profile>> {
     this.#assertOpen();
     this.#assertMethod(METHOD.settle);
     const { result } = await this.#client.request(
@@ -771,7 +793,12 @@ export class Session {
       this.#requestOptions(options, "indeterminate"),
       decodeSessionSettle,
     );
-    return result;
+    return bindSessionSettleResultProfile(result, this.profile);
+  }
+
+  /** Build bounded terminal evidence bound to this session's selected profile identity. */
+  settlementEvidence(result: SessionSettleResult<Profile>): SettlementEvidenceV2<Profile> {
+    return buildSettlementEvidence(result, this.profile);
   }
 
   async advanceToNext(

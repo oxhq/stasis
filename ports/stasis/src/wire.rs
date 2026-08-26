@@ -3228,6 +3228,7 @@ mod tests {
         DocumentEpoch, HistoryRevision, SessionNavigationAuthority, SessionNavigationId,
     };
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use servo::ServoUrl;
     use servo_base::id::{
         BrowsingContextId, BrowsingContextIndex, Index, PipelineId, PipelineIndex,
@@ -4932,6 +4933,412 @@ mod tests {
         for result in [&pending, &settled, &value] {
             audit(result);
         }
+    }
+
+    #[test]
+    fn controlled_web_session_v2_profile_is_an_explicit_execution_and_presentation_expansion() {
+        let profile_bytes = include_bytes!("../../../profiles/controlled-web-session-v2.json");
+        assert_eq!(
+            Sha256::digest(profile_bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "ced49928c0c5f77669285a658434209101d27907bd26d07296d5d40e2ad7a412",
+            "the candidate test must be closed over every advertised profile field",
+        );
+        let profile: Value = serde_json::from_slice(profile_bytes)
+            .expect("the controlled-web-session-v2 candidate profile must be valid JSON");
+
+        assert_eq!(profile["schemaVersion"], 1);
+        assert_eq!(profile["id"], "controlled-web-session-v2");
+        assert_eq!(profile["compatibility"]["predecessor"], "controlled-web-session-v1");
+        assert_eq!(
+            profile["compatibility"]["predecessorProfileSha256"],
+            "9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a"
+        );
+        assert_eq!(profile["compatibility"]["predecessorContractUnchanged"], true);
+        assert_eq!(
+            profile["compatibility"]["profileExpansion"],
+            "execution_and_headless_presentation_surfaces_only"
+        );
+        assert_eq!(
+            profile["execution"]["messageChannel"]["construction"]["interface"],
+            "MessageChannel"
+        );
+        assert_eq!(
+            profile["execution"]["messageChannel"]["construction"]
+                ["maximumRetainedNativePortEntriesPerGlobal"],
+            32
+        );
+        assert_eq!(
+            profile["execution"]["messageChannel"]["construction"]["capacityUnit"],
+            "retained_native_port_entry"
+        );
+        assert_eq!(
+            profile["execution"]["messageChannel"]["construction"]
+                ["completePairCapacityFromEmptyGlobal"],
+            16
+        );
+        assert_eq!(
+            profile["execution"]["messageChannel"]["construction"]
+                ["completePairCapacityCondition"],
+            "no_one_ended_terminal_identities_retained"
+        );
+        assert_eq!(
+            profile["execution"]["messageChannel"]["construction"]
+                ["oneEndedTerminalIdentityCapacity"],
+            "each_retained_identity_consumes_one_of_32_entries_and_reduces_available_complete_pair_capacity"
+        );
+        assert!(
+            profile["execution"]["messageChannel"]["construction"]
+                .get("maximumRetainedPairsPerGlobal")
+                .is_none(),
+            "pair capacity must not be advertised independently of retained entry shape",
+        );
+        assert_eq!(
+            profile["execution"]["messageChannel"]["delivery"]["retainedWorkProjection"],
+            json!({
+                "reservationIdentity": "exact_destination_port_before_retention_in_ordinary_task_queue_or_native_disabled_port_buffer",
+                "accountingReconciliation": "global_retained_equals_sum_per_destination_queued_plus_sum_native_buffered",
+                "reciprocalPairWithOwnedWork": "one_deterministic_minimum_port_identity_per_pair",
+                "zeroRetainedMessages": "does_not_make_idle_open_pair_pending",
+                "invalidMissingOrZeroDestinationAssociation": "pending_observation_failure",
+            })
+        );
+        assert_eq!(
+            profile["execution"]["controlledInputMethodFocus"],
+            json!({
+                "scope": "exact_public_controlled_non_auxiliary_top_level_WebView_document_global",
+                "request": "page_driven_InputMethod_Text_nonmultiline_allowVirtualKeyboard_false_only",
+                "trigger": "page_driven_programmatic_DOM_focus_including_React_autoFocus",
+                "semanticAutomation": "preexisting_profile_independent_suppression_unchanged",
+                "domSemantics": "focus_events_value_and_selection_preserved",
+                "embedderPresentation": "suppressed_before_time_surface_admission",
+                "visibleOwner": "not_published",
+                "embedderRequest": "not_sent",
+                "callback": "not_created_or_awaited",
+                "pendingAuthority": "no_external_work_created",
+                "otherEmbedderControls": "unchanged_unsupported_boundaries",
+                "predecessorBehavior": "controlled_web_session_v1_unchanged",
+            })
+        );
+        assert_eq!(
+            profile["execution"]["controlledFocusEventTimestamp"],
+            json!({
+                "scope": "exact_public_controlled_non_auxiliary_top_level_WebView_document_global",
+                "events": ["focus", "blur", "focusin", "focusout"],
+                "creation": "engine_generated_document_focus_transition_only",
+                "clock": "document_performance_clock_sampled_at_event_creation",
+                "observableValue": "Event_timeStamp_equals_document_relative_performance_time",
+                "hostValue": "sampled_implementation_value_is_overwritten_and_not_observable",
+                "scriptCreatedFocusEvent": "host_timestamp",
+                "otherEventsOutsideControlledAutomationScope": "host_timestamp",
+                "predecessorBehavior": "controlled_web_session_v1_unchanged",
+                "realtimeBehavior": "unchanged",
+            })
+        );
+        assert_eq!(
+            profile["execution"]["controlledAutomationEventTimestamps"],
+            json!({
+                "scope": "active_controlled_top_level_document_global",
+                "automationScope": "synchronous_public_mutating_automation_action_only",
+                "clock": "document_performance_clock_sampled_once_before_mutation",
+                "lifetime": "RAII_scope_restored_before_action_response",
+                "coverage": "every_browser_created_event_constructed_synchronously_during_the_admitted_action",
+                "implementationSeams": {
+                    "fillInputEvent": "explicit_internal_fill_InputEvent_stamp",
+                    "internalPointerEvent": "internal_PointerEvent_new_stamp",
+                    "genericEventTargetFire": "browser_created_simple_Event_stamp",
+                    "internalSubmitEvent": "internal_SubmitEvent_new_stamp",
+                    "internalFormDataEvent": "internal_FormDataEvent_new_stamp",
+                },
+                "representativeProofEvents": "fill_input_activate_click_reset_check_click_input_change_select_input_change_invalid_submit_formdata",
+                "observableValue": "all_browser_created_events_synchronously_constructed_during_one_admitted_action_share_its_document_relative_timestamp",
+                "samplingFailure": "reject_action_before_mutation_without_host_fallback",
+                "scriptCreatedConstructors": "Event_InputEvent_PointerEvent_SubmitEvent_FormDataEvent_remain_host_timestamp",
+                "genericEventConstructor": "Event_new_inherited_unchanged",
+                "predecessorBehavior": "controlled_web_session_v1_unchanged",
+                "nestedAndRealtimeBehavior": "unchanged",
+            })
+        );
+        assert_eq!(
+            profile["execution"]["controlledCssAnimationEventTimestamps"],
+            json!({
+                "scope": "exact_public_controlled_non_auxiliary_top_level_WebView_document_global",
+                "source": "nonempty_Animations_pending_event_dispatch_batch_already_retained_by_document_rendering_authority",
+                "eventKinds": [
+                    "animationstart",
+                    "animationiteration",
+                    "animationend",
+                    "animationcancel",
+                    "transitionrun",
+                    "transitionstart",
+                    "transitionend",
+                    "transitioncancel",
+                ],
+                "clock": "document_performance_clock_sampled_once_before_pending_queue_take",
+                "targetAdmission": "ScriptThread_current_controlled_top_level_target_matches_conservative_singleton_reconstruction_with_undiscarded_non_auxiliary_WindowProxy",
+                "recordAdmission": "queued_pipeline_and_rooted_node_owner_match_exact_public_controlled_non_auxiliary_top_level_target_and_fully_active_Document",
+                "construction": "internal_AnimationEvent_and_TransitionEvent_timestamp_overwrite_immediately_before_fire",
+                "observableValue": "every_admitted_internal_event_in_one_nonempty_dispatch_batch_shares_its_document_relative_timestamp",
+                "samplingFailure": "latch_controlled_clock_terminal_and_leave_batch_undispatched_without_host_fallback",
+                "pendingAuthority": "existing_pending_event_and_finite_infinite_unsupported_animation_rendering_facts_unchanged",
+                "settlementScheduling": {
+                    "scheduledPendingEventBatch": "finite_rendering_demand_advanced_to_exact_retained_scheduler_head_including_deadline_equal_to_now",
+                    "driveReadiness": "pending_animation_events_are_Drive_ready_only_without_a_live_scheduled_opportunity",
+                    "reason": "Drive_cannot_detach_a_controlled_scheduler_entry",
+                    "surfaceEffect": "liveness_correction_only_no_new_producer_task_source_or_execution_limit",
+                },
+                "executionLimit": "existing_10000_rendering_opportunity_limit",
+                "representativeExecutableProof": "instant_finite_animationstart_and_animationend_only",
+                "transitionSettlementCompatibility": "not_claimed_timestamp_adapter_applies_only_if_an_existing_owned_transition_record_reaches_pending_dispatch",
+                "scriptCreatedConstructors": "AnimationEvent_and_TransitionEvent_remain_host_timestamp",
+                "auxiliaryStaleMismatchedNestedAndRealtime": "host_timestamp_predecessor_behavior",
+                "semanticBoundary": "timestamp_only_event_order_cardinality_elapsedTime_and_CSS_animation_semantics_unchanged",
+                "predecessorBehavior": "controlled_web_session_v1_unchanged",
+            })
+        );
+        assert_eq!(
+            profile["execution"]["controlledImageElement"],
+            json!({
+                "mode": "controlled_top_level_direct_data_svg",
+                "selection": {
+                    "interface": "HTMLImageElement",
+                    "scope": "exact_public_controlled_non_auxiliary_top_level_WebView_document_global",
+                    "source": "direct_src_selected_without_srcset_picture_or_environment_change",
+                    "parser": "canonical_DataUrl",
+                    "mimeType": "image/svg+xml",
+                    "maximumSerializedUrlBytes": 65536,
+                    "requestProvenance": "captured_at_selection_and_carried_with_request_generation",
+                    "retainedVectorAuthority": "controlled_cache_id_stored_on_request_only_after_successful_registration_or_synchronous_exact_owner_retain",
+                    "executionDomain": "same_ScriptThread_and_ImageCache",
+                },
+                "retention": {
+                    "maximumRetainedControlledOwnershipRecordsPerWindow": 512,
+                    "recordKinds": [
+                        "pending_callback",
+                        "exact_cache_id_DOM_owner_identity",
+                        "vector_rasterization_key",
+                    ],
+                    "reservationUnit": "one_record_per_controlled_pending_callback_exact_cache_id_DOM_owner_identity_or_vector_rasterization_key",
+                    "overflow": "sticky_Image_producer_admission_limit_terminal_without_baseline_fallback",
+                    "decodeRequestAdmission": "ReadyForRequest_callback_and_identity_reservations_succeed_before_cache_request_issue",
+                    "teardown": "callback_identity_layout_and_raster_collections_cleared_together_releasing_all_records",
+                },
+                "completion": {
+                    "synchronousCacheHit": "admitted_provenance_bound_current_turn_without_async_producer_lease",
+                    "asyncCacheDecode": "Image_producer_fenced_through_ScriptThread_handoff",
+                    "callbackRetirement": "cache_owned_callback_drop_before_protocol_terminal_is_owned_cancellation_completed_without_producer_terminal",
+                    "retiredTargetDelivery": "dequeued_after_navigation_with_closed_pipeline_tombstone_and_without_live_Window_is_owned_cancellation_completed_without_producer_terminal",
+                    "retainedHandlerRejection": "normal_handler_Err_preserves_rejected_key_or_owner_in_Window_pending_collections_completes_scoped_message_guard_and_settles_as_unsupported_rendering_image_load",
+                    "handlerUnwind": "ControlledImageMessageCompletion_abandons_during_unwind_and_completes_every_normal_handler_return",
+                    "explicitAbandonment": "message_admission_failure_enqueue_rejection_producer_callback_panic_ScriptThread_handler_unwind_missing_untombstoned_or_live_tombstoned_target_prehandler_profile_or_exact_public_target_mismatch_clock_sampling_failure_or_guarded_transport_loss_latches_sticky_Image_producer_terminal",
+                    "leaseClassMatch": "completion_and_abandonment_require_exact_fence_sequence_and_registered_Image_kind_before_terminal_or_watermark_mutation",
+                    "vectorRasterization": "fenced_only_when_joined_from_a_retained_exact_cache_id_DOM_owner_identity",
+                    "vectorRasterizationStart": "may_begin_in_layout_before_post_reflow_exact_key_reservation",
+                    "vectorRasterizationAdmission": "post_reflow_exact_key_reservation_and_fenced_listener_install_before_next_ScriptThread_pending_snapshot_publish_or_observe",
+                    "vectorRasterizationCapacityFailure": "sticky_Image_producer_terminal_without_baseline_fallback_even_if_task_already_started",
+                    "terminalResponses": [
+                        "loaded",
+                        "failed_to_load_or_decode",
+                        "vector_rasterization_complete",
+                    ],
+                    "queuedDomCallback": "ordinary_task_after_guarded_handoff_with_request_generation_check",
+                    "preHandlerMismatchOrAbandonment": "sticky_producer_terminal_without_baseline_fallback",
+                    "requestAuthorityLifecycle": "pending_to_current_move_preserves_exact_cache_id_and_abort_replace_or_different_id_releases_exact_owner",
+                    "sameIdAbaProtection": "stale_generation_releases_only_when_neither_request_slot_owns_exact_cache_id",
+                    "decoderResourceBudget": "not_claimed_existing_wall_task_and_rendering_limits_only",
+                },
+                "pending": {
+                    "logicalIdentity": "union_of_callback_and_layout_PendingImageId_plus_exact_image_id_size_rasterization_keys",
+                    "layoutOwnerProvenance": "captured_per_exact_cache_id_DOM_owner_at_first_post_reflow_retention",
+                    "controlledClassification": "image_id_controlled_only_when_every_retained_callback_is_controlled_and_no_retained_layout_owner_is_baseline",
+                    "mixedLayoutOwnership": "baseline_layout_owner_globally_downgrades_cache_id_and_live_raster_keys_and_delivery_mismatch_rejects_before_any_callback_while_retained_as_unsupported_rendering",
+                    "mixedMissingOrBaseline": "unsupported_pending_rendering_image_load",
+                    "controlledProjection": "Image_producer_fence_not_pending_rendering_image_load",
+                    "reservationReconciliation": "live_controlled_records_equal_retained_controlled_callbacks_plus_exact_cache_id_DOM_owner_identities_plus_controlled_rasterization_keys",
+                    "producerReconciliation": "pending_Image_producers_greater_than_or_equal_to_controlled_logical_work_absent_terminal",
+                },
+                "eventTimestamp": {
+                    "events": ["load", "error", "loadend"],
+                    "creation": "engine_generated_HTMLImageElement_completion_only",
+                    "clock": "document_performance_clock_sampled_once_per_completion",
+                    "observableValue": "every_event_emitted_for_one_completion_shares_the_document_relative_timestamp",
+                    "ordinaryTerminalCardinality": "load_then_loadend_or_error_then_loadend",
+                    "existingCacheHitCardinality": "load_only",
+                    "cacheHit": "sampled_before_queued_DOM_manipulation_task_and_carried_with_request_generation",
+                    "async": "sampled_at_guarded_ScriptThread_delivery_and_carried_through_queued_callback",
+                    "hostFallback": "forbidden_for_admitted_work",
+                    "predecessorBehavior": "controlled_web_session_v1_unchanged",
+                },
+                "unsupported": {
+                    "httpHttpsBlobFileAndNonSvgDataUrls": "not_admitted_baseline_image_authorities_unchanged",
+                    "oversizeUrl": "not_admitted_baseline_image_authorities_unchanged",
+                    "srcsetPictureAndEnvironmentChange": "not_admitted_baseline_image_authorities_unchanged",
+                    "cssBackgroundListStyleAndContent": "not_admitted_unless_joining_a_retained_exact_cache_id_DOM_owner_identity",
+                    "faviconAndVideoPoster": "not_admitted_baseline_image_authorities_unchanged",
+                    "imageBitmapAndCanvasUpload": "not_admitted_baseline_image_authorities_unchanged",
+                    "animatedImages": "not_admitted_by_this_slice_existing_rendering_authority_unchanged",
+                    "iframeWorkerWorkletAndCrossLoop": "not_admitted_existing_context_boundaries_unchanged",
+                    "unadmittedSharedVectorCacheIdentity": "remove_all_controlled_owners_and_downgrade_live_raster_keys_to_baseline",
+                    "nestedOrExternalSvgResources": "not_content_inspected_not_proven_by_this_slice",
+                },
+            })
+        );
+        assert_eq!(
+            profile["execution"]["controlledInlineSvgRendering"],
+            json!({
+                "mode": "controlled_top_level_internal_serialized_data_svg",
+                "admission": {
+                    "interface": "SVGSVGElement",
+                    "scope": "exact_public_controlled_non_auxiliary_top_level_WebView_document_global",
+                    "source": "internally_serialized_inline_svg_subtree_only",
+                    "requestKind": "InternalRequest_Yes",
+                    "cachedUrlIdentity": "candidate_exactly_equals_element_cached_serialized_data_url",
+                    "parser": "canonical_DataUrl",
+                    "mimeType": "image/svg+xml",
+                    "maximumSerializedUrlBytes": 65536,
+                    "executionDomain": "same_ScriptThread_and_ImageCache",
+                },
+                "ownership": {
+                    "cacheIdJoin": "exact_PendingImageId_DOM_owner_identity_required",
+                    "retentionBudget": "shared_512_record_controlled_image_ownership_limit",
+                    "mixedOwnership": "baseline_owner_globally_downgrades_shared_cache_id_and_live_raster_keys",
+                    "hostFallback": "forbidden_for_admitted_work",
+                },
+                "completion": {
+                    "asyncCacheDecode": "Image_producer_fenced_through_ScriptThread_handoff",
+                    "vectorRasterization": "fenced_only_from_exact_retained_inline_svg_cache_id_DOM_owner_identity",
+                    "pendingProjection": "Image_producer_fence_not_pending_rendering_image_load",
+                    "domLoadEvent": "not_emitted_by_internal_inline_svg_rendering_completion",
+                },
+                "unsupported": {
+                    "baselineAndV1": "unchanged",
+                    "generalSvgRendering": "not_admitted_by_this_slice",
+                    "nestedOrExternalResources": "not_admitted_or_proven_existing_resource_authority_unchanged",
+                    "nonInternalOrMismatchedUrl": "baseline_image_authorities_unchanged",
+                    "iframeWorkerWorkletAndCrossLoop": "not_admitted_existing_context_boundaries_unchanged",
+                },
+            })
+        );
+        assert_eq!(
+            profile["unsupportedClasses"]["embedderControls"],
+            json!({
+                "controlledTopLevelSingleLineTextInputMethodPresentationWithoutVirtualKeyboard":
+                    "suppressed_without_external_work",
+                "selectElementColorPickerFilePickerContextMenuAndOtherControls":
+                    "embedder_control",
+            })
+        );
+        let input_method_product_surfaces: Vec<_> = profile["supportedProductSurface"]
+            .as_array()
+            .expect("supportedProductSurface must be an array")
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|surface| surface.contains("input_method"))
+            .collect();
+        assert_eq!(
+            input_method_product_surfaces,
+            [
+                "controlled_top_level_single_line_text_input_method_presentation_suppression_without_virtual_keyboard",
+            ]
+        );
+        let focus_timestamp_product_surfaces: Vec<_> = profile["supportedProductSurface"]
+            .as_array()
+            .expect("supportedProductSurface must be an array")
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|surface| surface.contains("focus_event_timestamp"))
+            .collect();
+        assert_eq!(
+            focus_timestamp_product_surfaces,
+            ["controlled_top_level_engine_focus_event_timestamp_from_document_clock"]
+        );
+        let automation_timestamp_product_surfaces: Vec<_> = profile["supportedProductSurface"]
+            .as_array()
+            .expect("supportedProductSurface must be an array")
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|surface| surface.contains("synchronous_public_automation_event_timestamps"))
+            .collect();
+        assert_eq!(
+            automation_timestamp_product_surfaces,
+            [
+                "controlled_top_level_synchronous_public_automation_event_timestamps_from_document_clock"
+            ]
+        );
+        let css_animation_timestamp_product_surfaces: Vec<_> = profile["supportedProductSurface"]
+            .as_array()
+            .expect("supportedProductSurface must be an array")
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|surface| surface.contains("internal_CSS_animation_event_timestamps"))
+            .collect();
+        assert_eq!(
+            css_animation_timestamp_product_surfaces,
+            [
+                "controlled_public_non_auxiliary_top_level_internal_CSS_animation_event_timestamps_from_document_clock"
+            ]
+        );
+        let image_product_surfaces: Vec<_> = profile["supportedProductSurface"]
+            .as_array()
+            .expect("supportedProductSurface must be an array")
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|surface| surface.contains("data_svg_HTMLImageElement"))
+            .collect();
+        assert_eq!(
+            image_product_surfaces,
+            ["bounded_controlled_top_level_direct_data_svg_HTMLImageElement_completion"]
+        );
+        let inline_svg_product_surfaces: Vec<_> = profile["supportedProductSurface"]
+            .as_array()
+            .expect("supportedProductSurface must be an array")
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|surface| surface.contains("serialized_data_svg_inline_rendering"))
+            .collect();
+        assert_eq!(
+            inline_svg_product_surfaces,
+            ["bounded_controlled_top_level_internal_serialized_data_svg_inline_rendering"]
+        );
+        assert_eq!(
+            profile["unsupportedClasses"]["hostTimestamp"],
+            json!({
+                "controlledTopLevelEngineGeneratedFocusTransitionInV2":
+                    "document_clock_timestamp",
+                "controlledTopLevelAdmittedImageCompletionEventsInV2":
+                    "shared_document_clock_timestamp",
+                "controlledTopLevelSynchronousPublicAutomationEventsInV2":
+                    "one_document_clock_timestamp_per_mutating_action",
+                "controlledPublicNonAuxiliaryTopLevelInternalCssAnimationAndTransitionEventsInV2":
+                    "one_document_clock_timestamp_per_nonempty_pending_event_dispatch_batch",
+                "scriptCreatedEventConstructorsAndAllUnlistedHostTimestampSurfaces": "host_timestamp",
+            })
+        );
+        assert_eq!(
+            profile["unsupportedClasses"]["imageElement"],
+            json!({
+                "admittedDirectDataSvg": "owned_bounded_Image_producer_work",
+                "baselineMixedOrUnownedRetainedWork": "unsupported_rendering_image_load",
+                "excludedSynchronousCacheHit": "predecessor_behavior_no_universal_new_typed_rejection",
+                "nestedOrExternalSvgResources": "not_proven",
+            })
+        );
+        // SessionStateV1 is intentionally the portable artifact for both runtime profiles. Its
+        // frozen state.profile identity remains controlled-web-session-v1.
+        assert_eq!(
+            profile["compatibility"]["stateArtifactProfile"],
+            "controlled-web-session-v1"
+        );
+        assert_eq!(
+            profile["sessionState"]["artifactProfile"],
+            "controlled-web-session-v1"
+        );
+        assert_eq!(
+            profile["sessionState"]["compatibleSelectedProfiles"],
+            json!(["controlled-web-session-v1", "controlled-web-session-v2"])
+        );
     }
 
     #[test]

@@ -85,6 +85,59 @@ pub enum DocumentControlProfile {
     TopLevelSession,
 }
 
+/// The immutable execution-surface policy selected before a WebView's initial navigation.
+///
+/// This is deliberately separate from [`DocumentControlProfile`]: document control decides which
+/// documents one controlled event loop may own, while this value decides which otherwise
+/// unsupported local execution surfaces that event loop may admit. Ordinary WebViews and every
+/// frozen v1 Stasis profile retain the baseline default.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum DocumentExecutionProfile {
+    /// Preserve Servo's ordinary surface policy and every frozen Stasis v1 boundary.
+    #[default]
+    Baseline,
+    /// Admit the additive controlled-web-session-v2 execution and headless-presentation surfaces.
+    /// This currently covers same-global untransferred MessageChannel delivery and the exact
+    /// passive single-line text InputMethod boundary; it is one immutable profile delta rather
+    /// than a set of independently selectable capabilities.
+    ControlledWebSessionV2,
+}
+
+/// A checked failure while selecting a [`DocumentExecutionProfile`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DocumentExecutionProfileError {
+    /// The additive execution surface requires a controlled document clock.
+    RequiresControlledClock,
+    /// The additive execution surface requires top-level session authority.
+    RequiresTopLevelSession,
+    /// An auxiliary WebView attempted to override its opener's inherited profile.
+    InheritedProfileMismatch,
+}
+
+/// Validate the execution profile independently at the embedder boundary.
+#[doc(hidden)]
+pub const fn validate_document_execution_profile(
+    profile: DocumentExecutionProfile,
+    clock: DocumentClockConfiguration,
+    control_profile: DocumentControlProfile,
+) -> Result<(), DocumentExecutionProfileError> {
+    match (profile, clock, control_profile) {
+        (
+            DocumentExecutionProfile::ControlledWebSessionV2,
+            DocumentClockConfiguration::Realtime,
+            _,
+        ) => Err(DocumentExecutionProfileError::RequiresControlledClock),
+        (
+            DocumentExecutionProfile::ControlledWebSessionV2,
+            _,
+            DocumentControlProfile::SingleDocument,
+        ) => Err(DocumentExecutionProfileError::RequiresTopLevelSession),
+        _ => Ok(()),
+    }
+}
+
 /// A checked failure while selecting a [`DocumentControlProfile`].
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,8 +184,9 @@ mod document_clock_configuration_tests {
 
     use super::{
         DocumentClockConfiguration, DocumentClockError, DocumentControlProfile,
-        DocumentControlProfileError, validate_document_clock_configuration,
-        validate_document_control_profile,
+        DocumentControlProfileError, DocumentExecutionProfile, DocumentExecutionProfileError,
+        validate_document_clock_configuration, validate_document_control_profile,
+        validate_document_execution_profile,
     };
 
     #[test]
@@ -187,6 +241,54 @@ mod document_clock_configuration_tests {
                     initial_time_ns: 0,
                     unix_time_origin_ns: DocumentUnixTime::from_nanos(0),
                 },
+            ),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn controlled_web_session_v2_requires_a_controlled_top_level_session() {
+        let controlled = DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: DocumentUnixTime::from_nanos(0),
+        };
+        assert_eq!(
+            validate_document_execution_profile(
+                DocumentExecutionProfile::ControlledWebSessionV2,
+                DocumentClockConfiguration::Realtime,
+                DocumentControlProfile::TopLevelSession,
+            ),
+            Err(DocumentExecutionProfileError::RequiresControlledClock),
+        );
+        assert_eq!(
+            validate_document_execution_profile(
+                DocumentExecutionProfile::ControlledWebSessionV2,
+                controlled,
+                DocumentControlProfile::SingleDocument,
+            ),
+            Err(DocumentExecutionProfileError::RequiresTopLevelSession),
+        );
+        assert_eq!(
+            validate_document_execution_profile(
+                DocumentExecutionProfile::ControlledWebSessionV2,
+                controlled,
+                DocumentControlProfile::TopLevelSession,
+            ),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn execution_profile_preserves_the_baseline_default() {
+        assert_eq!(
+            DocumentExecutionProfile::default(),
+            DocumentExecutionProfile::Baseline,
+        );
+        assert_eq!(
+            validate_document_execution_profile(
+                DocumentExecutionProfile::Baseline,
+                DocumentClockConfiguration::Realtime,
+                DocumentControlProfile::SingleDocument,
             ),
             Ok(()),
         );
@@ -1421,6 +1523,9 @@ pub struct NewWebViewDetails {
     /// The checked control profile selected before this WebView's initial navigation.
     #[doc(hidden)]
     pub document_control_profile: DocumentControlProfile,
+    /// The checked execution-surface profile selected before this WebView's initial navigation.
+    #[doc(hidden)]
+    pub document_execution_profile: DocumentExecutionProfile,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

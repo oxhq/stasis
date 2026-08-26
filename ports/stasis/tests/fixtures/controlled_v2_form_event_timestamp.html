@@ -1,0 +1,84 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Controlled automation form-event timestamps</title>
+
+<button id="start" type="button">schedule clock advance</button>
+<input id="fill" type="text">
+<button id="activate" type="button">activate</button>
+<form id="reset-form">
+  <input name="resettable" value="initial">
+  <button id="reset" type="reset">reset</button>
+</form>
+<input id="check" type="checkbox">
+<select id="select">
+  <option value="one">one</option>
+  <option value="two">two</option>
+</select>
+<form id="invalid-form">
+  <input id="required" required>
+</form>
+<form id="valid-form">
+  <input name="present" value="yes">
+</form>
+<button id="script-created" type="button">inspect script events</button>
+<output id="result">idle</output>
+
+<script>
+  const result = document.querySelector("#result");
+  const browserTrace = [];
+  let scriptTrace = "not-read";
+
+  function render() {
+    result.textContent = [
+      String(performance.now()),
+      browserTrace.join(">"),
+      scriptTrace,
+    ].join("|");
+  }
+
+  function record(scope) {
+    return event => {
+      browserTrace.push(`${scope}:${event.type}:${event.timeStamp}`);
+      render();
+    };
+  }
+
+  document.querySelector("#start").onclick = () => {
+    setTimeout(() => document.body.dataset.advanced = "yes", 5);
+  };
+  document.querySelector("#fill").addEventListener("input", record("fill"));
+  document.querySelector("#activate").addEventListener("click", record("activate"));
+  document.querySelector("#reset-form").addEventListener("reset", record("reset"));
+
+  const check = document.querySelector("#check");
+  for (const type of ["click", "input", "change"]) {
+    check.addEventListener(type, record("check"));
+  }
+
+  const select = document.querySelector("#select");
+  for (const type of ["input", "change"]) {
+    select.addEventListener(type, record("select"));
+  }
+
+  document.querySelector("#required").addEventListener("invalid", record("invalid"));
+
+  const validForm = document.querySelector("#valid-form");
+  validForm.addEventListener("submit", record("submit"));
+  validForm.addEventListener("formdata", event => {
+    record("submit")(event);
+    validForm.remove();
+  });
+
+  document.querySelector("#script-created").addEventListener("click", event => {
+    record("script-trigger")(event);
+    const scriptEvents = [
+      new Event("plain"),
+      new InputEvent("input"),
+      new PointerEvent("click"),
+      new SubmitEvent("submit"),
+      new FormDataEvent("formdata", { formData: new FormData() }),
+    ];
+    scriptTrace = scriptEvents.map(candidate => String(candidate.timeStamp)).join(",");
+    render();
+  });
+</script>

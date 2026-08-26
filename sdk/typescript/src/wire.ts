@@ -2,7 +2,10 @@ import { StasisTransportError } from "./errors.js";
 import {
   CONTROLLED_WEBAPP_V1_PROFILE,
   CONTROLLED_WEB_SESSION_V1_PROFILE,
+  isSelectableSessionProfile,
   type LegacySupportProfile,
+  type SelectableSessionProfile,
+  type SessionSupportProfile,
 } from "./profile.js";
 import type {
   AdvanceToNextResult,
@@ -380,18 +383,22 @@ export function encodeOpenParams(
 
 export function encodeSessionOpenParams(
   url: string | URL,
-  options: SessionOpenOptions,
-): Record<string, unknown> {
+  options: SessionOpenOptions<SelectableSessionProfile>,
+): Record<string, unknown> & { profile: SelectableSessionProfile } {
   const serializedUrl = typeof url === "string" ? url : url.toString();
   if (serializedUrl.length === 0) throw new TypeError("url must not be empty");
   const clock = options.clock;
   if (clock !== undefined && clock.mode !== "controlled") {
     throw new TypeError("Runtime.openSession() requires the controlled clock");
   }
-  const params: Record<string, unknown> = {
+  const profile = options.profile ?? CONTROLLED_WEB_SESSION_V1_PROFILE;
+  if (!isSelectableSessionProfile(profile)) {
+    throw new TypeError("profile must be a supported controlled session profile");
+  }
+  const params: Record<string, unknown> & { profile: SelectableSessionProfile } = {
     url: serializedUrl,
     clockMode: "controlled",
-    profile: CONTROLLED_WEB_SESSION_V1_PROFILE,
+    profile,
     initialVirtualTimeNs: encodeU128(
       clock?.initialVirtualTimeNs ?? 0n,
       "initialVirtualTimeNs",
@@ -1116,21 +1123,24 @@ export function decodeOpenResult(
   };
 }
 
-export interface SessionOpenResult {
+export interface SessionOpenResult<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+> {
   sessionId: string;
   requestedUrl: string;
   url: string;
   boundary: "controlled_ready";
   clockMode: "controlled";
-  profile: typeof CONTROLLED_WEB_SESSION_V1_PROFILE;
+  profile: Profile;
   stateToken: DocumentStateToken;
   sessionStateToken: SessionStateToken;
 }
 
-export function decodeSessionOpenResult(
+export function decodeSessionOpenResult<Profile extends SelectableSessionProfile>(
   value: unknown,
   envelopeSessionId: string | null,
-): SessionOpenResult {
+  expectedProfile: Profile,
+): SessionOpenResult<Profile> {
   const result = record(value, "session.open result");
   exactKeys(result, [
     "sessionId",
@@ -1152,8 +1162,8 @@ export function decodeSessionOpenResult(
   if (result.clockMode !== "controlled") {
     invalid("session.open session profile did not return the controlled clock");
   }
-  if (result.profile !== CONTROLLED_WEB_SESSION_V1_PROFILE) {
-    invalid(`session.open did not return profile ${CONTROLLED_WEB_SESSION_V1_PROFILE}`);
+  if (result.profile !== expectedProfile) {
+    invalid(`session.open did not return requested profile ${expectedProfile}`);
   }
   return {
     sessionId,
@@ -1161,7 +1171,7 @@ export function decodeSessionOpenResult(
     url: requireString(result.url, "session.open result.url"),
     boundary: "controlled_ready",
     clockMode: "controlled",
-    profile: CONTROLLED_WEB_SESSION_V1_PROFILE,
+    profile: expectedProfile,
     stateToken: decodeDocumentStateToken(
       result.stateToken,
       "session.open result.stateToken",

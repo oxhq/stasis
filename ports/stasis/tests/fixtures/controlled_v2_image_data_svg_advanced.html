@@ -1,0 +1,25 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled v2 data SVG completion after advance</title>
+<button id="start">schedule image</button>
+<img id="image" alt="controlled data SVG">
+<output id="result">idle</output>
+<script>
+  const image = document.querySelector("#image");
+  const result = document.querySelector("#result");
+  const events = [];
+  const source = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%222%22%20height%3D%222%22%3E%3Ccircle%20cx%3D%221%22%20cy%3D%221%22%20r%3D%221%22%20fill%3D%22blue%22%2F%3E%3C%2Fsvg%3E";
+
+  for (const type of ["load", "error", "loadend"]) {
+    image.addEventListener(type, (event) => {
+      events.push(`${event.type}:${event.timeStamp}`);
+      result.textContent = `${events.join(">")}|now:${performance.now()}`;
+    });
+  }
+
+  document.querySelector("#start").onclick = () => {
+    setTimeout(() => {
+      image.src = source;
+    }, 5);
+  };
+</script>

@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled MessageChannel retained-message limit fixture</title>
+<button id="start">start</button>
+<div id="result">idle</div>
+<script>
+  const channel = new MessageChannel();
+  document.querySelector("#start").onclick = () => {
+    let posted = 0;
+    let errorName = "no-error";
+    for (; posted < 1025; posted += 1) {
+      try {
+        channel.port2.postMessage(posted);
+      } catch (error) {
+        errorName = error.name;
+        break;
+      }
+    }
+    document.querySelector("#result").textContent = `posted:${posted}|${errorName}`;
+  };
+</script>

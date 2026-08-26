@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled MessagePort mixed-transfer fixture</title>
+<button id="start">start</button>
+<div id="result">booting</div>
+<script>
+  const channel = new MessageChannel();
+  document.querySelector("#start").onclick = () => {
+    const structuredCloneBuffer = new ArrayBuffer(16);
+    let structuredCloneRejection;
+
+    try {
+      structuredClone(
+        { buffer: structuredCloneBuffer, port: channel.port1 },
+        { transfer: [structuredCloneBuffer, channel.port1] },
+      );
+    } catch (error) {
+      structuredCloneRejection = error;
+    }
+
+    let deliveries = 0;
+    channel.port1.onmessage = () => {
+      deliveries += 1;
+    };
+    const postMessageBuffer = new ArrayBuffer(16);
+    let postMessageRejection;
+    try {
+      channel.port2.postMessage(
+        { buffer: postMessageBuffer },
+        [postMessageBuffer],
+      );
+    } catch (error) {
+      postMessageRejection = error;
+    }
+
+    const structuredCloneError = structuredCloneRejection
+      ? structuredCloneRejection.name
+      : "no-error";
+    const postMessageError = postMessageRejection
+      ? postMessageRejection.name
+      : "no-error";
+    document.querySelector("#result").textContent =
+      `clone:${structuredCloneError}:buffer:${structuredCloneBuffer.byteLength}|` +
+      `post:${postMessageError}:buffer:${postMessageBuffer.byteLength}|` +
+      `deliveries:${deliveries}`;
+  };
+</script>

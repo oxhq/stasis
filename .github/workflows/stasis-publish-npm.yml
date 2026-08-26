@@ -9,7 +9,7 @@ on:
       release_tag:
         description: Immutable stable release tag to verify
         required: true
-        default: v0.2.1
+        default: v0.3.0
         type: string
       publication_run_id:
         description: Release-event workflow run that published the npm package
@@ -41,11 +41,11 @@ jobs:
             github.event_name == 'release'
               && github.event.release.draft == false
               && github.event.release.prerelease == false
-              && github.event.release.tag_name == 'v0.2.1'
+              && github.event.release.tag_name == 'v0.3.0'
           )
           || (
             github.event_name == 'workflow_dispatch'
-              && inputs.release_tag == 'v0.2.1'
+              && inputs.release_tag == 'v0.3.0'
           )
         )
     runs-on: macos-15
@@ -158,8 +158,8 @@ jobs:
           cargo_version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("ports/stasis/Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')
           sdk_version=$(node -p 'JSON.parse(require("node:fs").readFileSync("sdk/typescript/package.json", "utf8")).version')
           version=${TAG#v}
-          if [[ "$version" != '0.2.1' || "$cargo_version" != "$version" || "$sdk_version" != "$version" ]]; then
-            echo 'native, SDK, and release tag versions do not match stable 0.2.1' >&2
+          if [[ "$version" != '0.3.0' || "$cargo_version" != "$version" || "$sdk_version" != "$version" ]]; then
+            echo 'native, SDK, and release tag versions do not match exact 0.3.0' >&2
             exit 1
           fi
           bundle="stasis-${version}-${STASIS_PLATFORM}"
@@ -413,6 +413,10 @@ jobs:
               "stasis-linux-x86_64-act-settle-inspect-proof",
               "stasis-runtime-manifest",
               "stasis-typescript",
+              # Windows artifacts prove the CI-only platform boundary and never become release,
+              # provenance, runtime-manifest, or managed npm inputs.
+              "stasis-windows-x86_64-ci",
+              "stasis-windows-x86_64-ci-logs",
           )
           patterns = tuple(
               (prefix, re.compile(rf"^{re.escape(prefix)}-attempt-([1-9][0-9]*)$"))
@@ -426,6 +430,16 @@ jobs:
               "stasis-runtime-manifest": "sdk",
               "stasis-typescript": "sdk",
           }
+          permitted_ci_only_prefixes = {
+              "stasis-windows-x86_64-ci",
+              "stasis-windows-x86_64-ci-logs",
+          }
+          if (
+              len(prefixes) != len(set(prefixes))
+              or set(prefixes) != set(prefix_groups) | permitted_ci_only_prefixes
+              or set(prefix_groups) & permitted_ci_only_prefixes
+          ):
+              raise SystemExit("npm package artifact prefix classifier is inconsistent")
           by_group_attempt = {group: {} for group in set(prefix_groups.values())}
           seen_artifact_names = set()
           for artifact in artifacts:
@@ -455,6 +469,8 @@ jobs:
               if attempt > overall_attempt:
                   raise SystemExit("package artifact claims a future run attempt")
               if expired:
+                  continue
+              if matched[0] in permitted_ci_only_prefixes:
                   continue
               group = prefix_groups[matched[0]]
               by_group_attempt[group].setdefault(attempt, []).append(name)
@@ -685,6 +701,12 @@ jobs:
           node etc/ci/stasis/verify_registry_sdk.mjs \
             --binary "$RUNNER_TEMP/stasis-published-release/$STASIS_BUNDLE/stasis" \
             --fixture ports/stasis/tests/fixtures/timer_10s.html \
+            --session-v2-fixture ports/stasis/tests/fixtures/message_channel_buffered.html \
+            --session-v2-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_data_svg.html \
+            --session-v2-inline-svg-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg.html \
+            --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
+            --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
+            --session-v2-css-animation-event-fixture ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html \
             --consumer-root "$consumer" \
             --package "$NPM_TARBALL" \
             --revision "$STASIS_REVISION" \
@@ -904,6 +926,194 @@ jobs:
                   )
                   and value == expected
               )
+
+          def require_exact_v2_fixture_proofs(document, context):
+              expected = {
+                  "v2DirectDataSvg": {
+                      "profile": "controlled-web-session-v2",
+                      "navigationBoundary": "controlled_ready",
+                      "outcome": "quiescent",
+                      "producerPending": "0",
+                      "producerTerminal": False,
+                      "pendingImages": "0",
+                      "runtimeFailures": "0",
+                      "unsupportedWork": "0",
+                      "externalIo": "0",
+                      "completionTrace": "load:0>loadend:0|now:0",
+                      "evidenceProfile": "controlled-web-session-v2",
+                      "sameControlledSession": True,
+                      "exactBinaryLaunch": True,
+                      "closeResponseAndEof": True,
+                  },
+                  "v2InlineSvgRendering": {
+                      "profile": "controlled-web-session-v2",
+                      "navigationBoundary": "controlled_ready",
+                      "outcome": "quiescent",
+                      "producerPending": "0",
+                      "producerTerminal": False,
+                      "pendingImages": "0",
+                      "runtimeFailures": "0",
+                      "unsupportedWork": "0",
+                      "externalIo": "0",
+                      "fixtureTrace": "inline-svg:4x3|events:0|now:0",
+                      "domCompletionEvents": "0",
+                      "evidenceProfile": "controlled-web-session-v2",
+                      "sameControlledSession": True,
+                      "exactBinaryLaunch": True,
+                      "closeResponseAndEof": True,
+                  },
+                  "v2InputMethodFocus": {
+                      "profile": "controlled-web-session-v2",
+                      "navigationBoundary": "controlled_ready",
+                      "outcome": "quiescent",
+                      "producerPending": "0",
+                      "producerTerminal": False,
+                      "runtimeFailures": "0",
+                      "unsupportedWork": "0",
+                      "externalIo": "0",
+                      "completionTrace": (
+                          "blurred|4|focus:trusted:0>focusin:trusted:0>blur:trusted:0>"
+                          "focusout:trusted:0|rwa-value|2:5"
+                      ),
+                      "evidenceProfile": "controlled-web-session-v2",
+                      "sameControlledSession": True,
+                      "exactBinaryLaunch": True,
+                      "closeResponseAndEof": True,
+                  },
+                  "v2AutomationEventTimestamps": {
+                      "profile": "controlled-web-session-v2",
+                      "navigationBoundary": "controlled_ready",
+                      "initialOutcome": "quiescent",
+                      "advancedVirtualTimeNs": "5000000",
+                      "dispatchedVirtualTimeNs": "5000000",
+                      "controlledEventCount": "11",
+                      "controlledTrace": (
+                          "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>"
+                          "check:input:5>check:change:5>select:input:5>select:change:5>invalid:invalid:5>"
+                          "submit:submit:5>submit:formdata:5|not-read"
+                      ),
+                      "browserEventCountAfterScriptProbe": "12",
+                      "scriptCreatedConstructorCount": "5",
+                      "scriptCreatedTrace": "0,0,0,0,0",
+                      "rejectedOutcome": "unsupported_work",
+                      "failureCode": "unsupported_clock_surface",
+                      "unsupportedKind": "other",
+                      "unsupportedCount": "1",
+                      "unsupportedReason": "time_surface",
+                      "unsupportedTimeSurface": "host_timestamp",
+                      "evidenceProfile": "controlled-web-session-v2",
+                      "sameControlledSession": True,
+                      "exactBinaryLaunch": True,
+                      "closeResponseAndEof": True,
+                  },
+              }
+              for field, expected_record in expected.items():
+                  record = document.get(field)
+                  if (
+                      type(record) is not dict
+                      or set(record) != set(expected_record)
+                      or any(
+                          type(record.get(key)) is not type(value)
+                          or record.get(key) != value
+                          for key, value in expected_record.items()
+                      )
+                  ):
+                      raise SystemExit(f"{context} lost exact {field} evidence")
+              css_record = document.get("v2CssAnimationEventTimestamps")
+              css_expected_fixed = {
+                  "profile": "controlled-web-session-v2",
+                  "initialOutcome": "quiescent",
+                  "settledVirtualTimeNs": "5000000",
+                  "controlledOutcome": "quiescent",
+                  "controlledEventCount": "2",
+                  "controlledEventKinds": "animationend,animationstart",
+                  "controlledOwnedEventCount": "2",
+                  "controlledRuntimeFailures": "0",
+                  "controlledUnsupportedWork": "0",
+                  "controlledExternalIo": "0",
+                  "pendingAnimationEvents": "0",
+                  "finiteAnimations": "0",
+                  "infiniteAnimations": "0",
+                  "unsupportedAnimations": "0",
+                  "producerPending": "0",
+                  "producerTerminal": False,
+                  "scriptCreatedConstructorCount": "2",
+                  "scriptCreatedTrace": "script:0,0",
+                  "rejectedOutcome": "unsupported_work",
+                  "failureCode": "unsupported_clock_surface",
+                  "unsupportedKind": "other",
+                  "unsupportedCount": "1",
+                  "unsupportedReason": "time_surface",
+                  "unsupportedTimeSurface": "host_timestamp",
+                  "evidenceProfile": "controlled-web-session-v2",
+                  "publicNonAuxiliaryControlledTarget": True,
+                  "sameControlledSession": True,
+                  "freshExactBinaryProcess": True,
+                  "managedRuntimeFallbackAccesses": "0",
+                  "exactBinaryLaunch": True,
+                  "closeResponseAndEof": True,
+              }
+              css_expected_fields = set(css_expected_fixed) | {
+                  "controlledEventCount", "controlledEventKinds",
+                  "controlledOwnedEventCount", "controlledDispatchTimeCount",
+                  "processedRenderingOpportunities",
+              }
+              event_count = (
+                  css_record.get("controlledEventCount", "")
+                  if type(css_record) is dict
+                  else ""
+              )
+              owned_event_count = (
+                  css_record.get("controlledOwnedEventCount", "")
+                  if type(css_record) is dict
+                  else ""
+              )
+              event_kinds = (
+                  css_record.get("controlledEventKinds", "").split(",")
+                  if type(css_record) is dict
+                  and isinstance(css_record.get("controlledEventKinds"), str)
+                  else []
+              )
+              allowed_event_kinds = {
+                  "animationcancel", "animationend", "animationiteration", "animationstart",
+              }
+              dispatch_times = (
+                  css_record.get("controlledDispatchTimeCount", "")
+                  if type(css_record) is dict
+                  else ""
+              )
+              rendering_opportunities = (
+                  css_record.get("processedRenderingOpportunities", "")
+                  if type(css_record) is dict
+                  else ""
+              )
+              if (
+                  type(css_record) is not dict
+                  or set(css_record) != css_expected_fields
+                  or any(
+                      type(css_record.get(key)) is not type(value)
+                      or css_record.get(key) != value
+                      for key, value in css_expected_fixed.items()
+                  )
+                  or not isinstance(event_count, str)
+                  or re.fullmatch(r"[1-9][0-9]*", event_count) is None
+                  or not 2 <= int(event_count) <= 4
+                  or owned_event_count != event_count
+                  or len(event_kinds) != int(event_count)
+                  or event_kinds != sorted(event_kinds)
+                  or len(set(event_kinds)) != len(event_kinds)
+                  or not set(event_kinds) <= allowed_event_kinds
+                  or "animationstart" not in event_kinds
+                  or "animationend" not in event_kinds
+                  or not isinstance(dispatch_times, str)
+                  or re.fullmatch(r"[1-9][0-9]*", dispatch_times) is None
+                  or int(dispatch_times) > int(event_count)
+                  or not isinstance(rendering_opportunities, str)
+                  or re.fullmatch(r"[1-9][0-9]*", rendering_opportunities) is None
+              ):
+                  raise SystemExit(
+                      f"{context} lost exact v2CssAnimationEventTimestamps evidence"
+                  )
 
           def hash_file(filename, algorithm):
               digest = hashlib.new(algorithm)
@@ -1137,7 +1347,7 @@ jobs:
           prepublish_run_attempt = os.environ["PREPUBLISH_RUN_ATTEMPT"]
           current_publish_attempt = os.environ["GITHUB_RUN_ATTEMPT"]
           binary_digest = os.environ["STASIS_NATIVE_BINARY_SHA256"]
-          if version != "0.2.1":
+          if version != "0.3.0":
               raise SystemExit("invalid staged SDK version")
           if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
               raise SystemExit("invalid staged SDK revision")
@@ -1191,7 +1401,7 @@ jobs:
               raise SystemExit("SDK gate proof size is outside the release limit")
           proof = strict_json_loads(proof_file.read_text(encoding="utf-8"), "SDK gate proof")
           expected_proof = {
-              "schema": 2,
+              "schema": 6,
               "gate": "sdk-act-settle-inspect",
               "package": f"@oxhq/stasis@{version}",
               "revision": revision,
@@ -1209,7 +1419,16 @@ jobs:
               "tarball": {"name": package_name, "sha256": sha256, "integrity": sha512},
               "nativeBinarySha256": binary_digest,
           }
-          if not isinstance(proof, dict) or set(proof) != set(expected_proof) | {"gateLogSha256"}:
+          if (
+              not isinstance(proof, dict)
+              or set(proof)
+                  != set(expected_proof) | {
+                      "gateLogSha256", "v2MessageChannel", "v2DirectDataSvg",
+                      "v2InlineSvgRendering", "v2InputMethodFocus",
+                      "v2AutomationEventTimestamps",
+                      "v2CssAnimationEventTimestamps",
+                  }
+          ):
               raise SystemExit("staged SDK proof schema changed")
           if type(proof.get("schema")) is not int:
               raise SystemExit("staged SDK proof schema type changed")
@@ -1223,6 +1442,63 @@ jobs:
           for key, value in expected_proof.items():
               if proof.get(key) != value:
                   raise SystemExit(f"staged SDK proof field changed: {key}")
+          v2_message_channel = proof.get("v2MessageChannel")
+          expected_v2_message_channel_fields = {
+              "profile", "idleOutcome", "idleMessagePortSources", "idleRuntimeFailures",
+              "bufferActionRotatedStateToken", "pendingPreservedBufferedStateToken",
+              "pendingMessagePortSources", "pendingRuntimeFailures",
+              "startActionRotatedStateToken", "drainedOutcome",
+              "drainedMessagePortSources", "drainedRuntimeFailures",
+              "aggregateProcessedOrdinaryTasks", "trace", "evidenceProfile",
+              "unsupportedWork", "exactBinaryLaunch", "closeResponseAndEof",
+          }
+          expected_v2_message_channel_fixed = {
+              "profile": "controlled-web-session-v2",
+              "idleOutcome": "quiescent",
+              "idleMessagePortSources": "0",
+              "idleRuntimeFailures": "0",
+              "bufferActionRotatedStateToken": True,
+              "pendingPreservedBufferedStateToken": True,
+              "pendingMessagePortSources": "1",
+              "pendingRuntimeFailures": "0",
+              "startActionRotatedStateToken": True,
+              "drainedOutcome": "quiescent",
+              "drainedMessagePortSources": "0",
+              "drainedRuntimeFailures": "0",
+              "trace": "callback1>microtask1>callback2>microtask2",
+              "evidenceProfile": "controlled-web-session-v2",
+              "unsupportedWork": "0",
+              "exactBinaryLaunch": True,
+              "closeResponseAndEof": True,
+          }
+          aggregate_tasks = (
+              v2_message_channel.get("aggregateProcessedOrdinaryTasks", "")
+              if isinstance(v2_message_channel, dict)
+              else ""
+          )
+          if (
+              not isinstance(v2_message_channel, dict)
+              or set(v2_message_channel) != expected_v2_message_channel_fields
+              or any(
+                  v2_message_channel.get(key) != value
+                  for key, value in expected_v2_message_channel_fixed.items()
+              )
+              or any(
+                  v2_message_channel.get(key) is not True
+                  for key in (
+                      "bufferActionRotatedStateToken",
+                      "pendingPreservedBufferedStateToken",
+                      "startActionRotatedStateToken",
+                      "exactBinaryLaunch",
+                      "closeResponseAndEof",
+                  )
+              )
+              or not isinstance(aggregate_tasks, str)
+              or re.fullmatch(r"(?:0|[1-9][0-9]*)", aggregate_tasks) is None
+              or int(aggregate_tasks) < 2
+          ):
+              raise SystemExit("staged SDK proof lost exact v2 MessageChannel evidence")
+          require_exact_v2_fixture_proofs(proof, "staged SDK proof")
           proof_log_digest = proof.get("gateLogSha256")
           if (
               not isinstance(proof_log_digest, str)
@@ -1245,7 +1521,13 @@ jobs:
           }
           if (
               not isinstance(prepublish_proof, dict)
-              or set(prepublish_proof) != set(expected_prepublish_proof) | {"gateLogSha256"}
+              or set(prepublish_proof)
+                  != set(expected_prepublish_proof) | {
+                      "gateLogSha256", "v2MessageChannel", "v2DirectDataSvg",
+                      "v2InlineSvgRendering", "v2InputMethodFocus",
+                      "v2AutomationEventTimestamps",
+                      "v2CssAnimationEventTimestamps",
+                  }
               or type(prepublish_proof.get("schema")) is not int
           ):
               raise SystemExit("prepublish SDK proof schema changed")
@@ -1262,6 +1544,35 @@ jobs:
           for key, value in expected_prepublish_proof.items():
               if prepublish_proof.get(key) != value:
                   raise SystemExit(f"prepublish SDK proof field changed: {key}")
+          prepublish_v2_message_channel = prepublish_proof.get("v2MessageChannel")
+          prepublish_aggregate_tasks = (
+              prepublish_v2_message_channel.get("aggregateProcessedOrdinaryTasks", "")
+              if isinstance(prepublish_v2_message_channel, dict)
+              else ""
+          )
+          if (
+              not isinstance(prepublish_v2_message_channel, dict)
+              or set(prepublish_v2_message_channel) != expected_v2_message_channel_fields
+              or any(
+                  prepublish_v2_message_channel.get(key) != value
+                  for key, value in expected_v2_message_channel_fixed.items()
+              )
+              or any(
+                  prepublish_v2_message_channel.get(key) is not True
+                  for key in (
+                      "bufferActionRotatedStateToken",
+                      "pendingPreservedBufferedStateToken",
+                      "startActionRotatedStateToken",
+                      "exactBinaryLaunch",
+                      "closeResponseAndEof",
+                  )
+              )
+              or not isinstance(prepublish_aggregate_tasks, str)
+              or re.fullmatch(r"(?:0|[1-9][0-9]*)", prepublish_aggregate_tasks) is None
+              or int(prepublish_aggregate_tasks) < 2
+          ):
+              raise SystemExit("prepublish SDK proof lost exact v2 MessageChannel evidence")
+          require_exact_v2_fixture_proofs(prepublish_proof, "prepublish SDK proof")
           prepublish_log_size = prepublish_log_file.stat().st_size
           if prepublish_log_size <= 0 or prepublish_log_size > 8 * 1024 * 1024:
               raise SystemExit("prepublish SDK gate log size is outside the release limit")
@@ -1421,7 +1732,25 @@ jobs:
           expected_gate_fields = {
               "gate", "package", "revision", "source", "tarball", "binary",
               "binarySha256", "virtualElapsedNs", "wallElapsedMs", "closeResponseAndEof",
+              "v2MessageChannel", "v2DirectDataSvg", "v2InlineSvgRendering",
+              "v2InputMethodFocus", "v2AutomationEventTimestamps",
+              "v2CssAnimationEventTimestamps",
           }
+          v2_message_channel = gate_record.get("v2MessageChannel")
+          expected_v2_message_channel_fields = {
+              "profile", "idleOutcome", "idleMessagePortSources", "idleRuntimeFailures",
+              "bufferActionRotatedStateToken", "pendingPreservedBufferedStateToken",
+              "pendingMessagePortSources", "pendingRuntimeFailures",
+              "startActionRotatedStateToken", "drainedOutcome",
+              "drainedMessagePortSources", "drainedRuntimeFailures",
+              "aggregateProcessedOrdinaryTasks", "trace", "evidenceProfile",
+              "unsupportedWork", "exactBinaryLaunch", "closeResponseAndEof",
+          }
+          aggregate_tasks = (
+              v2_message_channel.get("aggregateProcessedOrdinaryTasks", "")
+              if isinstance(v2_message_channel, dict)
+              else ""
+          )
           if (
               set(gate_record) != expected_gate_fields
               or gate_record.get("package") != f"@oxhq/stasis@{version}"
@@ -1441,8 +1770,43 @@ jobs:
               or not math.isfinite(wall_elapsed)
               or wall_elapsed < 0
               or wall_elapsed >= 8_000
+              or not isinstance(v2_message_channel, dict)
+              or set(v2_message_channel) != expected_v2_message_channel_fields
+              or v2_message_channel.get("profile") != "controlled-web-session-v2"
+              or v2_message_channel.get("idleOutcome") != "quiescent"
+              or v2_message_channel.get("idleMessagePortSources") != "0"
+              or v2_message_channel.get("idleRuntimeFailures") != "0"
+              or v2_message_channel.get("bufferActionRotatedStateToken") is not True
+              or v2_message_channel.get("pendingPreservedBufferedStateToken") is not True
+              or v2_message_channel.get("pendingMessagePortSources") != "1"
+              or v2_message_channel.get("pendingRuntimeFailures") != "0"
+              or v2_message_channel.get("startActionRotatedStateToken") is not True
+              or v2_message_channel.get("drainedOutcome") != "quiescent"
+              or v2_message_channel.get("drainedMessagePortSources") != "0"
+              or v2_message_channel.get("drainedRuntimeFailures") != "0"
+              or not isinstance(aggregate_tasks, str)
+              or re.fullmatch(r"(?:0|[1-9][0-9]*)", aggregate_tasks) is None
+              or int(aggregate_tasks) < 2
+              or v2_message_channel.get("trace")
+                  != "callback1>microtask1>callback2>microtask2"
+              or v2_message_channel.get("evidenceProfile") != "controlled-web-session-v2"
+              or v2_message_channel.get("unsupportedWork") != "0"
+              or v2_message_channel.get("exactBinaryLaunch") is not True
+              or v2_message_channel.get("closeResponseAndEof") is not True
           ):
               raise SystemExit("prepublish SDK gate record does not prove the selected artifacts")
+          require_exact_v2_fixture_proofs(gate_record, "prepublish SDK gate record")
+          if prepublish_v2_message_channel != v2_message_channel:
+              raise SystemExit("prepublish SDK proof v2 evidence differs from its raw gate log")
+          for field in (
+              "v2DirectDataSvg", "v2InlineSvgRendering", "v2InputMethodFocus",
+              "v2AutomationEventTimestamps",
+              "v2CssAnimationEventTimestamps",
+          ):
+              if prepublish_proof.get(field) != gate_record.get(field):
+                  raise SystemExit(
+                      f"prepublish SDK proof {field} evidence differs from its raw gate log"
+                  )
           PY
           provenance_subjects=(
             "verified-sdk/oxhq-stasis-${STASIS_VERSION}.tgz"
@@ -2680,6 +3044,12 @@ jobs:
           "${gate_runner[@]}" node etc/ci/stasis/verify_registry_sdk.mjs \
             --binary "$RUNNER_TEMP/stasis-registry-release/$STASIS_BUNDLE/stasis" \
             --fixture ports/stasis/tests/fixtures/timer_10s.html \
+            --session-v2-fixture ports/stasis/tests/fixtures/message_channel_buffered.html \
+            --session-v2-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_data_svg.html \
+            --session-v2-inline-svg-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg.html \
+            --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
+            --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
+            --session-v2-css-animation-event-fixture ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html \
             --consumer-root "$consumer" \
             --package "${registry_packages[0]}" \
             --revision "$STASIS_REVISION" \

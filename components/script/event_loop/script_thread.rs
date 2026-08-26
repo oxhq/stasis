@@ -65,9 +65,10 @@ use embedder_traits::document_pending::{
 };
 use embedder_traits::user_contents::{UserContentManagerId, UserContents, UserScript};
 use embedder_traits::{
-    DocumentControlProfile, EmbedderControlId, EmbedderControlResponse, EmbedderMsg,
-    FocusSequenceNumber, InputEventOutcome, JavaScriptEvaluationError, JavaScriptEvaluationId,
-    MediaSessionActionType, ScriptToEmbedderChan, Theme, ViewportDetails, WebDriverScriptCommand,
+    DocumentControlProfile, DocumentExecutionProfile, EmbedderControlId, EmbedderControlResponse,
+    EmbedderMsg, FocusSequenceNumber, InputEventOutcome, JavaScriptEvaluationError,
+    JavaScriptEvaluationId, MediaSessionActionType, ScriptToEmbedderChan, Theme, ViewportDetails,
+    WebDriverScriptCommand,
 };
 use encoding_rs::Encoding;
 use fonts::{FontContext, SystemFontServiceProxy, WebFontLoadEvent};
@@ -136,8 +137,9 @@ use stylo_atoms::Atom;
 use timers::{
     DetachedTimerEvent, DocumentClock, DocumentClockError, DocumentExecutionLedger,
     DocumentExecutionLimits, DocumentProducerCheckpoint, DocumentProducerFence,
-    DocumentProducerObserver, DocumentTime, DocumentTimeSurface, TimerControlError,
-    TimerDeadlineSnapshot, TimerEventRequest, TimerId, TimerScheduler,
+    DocumentProducerGuard, DocumentProducerKind, DocumentProducerObserver, DocumentTime,
+    DocumentTimeSurface, TimerControlError, TimerDeadlineSnapshot, TimerEventRequest, TimerId,
+    TimerScheduler,
 };
 use url::Position;
 #[cfg(feature = "webgpu")]
@@ -174,7 +176,7 @@ use crate::dom::servoparser::{ParserContext, ServoParser};
 use crate::dom::types::DebuggerGlobalScope;
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
-use crate::dom::window::Window;
+use crate::dom::window::{ImageCallbackDelivery, Window};
 use crate::dom::windowproxy::{CreatorBrowsingContextInfo, WindowProxy};
 use crate::event_loop::document_collection::DocumentCollection;
 use crate::event_loop::document_loader::DocumentLoader;
@@ -193,8 +195,9 @@ use crate::event_loop::svg_font::SvgFontResolver;
 use crate::fetch::fetch::FetchCanceller;
 use crate::fetch::network_listener::{FetchResponseListener, submit_timing};
 use crate::messaging::{
-    CommonScriptMsg, ControlledMessage, DocumentControlWaitResult, MainThreadScriptMsg,
-    MixedMessage, ScriptEventLoopSender, ScriptThreadReceivers, ScriptThreadSenders,
+    CommonScriptMsg, ControlledMessage, DocumentControlWaitResult, ImageCacheMessage,
+    MainThreadScriptMsg, MixedMessage, ScriptEventLoopSender, ScriptThreadReceivers,
+    ScriptThreadSenders,
 };
 use crate::microtask::{MicrotaskQueue, MicrotaskRunnable};
 use crate::mime::{APPLICATION, CHARSET, MimeExt, TEXT, XML};
@@ -639,10 +642,51 @@ fn controlled_event_consumes_ordinary_task_budget(event: &MixedMessage) -> bool 
     // actual timer task. Host animation ticks are ignored by a controlled document clock.
     !matches!(
         event,
-        MixedMessage::TimerFired
-            | MixedMessage::FromScript(MainThreadScriptMsg::Inactive | MainThreadScriptMsg::WakeUp)
-            | MixedMessage::FromConstellation(ScriptThreadMessage::TickAllAnimations(_))
+        MixedMessage::TimerFired |
+            MixedMessage::FromScript(MainThreadScriptMsg::Inactive | MainThreadScriptMsg::WakeUp) |
+            MixedMessage::FromConstellation(ScriptThreadMessage::TickAllAnimations(_))
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlledImageDeliveryTarget {
+    Live,
+    Retired,
+    Unknown,
+}
+
+fn controlled_image_delivery_target(
+    window_present: bool,
+    pipeline_tombstoned: bool,
+) -> ControlledImageDeliveryTarget {
+    match (window_present, pipeline_tombstoned) {
+        (true, false) => ControlledImageDeliveryTarget::Live,
+        (false, true) => ControlledImageDeliveryTarget::Retired,
+        (true, true) | (false, false) => ControlledImageDeliveryTarget::Unknown,
+    }
+}
+
+struct ControlledImageMessageCompletion {
+    guard: Option<DocumentProducerGuard>,
+}
+
+impl ControlledImageMessageCompletion {
+    fn new(guard: Option<DocumentProducerGuard>) -> Self {
+        Self { guard }
+    }
+}
+
+impl Drop for ControlledImageMessageCompletion {
+    fn drop(&mut self) {
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
+        if std::thread::panicking() {
+            let _ = guard.abandon();
+        } else {
+            drop(guard);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -706,19 +750,19 @@ fn initial_pipeline_bootstrap_pipeline(
         [pipeline_id] => *pipeline_id,
         _ => return None,
     };
-    (target.active_top_level.is_none()
-        && target.fully_active_pipelines().is_empty()
-        && only_pipeline == facts.pipeline_id
-        && only_pending == facts.pipeline_id
-        && facts.webview_id == target.webview_id
-        && facts.browsing_context_id == target.webview_id
-        && facts.parent_pipeline_id.is_none()
-        && facts.local_document_count == 0
-        && facts.local_incomplete_load_count == 0
-        && facts.local_parser_context_count == 0
-        && facts.is_http_or_https
-        && !facts.has_javascript_result
-        && !facts.has_srcdoc)
+    (target.active_top_level.is_none() &&
+        target.fully_active_pipelines().is_empty() &&
+        only_pipeline == facts.pipeline_id &&
+        only_pending == facts.pipeline_id &&
+        facts.webview_id == target.webview_id &&
+        facts.browsing_context_id == target.webview_id &&
+        facts.parent_pipeline_id.is_none() &&
+        facts.local_document_count == 0 &&
+        facts.local_incomplete_load_count == 0 &&
+        facts.local_parser_context_count == 0 &&
+        facts.is_http_or_https &&
+        !facts.has_javascript_result &&
+        !facts.has_srcdoc)
         .then_some(facts.pipeline_id)
 }
 
@@ -732,23 +776,23 @@ fn replacement_pipeline_bootstrap_pipeline(
         [pipeline_id] => *pipeline_id,
         _ => return None,
     };
-    (facts.source_pipeline_id != facts.pipeline_id
-        && active.pipeline_id == facts.source_pipeline_id
-        && target.pipelines().len() == 2
-        && target.contains_pipeline(facts.source_pipeline_id)
-        && target.contains_pipeline(facts.pipeline_id)
-        && target.fully_active_pipelines() == [facts.source_pipeline_id]
-        && only_pending == facts.pipeline_id
-        && facts.webview_id == target.webview_id
-        && facts.browsing_context_id == target.webview_id
-        && facts.parent_pipeline_id.is_none()
-        && facts.local_document_pipeline_id == Some(facts.source_pipeline_id)
-        && facts.local_document_count == 1
-        && facts.local_incomplete_load_count == 0
-        && facts.local_parser_context_count == 0
-        && facts.is_http_or_https
-        && !facts.has_javascript_result
-        && !facts.has_srcdoc)
+    (facts.source_pipeline_id != facts.pipeline_id &&
+        active.pipeline_id == facts.source_pipeline_id &&
+        target.pipelines().len() == 2 &&
+        target.contains_pipeline(facts.source_pipeline_id) &&
+        target.contains_pipeline(facts.pipeline_id) &&
+        target.fully_active_pipelines() == [facts.source_pipeline_id] &&
+        only_pending == facts.pipeline_id &&
+        facts.webview_id == target.webview_id &&
+        facts.browsing_context_id == target.webview_id &&
+        facts.parent_pipeline_id.is_none() &&
+        facts.local_document_pipeline_id == Some(facts.source_pipeline_id) &&
+        facts.local_document_count == 1 &&
+        facts.local_incomplete_load_count == 0 &&
+        facts.local_parser_context_count == 0 &&
+        facts.is_http_or_https &&
+        !facts.has_javascript_result &&
+        !facts.has_srcdoc)
         .then_some(facts.pipeline_id)
 }
 
@@ -763,41 +807,41 @@ fn initial_pipeline_activation_pipeline(
         [pipeline_id] => *pipeline_id,
         _ => return None,
     };
-    let exact_initial_target = target.active_top_level.is_none()
-        && target.pipelines() == [facts.pipeline_id]
-        && target.fully_active_pipelines().is_empty()
-        && facts.local_document_pipeline_id.is_none()
-        && facts.local_document_count == 0;
+    let exact_initial_target = target.active_top_level.is_none() &&
+        target.pipelines() == [facts.pipeline_id] &&
+        target.fully_active_pipelines().is_empty() &&
+        facts.local_document_pipeline_id.is_none() &&
+        facts.local_document_count == 0;
     let exact_replacement_target = target.active_top_level.is_some_and(|active| {
-        active.pipeline_id != facts.pipeline_id
-            && facts.local_document_pipeline_id == Some(active.pipeline_id)
-            && target.pipelines().len() == 2
-            && target.contains_pipeline(active.pipeline_id)
-            && target.contains_pipeline(facts.pipeline_id)
-            && target.fully_active_pipelines() == [active.pipeline_id]
-            && facts.local_document_count == 1
+        active.pipeline_id != facts.pipeline_id &&
+            facts.local_document_pipeline_id == Some(active.pipeline_id) &&
+            target.pipelines().len() == 2 &&
+            target.contains_pipeline(active.pipeline_id) &&
+            target.contains_pipeline(facts.pipeline_id) &&
+            target.fully_active_pipelines() == [active.pipeline_id] &&
+            facts.local_document_count == 1
     });
-    ((exact_initial_target || exact_replacement_target)
-        && only_pending == facts.pipeline_id
-        && facts.webview_id == target.webview_id
-        && facts.browsing_context_id == target.webview_id
-        && facts.parent_pipeline_id.is_none()
-        && facts.local_incomplete_load_count == 1
-        && facts.local_parser_context_count == 1
-        && facts.parser_pipeline_id == Some(facts.pipeline_id)
-        && facts.is_http_or_https
-        && !facts.has_javascript_result
-        && !facts.has_srcdoc
-        && facts.response_will_activate)
+    ((exact_initial_target || exact_replacement_target) &&
+        only_pending == facts.pipeline_id &&
+        facts.webview_id == target.webview_id &&
+        facts.browsing_context_id == target.webview_id &&
+        facts.parent_pipeline_id.is_none() &&
+        facts.local_incomplete_load_count == 1 &&
+        facts.local_parser_context_count == 1 &&
+        facts.parser_pipeline_id == Some(facts.pipeline_id) &&
+        facts.is_http_or_https &&
+        !facts.has_javascript_result &&
+        !facts.has_srcdoc &&
+        facts.response_will_activate)
         .then_some(facts.pipeline_id)
 }
 
 fn is_pending_capture_error(error: &DocumentControlError) -> bool {
     matches!(
         error,
-        DocumentControlError::PendingFactUnavailable(_)
-            | DocumentControlError::PendingSnapshot(_)
-            | DocumentControlError::TargetChanged { .. }
+        DocumentControlError::PendingFactUnavailable(_) |
+            DocumentControlError::PendingSnapshot(_) |
+            DocumentControlError::TargetChanged { .. }
     )
 }
 
@@ -1023,8 +1067,8 @@ fn record_synchronous_navigation_emission(
             webview_id: captured_webview_id,
             pipeline_id: captured_pipeline_id,
             ..
-        }
-        | SynchronousNavigationEmissionCapture::Failed {
+        } |
+        SynchronousNavigationEmissionCapture::Failed {
             webview_id: captured_webview_id,
             pipeline_id: captured_pipeline_id,
             ..
@@ -1132,6 +1176,10 @@ pub struct ScriptThread {
     /// The immutable top-level document authority selected independently from the clock.
     #[no_trace]
     document_control_profile: DocumentControlProfile,
+
+    /// The immutable execution-surface policy selected independently from document authority.
+    #[no_trace]
+    document_execution_profile: DocumentExecutionProfile,
 
     /// Script-side pre-mutation mirror of Constellation's session history revision.
     controlled_session_history_revision: Cell<u64>,
@@ -1525,6 +1573,63 @@ impl ScriptThread {
         with_script_thread(|script_thread| script_thread.document_control_profile)
     }
 
+    /// Return the execution-surface policy for the current ScriptThread.
+    pub(crate) fn current_document_execution_profile() -> DocumentExecutionProfile {
+        with_script_thread(|script_thread| script_thread.document_execution_profile)
+    }
+
+    /// Whether `window` can be conservatively reconstructed as the sole fully-active,
+    /// non-auxiliary top-level Document currently retained by this controlled event loop.
+    ///
+    /// A ScriptThread profile is event-loop-wide, so checking it together with
+    /// `Window::is_top_level()` is not sufficient: an auxiliary WebView can share the same loop.
+    /// This intentionally denies timestamp authority whenever that singleton membership cannot
+    /// be reconstructed; it does not claim a separately retained Constellation target identity.
+    pub(crate) fn current_controlled_top_level_target_matches(window: &Window) -> bool {
+        with_script_thread(|script_thread| {
+            if script_thread.document_control_profile != DocumentControlProfile::TopLevelSession ||
+                script_thread.document_execution_profile !=
+                    DocumentExecutionProfile::ControlledWebSessionV2 ||
+                script_thread.controlled_input.is_none() ||
+                !window.is_top_level()
+            {
+                return false;
+            }
+
+            let Some(window_proxy) = window.undiscarded_window_proxy() else {
+                return false;
+            };
+            if window_proxy.is_auxiliary() {
+                return false;
+            }
+
+            let webview_id = window.webview_id();
+            let Some(state) = &script_thread.document_control_state else {
+                return false;
+            };
+            if state.borrow().pending.owner_snapshot(webview_id).is_err() ||
+                script_thread
+                    .incomplete_loads
+                    .borrow()
+                    .iter()
+                    .any(|load| load.webview_id != webview_id)
+            {
+                return false;
+            }
+
+            let documents = script_thread.documents.borrow();
+            let mut documents = documents.iter();
+            let Some((pipeline_id, document)) = documents.next() else {
+                return false;
+            };
+            documents.next().is_none() &&
+                pipeline_id == window.pipeline_id() &&
+                document.webview_id() == webview_id &&
+                document.is_fully_active() &&
+                std::ptr::eq(document.window(), window)
+        })
+    }
+
     /// Admit one same-document authority change before script-visible history mutation.
     pub(crate) fn admit_controlled_session_history_change() -> bool {
         with_script_thread(|script_thread| {
@@ -1577,9 +1682,9 @@ impl ScriptThread {
             } if captured_webview_id == webview_id && captured_pipeline_id == pipeline_id => {
                 Ok(emissions > 0)
             },
-            SynchronousNavigationEmissionCapture::Inactive
-            | SynchronousNavigationEmissionCapture::Active { .. }
-            | SynchronousNavigationEmissionCapture::Failed { .. } => Err(()),
+            SynchronousNavigationEmissionCapture::Inactive |
+            SynchronousNavigationEmissionCapture::Active { .. } |
+            SynchronousNavigationEmissionCapture::Failed { .. } => Err(()),
         }
     }
 
@@ -1901,6 +2006,7 @@ impl ScriptThread {
         // Every Window and timer queue on this event loop shares this one clock domain.
         let document_clock = DocumentClock::new(state.document_clock);
         let document_control_profile = state.document_control_profile;
+        let document_execution_profile = state.document_execution_profile;
         let document_execution_ledger = document_clock.is_controlled().then(|| {
             DocumentExecutionLedger::new(
                 document_clock.id(),
@@ -2044,6 +2150,7 @@ impl ScriptThread {
                     )),
                     document_clock,
                     document_control_profile,
+                    document_execution_profile,
                     controlled_session_history_revision: Cell::new(0),
                     controlled_automation_navigation_capture: Cell::new(
                         SynchronousNavigationEmissionCapture::Inactive,
@@ -2453,10 +2560,10 @@ impl ScriptThread {
             .iter()
             .any(|(_, document)| document.needs_rendering_update(no_gc));
         let running_animations = self.documents.borrow().iter().any(|(_, document)| {
-            document.is_fully_active()
-                && !document.window().throttled()
-                && (document.animations().running_animation_count() != 0
-                    || document.has_active_request_animation_frame_callbacks())
+            document.is_fully_active() &&
+                !document.window().throttled() &&
+                (document.animations().running_animation_count() != 0 ||
+                    document.has_active_request_animation_frame_callbacks())
         });
 
         // If we are not running animations and no rendering update is
@@ -2469,9 +2576,9 @@ impl ScriptThread {
         // If animations are running and a reflow in this event loop iteration
         // produced a display list, rely on the renderer to inform us of the
         // next animation tick / rendering opportunity.
-        if renderer_may_drive_rendering(&self.document_clock)
-            && running_animations
-            && built_any_display_lists
+        if renderer_may_drive_rendering(&self.document_clock) &&
+            running_animations &&
+            built_any_display_lists
         {
             return;
         }
@@ -2675,9 +2782,9 @@ impl ScriptThread {
 
         if matches!(
             &command,
-            DocumentControlCommand::DriveOneTurn
-                | DocumentControlCommand::BootstrapInitialPipeline { .. }
-                | DocumentControlCommand::BootstrapReplacementPipeline { .. }
+            DocumentControlCommand::DriveOneTurn |
+                DocumentControlCommand::BootstrapInitialPipeline { .. } |
+                DocumentControlCommand::BootstrapReplacementPipeline { .. }
         ) {
             self.task_queue.start_event_loop_iteration();
         }
@@ -2688,9 +2795,9 @@ impl ScriptThread {
 
         if let Err(error) = self.validate_controlled_route(&target) {
             let outcome = match &command {
-                DocumentControlCommand::DriveOneTurn
-                | DocumentControlCommand::BootstrapInitialPipeline { .. }
-                | DocumentControlCommand::BootstrapReplacementPipeline { .. }
+                DocumentControlCommand::DriveOneTurn |
+                DocumentControlCommand::BootstrapInitialPipeline { .. } |
+                DocumentControlCommand::BootstrapReplacementPipeline { .. }
                     if is_pending_capture_error(&error) =>
                 {
                     DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate {
@@ -2705,8 +2812,8 @@ impl ScriptThread {
                     }
                 },
                 DocumentControlCommand::Automate(request)
-                    if DocumentControlAutomationKind::from_request(request).is_mutating()
-                        && is_pending_capture_error(&error) =>
+                    if DocumentControlAutomationKind::from_request(request).is_mutating() &&
+                        is_pending_capture_error(&error) =>
                 {
                     DocumentControlOutcome::AutomationOutcomeIndeterminate {
                         target: target.clone(),
@@ -2759,8 +2866,8 @@ impl ScriptThread {
                 }
                 true
             },
-            bootstrap @ (DocumentControlCommand::BootstrapInitialPipeline { .. }
-            | DocumentControlCommand::BootstrapReplacementPipeline { .. }) => {
+            bootstrap @ (DocumentControlCommand::BootstrapInitialPipeline { .. } |
+            DocumentControlCommand::BootstrapReplacementPipeline { .. }) => {
                 let (_pipeline_id, event_index, qualified, unavailable) = match bootstrap {
                     DocumentControlCommand::BootstrapInitialPipeline { pipeline_id } => (
                         pipeline_id,
@@ -3158,8 +3265,8 @@ impl ScriptThread {
             reject(DocumentControlError::Automation(error));
             return;
         }
-        if operation.is_mutating()
-            && pending
+        if operation.is_mutating() &&
+            pending
                 .execution
                 .is_some_and(|execution| execution.terminal.is_some())
         {
@@ -3195,21 +3302,43 @@ impl ScriptThread {
             return;
         }
 
-        let capture_synchronous_navigation = operation.is_mutating()
-            && self.document_control_profile == DocumentControlProfile::TopLevelSession;
-        if capture_synchronous_navigation
-            && self
-                .begin_synchronous_navigation_emission_capture(
-                    target.webview_id,
-                    active_pipeline.pipeline_id,
-                )
-                .is_err()
+        let synchronous_automation_event_time = if operation.is_mutating() &&
+            self.document_control_profile == DocumentControlProfile::TopLevelSession &&
+            self.document_execution_profile == DocumentExecutionProfile::ControlledWebSessionV2
+        {
+            match document
+                .window()
+                .sample_controlled_v2_document_performance_time()
+            {
+                Ok(sampled) => Some(sampled),
+                Err(error) => {
+                    reject(DocumentControlError::Clock(error));
+                    return;
+                },
+            }
+        } else {
+            None
+        };
+
+        let capture_synchronous_navigation = operation.is_mutating() &&
+            self.document_control_profile == DocumentControlProfile::TopLevelSession;
+        if capture_synchronous_navigation &&
+            self.begin_synchronous_navigation_emission_capture(
+                target.webview_id,
+                active_pipeline.pipeline_id,
+            )
+            .is_err()
         {
             indeterminate();
             return;
         }
 
         let execution = {
+            let _event_time_scope = synchronous_automation_event_time.map(|sampled| {
+                document
+                    .window()
+                    .begin_synchronous_automation_event_time(sampled)
+            });
             let mut realm = enter_auto_realm(cx, &*document);
             let cx = &mut realm.current_realm();
             execute_prevalidated_document_automation(cx, &document, &request)
@@ -3231,8 +3360,8 @@ impl ScriptThread {
         let result = match execution {
             Ok(result) => result,
             Err(error) => {
-                if synchronous_navigation_emitted
-                    || automation_error_may_follow_mutation(&request, &error)
+                if synchronous_navigation_emitted ||
+                    automation_error_may_follow_mutation(&request, &error)
                 {
                     indeterminate();
                 } else {
@@ -3441,21 +3570,21 @@ impl ScriptThread {
                 },
                 (
                     Some(_),
-                    DomTimerOuterWakeObservation::DeliveryHandoffInProgress
-                    | DomTimerOuterWakeObservation::Unbound,
-                )
-                | (
+                    DomTimerOuterWakeObservation::DeliveryHandoffInProgress |
+                    DomTimerOuterWakeObservation::Unbound,
+                ) |
+                (
                     None,
-                    DomTimerOuterWakeObservation::Scheduled(_)
-                    | DomTimerOuterWakeObservation::DeliveryHandoffInProgress
-                    | DomTimerOuterWakeObservation::DeliveryReady,
+                    DomTimerOuterWakeObservation::Scheduled(_) |
+                    DomTimerOuterWakeObservation::DeliveryHandoffInProgress |
+                    DomTimerOuterWakeObservation::DeliveryReady,
                 ) => return Err(unavailable()),
             };
 
             for timer in observation.timers {
                 let is_ordering_head = selected.is_some_and(|selected| {
-                    selected.handle == timer.handle
-                        && selected.creation_sequence == timer.creation_sequence
+                    selected.handle == timer.handle &&
+                        selected.creation_sequence == timer.creation_sequence
                 });
                 let (delivery_ready, outer_wake) = if is_ordering_head {
                     outer.ok_or_else(unavailable)?
@@ -3512,8 +3641,8 @@ impl ScriptThread {
                     outer_wake,
                 });
             }
-            if selected.is_some()
-                && !facts.iter().any(|timer| {
+            if selected.is_some() &&
+                !facts.iter().any(|timer| {
                     timer.identity.pipeline_id == pipeline_id && timer.is_ordering_head
                 })
             {
@@ -3534,6 +3663,7 @@ impl ScriptThread {
         (
             PendingRenderingObservation,
             Vec<PendingImageTimerTerminalObservation>,
+            usize,
         ),
         DocumentControlError,
     > {
@@ -3569,22 +3699,22 @@ impl ScriptThread {
 
         let mut pipelines = Vec::new();
         let mut image_terminals = Vec::new();
+        let mut controlled_image_work_items = 0usize;
         for (pipeline_id, document) in self.documents.borrow().iter() {
             if !target.contains_pipeline(pipeline_id) {
                 return Err(unavailable());
             }
             let rendering = document.pending_rendering_observation(no_gc);
             let eligibility = rendering.eligibility;
-            if rendering.animation_frames.callbacks_running
-                || eligibility.render_blocked
-                    != (rendering.render_blocking_elements != 0)
-                || eligibility.fully_active && eligibility.throttled
-                || eligibility.animation_tick_eligible
-                    != (eligibility.fully_active && !eligibility.throttled)
-                || eligibility.rendering_opportunity_eligible
-                    != (eligibility.fully_active
-                        && !eligibility.render_blocked
-                        && !rendering.canvas.waiting_on_canvas_image_updates)
+            if rendering.animation_frames.callbacks_running ||
+                eligibility.render_blocked != (rendering.render_blocking_elements != 0) ||
+                eligibility.fully_active && eligibility.throttled ||
+                eligibility.animation_tick_eligible !=
+                    (eligibility.fully_active && !eligibility.throttled) ||
+                eligibility.rendering_opportunity_eligible !=
+                    (eligibility.fully_active &&
+                        !eligibility.render_blocked &&
+                        !rendering.canvas.waiting_on_canvas_image_updates)
             {
                 return Err(unavailable());
             }
@@ -3663,15 +3793,37 @@ impl ScriptThread {
             if rendering
                 .canvas
                 .live_html_canvas_count
-                .checked_add(rendering.canvas.live_window_offscreen_canvas_count)
-                != Some(canvas_count)
+                .checked_add(rendering.canvas.live_window_offscreen_canvas_count) !=
+                Some(canvas_count)
             {
                 return Err(unavailable());
             }
             let nonanimated_images = document.window().pending_nonanimated_image_observation();
-            let pending_images = nonanimated_images
+            let retained_image_work = nonanimated_images
                 .retained_work_items
                 .ok_or(DocumentControlError::QueueLengthOverflow)?;
+            let controlled_image_work = nonanimated_images
+                .controlled_work_items
+                .ok_or(DocumentControlError::QueueLengthOverflow)?;
+            let unsupported_image_work = nonanimated_images
+                .unsupported_work_items
+                .ok_or(DocumentControlError::QueueLengthOverflow)?;
+            if !nonanimated_images.controlled_retained_record_inventory_matches ||
+                controlled_image_work.checked_add(unsupported_image_work) !=
+                    Some(retained_image_work)
+            {
+                return Err(unavailable());
+            }
+            controlled_image_work_items = controlled_image_work_items
+                .checked_add(controlled_image_work)
+                .ok_or(DocumentControlError::QueueLengthOverflow)?;
+            let pending_images = if self.document_execution_profile ==
+                DocumentExecutionProfile::ControlledWebSessionV2
+            {
+                unsupported_image_work
+            } else {
+                retained_image_work
+            };
 
             pipelines.push(PendingPipelineRenderingObservation {
                 pipeline_id,
@@ -3720,7 +3872,7 @@ impl ScriptThread {
         let rendering =
             PendingRenderingObservation::new(scheduled_opportunity, opportunity_ready, pipelines)
                 .map_err(DocumentControlError::PendingSnapshot)?;
-        Ok((rendering, image_terminals))
+        Ok((rendering, image_terminals, controlled_image_work_items))
     }
 
     /// Capture rooted active Document parsers. Pending top-level membership remains target
@@ -3861,7 +4013,7 @@ impl ScriptThread {
         )?;
         let (logical_timers, logical_timer_terminals) =
             Self::capture_controlled_logical_timers(logical_timer_owners, &scheduler)?;
-        let (rendering, image_terminals) =
+        let (rendering, image_terminals, controlled_image_work_items) =
             self.capture_controlled_rendering(target, &scheduler, no_gc)?;
         drop(scheduler);
         drop(input);
@@ -3968,6 +4120,19 @@ impl ScriptThread {
                     })?
             },
         };
+        if self.document_execution_profile == DocumentExecutionProfile::ControlledWebSessionV2 &&
+            producers.snapshot.terminal_error().is_none() &&
+            producers
+                .snapshot
+                .for_kind(DocumentProducerKind::Image)
+                .pending() <
+                u64::try_from(controlled_image_work_items)
+                    .map_err(|_| DocumentControlError::QueueLengthOverflow)?
+        {
+            return Err(DocumentControlError::PendingFactUnavailable(
+                DocumentPendingFact::Rendering,
+            ));
+        }
         let owner = state
             .pending
             .owner_snapshot(target.webview_id)
@@ -4424,8 +4589,8 @@ impl ScriptThread {
                     }
                     return ReplacementPipelineBootstrapWaitOutcome::Ready { event_index };
                 },
-                ReplacementPipelineBootstrapQueueState::Interrupted
-                | ReplacementPipelineBootstrapQueueState::Unavailable => {
+                ReplacementPipelineBootstrapQueueState::Interrupted |
+                ReplacementPipelineBootstrapQueueState::Unavailable => {
                     return ReplacementPipelineBootstrapWaitOutcome::Rejected(unavailable());
                 },
                 ReplacementPipelineBootstrapQueueState::InputRevisionOverflow => {
@@ -4572,9 +4737,9 @@ impl ScriptThread {
             .iter()
             .map(|(pipeline_id, _)| *pipeline_id)
             .collect::<Vec<_>>();
-        if document_ids != [pipeline_id]
-            || !self.incomplete_loads.borrow().is_empty()
-            || parser_context_ids != [pipeline_id]
+        if document_ids != [pipeline_id] ||
+            !self.incomplete_loads.borrow().is_empty() ||
+            parser_context_ids != [pipeline_id]
         {
             return Err(DocumentControlError::PendingFactUnavailable(
                 DocumentPendingFact::TargetMembership,
@@ -4610,9 +4775,9 @@ impl ScriptThread {
                 target_terminals,
                 command,
             } if (request_id, cancellation_id) == active => {
-                let authorized = matches!(command, DocumentControlCommand::DriveOneTurn)
-                    && target_terminals == *before_terminals
-                    && before.active_top_level.map_or_else(
+                let authorized = matches!(command, DocumentControlCommand::DriveOneTurn) &&
+                    target_terminals == *before_terminals &&
+                    before.active_top_level.map_or_else(
                         || {
                             is_exact_initial_pipeline_activation_transition(
                                 before,
@@ -4628,9 +4793,8 @@ impl ScriptThread {
                                 pipeline_id,
                             )
                         },
-                    )
-                    && self
-                        .validate_initial_pipeline_activation_local_target(&target, pipeline_id)
+                    ) &&
+                    self.validate_initial_pipeline_activation_local_target(&target, pipeline_id)
                         .is_ok();
                 if !authorized {
                     self.controlled_input
@@ -5450,9 +5614,9 @@ impl ScriptThread {
         };
         let task_duration = start.elapsed();
         for (doc_id, doc) in self.documents.borrow().iter() {
-            if let Some(pipeline_id) = pipeline_id
-                && pipeline_id == doc_id
-                && task_duration.as_nanos() > MAX_TASK_NS
+            if let Some(pipeline_id) = pipeline_id &&
+                pipeline_id == doc_id &&
+                task_duration.as_nanos() > MAX_TASK_NS
             {
                 if opts::get()
                     .debug
@@ -5640,9 +5804,9 @@ impl ScriptThread {
                     document.handle_no_longer_waiting_on_asynchronous_image_updates();
                 }
             },
-            msg @ ScriptThreadMessage::SpawnPipeline(..)
-            | msg @ ScriptThreadMessage::ExitFullScreen(..)
-            | msg @ ScriptThreadMessage::ExitScriptThread => {
+            msg @ ScriptThreadMessage::SpawnPipeline(..) |
+            msg @ ScriptThreadMessage::ExitFullScreen(..) |
+            msg @ ScriptThreadMessage::ExitScriptThread => {
                 panic!("should have handled {:?} already", msg)
             },
             ScriptThreadMessage::SetScrollStates(pipeline_id, scroll_states) => {
@@ -5790,8 +5954,8 @@ impl ScriptThread {
     fn handle_msg_from_script(&self, msg: MainThreadScriptMsg, cx: &mut js::context::JSContext) {
         match msg {
             MainThreadScriptMsg::Common(CommonScriptMsg::Task(_, task, pipeline_id, _)) => {
-                if self.document_producer_fence.is_some()
-                    && pipeline_id.is_some_and(|pipeline_id| {
+                if self.document_producer_fence.is_some() &&
+                    pipeline_id.is_some_and(|pipeline_id| {
                         self.closed_pipelines.borrow().contains(&pipeline_id)
                     })
                 {
@@ -5825,8 +5989,8 @@ impl ScriptThread {
                 response,
             } => {
                 let (message, producer_guard) = (*response).into_parts();
-                if self.document_producer_fence.is_some()
-                    && self.closed_pipelines.borrow().contains(&pipeline_id)
+                if self.document_producer_fence.is_some() &&
+                    self.closed_pipelines.borrow().contains(&pipeline_id)
                 {
                     // Controlled teardown establishes this tombstone before document destruction.
                     // A queued redirect must not resurrect network work for the closed pipeline.
@@ -6070,26 +6234,90 @@ impl ScriptThread {
 
     fn handle_msg_from_image_cache(
         &self,
-        response: ImageCacheResponseMessage,
+        transport: ImageCacheMessage,
         cx: &mut js::context::JSContext,
     ) {
-        match response {
+        let (response, delivery, message_guard) = match transport {
+            ImageCacheMessage::Baseline(response) => {
+                (response, ImageCallbackDelivery::Baseline, None)
+            },
+            ImageCacheMessage::ControlledV2(envelope) => {
+                let (response, guard) = envelope.into_parts();
+                let guard = guard.expect("controlled image transport requires an Image guard");
+                let pipeline_id = match &response {
+                    ImageCacheResponseMessage::NotifyPendingImageLoadStatus(response) => {
+                        response.pipeline_id
+                    },
+                    ImageCacheResponseMessage::VectorImageRasterizationComplete(response) => {
+                        response.pipeline_id
+                    },
+                };
+                let window = self.documents.borrow().find_window(pipeline_id);
+                let pipeline_tombstoned = self.closed_pipelines.borrow().contains(&pipeline_id);
+                let window =
+                    match controlled_image_delivery_target(window.is_some(), pipeline_tombstoned) {
+                        ControlledImageDeliveryTarget::Live => {
+                            window.expect("live controlled image delivery requires a Window")
+                        },
+                        ControlledImageDeliveryTarget::Retired => {
+                            // Pipeline teardown established the tombstone before removing this Window,
+                            // so the queued response has no remaining mutation target.
+                            drop(guard);
+                            return;
+                        },
+                        ControlledImageDeliveryTarget::Unknown => {
+                            // A missing untombstoned target or a live tombstoned target violates the
+                            // ScriptThread routing invariant and is not an owned cancellation.
+                            let _ = guard.abandon();
+                            return;
+                        },
+                    };
+                if self.document_control_profile != DocumentControlProfile::TopLevelSession ||
+                    self.document_execution_profile !=
+                        DocumentExecutionProfile::ControlledWebSessionV2 ||
+                    !Self::current_controlled_top_level_target_matches(&window)
+                {
+                    let _ = guard.abandon();
+                    return;
+                }
+                let Ok(completion_time) = window.sample_controlled_v2_document_performance_time()
+                else {
+                    let _ = guard.abandon();
+                    return;
+                };
+                (
+                    response,
+                    ImageCallbackDelivery::ControlledV2Fenced { completion_time },
+                    Some(guard),
+                )
+            },
+        };
+        let _message_completion = ControlledImageMessageCompletion::new(message_guard);
+
+        let _retained_pending_state = match response {
             ImageCacheResponseMessage::NotifyPendingImageLoadStatus(pending_image_response) => {
                 let window = self
                     .documents
                     .borrow()
                     .find_window(pending_image_response.pipeline_id);
                 if let Some(ref window) = window {
-                    window.pending_image_notification(pending_image_response, cx);
+                    window.pending_image_notification(pending_image_response, delivery, cx)
+                } else {
+                    Ok(())
                 }
             },
             ImageCacheResponseMessage::VectorImageRasterizationComplete(response) => {
                 let window = self.documents.borrow().find_window(response.pipeline_id);
                 if let Some(ref window) = window {
-                    window.handle_image_rasterization_complete_notification(cx.no_gc(), response);
+                    window.handle_image_rasterization_complete_notification(response, delivery, cx)
+                } else {
+                    Ok(())
                 }
             },
         };
+        // Delivery reached the owning event loop. A handler `Err` preserves the rejected
+        // provenance/key in Window's pending collections, where settlement reports it as typed
+        // unsupported work. It is not a lost producer handoff.
     }
 
     fn handle_webdriver_msg(
@@ -7847,12 +8075,12 @@ impl ScriptThread {
             .1
             .process_response(cx, request_id, fetch_metadata);
 
-        if self.document_producer_fence.is_some()
-            && incomplete_parser_contexts[parser_index]
+        if self.document_producer_fence.is_some() &&
+            incomplete_parser_contexts[parser_index]
                 .1
                 .get_document()
-                .is_none()
-            && !self
+                .is_none() &&
+            !self
                 .incomplete_loads
                 .borrow()
                 .iter()
@@ -7903,8 +8131,8 @@ impl ScriptThread {
             // we need to register an iframe entry to the performance timeline if present
             if let Some(window_proxy) = context
                 .get_document()
-                .and_then(|document| document.browsing_context())
-                && let Some(frame_element) = window_proxy.frame_element()
+                .and_then(|document| document.browsing_context()) &&
+                let Some(frame_element) = window_proxy.frame_element()
             {
                 let iframe_ctx = IframeContext::new(
                     frame_element
@@ -8131,8 +8359,8 @@ impl ScriptThread {
             return;
         };
 
-        if let Some(window) = self.documents.borrow().find_window(pipeline_id)
-            && window.live_devtools_updates()
+        if let Some(window) = self.documents.borrow().find_window(pipeline_id) &&
+            window.live_devtools_updates()
         {
             let css_error = CSSError {
                 filename,
@@ -8442,6 +8670,62 @@ impl Drop for ScriptThread {
         SCRIPT_THREAD_ROOT.with(|root| {
             root.set(None);
         });
+    }
+}
+
+#[cfg(test)]
+mod controlled_image_delivery_tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use timers::{DocumentProducerFence, DocumentProducerFenceError, DocumentProducerKind};
+
+    use super::{
+        ControlledImageDeliveryTarget, ControlledImageMessageCompletion,
+        controlled_image_delivery_target,
+    };
+
+    #[test]
+    fn image_delivery_completes_only_live_or_proven_retired_targets() {
+        assert_eq!(
+            controlled_image_delivery_target(true, false),
+            ControlledImageDeliveryTarget::Live
+        );
+        assert_eq!(
+            controlled_image_delivery_target(false, true),
+            ControlledImageDeliveryTarget::Retired
+        );
+        assert_eq!(
+            controlled_image_delivery_target(false, false),
+            ControlledImageDeliveryTarget::Unknown
+        );
+        assert_eq!(
+            controlled_image_delivery_target(true, true),
+            ControlledImageDeliveryTarget::Unknown
+        );
+    }
+
+    #[test]
+    fn image_handler_unwind_abandons_while_normal_return_completes() {
+        let completed = DocumentProducerFence::default();
+        drop(ControlledImageMessageCompletion::new(Some(
+            completed.begin(DocumentProducerKind::Image).unwrap(),
+        )));
+        assert!(completed.snapshot().is_empty());
+        assert_eq!(completed.snapshot().terminal_error(), None);
+
+        let abandoned = DocumentProducerFence::default();
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let _completion = ControlledImageMessageCompletion::new(Some(
+                abandoned.begin(DocumentProducerKind::Image).unwrap(),
+            ));
+            panic!("synthetic image handler panic");
+        }));
+        assert!(unwind.is_err());
+        assert!(matches!(
+            abandoned.snapshot().terminal_error(),
+            Some(DocumentProducerFenceError::ProducerAbandoned(lease_id))
+                if lease_id.kind() == DocumentProducerKind::Image
+        ));
     }
 }
 

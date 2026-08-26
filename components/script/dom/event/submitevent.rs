@@ -40,7 +40,11 @@ impl SubmitEvent {
         cancelable: bool,
         submitter: Option<&HTMLElement>,
     ) -> DomRoot<SubmitEvent> {
-        Self::new_with_proto(cx, window, None, type_, bubbles, cancelable, submitter)
+        let event = Self::new_with_proto(cx, window, None, type_, bubbles, cancelable, submitter);
+        if let Some(time_stamp) = window.synchronous_automation_event_time() {
+            event.upcast::<Event>().set_creation_time_stamp(time_stamp);
+        }
+        event
     }
 
     fn new_with_proto(

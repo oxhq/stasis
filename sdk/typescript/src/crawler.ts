@@ -9,6 +9,11 @@ import type {
   SettlePolicy,
 } from "./types.js";
 import { StasisAbortError } from "./errors.js";
+import {
+  CONTROLLED_WEB_SESSION_V2_PROFILE,
+  type SelectableSessionProfile,
+  type SessionSupportProfile,
+} from "./profile.js";
 import type {
   SessionAcquireOptions,
   StasisSessionRequest,
@@ -59,7 +64,7 @@ export interface ReferenceCrawlerSession {
 export interface ReferenceCrawlerPool<SessionType extends ReferenceCrawlerSession> {
   readonly maxProcesses: number;
   run<Result>(
-    request: StasisSessionRequest,
+    request: StasisSessionRequest<SelectableSessionProfile>,
     callback: (session: SessionType) => Result | Promise<Result>,
     options?: SessionAcquireOptions,
   ): Promise<Result>;
@@ -75,6 +80,8 @@ export interface ReferenceCrawlerOptions {
    * Without this list, the crawl is strictly same-origin.
    */
   readonly allowedOrigins?: readonly (string | URL)[];
+  /** Defaults to controlled-web-session-v1; candidate profiles require explicit selection. */
+  readonly profile?: SelectableSessionProfile;
   /** Imported into every fresh session before its first request. */
   readonly state?: SessionState;
   /** Use fixtures_only for a cross-run reproducible crawl. */
@@ -196,13 +203,29 @@ async function crawlOne<SessionType extends ReferenceCrawlerSession>(
   allowedOrigins: ReadonlySet<string>,
   options: ReferenceCrawlerOptions,
 ): Promise<CrawlPageResult> {
-  const openOptions: SessionOpenOptions = {
+  const sharedOpenOptions: SessionOpenOptions<SessionSupportProfile> = {
     ...(options.state === undefined ? {} : { state: options.state }),
     ...(options.network === undefined ? {} : { network: options.network }),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   };
+  const request: StasisSessionRequest<SelectableSessionProfile> =
+    options.profile === CONTROLLED_WEB_SESSION_V2_PROFILE
+      ? {
+          url: entry.url,
+          options: {
+            ...sharedOpenOptions,
+            profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+          },
+        }
+      : {
+          url: entry.url,
+          options: {
+            ...sharedOpenOptions,
+            ...(options.profile === undefined ? {} : { profile: options.profile }),
+          },
+        };
   return pool.run(
-    { url: entry.url, options: openOptions },
+    request,
     async (session) => {
       throwIfAborted(options.signal);
       const finalUrl = canonicalHttpUrl(session.url);

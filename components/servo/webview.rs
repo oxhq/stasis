@@ -17,12 +17,13 @@ use embedder_traits::document_control::{
 use embedder_traits::document_session::{SessionNavigationAuthority, SessionNavigationError};
 use embedder_traits::{
     ContextMenuAction, ContextMenuItem, Cursor, DocumentClockConfiguration, DocumentClockError,
-    DocumentControlProfile, DocumentControlProfileError, DocumentTimeSurface, EmbedderControlId,
-    EmbedderControlRequest, Image, InputEvent, InputEventAndId, InputEventId, JSValue,
-    JavaScriptEvaluationError, LoadStatus, MediaSessionActionType, NewWebViewDetails,
-    ScreenGeometry, ScreenshotCaptureError, Scroll, Theme, TraversalId, UrlRequest,
-    ViewportDetails, WebViewPoint, WebViewRect, validate_document_clock_configuration,
-    validate_document_control_profile,
+    DocumentControlProfile, DocumentControlProfileError, DocumentExecutionProfile,
+    DocumentExecutionProfileError, DocumentTimeSurface, EmbedderControlId, EmbedderControlRequest,
+    Image, InputEvent, InputEventAndId, InputEventId, JSValue, JavaScriptEvaluationError,
+    LoadStatus, MediaSessionActionType, NewWebViewDetails, ScreenGeometry, ScreenshotCaptureError,
+    Scroll, Theme, TraversalId, UrlRequest, ViewportDetails, WebViewPoint, WebViewRect,
+    validate_document_clock_configuration, validate_document_control_profile,
+    validate_document_execution_profile,
 };
 use euclid::{Scale, Size2D};
 use image::RgbaImage;
@@ -130,6 +131,7 @@ pub(crate) struct WebViewInner {
     user_content_manager: Option<Rc<UserContentManager>>,
     document_clock: ValidatedDocumentClockConfiguration,
     document_control_profile: DocumentControlProfile,
+    document_execution_profile: DocumentExecutionProfile,
     controlled_network_session: Option<ControlledNetworkSession>,
     /// Active top-level site for controlled cookie policy. Before the first history commit this is
     /// the builder URL, so a cross-site initial redirect cannot redefine its own cookie context.
@@ -172,6 +174,24 @@ impl ValidatedDocumentClockConfiguration {
     }
 }
 
+fn validate_webview_builder_profiles(
+    document_clock: DocumentClockConfiguration,
+    document_control_profile: DocumentControlProfile,
+    document_execution_profile: DocumentExecutionProfile,
+) -> Result<(), UnpublishedWebViewInitializationError> {
+    if validate_document_control_profile(document_control_profile, document_clock).is_err()
+        || validate_document_execution_profile(
+            document_execution_profile,
+            document_clock,
+            document_control_profile,
+        )
+        .is_err()
+    {
+        return Err(UnpublishedWebViewInitializationError::InvalidConfiguration);
+    }
+    Ok(())
+}
+
 impl Drop for WebViewInner {
     fn drop(&mut self) {
         self.servo
@@ -191,6 +211,16 @@ impl WebView {
     fn new_checked(
         mut builder: WebViewBuilder,
     ) -> Result<Self, UnpublishedWebViewInitializationError> {
+        // Revalidate the composed builder at the publication boundary. Individual setters are
+        // checked when called, but callers may invoke them in another order after selecting an
+        // execution profile. No invalid combination may reach the initializer or register paint
+        // state merely because each intermediate configuration was valid on its own.
+        validate_webview_builder_profiles(
+            builder.document_clock.get(),
+            builder.document_control_profile,
+            builder.document_execution_profile,
+        )?;
+
         let servo = builder.servo;
         let painter_id = servo
             .paint_mut()
@@ -231,6 +261,7 @@ impl WebView {
             user_content_manager: builder.user_content_manager.clone(),
             document_clock: builder.document_clock,
             document_control_profile: builder.document_control_profile,
+            document_execution_profile: builder.document_execution_profile,
             controlled_network_session: builder.controlled_network_session,
             controlled_cookie_top_level_url: builder.url.clone(),
             next_document_control_cancellation_id: 0,
@@ -260,6 +291,7 @@ impl WebView {
             user_content_manager_id,
             document_clock: builder.document_clock.get(),
             document_control_profile: builder.document_control_profile,
+            document_execution_profile: builder.document_execution_profile,
         };
 
         // There are two possibilities here. Either the WebView is a new toplevel
@@ -306,6 +338,7 @@ impl WebView {
             responder: IpcResponder::new(response_sender, None),
             document_clock: self.inner().document_clock,
             document_control_profile: self.inner().document_control_profile,
+            document_execution_profile: self.inner().document_execution_profile,
         };
         self.delegate().request_create_new(self.clone(), request);
     }
@@ -1228,6 +1261,8 @@ pub struct WebViewBuilder {
     document_clock_is_inherited: bool,
     document_control_profile: DocumentControlProfile,
     document_control_profile_is_inherited: bool,
+    document_execution_profile: DocumentExecutionProfile,
+    document_execution_profile_is_inherited: bool,
     controlled_network_session: Option<ControlledNetworkSession>,
     unpublished_initializer: Option<UnpublishedWebViewInitializer>,
     clipboard_delegate: Option<Rc<dyn ClipboardDelegate>>,
@@ -1253,6 +1288,8 @@ impl WebViewBuilder {
             document_clock_is_inherited: false,
             document_control_profile: DocumentControlProfile::SingleDocument,
             document_control_profile_is_inherited: false,
+            document_execution_profile: DocumentExecutionProfile::Baseline,
+            document_execution_profile_is_inherited: false,
             controlled_network_session: None,
             unpublished_initializer: None,
             clipboard_delegate: None,
@@ -1267,6 +1304,7 @@ impl WebViewBuilder {
         responder: IpcResponder<Option<NewWebViewDetails>>,
         document_clock: ValidatedDocumentClockConfiguration,
         document_control_profile: DocumentControlProfile,
+        document_execution_profile: DocumentExecutionProfile,
     ) -> Self {
         let mut builder = Self::new(servo, rendering_context);
         builder.create_new_webview_responder = Some(responder);
@@ -1274,6 +1312,8 @@ impl WebViewBuilder {
         builder.document_clock_is_inherited = true;
         builder.document_control_profile = document_control_profile;
         builder.document_control_profile_is_inherited = true;
+        builder.document_execution_profile = document_execution_profile;
+        builder.document_execution_profile_is_inherited = true;
         builder
     }
 
@@ -1362,6 +1402,31 @@ impl WebViewBuilder {
         }
         validate_document_control_profile(document_control_profile, self.document_clock.get())?;
         self.document_control_profile = document_control_profile;
+        Ok(self)
+    }
+
+    /// Select the immutable execution-surface policy before the initial navigation is sent.
+    ///
+    /// Ordinary WebViews and frozen Stasis v1 profiles retain [`DocumentExecutionProfile::Baseline`].
+    /// Auxiliary WebViews inherit their opener's profile and cannot override it.
+    #[doc(hidden)]
+    pub fn document_execution_profile(
+        mut self,
+        document_execution_profile: DocumentExecutionProfile,
+    ) -> Result<Self, DocumentExecutionProfileError> {
+        if self.document_execution_profile_is_inherited {
+            return if self.document_execution_profile == document_execution_profile {
+                Ok(self)
+            } else {
+                Err(DocumentExecutionProfileError::InheritedProfileMismatch)
+            };
+        }
+        validate_document_execution_profile(
+            document_execution_profile,
+            self.document_clock.get(),
+            self.document_control_profile,
+        )?;
+        self.document_execution_profile = document_execution_profile;
         Ok(self)
     }
 
@@ -1476,5 +1541,37 @@ mod document_control_tests {
             Err(DocumentControlError::CancellationSequenceOverflow)
         );
         assert_eq!(sequence, u64::MAX);
+    }
+
+    #[test]
+    fn publication_revalidates_the_composed_execution_profile() {
+        let controlled = DocumentClockConfiguration::Controlled {
+            initial_time_ns: 0,
+            unix_time_origin_ns: Default::default(),
+        };
+        assert_eq!(
+            validate_webview_builder_profiles(
+                controlled,
+                DocumentControlProfile::TopLevelSession,
+                DocumentExecutionProfile::ControlledWebSessionV2,
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            validate_webview_builder_profiles(
+                controlled,
+                DocumentControlProfile::SingleDocument,
+                DocumentExecutionProfile::ControlledWebSessionV2,
+            ),
+            Err(UnpublishedWebViewInitializationError::InvalidConfiguration),
+        );
+        assert_eq!(
+            validate_webview_builder_profiles(
+                DocumentClockConfiguration::Realtime,
+                DocumentControlProfile::TopLevelSession,
+                DocumentExecutionProfile::ControlledWebSessionV2,
+            ),
+            Err(UnpublishedWebViewInitializationError::InvalidConfiguration),
+        );
     }
 }

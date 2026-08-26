@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Controlled InputMethod autofocus</title>
+<output id="result">not-focused</output>
+<script>
+window.focusEvents = 0;
+function recordAutofocus(input) {
+  window.focusEvents += 1;
+  input.setSelectionRange(2, 5);
+  document.querySelector("#result").textContent = [
+    document.activeElement === input ? "focused" : "blurred",
+    String(window.focusEvents),
+    input.value,
+    `${input.selectionStart}:${input.selectionEnd}`,
+  ].join("|");
+}
+</script>
+<input
+  id="autofocus-input"
+  type="text"
+  value="rwa-value"
+  onfocus="recordAutofocus(this)"
+>
+<script>
+// React implements its autoFocus property through programmatic focus after mounting.
+document.querySelector("#autofocus-input").focus();
+</script>

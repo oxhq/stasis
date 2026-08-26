@@ -1,6 +1,8 @@
 import type {
   CONTROLLED_WEB_SESSION_V1_PROFILE,
   LegacySupportProfile,
+  SelectableSessionProfile,
+  SessionSupportProfile,
 } from "./profile.js";
 
 declare const documentStateTokenBrand: unique symbol;
@@ -158,7 +160,7 @@ export interface SessionCookie {
   readonly secure: boolean;
   readonly httpOnly: boolean;
   readonly sameSite: CookieSameSite;
-  /** The first v0.2 contract imports only session cookies. */
+  /** Session-profile state artifacts currently import only session cookies. */
   readonly expiresUnixTimeNs: null;
   readonly partitioned: false;
   readonly creationSequence: bigint;
@@ -185,9 +187,16 @@ export interface SessionState {
   readonly origins: readonly SessionOriginState[];
 }
 
-export interface SessionOpenOptions extends CommandOptions {
+export interface SessionOpenOptions<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+> extends CommandOptions {
   clock?: ControlledClockOptions;
-  /** Imported atomically before the initial navigation begins. */
+  /** Defaults to controlled-web-session-v1. Candidate profiles require explicit selection. */
+  profile?: Profile;
+  /**
+   * Imported atomically before the initial navigation begins. The v2 execution profile deliberately
+   * reuses the controlled-web-session-v1 state artifact and does not define an implicit migration.
+   */
   state?: SessionState;
   /** Immutable interception policy for the lifetime of this session. */
   network?: SessionNetworkOptions;
@@ -719,10 +728,23 @@ export interface SessionPendingSnapshot extends PendingSnapshot {
   stateToken: DocumentStateToken;
 }
 
-export type SessionSettleResult = SettleResult & {
+declare const sessionSettleProfileBrand: unique symbol;
+
+declare class BoundSessionSettleProfile<Profile extends SelectableSessionProfile> {
+  private readonly sessionSettleProfileBrand: Profile;
+}
+
+type SessionSettleProfileIdentity<Profile extends SelectableSessionProfile> =
+  Profile extends SessionSupportProfile
+    ? { readonly [sessionSettleProfileBrand]?: Profile }
+    : BoundSessionSettleProfile<Profile>;
+
+export type SessionSettleResult<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+> = SettleResult & {
   stateToken: DocumentStateToken;
   snapshot: SessionPendingSnapshot;
-};
+} & SessionSettleProfileIdentity<Profile>;
 
 export type SessionAdvanceToNextResult = AdvanceToNextResult & {
   stateToken: DocumentStateToken;

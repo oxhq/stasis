@@ -234,8 +234,8 @@ fn validate_protocol_error_details(
                 if integer > MAX_EXACT_JSON_INTEGER as u64 {
                     return Err(ProtocolErrorDetailsError::IntegerNotExactlyRepresentable);
                 }
-            } else if number.as_f64().is_none()
-                || !number
+            } else if number.as_f64().is_none() ||
+                !number
                     .to_string()
                     .chars()
                     .any(|character| matches!(character, '.' | 'e' | 'E'))

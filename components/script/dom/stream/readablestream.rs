@@ -2462,6 +2462,19 @@ pub(crate) fn bytes_from_chunk_jsval(
 }
 
 /// <https://streams.spec.whatwg.org/#rs-transfer>
+impl ReadableStream {
+    /// Reject a port-backed transfer before SpiderMonkey can detach an earlier transfer-list item.
+    pub(crate) fn require_transfer_admission(&self) -> Fallible<()> {
+        // Keep the Streams transfer algorithm's validation error ahead of the Stasis boundary.
+        if self.is_locked() {
+            return Err(Error::DataClone(None));
+        }
+
+        self.global().require_external_subscription()
+    }
+}
+
+/// <https://streams.spec.whatwg.org/#rs-transfer>
 impl Transferable for ReadableStream {
     type Index = MessagePortIndex;
     type Data = MessagePortImpl;
@@ -2474,8 +2487,8 @@ impl Transferable for ReadableStream {
             return Err(Error::DataClone(None));
         }
 
+        self.require_transfer_admission()?;
         let global = self.global();
-        global.require_external_subscription()?;
         let mut realm = enter_auto_realm(cx, &*global);
         let mut realm = realm.current_realm();
         let cx = &mut realm;

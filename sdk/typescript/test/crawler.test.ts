@@ -11,6 +11,10 @@ import {
   FreshSessionPool,
   type StasisSessionRequest,
 } from "../src/session-pool.js";
+import {
+  CONTROLLED_WEB_SESSION_V2_PROFILE,
+  type SelectableSessionProfile,
+} from "../src/profile.js";
 import type {
   DocumentStateToken,
   SessionExtractPlan,
@@ -28,12 +32,15 @@ interface PageFixture {
 }
 
 interface CrawlerHarness {
-  readonly pool: FreshSessionPool<StasisSessionRequest, FakeCrawlerSession>;
+  readonly pool: FreshSessionPool<
+    StasisSessionRequest<SelectableSessionProfile>,
+    FakeCrawlerSession
+  >;
   readonly starts: string[];
   readonly closes: number[];
   readonly terminations: number[];
   readonly tokenUses: { processId: number; operation: string; token: string }[];
-  readonly requests: StasisSessionRequest[];
+  readonly requests: StasisSessionRequest<SelectableSessionProfile>[];
   readonly maximumActive: () => number;
 }
 
@@ -118,8 +125,11 @@ function crawlerHarness(
   const closes: number[] = [];
   const terminations: number[] = [];
   const tokenUses: CrawlerHarness["tokenUses"] = [];
-  const requests: StasisSessionRequest[] = [];
-  const pool = new FreshSessionPool<StasisSessionRequest, FakeCrawlerSession>({
+  const requests: StasisSessionRequest<SelectableSessionProfile>[] = [];
+  const pool = new FreshSessionPool<
+    StasisSessionRequest<SelectableSessionProfile>,
+    FakeCrawlerSession
+  >({
     maxProcesses,
     maxQueue: 32,
     create: async (request) => {
@@ -369,12 +379,31 @@ test("crawler forwards immutable fixtures/state and validates all finite bounds"
     maxPages: 1,
     maxDepth: 0,
     concurrency: 1,
+    profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
     network,
     state,
   });
   assert.equal(harness.requests[0]?.options?.network, network);
   assert.equal(harness.requests[0]?.options?.state, state);
+  assert.equal(
+    harness.requests[0]?.options?.profile,
+    CONTROLLED_WEB_SESSION_V2_PROFILE,
+  );
   await harness.pool.close();
+
+  const defaultHarness = crawlerHarness(new Map([["https://example.test/", {}]]), 1);
+  await crawlWithStasis(defaultHarness.pool, {
+    start: "https://example.test/",
+    maxPages: 1,
+    maxDepth: 0,
+    concurrency: 1,
+  });
+  assert.equal(
+    Object.hasOwn(defaultHarness.requests[0]?.options ?? {}, "profile"),
+    false,
+    "crawler omission must preserve the stable openSession default instead of synthesizing v2",
+  );
+  await defaultHarness.pool.close();
 
   const invalidHarness = crawlerHarness(new Map(), 2);
   for (const [name, options] of [

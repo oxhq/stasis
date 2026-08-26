@@ -1,6 +1,66 @@
-# Stasis 0.2 release train
+# Stasis 0.3 candidate train
 
-`v0.2.1` is the current controlled web-session release. It supersedes the
+The source tree, native `stasis-shell` crate, TypeScript package metadata, and
+release validators are aligned to exact version `0.3.0`. Source version is not
+a publication claim. Before promotion, `v0.2.1` and `@oxhq/stasis@0.2.1` remain
+the immutable stable predecessor until an exact `v0.3.0` tag is promoted,
+published immutably, published to npm with provenance, and verified from
+anonymous managed-runtime bytes. After promotion, verify those public artifacts;
+do not infer current registry state from this checked-in text.
+
+The candidate adds the explicitly selected `controlled-web-session-v2` profile
+for bounded same-global, untransferred `MessageChannel` work, a bounded direct top-level
+`HTMLImageElement.src` `data:image/svg+xml` cache/decode completion path, a distinct bounded inline
+`<svg>` path in the controlled top-level document for its exact cached internally serialized
+data-SVG request and cache-ID owner, and the narrow exact public non-auxiliary controlled
+top-level single-line `InputMethodType::Text` presentation boundary when `multiline = false` and no
+virtual keyboard is requested. The image slice admits only canonical exact-MIME direct-source work
+within its 65,536-byte URL and 512 retained-ownership-record bounds on the same
+ScriptThread/ImageCache. The inline slice additionally requires an internal request and exact
+cached-URL/cache-ID join, fences decode and raster completion, and emits no new DOM load event;
+excluded image paths receive no new authority. Cache-owned callback retirement and a dequeued
+response whose closed-pipeline tombstone proves that navigation retired its Window complete
+normally as owned cancellation. A normal live handler rejection retains the pending owner or key,
+completes the scoped message guard, and settles as typed `unsupported_rendering`; admission,
+enqueue, producer callback panic, actual handler unwind, pre-handler authority, target-invariant or clock failure,
+and guarded transport loss explicitly abandon the stream and remain terminal. Completion and
+abandonment require the exact live fence/sequence and registered Image producer class before any
+terminal or watermark mutation. One document-clock sample is shared by an admitted
+engine-generated HTML image completion set, and engine-generated exact-public-target top-level
+focus transitions in v2 also receive a document-clock `Event.timeStamp`. Each public mutating
+automation action samples the document Performance clock once before mutation and shares that value
+with every browser-created event constructed synchronously during the action; the fill, activation,
+reset, check/uncheck, select, invalid, submit, and formdata corpus is representative, not an event-name
+allowlist. MessageChannel construction and posting require the exact active public top-level target
+and an incumbent matching the owner global, pipeline, and WebView before pair publication or
+structured cloning. A nonempty owned CSS animation pending-event dispatch batch likewise samples the document
+Performance clock once and shares it only with internal `AnimationEvent` or `TransitionEvent`
+records owned by the exact public non-auxiliary controlled top-level WebView/document. The `TransitionEvent` adapter is
+conditional on an existing owned transition record reaching that queue; general transition
+settlement is not claimed. Scheduled pending animation-event work uses guarded `AdvanceTo` at the
+exact retained scheduler head, including an exact-`now` deadline; only an unscheduled batch is
+`Drive`-ready. This corrects liveness without adding a task source or limit. Auxiliary top-level WebViews remain host-stamped. Script-created events,
+including the WebIDL animation
+and transition event constructors, excluded image, general SVG/resource, and other
+unlisted host-stamped paths remain unsupported or retain predecessor behavior. Baseline and v1 SVG
+behavior and the existing CSS animation authority, semantics, and limits are unchanged. It keeps
+`controlled-web-session-v1` frozen and as the default. Candidate package runs
+must execute the complete `baseline_protocol` integration target on macOS
+arm64, Linux x86-64 under Xvfb, and the Windows x86-64 CI job, in addition to
+the existing controlled-session and release-artifact gates. Windows remains a
+CI-only bundle and is not admitted to the managed release manifest. Each 0.3
+macOS/Linux candidate archive has twelve files: the historical ten-file
+runtime/source inventory plus `controlled-web-session-v2.json` and
+`session-v0.3-candidate.md`, both byte-bound to the candidate source revision.
+
+The checked-out release and npm workflows accept only exact `v0.3.0` for new
+promotion/publication work. They do not authorize rebuilding or replacing any
+published `0.2.x` bytes. Do not describe `0.3.0` as released until its hosted
+promotion and public-consumer evidence exists.
+
+# Stasis 0.2 release history (immutable predecessor)
+
+`v0.2.1` is the immutable corrective controlled web-session predecessor. It supersedes the
 immutable `v0.2.0` bytes with one focused correction: redirect predecessors
 remain pending until their terminal callback even when the successor request
 starts first, so bounded evidence cannot omit the predecessor's response
@@ -14,14 +74,14 @@ pool/crawler helpers. The stable product boundary is specified in
 `docs/stasis/session-v0.2.md` and
 `profiles/controlled-web-session-v1.json`.
 
-The release identity is exact: native `stasis-shell` version `0.2.1`, SDK
-`@oxhq/stasis@0.2.1`, and GitHub tag `v0.2.1`. The release workflows reject
+The immutable release identity is exact: native `stasis-shell` version `0.2.1`, SDK
+`@oxhq/stasis@0.2.1`, and GitHub tag `v0.2.1`. Its tagged release workflows rejected
 every other stable or prerelease identity. The native matrix remains deliberately
 bounded to Linux x86-64 and macOS arm64, with the same compatibility,
 ten-member archive, checksum, source-identity, and provenance contracts used by
-the first stable train. `etc/ci/stasis/release_archive.py` accepts only `0.2.1`
-for newly produced release archives; this does not alter or re-authorize the
-historical `v0.2.0` or `0.1.x` bytes.
+the first stable train. The helper at the `v0.2.1` tag accepted only `0.2.1`;
+the current main helper accepts only the `0.3.0` candidate and cannot alter or
+re-authorize historical `v0.2.1`, `v0.2.0`, or `0.1.x` bytes.
 
 ## Windows x86-64 CI-only proof artifact
 
@@ -29,19 +89,31 @@ Package-mode runs also execute a separate `package-windows-ci` job on the
 GitHub-hosted `windows-2022` x86-64 runner. This job is deliberately outside the
 stable macOS/Linux native release matrix. It builds the exact event SHA with
 `mach.ps1 exec -- cargo build --locked -p stasis-shell --profile
-production-stripped`, runs the v0.2 TypeScript session North Star through an
-explicit `stasis.exe`, and runs the native `controlled_mvp` and controlled-network
-redirect-order gates plus the Windows stdio protocol-isolation tests.
+production-stripped`, runs the frozen v0.2 TypeScript session North Star through
+an explicit `stasis.exe`, and runs the complete `baseline_protocol` target, the
+native `controlled_mvp` and controlled-network redirect-order gates, plus the
+Windows stdio protocol-isolation tests.
 
 The job creates an unsigned, attempt-qualified Windows CI ZIP. The ZIP has one
 root directory containing `stasis.exe`, the ANGLE `libEGL.dll` and
-`libGLESv2.dll` rendering runtime, the source and license documents, and the
+`libGLESv2.dll` rendering runtime, the source and license documents, the
+canonical v2 profile and candidate contract, and the
 app-local x86-64 MSVC runtime DLL closure derived from the native files' PE
 imports. The job writes archive and executable SHA-256 sidecars, extracts the
 ZIP into a fresh directory, verifies every extracted member, and runs the
 ignored `release_gate_published_binary_completes_act_settle_inspect` fixture
 against that extracted executable. The bundle and its logs are retained as
 separate Actions artifacts for the producing run attempt.
+
+Before invoking Cargo, the job binds both uv and Mozilla's `PYTHON3` override to
+the absolute interpreter emitted by the pinned `actions/setup-python` step,
+rejects a `WindowsApps` Store alias,
+checks the `.python-version` minor both directly and inside `mach.ps1 exec`, and
+requires that `python.exe` on `PATH` resolves to that same setup-python
+installation. The locked `aws-lc-sys 0.44.0` build has an explicit
+`AWS_LC_SYS_PREBUILT_NASM=1` fallback: a usable runner `nasm.exe` is version-
+probed when present; otherwise aws-lc uses the crate's Cargo-checksummed prebuilt
+x86-64 objects. This is an intentional build input, not an ambient-tool guess.
 
 This proves only that the checked-out revision builds, bundles, and passes the
 declared native and explicit-SDK gates on that Windows runner. The ZIP is not a
@@ -67,10 +139,10 @@ The npm tarball and its SDK proof remain attempt-qualified Actions artifacts,
 not GitHub release assets. Build provenance covers all release assets and the
 SDK package/proof. The SDK's checked-in generated runtime-manifest module is an
 intentionally mismatched historical alpha placeholder: local `prepack` fails
-closed until the credential-free package job generates the exact `v0.2.1`
-manifest from both verified native archives.
+closed until the credential-free package job generates the exact candidate
+`v0.3.0` manifest from both verified native archives.
 
-## 0.2 package and product gates
+## 0.3 candidate package and product gates
 
 The credential boundaries and attempt-specific producer selection remain the
 same as the 0.1 train: native macOS and Linux producers are resolved
@@ -102,7 +174,22 @@ extracted release binary:
    reference crawler, proving fresh-process disposal, canonical link extraction,
    and a concurrency bound of two.
 
-The full v0.2 story also runs against each exact production-stripped native
+The packed-SDK exact-binary gate also opens `controlled-web-session-v2` explicitly. In one fresh
+controlled session it proves idle and buffered local MessageChannel ownership, navigates to a
+direct data-SVG fixture and observes the exact document-clock `load`/`loadend` completion trace,
+then navigates to an inline-SVG fixture and proves quiescence with no invented DOM load event before
+navigating to the programmatic-focus fixture and observing the exact trusted focus-transition
+trace. Finally it advances document time to 5 ms, proves the exact synchronous browser-event trace
+for fill, activate, reset, check, select, invalid and valid submission, then proves that five
+script-created event interfaces remain host-stamped and settle as `unsupported_clock_surface`.
+A second fresh exact-binary process proves controlled internal `animationstart` and `animationend`
+dispatch reaches quiescence through finite rendering demand, then proves script-created
+`AnimationEvent` and `TransitionEvent` values remain host-stamped and typed unsupported. The durable
+SDK proof binds all six candidate slices to the same package, native digest, source revision, both
+close responses, and both protocol EOFs.
+
+The frozen v0.2 story and complete native `baseline_protocol` target also run
+against each exact production-stripped native
 binary on its own macOS arm64 or Linux x64 producer before any release artifact
 is uploaded. This makes native platform correctness a prepublication gate,
 rather than relying on post-publication registry verification to discover a
@@ -116,7 +203,7 @@ Both fixture runners and the entire session fixture directory are copied beside
 the installed tarball before execution. Credential-free package gating uses the
 dedicated `STASIS_NORTH_STAR_BINARY` and
 `STASIS_SESSION_NORTH_STAR_BINARY` overrides. Prepublication repeats both
-stories, including the v2 session proof against the explicitly verified release
+stories, including the frozen v0.2/v1 session proof against the explicitly verified release
 binary. Final public verification unsets both overrides and GitHub/npm tokens
 for both stories, proving anonymous managed-runtime acquisition, archive
 size/hash/inventory validation, atomic cache installation, and launch from
@@ -130,23 +217,24 @@ gh workflow run stasis-package.yml \
   --repo oxhq/stasis \
   --ref main \
   -f package_run_id=REPLACE_WITH_SUCCESSFUL_MAIN_PUSH_RUN_ID \
-  -f release_tag=v0.2.1
+  -f release_tag=v0.3.0
 ```
 
-After the exact draft is inspected and published as an immutable,
+Run that promotion only after the candidate's hosted package gates pass. After
+the exact draft is inspected and published as an immutable,
 non-prerelease GitHub release, the release event may publish only
-`@oxhq/stasis@0.2.1` with npm trusted publishing and provenance. The exact
-post-publication dist-tag map is:
+`@oxhq/stasis@0.3.0` with npm trusted publishing and provenance. The expected
+post-publication dist-tag map would then be:
 
 ```json
 {
   "alpha": "0.1.0-alpha.0",
-  "latest": "0.2.1"
+  "latest": "0.3.0"
 }
 ```
 
 The workflow fails if the immutable historical `alpha` tag moves, `latest`
-does not point to `0.2.1`, any unexpected dist-tag appears, public registry
+does not point to `0.3.0` after publication, any unexpected dist-tag appears, public registry
 bytes differ from the staged tarball, provenance/signature verification fails,
 or either anonymous North Star fails. Manual npm-workflow dispatch remains
 read-only recovery tied to the original release-event run and attempt; it may
@@ -158,8 +246,8 @@ never publish or retag.
 release, native assets, npm package, provenance, and tag remain immutable. The
 initial Linux post-publication run exposed a scheduler-dependent redirect
 evidence ordering race; an exact read-only recovery run subsequently passed,
-but that rerun did not erase the defect. `v0.2.1` is the corrective stable
-package and the only 0.2 release that should remain on npm `latest`.
+but that rerun did not erase the defect. `v0.2.1` is the corrective 0.2 stable
+package. It remains immutable when a later stable release moves npm `latest`.
 
 # Stasis 0.1 release history (immutable)
 
@@ -245,8 +333,14 @@ their immutable identities.
 
 `.github/workflows/stasis-package.yml` has four credential boundaries:
 
-1. `archive-contract` checks the exact source version and runs the archive and
-   npm self-tests.
+1. `archive-contract` checks the exact source version, runs the archive and npm
+   self-tests, and gates the SDK under exact Node 20.0.0. The Node-floor lane
+   typechecks and builds the source, emits the same typed test sources as plain
+   ESM with `tsc`, and executes those emitted files with the native `node --test`
+   runner. It does not use `tsx`'s custom ESM loader because that loader's worker
+   initialization fails before tests start on Node 20.0.0. Every SDK test file
+   is supplied to the native runner under that exact Node; each test's own
+   explicit native-binary skip condition remains visible as a skip.
 2. `package-native` builds both native targets in a fail-fast matrix. The Linux
    job requires Ubuntu 22.04's exact glibc 2.35 build floor. Each job creates and
    re-verifies its archive, runs the automation and bounded-settlement negative

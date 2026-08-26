@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled local MessageChannel fixture</title>
+<div id="result">booting</div>
+<script>
+  const result = document.querySelector("#result");
+  const events = ["script"];
+  const channel = new MessageChannel();
+  let deliveries = 0;
+
+  channel.port1.onmessage = (event) => {
+    deliveries += 1;
+    events.push(`message:${event.data.sequence}`);
+    if (deliveries < 3) {
+      channel.port2.postMessage({ sequence: deliveries + 1 });
+      return;
+    }
+
+    queueMicrotask(() => {
+      events.push("microtask");
+      result.textContent = events.join(">");
+    });
+  };
+
+  channel.port2.postMessage({ sequence: 1 });
+</script>

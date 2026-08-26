@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled v2 inline SVG rendering</title>
+<svg id="inline-svg" width="4" height="3" viewBox="0 0 4 3"
+  xmlns="http://www.w3.org/2000/svg" aria-label="controlled inline SVG">
+  <rect width="4" height="3" fill="green"></rect>
+</svg>
+<output id="result">waiting</output>
+<script>
+  const svg = document.querySelector("#inline-svg");
+  const result = document.querySelector("#result");
+  const completionEvents = [];
+
+  function recordResult() {
+    result.textContent = [
+      "inline-svg:4x3",
+      `events:${completionEvents.length}`,
+      `now:${performance.now()}`,
+    ].join("|");
+  }
+
+  for (const type of ["load", "error", "loadend"]) {
+    svg.addEventListener(type, (event) => {
+      completionEvents.push(`${event.type}:${event.timeStamp}`);
+      recordResult();
+    });
+  }
+
+  // Force this element through layout's inline-SVG serialization/raster path. Settlement must
+  // fence the resulting owned work without inventing an HTMLImageElement-style completion event.
+  svg.getBoundingClientRect();
+  recordResult();
+</script>

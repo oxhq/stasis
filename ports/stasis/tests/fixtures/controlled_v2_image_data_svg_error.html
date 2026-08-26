@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled v2 direct data SVG decode error</title>
+<img id="image" alt="invalid controlled data SVG">
+<output id="result">waiting</output>
+<script>
+  const image = document.querySelector("#image");
+  const result = document.querySelector("#result");
+  const events = [];
+
+  for (const type of ["load", "error", "loadend"]) {
+    image.addEventListener(type, (event) => {
+      events.push(`${event.type}:${event.timeStamp}`);
+      result.textContent = `${events.join(">")}|now:${performance.now()}`;
+    });
+  }
+
+  // Canonical MIME and bounded URL admission succeed; decoding must take the owned error path.
+  image.src = "data:image/svg+xml;base64,AA==";
+</script>

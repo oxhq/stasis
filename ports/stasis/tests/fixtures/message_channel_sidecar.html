@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled MessageChannel clone-sidecar fixture</title>
+<button id="start">start</button>
+<div id="result">idle</div>
+<script>
+  const channel = new MessageChannel();
+  document.querySelector("#start").onclick = () => {
+    let errorName = "no-error";
+    try {
+      channel.port2.postMessage(new Blob(["bounded-sidecar"]));
+    } catch (error) {
+      errorName = error.name;
+    }
+    document.querySelector("#result").textContent = errorName;
+  };
+</script>

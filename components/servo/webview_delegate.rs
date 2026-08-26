@@ -924,6 +924,7 @@ pub struct CreateNewWebViewRequest {
     pub(crate) responder: IpcResponder<Option<NewWebViewDetails>>,
     pub(crate) document_clock: ValidatedDocumentClockConfiguration,
     pub(crate) document_control_profile: embedder_traits::DocumentControlProfile,
+    pub(crate) document_execution_profile: embedder_traits::DocumentExecutionProfile,
 }
 
 impl CreateNewWebViewRequest {
@@ -935,6 +936,7 @@ impl CreateNewWebViewRequest {
             self.responder,
             self.document_clock,
             self.document_control_profile,
+            self.document_execution_profile,
         )
     }
 }

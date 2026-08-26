@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled MessageChannel retained-message reuse fixture</title>
+<button id="buffer">buffer</button>
+<button id="start">start</button>
+<button id="reuse">reuse</button>
+<div id="result">idle</div>
+<script>
+  const channel = new MessageChannel();
+  const result = document.querySelector("#result");
+  let delivered = 0;
+
+  document.querySelector("#buffer").onclick = () => {
+    let posted = 0;
+    let errorName = "no-error";
+    for (; posted < 1024; posted += 1) {
+      try {
+        channel.port2.postMessage(posted);
+      } catch (error) {
+        errorName = error.name;
+        break;
+      }
+    }
+    result.textContent = `buffered:${posted}|${errorName}`;
+  };
+
+  document.querySelector("#start").onclick = () => {
+    channel.port1.addEventListener("message", () => {
+      delivered += 1;
+      result.textContent = `delivered:${delivered}`;
+      if (delivered === 1025) {
+        channel.port1.close();
+        channel.port2.close();
+      }
+    });
+    channel.port1.start();
+  };
+
+  document.querySelector("#reuse").onclick = () => {
+    try {
+      channel.port2.postMessage("after-drain");
+      result.textContent = `reused:posted|delivered:${delivered}`;
+    } catch (error) {
+      result.textContent = `reused:${error.name}|delivered:${delivered}`;
+    }
+  };
+</script>

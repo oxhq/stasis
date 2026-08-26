@@ -11,7 +11,8 @@ use embedder_traits::document_session::{
 };
 use embedder_traits::user_contents::UserContentManagerId;
 use embedder_traits::{
-    DocumentClockConfiguration, DocumentControlProfile, InputEvent, MouseLeftViewportEvent, Theme,
+    DocumentClockConfiguration, DocumentControlProfile, DocumentExecutionProfile, InputEvent,
+    MouseLeftViewportEvent, Theme,
 };
 use euclid::Point2D;
 use log::{debug, warn};
@@ -141,6 +142,9 @@ pub(crate) struct ConstellationWebView {
     /// The immutable top-level document authority selected independently from the clock.
     document_control_profile: DocumentControlProfile,
 
+    /// The immutable execution-surface policy selected independently from document authority.
+    document_execution_profile: DocumentExecutionProfile,
+
     /// Checked active-document identity for controlled-web-session-v1 only.
     document_epoch: u64,
 
@@ -188,12 +192,14 @@ impl ConstellationWebView {
         user_content_manager_id: Option<UserContentManagerId>,
         document_clock: DocumentClockConfiguration,
         document_control_profile: DocumentControlProfile,
+        document_execution_profile: DocumentExecutionProfile,
     ) -> Self {
         Self {
             webview_id,
             user_content_manager_id,
             document_clock,
             document_control_profile,
+            document_execution_profile,
             document_epoch: 0,
             session_navigation_id: 0,
             history_revision: 0,
@@ -226,6 +232,10 @@ impl ConstellationWebView {
 
     pub(crate) const fn document_control_profile(&self) -> DocumentControlProfile {
         self.document_control_profile
+    }
+
+    pub(crate) const fn document_execution_profile(&self) -> DocumentExecutionProfile {
+        self.document_execution_profile
     }
 
     pub(crate) fn permits_session_history_traversal(&self) -> bool {
@@ -844,6 +854,7 @@ mod tests {
                 unix_time_origin_ns: DocumentUnixTime::from_nanos(11),
             },
             DocumentControlProfile::SingleDocument,
+            DocumentExecutionProfile::Baseline,
         )
     }
 
@@ -857,6 +868,7 @@ mod tests {
                 unix_time_origin_ns: DocumentUnixTime::from_nanos(11),
             },
             DocumentControlProfile::TopLevelSession,
+            DocumentExecutionProfile::Baseline,
         )
     }
 
@@ -915,6 +927,7 @@ mod tests {
             None,
             DocumentClockConfiguration::Realtime,
             DocumentControlProfile::SingleDocument,
+            DocumentExecutionProfile::Baseline,
         );
         assert!(
             webview
@@ -940,11 +953,16 @@ mod tests {
                 unix_time_origin_ns: DocumentUnixTime::from_nanos(11),
             },
             DocumentControlProfile::TopLevelSession,
+            DocumentExecutionProfile::ControlledWebSessionV2,
         );
 
         assert_eq!(
             webview.document_control_profile(),
             DocumentControlProfile::TopLevelSession,
+        );
+        assert_eq!(
+            webview.document_execution_profile(),
+            DocumentExecutionProfile::ControlledWebSessionV2,
         );
         assert_eq!(webview.controlled_event_loop_id(), None);
     }

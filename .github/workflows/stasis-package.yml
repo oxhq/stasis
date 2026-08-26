@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       release_tag:
-        description: Exact stable Stasis release tag; v0.2.1 is the only accepted value
+        description: Exact Stasis release-candidate tag; v0.3.0 is the only accepted value
         required: false
         type: string
   push:
@@ -20,15 +20,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: stasis-package-run-${{ inputs.package_run_id || github.run_id }}
-  queue: max
+  group: stasis-package-${{ inputs.release_tag || github.run_id }}
+  cancel-in-progress: false
 
 env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
   STASIS_FROZEN_V1_PROFILE_SHA256: 6e262edf0f8be11a1cece28f68f00d59fdac68b79b0a670ac891d36998720100
   STASIS_FROZEN_V2_PROFILE_SHA256: 9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a
-  STASIS_RELEASE_VERSION: 0.2.1
+  STASIS_RELEASE_VERSION: 0.3.0
 
 jobs:
   validate-invocation:
@@ -60,7 +60,7 @@ jobs:
     needs: validate-invocation
     if: needs.validate-invocation.outputs.mode == 'package'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - name: Check out the exact event commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -68,6 +68,12 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
           ref: ${{ github.sha }}
+
+      - name: Set up the declared Node 20 SDK floor
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "20.0.0"
+          package-manager-cache: false
 
       - name: Verify source identity and archive contract
         shell: bash
@@ -84,10 +90,43 @@ jobs:
             --source-root .
           python3 etc/ci/stasis/release_archive.py verify-frozen-v2-profile \
             --source-root .
+          python3 etc/ci/stasis/release_archive.py verify-candidate-v2-profile \
+            --source-root .
           python3 etc/ci/stasis/release_archive.py self-test
           python3 etc/ci/stasis/npm_release.py self-test
           python3 etc/ci/stasis/verify_build_provenance.py self-test
           node --check etc/ci/stasis/verify_registry_sdk.mjs
+
+      - name: Gate the source SDK on Node 20
+        shell: bash
+        working-directory: sdk/typescript
+        run: |
+          set -euo pipefail
+          test "$(node -p 'process.versions.node')" = '20.0.0'
+          corepack enable pnpm
+          corepack prepare pnpm@9.12.3 --activate
+          test "$(pnpm --version)" = '9.12.3'
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm build
+          node20_test_root="$RUNNER_TEMP/stasis-node20-tests"
+          test ! -e "$node20_test_root"
+          mkdir -p "$node20_test_root/test"
+          pnpm exec tsc -p tsconfig.json \
+            --outDir "$node20_test_root" \
+            --rootDir . \
+            --noEmit false \
+            --declaration false \
+            --declarationMap false \
+            --sourceMap false \
+            --inlineSources false
+          cp package.json "$node20_test_root/package.json"
+          cp -R scripts "$node20_test_root/scripts"
+          cp -R test/fixtures "$node20_test_root/test/fixtures"
+          for source_test in test/*.test.ts; do
+            test -f "$node20_test_root/${source_test%.ts}.js"
+          done
+          node --test "$node20_test_root"/test/*.test.js
 
   package-native:
     name: Package and gate ${{ matrix.release_platform }}
@@ -195,15 +234,26 @@ jobs:
         run: |
           set -euo pipefail
           test "$STASIS_REVISION" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if ! worktree_changes=$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none); then
+            echo 'could not inspect the checkout before the native build' >&2
+            exit 1
+          fi
+          if [[ -n "$worktree_changes" ]]; then
+            git status --short --untracked-files=all --ignore-submodules=none >&2
+            echo 'the checkout is dirty after native bootstrap' >&2
+            exit 1
+          fi
           cargo build --locked -p stasis-shell --profile production-stripped
           if [[ "$STASIS_PLATFORM" == 'macos-aarch64' ]]; then
             bash etc/ci/stasis/prepare_macos_runner.sh check 4194304
           else
             test "$(LC_ALL=C getconf GNU_LIBC_VERSION)" = 'glibc 2.35'
             file target/production-stripped/stasis | grep -F 'ELF 64-bit LSB'
-            ldd target/production-stripped/stasis | LC_ALL=C sort > dist-linux-dependencies.txt
-            test -s dist-linux-dependencies.txt
-            if grep -F 'not found' dist-linux-dependencies.txt; then
+            linux_dependencies="$RUNNER_TEMP/stasis-linux-dependencies.txt"
+            ldd target/production-stripped/stasis | LC_ALL=C sort > "$linux_dependencies"
+            test -s "$linux_dependencies"
+            if grep -F 'not found' "$linux_dependencies"; then
               echo 'the Linux release binary has an unresolved shared-library dependency' >&2
               exit 1
             fi
@@ -221,13 +271,13 @@ jobs:
           PY
           fi
 
-      - name: Set up Node for the platform v0.2 gate
+      - name: Set up Node for the controlled-session gate
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "24"
           package-manager-cache: false
 
-      - name: Build the SDK harness for the platform v0.2 gate
+      - name: Build the SDK harness for the controlled-session gate
         shell: bash
         working-directory: sdk/typescript
         run: |
@@ -238,7 +288,7 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
-      - name: Gate the v0.2 controlled-session North Star on this native platform
+      - name: Gate the controlled-session v1 North Star on this native platform
         shell: bash
         working-directory: sdk/typescript
         run: |
@@ -276,6 +326,19 @@ jobs:
               -p stasis-shell --test controlled_mvp \
               -- --test-threads=1 --show-output
 
+      - name: Gate the full baseline protocol matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_runner=(env)
+          if [[ "$STASIS_PLATFORM" == 'linux-x86_64' ]]; then
+            test_runner=(xvfb-run -a env)
+          fi
+          "${test_runner[@]}" \
+            cargo test --locked --profile production-stripped \
+              -p stasis-shell --test baseline_protocol \
+              -- --test-threads=1 --show-output
+
       - name: Gate controlled-network redirect ordering invariants
         shell: bash
         run: |
@@ -290,6 +353,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if ! worktree_changes=$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none); then
+            echo 'could not inspect the checkout before release archive staging' >&2
+            exit 1
+          fi
+          if [[ -n "$worktree_changes" ]]; then
+            git status --short --untracked-files=all --ignore-submodules=none >&2
+            echo 'the source tree changed before release archive staging' >&2
+            exit 1
+          fi
           python3 etc/ci/stasis/release_archive.py create \
             --binary target/production-stripped/stasis \
             --dist dist \
@@ -392,7 +465,8 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
 
-      - name: Set up pinned Python
+      - id: windows-python
+        name: Set up pinned Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version-file: .python-version
@@ -402,6 +476,83 @@ jobs:
         with:
           version: "0.11.16"
           enable-cache: false
+
+      - name: Verify the Windows Python and aws-lc assembler boundary
+        env:
+          STASIS_SETUP_PYTHON: ${{ steps.windows-python.outputs.python-path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = $env:STASIS_SETUP_PYTHON
+          if ([string]::IsNullOrWhiteSpace($python) `
+            -or -not (Test-Path -LiteralPath $python -PathType Leaf)) {
+            throw "setup-python did not produce a usable interpreter: $python"
+          }
+          $python = (Resolve-Path -LiteralPath $python).Path
+          if ($python -match '(?i)\\WindowsApps\\') {
+            throw "setup-python resolved the Windows Store alias: $python"
+          }
+          $expectedPython = (Get-Content -LiteralPath '.python-version' -Raw).Trim()
+          if ($expectedPython -notmatch '^[0-9]+\.[0-9]+$') {
+            throw "the pinned Python minor is invalid: $expectedPython"
+          }
+          $actualPython = (& $python -c `
+            'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")').Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualPython -cne $expectedPython) {
+            throw "setup-python provided Python $actualPython, expected $expectedPython"
+          }
+          $pathPython = (Get-Command python.exe -CommandType Application -ErrorAction Stop |
+            Select-Object -First 1).Source
+          $pathPython = (Resolve-Path -LiteralPath $pathPython).Path
+          if ($pathPython -ne $python) {
+            throw "PATH resolves python.exe to $pathPython instead of setup-python $python"
+          }
+          "UV_PYTHON=$python" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PYTHON3=$python" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "STASIS_EXPECTED_PYTHON_MINOR=$expectedPython" `
+            | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "STASIS_WINDOWS_PYTHON_BOUNDARY=setup-python-$expectedPython-via-uv" `
+            | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          if (-not [string]::IsNullOrEmpty($env:AWS_LC_SYS_PREBUILT_NASM)) {
+            throw 'AWS_LC_SYS_PREBUILT_NASM must be selected only after the runner NASM probe'
+          }
+          if (-not [string]::IsNullOrEmpty($env:AWS_LC_SYS_NO_ASM)) {
+            throw 'AWS_LC_SYS_NO_ASM conflicts with the declared Windows assembly boundary'
+          }
+          $lock = Get-Content -LiteralPath 'Cargo.lock' -Raw
+          $awsLc = [regex]::Matches(
+            $lock,
+            '(?ms)^\[\[package\]\]\r?\nname = "aws-lc-sys"\r?\nversion = "([^"]+)"'
+          )
+          if ($awsLc.Count -ne 1 -or $awsLc[0].Groups[1].Value -cne '0.44.0') {
+            throw 'Cargo.lock no longer contains the audited aws-lc-sys 0.44.0 package'
+          }
+          $nasm = Get-Command nasm.exe -CommandType Application -ErrorAction SilentlyContinue
+          if ($null -eq $nasm) {
+            Write-Host 'NASM is absent; aws-lc-sys will use its locked prebuilt x86-64 objects.'
+            $prebuiltNasm = '1'
+            $assemblerBoundary = 'aws-lc-sys-0.44.0-prebuilt'
+          } else {
+            $nasmVersion = (& $nasm.Source -version | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($nasmVersion)) {
+              throw "the runner NASM is unusable: $($nasm.Source)"
+            }
+            Write-Host "Using runner NASM at $($nasm.Source): $nasmVersion"
+            $prebuiltNasm = '0'
+            $assemblerBoundary = 'runner-nasm-probed'
+          }
+          $expectedBoundaryByChoice = @{
+            '0' = 'runner-nasm-probed'
+            '1' = 'aws-lc-sys-0.44.0-prebuilt'
+          }
+          if ($expectedBoundaryByChoice[$prebuiltNasm] -cne $assemblerBoundary) {
+            throw 'the Windows NASM choice and proof boundary diverged'
+          }
+          @(
+            "AWS_LC_SYS_PREBUILT_NASM=$prebuiltNasm"
+            "STASIS_WINDOWS_PREBUILT_NASM=$prebuiltNasm"
+            "STASIS_WINDOWS_ASSEMBLER_BOUNDARY=$assemblerBoundary"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - id: windows-names
         name: Resolve the exact Windows CI identity
@@ -450,6 +601,33 @@ jobs:
       - name: Bootstrap the Windows build environment
         run: |
           $ErrorActionPreference = 'Stop'
+          $pythonProbe = @'
+          import os
+          import pathlib
+          import sys
+
+          executable = str(pathlib.Path(sys.executable).resolve())
+          mozilla_python = str(pathlib.Path(os.environ["PYTHON3"]).resolve())
+          expected = os.environ["STASIS_EXPECTED_PYTHON_MINOR"]
+          actual = f"{sys.version_info.major}.{sys.version_info.minor}"
+          if (
+              actual != expected
+              or "\\windowsapps\\" in executable.lower()
+              or "\\windowsapps\\" in mozilla_python.lower()
+              or not pathlib.Path(mozilla_python).is_file()
+              or not pathlib.Path(executable).samefile(mozilla_python)
+          ):
+              raise SystemExit(
+                  f"mach Python boundary mismatch: executable={executable!r}, "
+                  f"PYTHON3={mozilla_python!r}, "
+                  f"version={actual!r}, expected={expected!r}"
+              )
+          print(f"mach Python: {executable}; Mozilla PYTHON3: {mozilla_python} ({actual})")
+          '@
+          & .\mach.ps1 exec -- python -c $pythonProbe
+          if ($LASTEXITCODE -ne 0) {
+            throw "mach Python verification failed with exit code $LASTEXITCODE"
+          }
           $lldLink = Join-Path $env:LIBCLANG_PATH 'lld-link.exe'
           if (-not (Test-Path -LiteralPath $lldLink -PathType Leaf)) {
             throw "LLVM linker is missing: $lldLink"
@@ -467,8 +645,24 @@ jobs:
       - name: Build the exact-SHA production-stripped Stasis executable
         run: |
           $ErrorActionPreference = 'Stop'
+          $validAssemblerBoundary =
+            ($env:AWS_LC_SYS_PREBUILT_NASM -ceq '0' `
+              -and $env:STASIS_WINDOWS_PREBUILT_NASM -ceq '0' `
+              -and $env:STASIS_WINDOWS_ASSEMBLER_BOUNDARY -ceq 'runner-nasm-probed') `
+            -or ($env:AWS_LC_SYS_PREBUILT_NASM -ceq '1' `
+              -and $env:STASIS_WINDOWS_PREBUILT_NASM -ceq '1' `
+              -and $env:STASIS_WINDOWS_ASSEMBLER_BOUNDARY `
+                -ceq 'aws-lc-sys-0.44.0-prebuilt')
+          if (-not $validAssemblerBoundary) {
+            throw 'the Windows build did not inherit one exact audited NASM boundary'
+          }
           if ((& git rev-parse HEAD).Trim() -cne $env:GITHUB_SHA) {
             throw 'the checkout changed after Windows bootstrap'
+          }
+          $worktreeChanges = @(& git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)
+          if ($LASTEXITCODE -ne 0 -or $worktreeChanges.Count -ne 0) {
+            $worktreeChanges | ForEach-Object { Write-Error $_ }
+            throw 'the checkout is dirty after Windows bootstrap'
           }
           $rustVersion = (& .\mach.ps1 exec -- rustc -vV | Out-String)
           if ($LASTEXITCODE -ne 0) {
@@ -513,7 +707,7 @@ jobs:
           }
           $profileDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Set up Node for the Windows v0.2 gate
+      - name: Set up Node for the Windows controlled-session gate
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "24"
@@ -535,7 +729,7 @@ jobs:
           pnpm build
           if ($LASTEXITCODE -ne 0) { throw 'the TypeScript SDK build failed' }
 
-      - name: Gate the v0.2 session North Star with the explicit executable
+      - name: Gate the controlled-session v1 North Star with the explicit executable
         working-directory: sdk/typescript
         run: |
           $ErrorActionPreference = 'Stop'
@@ -549,7 +743,7 @@ jobs:
             | Tee-Object -FilePath $log
           $exitCode = $LASTEXITCODE
           if ($exitCode -ne 0) {
-            throw "the Windows v0.2 session North Star failed with exit code $exitCode"
+            throw "the Windows controlled-session North Star failed with exit code $exitCode"
           }
           $proof = Get-Content -LiteralPath $log -Raw
           foreach ($required in @(
@@ -575,6 +769,21 @@ jobs:
           $exitCode = $LASTEXITCODE
           if ($exitCode -ne 0) {
             throw "the Windows controlled_mvp gate failed with exit code $exitCode"
+          }
+
+      - name: Gate the full baseline protocol matrix on Windows
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = Join-Path $env:STASIS_WINDOWS_LOGS 'baseline-protocol.log'
+          $testCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell ' +
+            '--test baseline_protocol -- --test-threads=1 --show-output; ' +
+            'exit $LASTEXITCODE'
+          & .\mach.ps1 exec -- pwsh -NoProfile -Command $testCommand 2>&1 `
+            | Tee-Object -FilePath $log
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            throw "the Windows baseline_protocol gate failed with exit code $exitCode"
           }
 
       - name: Gate controlled-network redirect ordering invariants
@@ -610,6 +819,14 @@ jobs:
       - name: Create the Windows CI-only bundle and checksums
         run: |
           $ErrorActionPreference = 'Stop'
+          if ((& git rev-parse HEAD).Trim() -cne $env:GITHUB_SHA) {
+            throw 'the checkout commit changed before Windows bundle staging'
+          }
+          $worktreeChanges = @(& git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)
+          if ($LASTEXITCODE -ne 0 -or $worktreeChanges.Count -ne 0) {
+            $worktreeChanges | ForEach-Object { Write-Error $_ }
+            throw 'the source tree changed before Windows bundle staging'
+          }
           $bundleRoot = Join-Path $env:STASIS_WINDOWS_DIST $env:STASIS_WINDOWS_BUNDLE
           New-Item -ItemType Directory -Path $bundleRoot | Out-Null
           $copyMap = [ordered]@{
@@ -619,6 +836,8 @@ jobs:
             'STASIS.md' = 'STASIS.md'
             'STASIS_UPSTREAM.toml' = 'STASIS_UPSTREAM.toml'
             'docs/stasis/releases.md' = 'RELEASES.md'
+            'docs/stasis/session-v0.3-candidate.md' = 'session-v0.3-candidate.md'
+            'profiles/controlled-web-session-v2.json' = 'controlled-web-session-v2.json'
             'resources/resource_protocol/license.html' = 'THIRD_PARTY_LICENSES.html'
           }
           foreach ($entry in $copyMap.GetEnumerator()) {
@@ -656,6 +875,33 @@ jobs:
           if (-not (Test-Path -LiteralPath $dumpbin -PathType Leaf)) {
             throw "dumpbin is missing: $dumpbin"
           }
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+
+          public static class StasisSystem32Loader
+          {
+              private const uint LoadLibrarySearchSystem32 = 0x00000800;
+
+              [DllImport("kernel32.dll", EntryPoint = "LoadLibraryExW", CharSet = CharSet.Unicode,
+                  SetLastError = true)]
+              private static extern IntPtr LoadLibraryEx(
+                  string fileName, IntPtr reserved, uint flags);
+
+              [DllImport("kernel32.dll", SetLastError = true)]
+              private static extern bool FreeLibrary(IntPtr module);
+
+              public static bool TryLoad(string fileName)
+              {
+                  IntPtr module = LoadLibraryEx(fileName, IntPtr.Zero, LoadLibrarySearchSystem32);
+                  if (module == IntPtr.Zero) return false;
+                  if (!FreeLibrary(module)) {
+                      throw new InvalidOperationException("FreeLibrary failed for " + fileName);
+                  }
+                  return true;
+              }
+          }
+          '@
           $redistRoot = Join-Path $vsInstall 'VC\Redist\MSVC'
           $redistVersion = Get-ChildItem -LiteralPath $redistRoot -Directory `
             | Where-Object Name -Match '^[0-9]+\.[0-9]+\.[0-9]+$' `
@@ -678,15 +924,37 @@ jobs:
           }
 
           function Get-ImportedDllNames([string] $path) {
-            $output = & $dumpbin /nologo /dependents $path 2>&1
+            $output = @(& $dumpbin /nologo /dependents $path 2>&1)
             if ($LASTEXITCODE -ne 0) {
               throw "dumpbin failed for $path with exit code $LASTEXITCODE"
             }
-            return @($output | ForEach-Object {
-              if ("$_" -match '^\s+([A-Za-z0-9._-]+\.dll)\s*$') {
-                $Matches[1]
+            $inDependencySection = $false
+            $sawDependencySection = $false
+            $imports = [Collections.Generic.List[string]]::new()
+            foreach ($outputLine in $output) {
+              $line = "$outputLine"
+              if ($line -match '^\s*Image has the following (?:delay load )?dependencies:\s*$') {
+                $inDependencySection = $true
+                $sawDependencySection = $true
+                continue
               }
-            } | Sort-Object -Unique)
+              if ($line -match '^\s*Summary\s*$') {
+                $inDependencySection = $false
+                continue
+              }
+              if (-not $inDependencySection -or [string]::IsNullOrWhiteSpace($line)) {
+                continue
+              }
+              $dependency = $line.Trim()
+              if ($dependency -notmatch '^[A-Za-z0-9._-]+\.dll$') {
+                throw "dumpbin reported an unrepresentable dependency '$dependency' for $path"
+              }
+              [void]$imports.Add($dependency)
+            }
+            if (-not $sawDependencySection) {
+              throw "dumpbin did not report a dependency section for $path"
+            }
+            return @($imports | Sort-Object -Unique)
           }
 
           $pending = [Collections.Generic.Queue[string]]::new()
@@ -713,8 +981,19 @@ jobs:
                 if (-not (Test-Path -LiteralPath (Join-Path $bundleRoot $dependency) -PathType Leaf)) {
                   throw "required app-local ANGLE DLL is unavailable: $dependency"
                 }
+              } elseif (Test-Path -LiteralPath (Join-Path $bundleRoot $dependency) -PathType Leaf) {
+                # An already-staged app-local dependency is part of the closed bundle graph.
               } elseif ($dependency -match '^(?i:(?:msvcp|vcruntime|concrt)[0-9].*\.dll)$') {
                 throw "required app-local MSVC runtime DLL is unavailable: $dependency"
+              } elseif ($dependency -match '^(?i:(?:api-ms-win-|ext-ms-win-).+\.dll)$') {
+                if (-not [StasisSystem32Loader]::TryLoad($dependency)) {
+                  throw "Windows cannot resolve the API-set contract from System32: $dependency"
+                }
+              } elseif (Test-Path -LiteralPath `
+                  (Join-Path (Join-Path $env:SystemRoot 'System32') $dependency) -PathType Leaf) {
+                # A concrete System32 image is an operating-system dependency, not ambient PATH.
+              } else {
+                throw "unclassified non-system DLL dependency is not app-local: $dependency (imported by $current)"
               }
             }
           }
@@ -757,9 +1036,13 @@ jobs:
           Run: $env:GITHUB_RUN_ID
           Attempt: $env:GITHUB_RUN_ATTEMPT
           Build: mach.ps1 exec -- cargo build --locked -p stasis-shell --profile production-stripped
+          Python: $env:STASIS_WINDOWS_PYTHON_BOUNDARY
+          Assembly: $env:STASIS_WINDOWS_ASSEMBLER_BOUNDARY
+          AWS_LC_SYS_PREBUILT_NASM: $env:STASIS_WINDOWS_PREBUILT_NASM
 
           Proof boundary: exact-SHA Windows build, explicit-executable TypeScript session
-          North Star, native fixture and redirect-order tests, ANGLE rendering backend,
+          North Star, complete baseline_protocol plus native fixture and redirect-order tests,
+          canonical controlled-web-session-v2 profile and candidate contract, ANGLE rendering backend,
           app-local MSVC runtime closure, fresh ZIP extraction, and extracted-binary
           act-settle-inspect. This artifact is outside the stable macOS/Linux release,
           promotion, provenance, runtime-manifest, and npm managed-runtime inventories.
@@ -871,6 +1154,69 @@ jobs:
             -Raw).Trim()
           $dumpbin = Join-Path $vsInstall `
             "VC\Tools\MSVC\$vcToolsVersion\bin\Hostx64\x64\dumpbin.exe"
+          if (-not (Test-Path -LiteralPath $dumpbin -PathType Leaf)) {
+            throw "dumpbin is missing during fresh extraction verification: $dumpbin"
+          }
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+
+          public static class StasisSystem32Loader
+          {
+              private const uint LoadLibrarySearchSystem32 = 0x00000800;
+
+              [DllImport("kernel32.dll", EntryPoint = "LoadLibraryExW", CharSet = CharSet.Unicode,
+                  SetLastError = true)]
+              private static extern IntPtr LoadLibraryEx(
+                  string fileName, IntPtr reserved, uint flags);
+
+              [DllImport("kernel32.dll", SetLastError = true)]
+              private static extern bool FreeLibrary(IntPtr module);
+
+              public static bool TryLoad(string fileName)
+              {
+                  IntPtr module = LoadLibraryEx(fileName, IntPtr.Zero, LoadLibrarySearchSystem32);
+                  if (module == IntPtr.Zero) return false;
+                  if (!FreeLibrary(module)) {
+                      throw new InvalidOperationException("FreeLibrary failed for " + fileName);
+                  }
+                  return true;
+              }
+          }
+          '@
+          function Get-ImportedDllNames([string] $path) {
+            $output = @(& $dumpbin /nologo /dependents $path 2>&1)
+            if ($LASTEXITCODE -ne 0) {
+              throw "dumpbin failed for extracted file $path with exit code $LASTEXITCODE"
+            }
+            $inDependencySection = $false
+            $sawDependencySection = $false
+            $imports = [Collections.Generic.List[string]]::new()
+            foreach ($outputLine in $output) {
+              $line = "$outputLine"
+              if ($line -match '^\s*Image has the following (?:delay load )?dependencies:\s*$') {
+                $inDependencySection = $true
+                $sawDependencySection = $true
+                continue
+              }
+              if ($line -match '^\s*Summary\s*$') {
+                $inDependencySection = $false
+                continue
+              }
+              if (-not $inDependencySection -or [string]::IsNullOrWhiteSpace($line)) {
+                continue
+              }
+              $dependency = $line.Trim()
+              if ($dependency -notmatch '^[A-Za-z0-9._-]+\.dll$') {
+                throw "dumpbin reported an unrepresentable dependency '$dependency' for $path"
+              }
+              [void]$imports.Add($dependency)
+            }
+            if (-not $sawDependencySection) {
+              throw "dumpbin did not report a dependency section for extracted file $path"
+            }
+            return @($imports | Sort-Object -Unique)
+          }
           $extractedBinary = Join-Path $extractedRoot 'stasis.exe'
           $headers = (& $dumpbin /nologo /headers $extractedBinary 2>&1 | Out-String)
           if ($LASTEXITCODE -ne 0 -or $headers -notmatch '(?im)^\s*8664 machine \(x64\)\s*$') {
@@ -886,16 +1232,31 @@ jobs:
             }
           }
           foreach ($file in @((Get-Item -LiteralPath $extractedBinary)) + $runtimeDlls) {
-            $dependencies = & $dumpbin /nologo /dependents $file.FullName 2>&1
-            if ($LASTEXITCODE -ne 0) {
-              throw "dumpbin failed for extracted file $($file.Name)"
+            $fileHeaders = (& $dumpbin /nologo /headers $file.FullName 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0 -or $fileHeaders -notmatch '(?im)^\s*8664 machine \(x64\)\s*$') {
+              throw "the extracted bundled PE is not x86-64: $($file.Name)"
             }
-            foreach ($dependency in $dependencies) {
-              if ("$dependency" -match '^\s+((?i:(?:msvcp|vcruntime|concrt)[0-9].*\.dll))\s*$') {
-                if (-not (Test-Path -LiteralPath (Join-Path $extractedRoot $Matches[1]) -PathType Leaf)) {
-                  throw "the extracted app-local MSVC runtime closure omitted $($Matches[1])"
-                }
+            foreach ($dependency in Get-ImportedDllNames $file.FullName) {
+              $appLocalDependency = Join-Path $extractedRoot $dependency
+              if ($dependency -match '^(?i:(?:msvcp|vcruntime|concrt)[0-9].*\.dll)$' `
+                  -and -not (Test-Path -LiteralPath $appLocalDependency -PathType Leaf)) {
+                throw "the extracted app-local MSVC runtime closure omitted $dependency"
               }
+              if (Test-Path -LiteralPath $appLocalDependency -PathType Leaf) {
+                continue
+              }
+              if ($dependency -match '^(?i:(?:api-ms-win-|ext-ms-win-).+\.dll)$') {
+                if (-not [StasisSystem32Loader]::TryLoad($dependency)) {
+                  throw "fresh extraction cannot resolve API-set contract from System32: $dependency"
+                }
+                continue
+              }
+              $systemDependency = Join-Path `
+                (Join-Path $env:SystemRoot 'System32') $dependency
+              if (Test-Path -LiteralPath $systemDependency -PathType Leaf) {
+                continue
+              }
+              throw "fresh extraction has an unclassified non-system DLL dependency: $dependency (imported by $($file.Name))"
             }
           }
 
@@ -935,6 +1296,8 @@ jobs:
           archive_sha256=$archiveHash
           binary_sha256=$binaryHash
           runtime_dll_count=$($runtimeDlls.Count)
+          assembler_boundary=$env:STASIS_WINDOWS_ASSEMBLER_BOUNDARY
+          aws_lc_sys_prebuilt_nasm=$env:STASIS_WINDOWS_PREBUILT_NASM
           artifact_gate=passed
           "@ | Set-Content -LiteralPath `
             (Join-Path $env:STASIS_WINDOWS_LOGS 'bundle-verification.txt') `
@@ -980,7 +1343,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RUN_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      STASIS_VERSION: 0.2.1
+      STASIS_VERSION: 0.3.0
       STASIS_REVISION: ${{ github.sha }}
     steps:
       - name: Check out the exact event commit
@@ -1070,7 +1433,29 @@ jobs:
               "stasis-linux-x86_64-act-settle-inspect-proof",
               "stasis-runtime-manifest",
               "stasis-typescript",
+              # Windows is a CI-only proof boundary. Its exact artifacts may already exist when
+              # this concurrent SDK job inspects the run, but they are not native SDK inputs.
+              "stasis-windows-x86_64-ci",
+              "stasis-windows-x86_64-ci-logs",
           )
+          permitted_non_native_prefixes = {
+              "stasis-runtime-manifest",
+              "stasis-typescript",
+              "stasis-windows-x86_64-ci",
+              "stasis-windows-x86_64-ci-logs",
+          }
+          native_prefixes = set(prefixes) - permitted_non_native_prefixes
+          if (
+              len(prefixes) != len(set(prefixes))
+              or native_prefixes
+                  != {
+                      "stasis-macos-aarch64",
+                      "stasis-macos-aarch64-act-settle-inspect-proof",
+                      "stasis-linux-x86_64",
+                      "stasis-linux-x86_64-act-settle-inspect-proof",
+                  }
+          ):
+              raise SystemExit("package SDK artifact prefix classifier is inconsistent")
           patterns = tuple(
               (prefix, re.compile(rf"^{re.escape(prefix)}-attempt-([1-9][0-9]*)$"))
               for prefix in prefixes
@@ -1106,8 +1491,10 @@ jobs:
                   platform = "macos-aarch64"
               elif matched[0].startswith("stasis-linux-"):
                   platform = "linux-x86_64"
-              else:
+              elif matched[0] in permitted_non_native_prefixes:
                   continue
+              else:
+                  raise SystemExit("package SDK artifact classifier accepted an unknown prefix")
               native_by_platform_attempt[platform].setdefault(attempt, []).append(name)
 
           producer_names = {
@@ -1267,7 +1654,7 @@ jobs:
               "linux-x86_64": os.environ["LINUX_RUN_ATTEMPT"],
           }
           repository = os.environ["GITHUB_REPOSITORY"]
-          if version != "0.2.1" or not re.fullmatch(r"[0-9a-f]{40}", revision):
+          if version != "0.3.0" or not re.fullmatch(r"[0-9a-f]{40}", revision):
               raise SystemExit("runtime manifest release identity is invalid")
           upstream = tomllib.loads(pathlib.Path("STASIS_UPSTREAM.toml").read_text(encoding="utf-8"))
           expected_upstream_keys = {
@@ -1287,7 +1674,8 @@ jobs:
               "INSTALL.txt", "LICENSE", "LICENSE_WHATWG_SPECS",
               "NATIVE-LIBRARIES.txt", "README.md", "SOURCE.txt",
               "STASIS_UPSTREAM.toml", "THIRD_PARTY_LICENSES.html",
-              "VERSION.txt", "stasis",
+              "VERSION.txt", "controlled-web-session-v2.json",
+              "session-v0.3-candidate.md", "stasis",
           ]
 
           def sha256(filename):
@@ -1409,6 +1797,12 @@ jobs:
           node etc/ci/stasis/verify_registry_sdk.mjs \
             --binary "$binary" \
             --fixture ports/stasis/tests/fixtures/timer_10s.html \
+            --session-v2-fixture ports/stasis/tests/fixtures/message_channel_buffered.html \
+            --session-v2-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_data_svg.html \
+            --session-v2-inline-svg-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg.html \
+            --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
+            --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
+            --session-v2-css-animation-event-fixture ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html \
             --consumer-root "$consumer" \
             --package "$STASIS_SDK_TARBALL" \
             --revision "$GITHUB_SHA" \
@@ -1559,7 +1953,7 @@ jobs:
       - name: Recheck exact identities and digests without repository code
         shell: bash
         env:
-          STASIS_VERSION: 0.2.1
+          STASIS_VERSION: 0.3.0
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -1658,6 +2052,194 @@ jobs:
                   )
                   and value == expected
               )
+
+          def require_exact_v2_fixture_proofs(document, context):
+              expected = {
+                  "v2DirectDataSvg": {
+                      "profile": "controlled-web-session-v2",
+                      "navigationBoundary": "controlled_ready",
+                      "outcome": "quiescent",
+                      "producerPending": "0",
+                      "producerTerminal": False,
+                      "pendingImages": "0",
+                      "runtimeFailures": "0",
+                      "unsupportedWork": "0",
+                      "externalIo": "0",
+                      "completionTrace": "load:0>loadend:0|now:0",
+                      "evidenceProfile": "controlled-web-session-v2",
+                      "sameControlledSession": True,
+                      "exactBinaryLaunch": True,
+                      "closeResponseAndEof": True,
+                  },
+                  "v2InlineSvgRendering": {
+                      "profile": "controlled-web-session-v2",
+                      "navigationBoundary": "controlled_ready",
+                      "outcome": "quiescent",
+                      "producerPending": "0",
+                      "producerTerminal": False,
+                      "pendingImages": "0",
+                      "runtimeFailures": "0",
+                      "unsupportedWork": "0",
+                      "externalIo": "0",
+                      "fixtureTrace": "inline-svg:4x3|events:0|now:0",
+                      "domCompletionEvents": "0",
+                      "evidenceProfile": "controlled-web-session-v2",
+                      "sameControlledSession": True,
+                      "exactBinaryLaunch": True,
+                      "closeResponseAndEof": True,
+                  },
+                  "v2InputMethodFocus": {
+                      "profile": "controlled-web-session-v2",
+                      "navigationBoundary": "controlled_ready",
+                      "outcome": "quiescent",
+                      "producerPending": "0",
+                      "producerTerminal": False,
+                      "runtimeFailures": "0",
+                      "unsupportedWork": "0",
+                      "externalIo": "0",
+                      "completionTrace": (
+                          "blurred|4|focus:trusted:0>focusin:trusted:0>blur:trusted:0>"
+                          "focusout:trusted:0|rwa-value|2:5"
+                      ),
+                      "evidenceProfile": "controlled-web-session-v2",
+                      "sameControlledSession": True,
+                      "exactBinaryLaunch": True,
+                      "closeResponseAndEof": True,
+                  },
+                  "v2AutomationEventTimestamps": {
+                      "profile": "controlled-web-session-v2",
+                      "navigationBoundary": "controlled_ready",
+                      "initialOutcome": "quiescent",
+                      "advancedVirtualTimeNs": "5000000",
+                      "dispatchedVirtualTimeNs": "5000000",
+                      "controlledEventCount": "11",
+                      "controlledTrace": (
+                          "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>"
+                          "check:input:5>check:change:5>select:input:5>select:change:5>invalid:invalid:5>"
+                          "submit:submit:5>submit:formdata:5|not-read"
+                      ),
+                      "browserEventCountAfterScriptProbe": "12",
+                      "scriptCreatedConstructorCount": "5",
+                      "scriptCreatedTrace": "0,0,0,0,0",
+                      "rejectedOutcome": "unsupported_work",
+                      "failureCode": "unsupported_clock_surface",
+                      "unsupportedKind": "other",
+                      "unsupportedCount": "1",
+                      "unsupportedReason": "time_surface",
+                      "unsupportedTimeSurface": "host_timestamp",
+                      "evidenceProfile": "controlled-web-session-v2",
+                      "sameControlledSession": True,
+                      "exactBinaryLaunch": True,
+                      "closeResponseAndEof": True,
+                  },
+              }
+              for field, expected_record in expected.items():
+                  record = document.get(field)
+                  if (
+                      type(record) is not dict
+                      or set(record) != set(expected_record)
+                      or any(
+                          type(record.get(key)) is not type(value)
+                          or record.get(key) != value
+                          for key, value in expected_record.items()
+                      )
+                  ):
+                      raise SystemExit(f"{context} lost exact {field} evidence")
+              css_record = document.get("v2CssAnimationEventTimestamps")
+              css_expected_fixed = {
+                  "profile": "controlled-web-session-v2",
+                  "initialOutcome": "quiescent",
+                  "settledVirtualTimeNs": "5000000",
+                  "controlledOutcome": "quiescent",
+                  "controlledEventCount": "2",
+                  "controlledEventKinds": "animationend,animationstart",
+                  "controlledOwnedEventCount": "2",
+                  "controlledRuntimeFailures": "0",
+                  "controlledUnsupportedWork": "0",
+                  "controlledExternalIo": "0",
+                  "pendingAnimationEvents": "0",
+                  "finiteAnimations": "0",
+                  "infiniteAnimations": "0",
+                  "unsupportedAnimations": "0",
+                  "producerPending": "0",
+                  "producerTerminal": False,
+                  "scriptCreatedConstructorCount": "2",
+                  "scriptCreatedTrace": "script:0,0",
+                  "rejectedOutcome": "unsupported_work",
+                  "failureCode": "unsupported_clock_surface",
+                  "unsupportedKind": "other",
+                  "unsupportedCount": "1",
+                  "unsupportedReason": "time_surface",
+                  "unsupportedTimeSurface": "host_timestamp",
+                  "evidenceProfile": "controlled-web-session-v2",
+                  "publicNonAuxiliaryControlledTarget": True,
+                  "sameControlledSession": True,
+                  "freshExactBinaryProcess": True,
+                  "managedRuntimeFallbackAccesses": "0",
+                  "exactBinaryLaunch": True,
+                  "closeResponseAndEof": True,
+              }
+              css_expected_fields = set(css_expected_fixed) | {
+                  "controlledEventCount", "controlledEventKinds",
+                  "controlledOwnedEventCount", "controlledDispatchTimeCount",
+                  "processedRenderingOpportunities",
+              }
+              event_count = (
+                  css_record.get("controlledEventCount", "")
+                  if type(css_record) is dict
+                  else ""
+              )
+              owned_event_count = (
+                  css_record.get("controlledOwnedEventCount", "")
+                  if type(css_record) is dict
+                  else ""
+              )
+              event_kinds = (
+                  css_record.get("controlledEventKinds", "").split(",")
+                  if type(css_record) is dict
+                  and isinstance(css_record.get("controlledEventKinds"), str)
+                  else []
+              )
+              allowed_event_kinds = {
+                  "animationcancel", "animationend", "animationiteration", "animationstart",
+              }
+              dispatch_times = (
+                  css_record.get("controlledDispatchTimeCount", "")
+                  if type(css_record) is dict
+                  else ""
+              )
+              rendering_opportunities = (
+                  css_record.get("processedRenderingOpportunities", "")
+                  if type(css_record) is dict
+                  else ""
+              )
+              if (
+                  type(css_record) is not dict
+                  or set(css_record) != css_expected_fields
+                  or any(
+                      type(css_record.get(key)) is not type(value)
+                      or css_record.get(key) != value
+                      for key, value in css_expected_fixed.items()
+                  )
+                  or not isinstance(event_count, str)
+                  or re.fullmatch(r"[1-9][0-9]*", event_count) is None
+                  or not 2 <= int(event_count) <= 4
+                  or owned_event_count != event_count
+                  or len(event_kinds) != int(event_count)
+                  or event_kinds != sorted(event_kinds)
+                  or len(set(event_kinds)) != len(event_kinds)
+                  or not set(event_kinds) <= allowed_event_kinds
+                  or "animationstart" not in event_kinds
+                  or "animationend" not in event_kinds
+                  or not isinstance(dispatch_times, str)
+                  or re.fullmatch(r"[1-9][0-9]*", dispatch_times) is None
+                  or int(dispatch_times) > int(event_count)
+                  or not isinstance(rendering_opportunities, str)
+                  or re.fullmatch(r"[1-9][0-9]*", rendering_opportunities) is None
+              ):
+                  raise SystemExit(
+                      f"{context} lost exact v2CssAnimationEventTimestamps evidence"
+                  )
 
           def canonical_member_path(member):
               name = member.name
@@ -1912,6 +2494,7 @@ jobs:
               "stasis", "INSTALL.txt", "LICENSE", "LICENSE_WHATWG_SPECS",
               "NATIVE-LIBRARIES.txt", "README.md", "SOURCE.txt",
               "STASIS_UPSTREAM.toml", "THIRD_PARTY_LICENSES.html", "VERSION.txt",
+              "controlled-web-session-v2.json", "session-v0.3-candidate.md",
           }
 
           def decompress_native_archive(archive, destination):
@@ -2213,7 +2796,8 @@ jobs:
                       "INSTALL.txt", "LICENSE", "LICENSE_WHATWG_SPECS",
                       "NATIVE-LIBRARIES.txt", "README.md", "SOURCE.txt",
                       "STASIS_UPSTREAM.toml", "THIRD_PARTY_LICENSES.html",
-                      "VERSION.txt", "stasis",
+                      "VERSION.txt", "controlled-web-session-v2.json",
+                      "session-v0.3-candidate.md", "stasis",
                   ],
                   "executablePath": "stasis",
                   "executableSha256": binding["executableSha256"],
@@ -2242,7 +2826,7 @@ jobs:
               sdk_proof_file.read_text(encoding="utf-8"), "SDK gate proof"
           )
           expected_sdk = {
-              "schema": 2,
+              "schema": 6,
               "gate": "sdk-act-settle-inspect",
               "package": f"@oxhq/stasis@{version}",
               "revision": revision,
@@ -2254,7 +2838,13 @@ jobs:
           }
           if (
               not isinstance(sdk_proof, dict)
-              or set(sdk_proof) != set(expected_sdk) | {"gateLogSha256"}
+              or set(sdk_proof)
+                  != set(expected_sdk) | {
+                      "gateLogSha256", "v2MessageChannel", "v2DirectDataSvg",
+                      "v2InlineSvgRendering", "v2InputMethodFocus",
+                      "v2AutomationEventTimestamps",
+                      "v2CssAnimationEventTimestamps",
+                  }
               or type(sdk_proof.get("schema")) is not int
           ):
               raise SystemExit("SDK gate proof schema changed")
@@ -2267,6 +2857,63 @@ jobs:
               raise SystemExit("SDK gate proof native digest is invalid")
           if any(sdk_proof.get(key) != value for key, value in expected_sdk.items()):
               raise SystemExit("SDK gate proof identity changed")
+          v2_message_channel = sdk_proof.get("v2MessageChannel")
+          expected_v2_fields = {
+              "profile", "idleOutcome", "idleMessagePortSources", "idleRuntimeFailures",
+              "bufferActionRotatedStateToken", "pendingPreservedBufferedStateToken",
+              "pendingMessagePortSources", "pendingRuntimeFailures",
+              "startActionRotatedStateToken", "drainedOutcome",
+              "drainedMessagePortSources", "drainedRuntimeFailures",
+              "aggregateProcessedOrdinaryTasks", "trace", "evidenceProfile",
+              "unsupportedWork", "exactBinaryLaunch", "closeResponseAndEof",
+          }
+          expected_v2_fixed = {
+              "profile": "controlled-web-session-v2",
+              "idleOutcome": "quiescent",
+              "idleMessagePortSources": "0",
+              "idleRuntimeFailures": "0",
+              "bufferActionRotatedStateToken": True,
+              "pendingPreservedBufferedStateToken": True,
+              "pendingMessagePortSources": "1",
+              "pendingRuntimeFailures": "0",
+              "startActionRotatedStateToken": True,
+              "drainedOutcome": "quiescent",
+              "drainedMessagePortSources": "0",
+              "drainedRuntimeFailures": "0",
+              "trace": "callback1>microtask1>callback2>microtask2",
+              "evidenceProfile": "controlled-web-session-v2",
+              "unsupportedWork": "0",
+              "exactBinaryLaunch": True,
+              "closeResponseAndEof": True,
+          }
+          aggregate_tasks = (
+              v2_message_channel.get("aggregateProcessedOrdinaryTasks", "")
+              if isinstance(v2_message_channel, dict)
+              else ""
+          )
+          if (
+              not isinstance(v2_message_channel, dict)
+              or set(v2_message_channel) != expected_v2_fields
+              or any(
+                  v2_message_channel.get(key) != value
+                  for key, value in expected_v2_fixed.items()
+              )
+              or any(
+                  v2_message_channel.get(key) is not True
+                  for key in (
+                      "bufferActionRotatedStateToken",
+                      "pendingPreservedBufferedStateToken",
+                      "startActionRotatedStateToken",
+                      "exactBinaryLaunch",
+                      "closeResponseAndEof",
+                  )
+              )
+              or not isinstance(aggregate_tasks, str)
+              or re.fullmatch(r"(?:0|[1-9][0-9]*)", aggregate_tasks) is None
+              or int(aggregate_tasks) < 2
+          ):
+              raise SystemExit("SDK gate proof does not preserve exact v2 MessageChannel evidence")
+          require_exact_v2_fixture_proofs(sdk_proof, "SDK gate proof")
           sdk_log_digest = sdk_proof.get("gateLogSha256")
           if (
               not isinstance(sdk_log_digest, str)
@@ -2279,17 +2926,17 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: |
-            release-assets/macos-aarch64/stasis-0.2.1-macos-aarch64.tar.gz
-            release-assets/macos-aarch64/stasis-0.2.1-macos-aarch64.tar.gz.sha256
-            release-assets/macos-aarch64/stasis-0.2.1-macos-aarch64.binary.sha256
-            gate-proof/macos-aarch64/stasis-0.2.1-macos-aarch64-act-settle-inspect.json
-            release-assets/linux-x86_64/stasis-0.2.1-linux-x86_64.tar.gz
-            release-assets/linux-x86_64/stasis-0.2.1-linux-x86_64.tar.gz.sha256
-            release-assets/linux-x86_64/stasis-0.2.1-linux-x86_64.binary.sha256
-            gate-proof/linux-x86_64/stasis-0.2.1-linux-x86_64-act-settle-inspect.json
-            runtime-manifest/stasis-0.2.1-runtime-manifest.json
-            sdk-proof/oxhq-stasis-0.2.1.tgz
-            sdk-proof/stasis-0.2.1-typescript-act-settle-inspect.json
+            release-assets/macos-aarch64/stasis-0.3.0-macos-aarch64.tar.gz
+            release-assets/macos-aarch64/stasis-0.3.0-macos-aarch64.tar.gz.sha256
+            release-assets/macos-aarch64/stasis-0.3.0-macos-aarch64.binary.sha256
+            gate-proof/macos-aarch64/stasis-0.3.0-macos-aarch64-act-settle-inspect.json
+            release-assets/linux-x86_64/stasis-0.3.0-linux-x86_64.tar.gz
+            release-assets/linux-x86_64/stasis-0.3.0-linux-x86_64.tar.gz.sha256
+            release-assets/linux-x86_64/stasis-0.3.0-linux-x86_64.binary.sha256
+            gate-proof/linux-x86_64/stasis-0.3.0-linux-x86_64-act-settle-inspect.json
+            runtime-manifest/stasis-0.3.0-runtime-manifest.json
+            sdk-proof/oxhq-stasis-0.3.0.tgz
+            sdk-proof/stasis-0.3.0-typescript-act-settle-inspect.json
 
   verify-promotion:
     name: Verify immutable promotion inputs
@@ -2482,6 +3129,10 @@ jobs:
               "stasis-linux-x86_64-act-settle-inspect-proof",
               "stasis-runtime-manifest",
               "stasis-typescript",
+              # Windows artifacts prove the CI-only platform boundary and never become release,
+              # provenance, runtime-manifest, or managed npm inputs.
+              "stasis-windows-x86_64-ci",
+              "stasis-windows-x86_64-ci-logs",
           )
           patterns = tuple(
               (prefix, re.compile(rf"^{re.escape(prefix)}-attempt-([1-9][0-9]*)$"))
@@ -2495,6 +3146,16 @@ jobs:
               "stasis-runtime-manifest": "sdk",
               "stasis-typescript": "sdk",
           }
+          permitted_ci_only_prefixes = {
+              "stasis-windows-x86_64-ci",
+              "stasis-windows-x86_64-ci-logs",
+          }
+          if (
+              len(prefixes) != len(set(prefixes))
+              or set(prefixes) != set(prefix_groups) | permitted_ci_only_prefixes
+              or set(prefix_groups) & permitted_ci_only_prefixes
+          ):
+              raise SystemExit("promotion artifact prefix classifier is inconsistent")
           by_group_attempt = {group: {} for group in set(prefix_groups.values())}
           for artifact in artifacts:
               if artifact.get("expired") is True:
@@ -2520,6 +3181,8 @@ jobs:
               attempt = int(matched[1].group(1))
               if attempt > overall_attempt:
                   raise SystemExit("package artifact claims a future run attempt")
+              if matched[0] in permitted_ci_only_prefixes:
+                  continue
               group = prefix_groups[matched[0]]
               by_group_attempt[group].setdefault(attempt, []).append(name)
 
@@ -2735,7 +3398,8 @@ jobs:
               "INSTALL.txt", "LICENSE", "LICENSE_WHATWG_SPECS",
               "NATIVE-LIBRARIES.txt", "README.md", "SOURCE.txt",
               "STASIS_UPSTREAM.toml", "THIRD_PARTY_LICENSES.html",
-              "VERSION.txt", "stasis",
+              "VERSION.txt", "controlled-web-session-v2.json",
+              "session-v0.3-candidate.md", "stasis",
           ]
           targets = (
               ("darwin-arm64", "darwin", "arm64", "macos-aarch64"),
@@ -3117,7 +3781,8 @@ jobs:
               "INSTALL.txt", "LICENSE", "LICENSE_WHATWG_SPECS",
               "NATIVE-LIBRARIES.txt", "README.md", "SOURCE.txt",
               "STASIS_UPSTREAM.toml", "THIRD_PARTY_LICENSES.html",
-              "VERSION.txt", "stasis",
+              "VERSION.txt", "controlled-web-session-v2.json",
+              "session-v0.3-candidate.md", "stasis",
           ]
           artifacts = {}
           for key, node_platform, node_arch, platform in (
@@ -3330,7 +3995,7 @@ jobs:
           cat > release-notes.md <<EOF
           # Stasis $TAG
 
-          Corrective Stasis controlled web-session release.
+          Stasis modern-web controlled-session release.
 
           - Exact source commit: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$HEAD_SHA
           - Package and gate run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID
@@ -3339,12 +4004,34 @@ jobs:
           - Linux compatibility floor: Ubuntu 22.04 / glibc 2.35
           - macOS signing: unsigned and not Apple-notarized
 
-          Stasis 0.2 preserves the frozen controlled-webapp-v1 contract and adds
-          controlled-web-session-v1 navigation, session state, network evidence, and
-          crawler-grade extraction. Both profiles fail closed outside their declared surface.
+          Stasis 0.3 preserves the frozen controlled-webapp-v1 and
+          controlled-web-session-v1 contracts. The explicitly selected
+          controlled-web-session-v2 candidate adds bounded, same-global, untransferred
+          MessageChannel/MessagePort delivery; a bounded direct top-level HTMLImageElement.src
+          data:image/svg+xml cache/decode completion path; a distinct bounded top-level inline SVG
+          path for its exact cached internally serialized data-SVG request and cache-ID owner on the
+          same ScriptThread/ImageCache; and
+          an explicit headless InputMethod boundary for controlled top-level, single-line text focus
+          without a virtual-keyboard request. Admitted HTML image completion sets and
+          engine-generated focus transitions use document-clock timestamps. Every browser-created
+          event constructed synchronously during one public mutating automation action shares one
+          pre-mutation document-clock sample; the form-event proof is representative. Each nonempty
+          owned CSS animation pending-event dispatch batch also shares one document-clock sample
+          across internal AnimationEvent records owned by the exact public non-auxiliary controlled
+          top-level WebView/document. TransitionEvent stamping is conditional on an existing owned
+          transition record reaching that queue; general transition settlement is not claimed.
+          Auxiliary WebViews remain host-stamped.
+          The HTML image path requires canonical exact-MIME
+          direct-src selection within its URL and retained-ownership limits. The inline path also
+          requires an internal request and exact cached-URL/cache-ID join; it is fenced through
+          decode/raster completion and creates no DOM load event. Script-created events, including
+          AnimationEvent/TransitionEvent constructors, port
+          transfer, excluded image sources/consumers, general SVG/resource semantics, cross-global
+          messaging, workers, iframes, external ingress, and other undeclared sources receive no
+          new controlled authority. Baseline and v1 SVG behavior are unchanged.
 
-          This patch retains redirect predecessors until their terminal callback even when
-          a successor begins first, preserving complete response evidence in either ordering.
+          Windows x86_64 is compiled, packaged, dependency-closed, and exercised in package CI.
+          It remains an unsigned CI-only artifact and is not a managed release asset in this tag.
 
           This draft contains both native archives, archive and binary SHA-256 sidecars,
           artifact-bound native gate proofs, and the exact runtime distribution manifest

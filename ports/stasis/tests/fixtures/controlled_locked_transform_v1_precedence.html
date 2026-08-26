@@ -1,0 +1,25 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled v1 locked TransformStream transfer precedence fixture</title>
+<button id="start">start</button>
+<div id="result">idle</div>
+<script>
+  document.querySelector("#start").onclick = () => {
+    const buffer = new ArrayBuffer(16);
+    const stream = new TransformStream();
+    const reader = stream.readable.getReader();
+    let errorName = "no-error";
+    try {
+      structuredClone(
+        { buffer, stream },
+        { transfer: [buffer, stream] },
+      );
+    } catch (error) {
+      errorName = error.name;
+    } finally {
+      reader.releaseLock();
+    }
+    document.querySelector("#result").textContent =
+      `${errorName}:buffer:${buffer.byteLength}`;
+  };
+</script>

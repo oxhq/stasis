@@ -458,8 +458,8 @@ fn checked_javascript_date_time_microseconds(
     for anchor in [exact_candidate_microseconds, millisecond_anchor] {
         for candidate in [anchor, f64_next_down(anchor), f64_next_up(anchor)] {
             let observed_time_clip = simulated_javascript_date_time_clip(candidate);
-            if !observed_time_clip.is_finite()
-                || observed_time_clip as i128 != expected_milliseconds
+            if !observed_time_clip.is_finite() ||
+                observed_time_clip as i128 != expected_milliseconds
             {
                 continue;
             }
@@ -806,6 +806,27 @@ impl DocumentClock {
         }
     }
 
+    /// Latch a checked controlled-clock failure discovered by a document-surface adapter.
+    ///
+    /// Some surface conversions (for example, subtracting a replacement Document's time origin)
+    /// occur outside the core clock mutex. They must retain their exact first failure in the same
+    /// terminal domain before suppressing page-visible work. Realtime callers receive
+    /// [`DocumentClockError::RealtimeClock`] and cannot manufacture a controlled terminal.
+    pub fn latch_terminal_error(
+        &self,
+        error: DocumentClockError,
+    ) -> Result<DocumentClockError, DocumentClockError> {
+        let DocumentClockInner::Controlled { state, .. } = &*self.inner else {
+            return Err(DocumentClockError::RealtimeClock);
+        };
+        let mut state = state.lock().expect("controlled document clock poisoned");
+        if let Some(terminal) = state.terminal {
+            return Ok(terminal);
+        }
+        state.terminal = Some(error);
+        Ok(error)
+    }
+
     /// Return the current offset, checking the host-duration conversion.
     pub fn try_now(&self) -> Result<DocumentTime, DocumentClockError> {
         match &*self.inner {
@@ -978,15 +999,15 @@ impl DocumentClock {
     /// this clock. Declaring a future surface early would let a controlled page leak host time
     /// without leaving fail-closed evidence.
     pub fn require_surface(&self, surface: DocumentTimeSurface) -> Result<(), DocumentClockError> {
-        if !self.is_controlled()
-            || matches!(
+        if !self.is_controlled() ||
+            matches!(
                 surface,
-                DocumentTimeSurface::WindowTimers
-                    | DocumentTimeSurface::JavaScriptDate
-                    | DocumentTimeSurface::Performance
-                    | DocumentTimeSurface::UpdateRendering
-                    | DocumentTimeSurface::AnimationFrame
-                    | DocumentTimeSurface::DocumentTimeline
+                DocumentTimeSurface::WindowTimers |
+                    DocumentTimeSurface::JavaScriptDate |
+                    DocumentTimeSurface::Performance |
+                    DocumentTimeSurface::UpdateRendering |
+                    DocumentTimeSurface::AnimationFrame |
+                    DocumentTimeSurface::DocumentTimeline
             )
         {
             Ok(())
@@ -1227,6 +1248,15 @@ impl DocumentProducerFenceState {
 pub enum DocumentProducerFenceError {
     /// A sequence or watermark would exceed the `u64` representation.
     CounterOverflow,
+    /// A bounded producer registration was rejected before it could create a lease.
+    AdmissionLimitExceeded {
+        /// Producer class whose retained-registration boundary was reached.
+        kind: DocumentProducerKind,
+        /// Configured maximum number of retained registrations.
+        limit: u64,
+        /// One-based registration rejected at the boundary.
+        observed: u64,
+    },
     /// No event-loop microtask checkpoint has completed yet.
     CheckpointNotCompleted,
     /// An observation reused or moved backwards from an already observed checkpoint.
@@ -1363,6 +1393,37 @@ impl DocumentProducerFence {
             fence: self.clone(),
             lease_id: Some(lease_id),
         })
+    }
+
+    /// Latch a bounded producer-registration failure without inventing a producer lease.
+    ///
+    /// Registration capacity is owned by the adapter retaining the callback, rather than by the
+    /// fence's message watermarks. This operation records that checked admission failure in the
+    /// same sticky terminal domain while leaving enqueue, completion, and pending counts exact.
+    /// The terminal field is part of snapshot identity, so an already captured snapshot cannot
+    /// remain authoritative across the rejected admission. Revision and watermarks stay unchanged
+    /// to preserve the fence conservation law `revision == enqueued + completed`.
+    pub fn latch_admission_limit_exceeded(
+        &self,
+        kind: DocumentProducerKind,
+        limit: u64,
+        observed: u64,
+    ) -> DocumentProducerFenceError {
+        debug_assert!(observed > limit);
+        let mut state = self.inner.lock().expect("document producer fence poisoned");
+        if let Some(error) = state.terminal_error {
+            return error;
+        }
+
+        let error = DocumentProducerFenceError::AdmissionLimitExceeded {
+            kind,
+            limit,
+            observed,
+        };
+        state.terminal_error = Some(error);
+        drop(state);
+        self.notify_state_change();
+        error
     }
 
     /// Capture all producer watermarks under one lock acquisition.
@@ -1604,8 +1665,8 @@ impl DocumentProducerObserver {
         if checkpoint == DocumentProducerCheckpoint::ZERO {
             return Err(DocumentProducerFenceError::CheckpointNotCompleted);
         }
-        if let Some(previous) = self.last_checkpoint
-            && checkpoint <= previous
+        if let Some(previous) = self.last_checkpoint &&
+            checkpoint <= previous
         {
             return Err(DocumentProducerFenceError::StaleCheckpoint {
                 previous,
@@ -2596,6 +2657,49 @@ mod tests {
     }
 
     #[test]
+    fn admission_limit_terminal_invalidates_snapshot_without_changing_conserved_watermarks() {
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed_notifications = notifications.clone();
+        let fence = DocumentProducerFence::with_notifier(Some(Arc::new(move || {
+            observed_notifications.fetch_add(1, Ordering::SeqCst);
+        })));
+        let before = fence.snapshot();
+
+        let error = fence.latch_admission_limit_exceeded(DocumentProducerKind::Image, 512, 513);
+
+        assert_eq!(
+            error,
+            DocumentProducerFenceError::AdmissionLimitExceeded {
+                kind: DocumentProducerKind::Image,
+                limit: 512,
+                observed: 513,
+            }
+        );
+        let terminal = fence.snapshot();
+        assert_eq!(terminal.terminal_error(), Some(error));
+        assert_eq!(terminal.revision(), before.revision());
+        assert_eq!(terminal.enqueued(), before.enqueued());
+        assert_eq!(terminal.completed(), before.completed());
+        assert_eq!(terminal.pending(), before.pending());
+        assert_eq!(
+            terminal.for_kind(DocumentProducerKind::Image),
+            before.for_kind(DocumentProducerKind::Image)
+        );
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            fence.with_matching_snapshot(before, || ()),
+            Err(mismatch) if mismatch.observed() == terminal
+        ));
+
+        assert_eq!(
+            fence.latch_admission_limit_exceeded(DocumentProducerKind::Task, 7, 8),
+            error
+        );
+        assert_eq!(fence.snapshot(), terminal);
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn enqueue_reserves_capacity_for_infallible_guard_completion() {
         let state = DocumentProducerFenceState {
             revision: u64::MAX - 2,
@@ -3443,6 +3547,24 @@ mod tests {
         assert_eq!(
             clock.advance_to(DocumentTime::ZERO),
             Err(DocumentClockError::Overflow)
+        );
+    }
+
+    #[test]
+    fn surface_adapter_can_latch_its_exact_first_clock_terminal() {
+        let clock = controlled_clock(7);
+        let first = DocumentClockError::TimeMovedBackwards {
+            current: DocumentTime::from_nanos(9),
+            requested: DocumentTime::from_nanos(7),
+        };
+        assert_eq!(clock.latch_terminal_error(first), Ok(first));
+        assert_eq!(
+            clock.latch_terminal_error(DocumentClockError::Overflow),
+            Ok(first)
+        );
+        assert_eq!(
+            DocumentClock::default().latch_terminal_error(DocumentClockError::Overflow),
+            Err(DocumentClockError::RealtimeClock)
         );
     }
 

@@ -893,22 +893,47 @@ impl HTMLLinkElement {
             Image::Vector(vector_image) => {
                 // This size is completely arbitrary.
                 let size = DeviceIntSize::new(250, 250);
+                let vector_image_id = vector_image.id;
 
                 let image_cache = window.image_cache();
                 if let Some(raster_image) =
-                    image_cache.rasterize_vector_image(vector_image.id, size, None)
+                    image_cache.rasterize_vector_image(vector_image_id, size, None)
                 {
                     send_rasterized_favicon_to_embedder(&raster_image);
                 } else {
-                    // The rasterization callback will end up calling "process_favicon_response" again,
-                    // but this time with a raster image.
-                    let image_cache_sender = self.register_image_cache_callback(vector_image.id);
-                    image_cache.add_rasterization_complete_listener(
-                        window.pipeline_id(),
-                        vector_image.id,
+                    let trusted_node = Trusted::new(self);
+                    let request_generation_id = self.get_request_generation_id();
+                    let listener = window.register_baseline_image_rasterization_listener(
+                        vector_image_id,
                         size,
-                        image_cache_sender,
+                        move |_cx| {
+                            let element = trusted_node.root();
+                            if request_generation_id != element.get_request_generation_id() {
+                                return true;
+                            }
+                            let window = element.owner_window();
+                            let Some(raster_image) = window.image_cache().rasterize_vector_image(
+                                vector_image_id,
+                                size,
+                                None,
+                            ) else {
+                                // A completion without an available raster cannot be reported as
+                                // done. Window retains the baseline raster owner, which keeps
+                                // controlled settlement explicitly unsupported.
+                                return false;
+                            };
+                            element.process_favicon_response(Image::Raster(raster_image.into()));
+                            true
+                        },
                     );
+                    if let Some(listener) = listener {
+                        image_cache.add_rasterization_complete_listener(
+                            window.pipeline_id(),
+                            vector_image_id,
+                            size,
+                            listener,
+                        );
+                    }
                 }
             },
         }

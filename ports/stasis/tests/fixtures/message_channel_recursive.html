@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<button id="start">start</button>
+<output id="count">0</output>
+<script>
+const channel = new MessageChannel();
+let count = 0;
+
+channel.port1.onmessage = () => {
+  count += 1;
+  document.querySelector("#count").textContent = String(count);
+  channel.port2.postMessage(null);
+};
+
+document.querySelector("#start").onclick = () => {
+  channel.port2.postMessage(null);
+};
+</script>

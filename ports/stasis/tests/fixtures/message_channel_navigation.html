@@ -1,0 +1,61 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>MessageChannel replacement profile fixture</title>
+<button id="prime" type="button">Retain idle MessageChannel</button>
+<button id="start" type="button">Start MessageChannel</button>
+<div id="result">idle</div>
+<script>
+const result = document.querySelector("#result");
+const staleCallbackCountKey = "stasis-message-channel-stale-callback-count";
+const durableSessionStorage = sessionStorage;
+
+if (durableSessionStorage.getItem(staleCallbackCountKey) === null) {
+  durableSessionStorage.setItem(staleCallbackCountKey, "0");
+}
+
+document.querySelector("#prime").addEventListener("click", () => {
+  const channel = new MessageChannel();
+  globalThis.idleChannelUnderTest = channel;
+
+  // addEventListener does not start a MessagePort. This message must therefore remain in A's
+  // native port buffer: pending observes one owned source before navigation, and producer fencing
+  // must remove it across A -> B -> A. A surviving old-generation buffer is directly visible as a
+  // leaked pending source. If it is ever incorrectly started, its callback also leaves a DOM mark.
+  channel.port1.addEventListener("message", () => {
+    const staleCallbackCount = Number.parseInt(
+      durableSessionStorage.getItem(staleCallbackCountKey) ?? "0",
+      10,
+    );
+    durableSessionStorage.setItem(staleCallbackCountKey, `${staleCallbackCount + 1}`);
+    const currentResult = window.document.querySelector("#result");
+    if (currentResult !== null) {
+      currentResult.textContent = "leaked-old-document-message";
+    }
+  });
+  channel.port2.postMessage("must-retire-with-document-a");
+  result.textContent = "primed";
+});
+
+document.querySelector("#start").addEventListener("click", () => {
+  try {
+    const staleCallbackCount = durableSessionStorage.getItem(staleCallbackCountKey);
+    if (staleCallbackCount !== "0") {
+      result.textContent = `stale-callbacks:${staleCallbackCount ?? "missing"}`;
+      return;
+    }
+
+    const channel = new MessageChannel();
+    globalThis.channelUnderTest = channel;
+    channel.port1.onmessage = (event) => {
+      result.textContent = `message:${event.data}`;
+      channel.port1.close();
+      channel.port2.close();
+      globalThis.channelUnderTest = null;
+    };
+    channel.port2.postMessage("after-replacement");
+    result.textContent = "posted";
+  } catch (error) {
+    result.textContent = error.name;
+  }
+});
+</script>

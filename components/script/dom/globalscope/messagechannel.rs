@@ -26,6 +26,7 @@ impl MessageChannel {
         cx: &mut JSContext,
         incumbent: &GlobalScope,
         proto: Option<HandleObject>,
+        controlled_local: bool,
     ) -> DomRoot<MessageChannel> {
         // Step 1
         let port1 = MessagePort::new(cx, incumbent);
@@ -33,8 +34,13 @@ impl MessageChannel {
         // Step 2
         let port2 = MessagePort::new(cx, incumbent);
 
-        incumbent.track_message_port(&port1, None);
-        incumbent.track_message_port(&port2, None);
+        if controlled_local {
+            incumbent.track_controlled_local_message_port(&port1);
+            incumbent.track_controlled_local_message_port(&port2);
+        } else {
+            incumbent.track_message_port(&port1, None);
+            incumbent.track_message_port(&port2, None);
+        }
 
         // Step 3
         incumbent.entangle_ports(*port1.message_port_id(), *port2.message_port_id());
@@ -64,8 +70,11 @@ impl MessageChannelMethods<crate::DomTypeHolder> for MessageChannel {
         global: &GlobalScope,
         proto: Option<HandleObject>,
     ) -> Fallible<DomRoot<MessageChannel>> {
-        global.require_external_subscription()?;
-        Ok(MessageChannel::new(cx, global, proto))
+        // Resolve the caller before publishing either port. A constructor borrowed from the
+        // controlled Window by another realm must not acquire that Window's local authority.
+        let incumbent = GlobalScope::incumbent();
+        let controlled_local = global.admit_message_channel_constructor(incumbent.as_deref())?;
+        Ok(MessageChannel::new(cx, global, proto, controlled_local))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-messagechannel-port1>

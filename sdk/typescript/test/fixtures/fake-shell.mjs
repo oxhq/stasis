@@ -29,7 +29,10 @@ let sessionCookies = [];
 let sessionOrigins = [];
 
 const isSessionScenario = scenario.startsWith("session-");
-const sessionProfile = "controlled-web-session-v1";
+const sessionV1Profile = "controlled-web-session-v1";
+const sessionV2Profile = "controlled-web-session-v2";
+const sessionProfiles = new Set([sessionV1Profile, sessionV2Profile]);
+const isSessionProfile = (profile) => sessionProfiles.has(profile);
 
 const rotateDocumentToken = () => {
   documentTokenOrdinal += 1;
@@ -45,7 +48,7 @@ const rotateSessionStateToken = () => {
 
 const sessionState = () => ({
   schemaVersion: 1,
-  profile: sessionProfile,
+  profile: sessionV1Profile,
   sensitive: true,
   sessionStorageScope: "top_level_browsing_context",
   cookies: sessionCookies,
@@ -343,7 +346,14 @@ async function handle(request) {
             "session.close",
           ],
           clockModes: ["real", "controlled"],
-          profiles: ["controlled-webapp-v1", ...(isSessionScenario ? [sessionProfile] : [])],
+          profiles: [
+            "controlled-webapp-v1",
+            ...(isSessionScenario
+              ? scenario === "session-v2-unadvertised"
+                ? [sessionV1Profile]
+                : [sessionV1Profile, sessionV2Profile]
+              : []),
+          ],
           settlement: true,
           settlementLimits: ["maxVirtualTimeNs", "maxControlTurns", "wallIoTimeoutNs"],
         },
@@ -356,7 +366,7 @@ async function handle(request) {
   if (request.method === "session.open") {
     openParams = request.params;
     sessionId = "fake-session";
-    if (request.params.profile === sessionProfile) {
+    if (isSessionProfile(request.params.profile)) {
       stateToken = documentToken(1);
       sessionStateToken = sessionToken(1);
       documentTokenOrdinal = 1;
@@ -373,7 +383,10 @@ async function handle(request) {
         url: request.params.url,
         boundary: "controlled_ready",
         clockMode: "controlled",
-        profile: sessionProfile,
+        profile:
+          scenario === "session-v2-response-mismatch"
+            ? sessionV1Profile
+            : request.params.profile,
         stateToken,
         sessionStateToken:
           scenario === "session-invalid-session-state-token"
@@ -408,7 +421,7 @@ async function handle(request) {
   if (request.method === "action.activate") {
     lastActivateParams = request.params;
     if (scenario === "command-hang-mutate") return;
-    if (openParams?.profile === sessionProfile) {
+    if (isSessionProfile(openParams?.profile)) {
       if (request.params.expectedStateToken !== stateToken) {
         throw new Error("action.activate expectedStateToken mismatch");
       }
@@ -428,7 +441,7 @@ async function handle(request) {
   }
   if (request.method === "action.fill") {
     lastFillParams = request.params;
-    if (openParams?.profile === sessionProfile) {
+    if (isSessionProfile(openParams?.profile)) {
       if (request.params.expectedStateToken !== stateToken) {
         throw new Error("action.fill expectedStateToken mismatch");
       }
@@ -493,7 +506,7 @@ async function handle(request) {
   }
   if (request.method === "dom.query") {
     lastQueryParams = request.params;
-    if (openParams?.profile === sessionProfile) {
+    if (isSessionProfile(openParams?.profile)) {
       if (request.params.expectedStateToken !== stateToken) {
         throw new Error("dom.query expectedStateToken mismatch");
       }
@@ -514,7 +527,7 @@ async function handle(request) {
   }
   if (request.method === "dom.text") {
     lastTextParams = request.params;
-    if (openParams?.profile === sessionProfile) {
+    if (isSessionProfile(openParams?.profile)) {
       if (request.params.expectedStateToken !== stateToken) {
         throw new Error("dom.text expectedStateToken mismatch");
       }
@@ -535,7 +548,7 @@ async function handle(request) {
   }
   if (request.method === "dom.extract") {
     lastExtractParams = request.params;
-    if (openParams?.profile === sessionProfile) {
+    if (isSessionProfile(openParams?.profile)) {
       if (request.params.expectedStateToken !== stateToken) {
         throw new Error("dom.extract expectedStateToken mismatch");
       }
@@ -698,7 +711,7 @@ async function handle(request) {
       await send(request, invalid);
       return;
     }
-    if (openParams?.profile === sessionProfile) {
+    if (isSessionProfile(openParams?.profile)) {
       await send(request, {
         ...pending(),
         stateToken:
@@ -724,7 +737,7 @@ async function handle(request) {
       delete result.limit;
     }
     if (scenario === "settle-summary-mismatch") result.stateGeneration = "1";
-    if (openParams?.profile === sessionProfile) {
+    if (isSessionProfile(openParams?.profile)) {
       if (request.params.expectedStateToken !== stateToken) {
         throw new Error("runtime.settle expectedStateToken mismatch");
       }
@@ -746,7 +759,7 @@ async function handle(request) {
       stateGeneration: "9007199254740997",
       snapshot,
     };
-    if (openParams?.profile === sessionProfile) {
+    if (isSessionProfile(openParams?.profile)) {
       if (request.params.expectedStateToken !== stateToken) {
         throw new Error("runtime.advance_to_next expectedStateToken mismatch");
       }

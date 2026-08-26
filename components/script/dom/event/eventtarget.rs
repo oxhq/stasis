@@ -220,8 +220,8 @@ impl CompiledEventListener {
             CompiledEventListener::Handler(ref handler) => {
                 match *handler {
                     CommonEventHandler::ErrorEventHandler(ref handler) => {
-                        if let Some(event) = event.downcast::<ErrorEvent>() &&
-                            (object.is::<Window>() || object.is::<WorkerGlobalScope>())
+                        if let Some(event) = event.downcast::<ErrorEvent>()
+                            && (object.is::<Window>() || object.is::<WorkerGlobalScope>())
                         {
                             rooted!(&in(cx) let mut error: JSVal);
                             event.Error(error.handle_mut());
@@ -238,9 +238,9 @@ impl CompiledEventListener {
                                 exception_handle,
                             );
                             // Step 4
-                            if let Ok(()) = return_value &&
-                                rooted_return_value.handle().is_boolean() &&
-                                rooted_return_value.handle().to_boolean()
+                            if let Ok(()) = return_value
+                                && rooted_return_value.handle().is_boolean()
+                                && rooted_return_value.handle().to_boolean()
                             {
                                 event.upcast::<Event>().PreventDefault();
                             }
@@ -487,10 +487,10 @@ impl EventTarget {
         let event_type = ty.trim_matches(HTML_SPACE_CHARACTERS);
 
         // type is one of "touchstart", "touchmove", "wheel", or "mousewheel"
-        let matches_event_type = event_type.eq_ignore_ascii_case("touchstart") ||
-            event_type.eq_ignore_ascii_case("touchmove") ||
-            event_type.eq_ignore_ascii_case("wheel") ||
-            event_type.eq_ignore_ascii_case("mousewheel");
+        let matches_event_type = event_type.eq_ignore_ascii_case("touchstart")
+            || event_type.eq_ignore_ascii_case("touchmove")
+            || event_type.eq_ignore_ascii_case("wheel")
+            || event_type.eq_ignore_ascii_case("mousewheel");
 
         if !matches_event_type {
             return false;
@@ -559,8 +559,8 @@ impl EventTarget {
     pub(crate) fn remove_listener(&self, ty: &Atom, entry: &Rc<RefCell<EventListenerEntry>>) {
         let mut handlers = self.handlers.borrow_mut();
 
-        if let Some(entries) = handlers.get_mut(ty) &&
-            let Some(position) = entries.iter().position(|e| *e == *entry)
+        if let Some(entries) = handlers.get_mut(ty)
+            && let Some(position) = entries.iter().position(|e| *e == *entry)
         {
             entries.remove(position).borrow_mut().removed = true;
             self.notify_listener_removed(ty);
@@ -868,7 +868,16 @@ impl EventTarget {
         cancelable: EventCancelable,
         composed: EventComposed,
     ) -> bool {
-        let event = Event::new(cx, &self.global(), name, bubbles, cancelable);
+        let global = self.global();
+        let event = Event::new(cx, &global, name, bubbles, cancelable);
+        // The scope is intentionally causal rather than an event-name allowlist: any internal
+        // event constructed synchronously by the owning public automation action shares its one
+        // sampled timestamp. Script-created Event constructors do not pass through this helper.
+        if let Some(window) = global.downcast::<Window>()
+            && let Some(time_stamp) = window.synchronous_automation_event_time()
+        {
+            event.set_creation_time_stamp(time_stamp);
+        }
         event.set_composed(composed.into());
         event.fire(cx, self)
     }
@@ -1032,8 +1041,8 @@ impl EventTarget {
             if !a_root.is::<ShadowRoot>() {
                 return a;
             }
-            if let Some(b_node) = b.downcast::<Node>() &&
-                a_root.is_shadow_including_inclusive_ancestor_of(b_node)
+            if let Some(b_node) = b.downcast::<Node>()
+                && a_root.is_shadow_including_inclusive_ancestor_of(b_node)
             {
                 return a;
             }

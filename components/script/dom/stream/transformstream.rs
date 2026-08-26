@@ -1065,6 +1065,19 @@ impl TransformStreamMethods<crate::DomTypeHolder> for TransformStream {
 }
 
 /// <https://streams.spec.whatwg.org/#ts-transfer>
+impl TransformStream {
+    /// Reject a port-backed transfer before SpiderMonkey can detach an earlier transfer-list item.
+    pub(crate) fn require_transfer_admission(&self) -> Fallible<()> {
+        // Keep the Streams transfer algorithm's validation error ahead of the Stasis boundary.
+        if self.get_readable().is_locked() || self.get_writable().is_locked() {
+            return Err(Error::DataClone(None));
+        }
+
+        self.global().require_external_subscription()
+    }
+}
+
+/// <https://streams.spec.whatwg.org/#ts-transfer>
 impl Transferable for TransformStream {
     type Index = MessagePortIndex;
     type Data = TransformStreamData;
@@ -1072,6 +1085,8 @@ impl Transferable for TransformStream {
     /// <https://streams.spec.whatwg.org/#ref-for-transfer-steps②>
     fn transfer(&self, cx: &mut JSContext) -> Fallible<(MessagePortId, TransformStreamData)> {
         let global = self.global();
+        // Preserve the predecessor profiles' established error precedence. The v2-only
+        // complete-list preflight calls `require_transfer_admission` before any transfer step.
         global.require_external_subscription()?;
         let mut realm = enter_auto_realm(cx, &*global);
         let mut realm = realm.current_realm();

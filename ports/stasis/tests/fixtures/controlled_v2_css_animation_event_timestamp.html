@@ -1,0 +1,65 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled v2 CSS animation event timestamp</title>
+<style>
+  #target {
+    transform: translateX(0);
+  }
+
+  #target.running {
+    animation: controlled-slide 1ms linear -1ms 1;
+  }
+
+  @keyframes controlled-slide {
+    from { transform: translateX(0); }
+    to { transform: translateX(1px); }
+  }
+</style>
+<button id="start" type="button">start owned CSS work</button>
+<button id="script-created" type="button">create script events</button>
+<div id="target">target</div>
+<div id="result">pending</div>
+<script>
+  const result = document.querySelector("#result");
+  const target = document.querySelector("#target");
+  const observed = [];
+  let armedAt = null;
+
+  const formatTime = (value) => Number(value.toFixed(3)).toString();
+  const publish = () => {
+    result.textContent = `armed:${formatTime(armedAt ?? -1)}|${observed.join(">")}`;
+  };
+  const record = (event) => {
+    const eventTime = event.timeStamp;
+    const now = performance.now();
+    observed.push(
+      `${event.type}:${event.isTrusted ? "trusted" : "untrusted"}:${formatTime(eventTime)}:${formatTime(now)}:${eventTime === now && eventTime >= armedAt ? "owned" : "wrong"}`,
+    );
+    publish();
+  };
+
+  for (const type of [
+    "animationstart",
+    "animationend",
+  ]) {
+    target.addEventListener(type, record);
+  }
+
+  document.querySelector("#start").addEventListener("click", () => {
+    armedAt = performance.now();
+    target.classList.add("running");
+    // Establish a bounded, already-complete animation in this exact controlled turn. Event
+    // dispatch still occurs only through the document's owned update-the-rendering queue.
+    target.getBoundingClientRect();
+    publish();
+  });
+
+  document.querySelector("#script-created").addEventListener("click", () => {
+    const animation = new AnimationEvent("animationstart", { animationName: "script" });
+    const transition = new TransitionEvent("transitionrun", { propertyName: "opacity" });
+    observed.push(`script:${formatTime(animation.timeStamp)},${formatTime(transition.timeStamp)}`);
+    publish();
+  });
+
+  setTimeout(() => {}, 5);
+</script>

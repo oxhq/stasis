@@ -11,7 +11,10 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use background_hang_monitor_api::{BackgroundHangMonitorControlMsg, HangAlert};
-use embedder_traits::{DocumentClockConfiguration, DocumentControlProfile, ScriptToEmbedderChan};
+use embedder_traits::{
+    DocumentClockConfiguration, DocumentControlProfile, DocumentExecutionProfile,
+    ScriptToEmbedderChan,
+};
 use ipc_channel::IpcError;
 use layout_api::ScriptThreadFactory;
 use log::error;
@@ -34,6 +37,7 @@ pub struct EventLoop {
     id: ScriptEventLoopId,
     document_clock: DocumentClockConfiguration,
     document_control_profile: DocumentControlProfile,
+    document_execution_profile: DocumentExecutionProfile,
     /// When running in another process, this is an `IpcSender` to the BackgroundHangMonitor
     /// on the other side of the process boundary. When running in the same process, the
     /// BackgroundHangMonitor is shared among all [`EventLoop`]s so this will be `None`.
@@ -71,6 +75,7 @@ impl EventLoop {
         is_private: bool,
         document_clock: DocumentClockConfiguration,
         document_control_profile: DocumentControlProfile,
+        document_execution_profile: DocumentExecutionProfile,
     ) -> Result<Rc<Self>, IpcError> {
         let (script_chan, script_port) =
             servo_base::generic_channel::channel().expect("Pipeline script chan");
@@ -97,6 +102,7 @@ impl EventLoop {
             id: event_loop_id,
             document_clock,
             document_control_profile,
+            document_execution_profile,
             script_to_constellation_sender: constellation.script_sender.clone(),
             script_to_embedder_sender,
             namespace_request_sender: constellation.namespace_ipc_sender.clone(),
@@ -145,6 +151,7 @@ impl EventLoop {
         let id = initial_script_state.id;
         let document_clock = initial_script_state.document_clock;
         let document_control_profile = initial_script_state.document_control_profile;
+        let document_execution_profile = initial_script_state.document_execution_profile;
         let background_hang_monitor_register = constellation
             .background_monitor_register
             .clone()
@@ -163,6 +170,7 @@ impl EventLoop {
             id,
             document_clock,
             document_control_profile,
+            document_execution_profile,
             background_hang_monitor_sender: None,
             dont_send_or_sync: PhantomData,
         }
@@ -177,6 +185,7 @@ impl EventLoop {
         let id = initial_script_state.id;
         let document_clock = initial_script_state.document_clock;
         let document_control_profile = initial_script_state.document_control_profile;
+        let document_execution_profile = initial_script_state.document_execution_profile;
 
         let (background_hand_monitor_sender, backgrond_hand_monitor_receiver) =
             generic_channel::channel().expect("Sampler chan");
@@ -206,6 +215,7 @@ impl EventLoop {
             id,
             document_clock,
             document_control_profile,
+            document_execution_profile,
             background_hang_monitor_sender: Some(background_hand_monitor_sender),
             dont_send_or_sync: PhantomData,
         })
@@ -221,6 +231,10 @@ impl EventLoop {
 
     pub(crate) const fn document_control_profile(&self) -> DocumentControlProfile {
         self.document_control_profile
+    }
+
+    pub(crate) const fn document_execution_profile(&self) -> DocumentExecutionProfile {
+        self.document_execution_profile
     }
 
     /// Send a message to the event loop.

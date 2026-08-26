@@ -19,25 +19,26 @@ use serde_json::{Map, Number, Value, json};
 use servo::document_control::{DocumentControlCommand, DocumentControlError};
 use servo::{
     ControlledNetworkConfigurationError, ControlledNetworkSession, ControlledNetworkTimeError,
-    DocumentClockConfiguration, DocumentClockError, DocumentControlProfileError, GenericReceiver,
-    JSValue, JavaScriptEvaluationError, LoadStatus, Preferences, RenderingContext, Servo,
-    ServoBuilder, SoftwareRenderingContext, UnpublishedWebViewInitializationError, WebView,
-    WebViewBuilder, WebViewDelegate,
+    DocumentClockConfiguration, DocumentClockError, DocumentControlProfileError,
+    DocumentExecutionProfileError, GenericReceiver, JSValue, JavaScriptEvaluationError, LoadStatus,
+    Preferences, RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext,
+    UnpublishedWebViewInitializationError, WebView, WebViewBuilder, WebViewDelegate,
 };
 pub use servo::{
-    DocumentControlProfile, SessionNavigationAuthority, SessionNavigationError, SessionNavigationId,
+    DocumentControlProfile, DocumentExecutionProfile, SessionNavigationAuthority,
+    SessionNavigationError, SessionNavigationId,
 };
 use servo_base::generic_channel::TryReceiveError;
-use url::Url;
-
-use crate::protocol::ProtocolError;
-use crate::wake::{ShellWaker, WaitError};
 use stasis_shell::session_state::{
     self, LiveSessionStateBackend, ServoSessionStateBackend, SessionCookiesResultV1,
     SessionCookiesSetParamsV1, SessionStateAuthority, SessionStateError,
     SessionStateExportResultV1, SessionStateMutationResultV1, SessionStateToken, SessionStateV1,
     SessionStorageResultV1, SessionStorageSetParamsV1,
 };
+use url::Url;
+
+use crate::protocol::ProtocolError;
+use crate::wake::{ShellWaker, WaitError};
 
 #[path = "operation.rs"]
 mod operation;
@@ -233,6 +234,7 @@ impl EngineClockMode {
 pub struct EngineSessionOpenOptions {
     pub clock_mode: EngineClockMode,
     pub document_control_profile: DocumentControlProfile,
+    pub document_execution_profile: DocumentExecutionProfile,
     pub state: Option<SessionStateV1>,
     pub network: Option<Value>,
 }
@@ -376,6 +378,7 @@ pub struct EngineSession {
     waker: ShellWaker,
     clock_mode: EngineClockMode,
     document_control_profile: DocumentControlProfile,
+    document_execution_profile: DocumentExecutionProfile,
     session_state_authority: Option<Rc<RefCell<SessionStateAuthority>>>,
     controlled_network: Option<ControlledNetworkSession>,
     pending_control: Option<PendingControlOperation>,
@@ -424,6 +427,7 @@ impl EngineSession {
             EngineSessionOpenOptions {
                 clock_mode,
                 document_control_profile,
+                document_execution_profile: DocumentExecutionProfile::Baseline,
                 state: None,
                 network: None,
             },
@@ -439,6 +443,7 @@ impl EngineSession {
         let EngineSessionOpenOptions {
             clock_mode,
             document_control_profile,
+            document_execution_profile,
             state,
             network,
         } = options;
@@ -500,7 +505,9 @@ impl EngineSession {
             .document_clock(clock_mode.document_clock())
             .map_err(EngineError::ClockConfiguration)?
             .document_control_profile(document_control_profile)
-            .map_err(EngineError::ControlProfileConfiguration)?;
+            .map_err(EngineError::ControlProfileConfiguration)?
+            .document_execution_profile(document_execution_profile)
+            .map_err(EngineError::ExecutionProfileConfiguration)?;
         let builder = if let Some(network) = controlled_network.as_ref() {
             builder
                 .controlled_network_session(network.clone())
@@ -550,6 +557,7 @@ impl EngineSession {
             waker,
             clock_mode,
             document_control_profile,
+            document_execution_profile,
             session_state_authority,
             controlled_network,
             pending_control: None,
@@ -576,6 +584,10 @@ impl EngineSession {
 
     pub const fn document_control_profile(&self) -> DocumentControlProfile {
         self.document_control_profile
+    }
+
+    pub const fn document_execution_profile(&self) -> DocumentExecutionProfile {
+        self.document_execution_profile
     }
 
     pub fn session_state_token(&self) -> Result<SessionStateToken, SessionStateError> {
@@ -968,6 +980,7 @@ pub enum EngineError {
     SessionConfiguration(&'static str),
     ClockConfiguration(DocumentClockError),
     ControlProfileConfiguration(DocumentControlProfileError),
+    ExecutionProfileConfiguration(DocumentExecutionProfileError),
     ControlledNetworkConfiguration(ControlledNetworkConfigurationError),
     NetworkFixture(NetworkFixtureError),
     UnpublishedInitialization(UnpublishedWebViewInitializationError),
@@ -997,6 +1010,11 @@ impl EngineError {
             ),
             Self::ControlProfileConfiguration(error) => ProtocolError::operation(
                 "engine_control_profile_configuration_failed",
+                format!("{error:?}"),
+                "none",
+            ),
+            Self::ExecutionProfileConfiguration(error) => ProtocolError::operation(
+                "engine_execution_profile_configuration_failed",
                 format!("{error:?}"),
                 "none",
             ),

@@ -1250,10 +1250,10 @@ fn rendering_ready(pending: &RawPendingSnapshot) -> bool {
         || pending.rendering.pipelines().iter().any(|rendering| {
             rendering.activity == PendingRenderingPipelineActivity::FullyActive
                 && rendering.render_blocking_elements == 0
-                && (rendering.pending_animation_events != 0
-                    || rendering.animated_images.update_ready
+                && (rendering.animated_images.update_ready
                     || (rendering_opportunity_is_unscheduled
-                        && (rendering.runnable_animation_frame_callbacks != 0
+                        && (rendering.pending_animation_events != 0
+                            || rendering.runnable_animation_frame_callbacks != 0
                             || rendering.document_update_required
                             || rendering.canvas.dirty_contexts != 0)))
         })
@@ -1264,6 +1264,7 @@ fn has_finite_rendering_demand(rendering: &PendingPipelineRenderingObservation) 
         && rendering.render_blocking_elements == 0
         && (rendering.runnable_animation_frame_callbacks != 0
             || rendering.document_update_required
+            || rendering.pending_animation_events != 0
             || rendering.finite_animations != 0
             || rendering.canvas.dirty_contexts != 0)
 }
@@ -3370,6 +3371,32 @@ mod tests {
             observe(&mut coordinator, pending, Some(advance_token)).unwrap(),
             SettleProgress::Command(DocumentControlCommand::AdvanceTo(_))
         ));
+    }
+
+    #[test]
+    fn scheduled_pending_animation_events_advance_instead_of_spinning() {
+        for delay in [Duration::ZERO, Duration::from_nanos(20)] {
+            let mut fixture = Fixture::new();
+            fixture.schedule(delay);
+            let mut pending = fixture.snapshot(2, 1);
+            let head = pending.scheduler.next_deadline.unwrap();
+            let mut rendering = pending.rendering.pipelines()[0];
+            rendering.pending_animation_events = 1;
+            pending.rendering =
+                PendingRenderingObservation::new(Some(head), false, vec![rendering]).unwrap();
+            pending.validate().unwrap();
+            let advance_token = token(&pending);
+
+            let mut coordinator = SettleCoordinator::new(SettlePolicy::default());
+            assert_observe(coordinator.start().unwrap());
+            assert!(
+                matches!(
+                    observe(&mut coordinator, pending, Some(advance_token)).unwrap(),
+                    SettleProgress::Command(DocumentControlCommand::AdvanceTo(_))
+                ),
+                "scheduled pending animation events at {delay:?} must advance"
+            );
+        }
     }
 
     #[test]

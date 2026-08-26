@@ -1,5 +1,10 @@
 import { launch, type Runtime, type Session } from "./api.js";
 import { StasisAbortError } from "./errors.js";
+import {
+  CONTROLLED_WEB_SESSION_V2_PROFILE,
+  type SelectableSessionProfile,
+  type SessionSupportProfile,
+} from "./profile.js";
 import type { LaunchOptions, SessionOpenOptions } from "./types.js";
 
 /** A freshly-created native process and its single terminal session. */
@@ -332,10 +337,17 @@ export class FreshSessionPool<Request, SessionType> {
   }
 }
 
-export interface StasisSessionRequest {
-  readonly url: string | URL;
-  readonly options?: SessionOpenOptions;
-}
+export type StasisSessionRequest<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+> = Profile extends SessionSupportProfile
+  ? {
+      readonly url: string | URL;
+      readonly options?: SessionOpenOptions<SessionSupportProfile>;
+    }
+  : {
+      readonly url: string | URL;
+      readonly options: SessionOpenOptions<Profile> & { readonly profile: Profile };
+    };
 
 export interface StasisSessionPoolOptions {
   readonly maxProcesses: number;
@@ -345,9 +357,11 @@ export interface StasisSessionPoolOptions {
 }
 
 /** Create the production process-per-session pool used by the reference crawler. */
-export function createStasisSessionPool(
+export function createStasisSessionPool<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+>(
   options: StasisSessionPoolOptions,
-): FreshSessionPool<StasisSessionRequest, Session> {
+): FreshSessionPool<StasisSessionRequest<Profile>, Session<Profile>> {
   const launchOptions = options.launch ?? {};
   return new FreshSessionPool({
     maxProcesses: options.maxProcesses,
@@ -365,13 +379,20 @@ export function createStasisSessionPool(
           ...launchOptions,
           ...(signal === undefined ? {} : { signal }),
         });
-        const session = await runtime.openSession(request.url, {
-          ...request.options,
-          ...(signal === undefined ? {} : { signal }),
-        });
+        const session = request.options?.profile === CONTROLLED_WEB_SESSION_V2_PROFILE
+          ? await runtime.openSession(request.url, {
+              ...request.options,
+              profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+              ...(signal === undefined ? {} : { signal }),
+            })
+          : await runtime.openSession(request.url, {
+              ...request.options,
+              ...(signal === undefined ? {} : { signal }),
+            } as SessionOpenOptions<SessionSupportProfile>);
+        const typedSession = session as Session<Profile>;
         return {
-          session,
-          close: () => session.close(),
+          session: typedSession,
+          close: () => typedSession.close(),
           terminate: () => runtime?.close() ?? Promise.resolve(),
         };
       } catch (error) {

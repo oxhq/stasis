@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled MessageChannel closed-capacity fixture</title>
+<button id="start">start</button>
+<div id="result">booting</div>
+<script>
+  document.querySelector("#start").onclick = () => {
+    let created = 0;
+    let rejection;
+    for (; created < 17; created += 1) {
+      try {
+        const channel = new MessageChannel();
+        channel.port1.close();
+        channel.port2.close();
+      } catch (error) {
+        rejection = error;
+        break;
+      }
+    }
+
+    // Explicit closure makes each pair inert, but its native entries remain retained until the
+    // event-loop GC checkpoint. This seventeenth pair must not bypass the 32-entry hard bound.
+    const errorName = rejection ? rejection.name : "no-error";
+    document.querySelector("#result").textContent = `created:${created}|${errorName}`;
+  };
+</script>

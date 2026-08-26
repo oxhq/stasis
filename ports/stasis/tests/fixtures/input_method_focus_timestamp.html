@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Controlled InputMethod focus-event timestamp</title>
+<output id="result">not-focused</output>
+<input id="autofocus-input" type="text" value="rwa-value">
+<script>
+// React implements its autoFocus property through programmatic focus after mounting.
+const input = document.querySelector("#autofocus-input");
+const result = document.querySelector("#result");
+const focusTrace = [];
+
+function recordFocusTransition(event) {
+  if (event.type === "focus") {
+    input.setSelectionRange(2, 5);
+  }
+  focusTrace.push([
+    event.type,
+    event.isTrusted ? "trusted" : "untrusted",
+    String(event.timeStamp),
+  ].join(":"));
+  result.textContent = [
+    document.activeElement === input ? "focused" : "blurred",
+    String(focusTrace.length),
+    focusTrace.join(">"),
+    input.value,
+    `${input.selectionStart}:${input.selectionEnd}`,
+  ].join("|");
+}
+
+for (const type of ["focus", "focusin", "blur", "focusout"]) {
+  input.addEventListener(type, recordFocusTransition);
+}
+
+input.focus();
+input.blur();
+</script>

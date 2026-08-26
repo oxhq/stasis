@@ -1,0 +1,46 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Controlled focus-event timestamp after virtual advance</title>
+<button id="start">schedule focus</button>
+<button id="synthetic">read synthetic FocusEvent timestamp</button>
+<input id="focus-input" type="text" value="rwa-value">
+<output id="result">idle</output>
+<script>
+  const input = document.querySelector("#focus-input");
+  const result = document.querySelector("#result");
+  const focusTrace = [];
+
+  function recordFocusTransition(event) {
+    if (event.type === "focus") {
+      input.setSelectionRange(2, 5);
+    }
+    focusTrace.push([
+      event.type,
+      event.isTrusted ? "trusted" : "untrusted",
+      String(event.timeStamp),
+    ].join(":"));
+    result.textContent = [
+      document.activeElement === input ? "focused" : "blurred",
+      String(focusTrace.length),
+      focusTrace.join(">"),
+      String(performance.now()),
+      input.value,
+      `${input.selectionStart}:${input.selectionEnd}`,
+    ].join("|");
+  }
+
+  for (const type of ["focus", "focusin", "blur", "focusout"]) {
+    input.addEventListener(type, recordFocusTransition);
+  }
+
+  document.querySelector("#start").onclick = () => {
+    setTimeout(() => {
+      input.focus();
+      input.blur();
+    }, 5);
+  };
+
+  document.querySelector("#synthetic").onclick = () => {
+    result.textContent = `synthetic:${new FocusEvent("focus").timeStamp}`;
+  };
+</script>

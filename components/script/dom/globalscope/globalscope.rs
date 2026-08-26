@@ -21,8 +21,8 @@ use crossbeam_channel::Sender;
 use devtools_traits::{PageError, ScriptToDevtoolsControlMsg, get_time_stamp};
 use dom_struct::dom_struct;
 use embedder_traits::{
-    ConsoleLogLevel, DocumentControlProfile, EmbedderMsg, JavaScriptEvaluationError,
-    ScriptToEmbedderChan,
+    ConsoleLogLevel, DocumentControlProfile, DocumentExecutionProfile, EmbedderMsg,
+    JavaScriptEvaluationError, ScriptToEmbedderChan,
 };
 use fonts::FontContext;
 use indexmap::IndexSet;
@@ -69,8 +69,8 @@ use servo_base::id::{
 use servo_config::pref;
 use servo_constellation_traits::{
     BlobData, BlobImpl, BroadcastChannelMsg, ConstellationInterest, FileBlob, MessagePortImpl,
-    MessagePortMsg, PortMessageTask, ScriptToConstellationChan, ScriptToConstellationMessage,
-    ScriptToConstellationSender,
+    MessagePortIncomingResult, MessagePortMsg, PortMessageTask, ScriptToConstellationChan,
+    ScriptToConstellationMessage, ScriptToConstellationSender, StructuredSerializedData,
 };
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
 use storage_traits::StorageThreads;
@@ -203,6 +203,7 @@ struct PendingEventSourceRegistration {
 pub(crate) enum PendingPersistentSourceObservationError {
     EventSourceIdentityExhausted,
     DuplicateIdentity(PendingPersistentSourceIdentity),
+    ControlledLocalMessageAccountingMismatch,
 }
 
 fn canonical_pending_persistent_sources(
@@ -241,12 +242,303 @@ fn web_storage_io_permit(clock: &DocumentClock, profile: DocumentControlProfile)
     resource_thread_io_permit(clock)
 }
 
+/// Hard admission bounds for the additive controlled-local MessageChannel profile.
+///
+/// These limits intentionally cover retained native state, not just how many tasks the caller is
+/// willing to execute while settling. React's scheduler uses one pair and tiny scalar messages, so
+/// this conservative envelope is sufficient without claiming arbitrary structured-clone support.
+const MAX_CONTROLLED_LOCAL_MESSAGE_PORTS: usize = 32;
+const MAX_CONTROLLED_LOCAL_RETAINED_MESSAGES: usize = 1024;
+const MAX_CONTROLLED_LOCAL_SERIALIZED_BYTES: usize = 64 * 1024;
+
+fn controlled_local_channel_capacity_admitted(retained_ports: usize) -> bool {
+    retained_ports
+        .checked_add(2)
+        .is_some_and(|count| count <= MAX_CONTROLLED_LOCAL_MESSAGE_PORTS)
+}
+
+fn next_controlled_local_retained_message_count(current: usize) -> Option<usize> {
+    current
+        .checked_add(1)
+        .filter(|count| *count <= MAX_CONTROLLED_LOCAL_RETAINED_MESSAGES)
+}
+
+fn optional_map_is_empty<K, V>(map: &Option<FxHashMap<K, V>>) -> bool {
+    map.as_ref().is_none_or(FxHashMap::is_empty)
+}
+
+fn controlled_local_message_data_admitted(data: &StructuredSerializedData) -> bool {
+    data.serialized.len() <= MAX_CONTROLLED_LOCAL_SERIALIZED_BYTES
+        && optional_map_is_empty(&data.blobs)
+        && optional_map_is_empty(&data.files)
+        && optional_map_is_empty(&data.file_lists)
+        && optional_map_is_empty(&data.points)
+        && optional_map_is_empty(&data.rects)
+        && optional_map_is_empty(&data.quads)
+        && optional_map_is_empty(&data.matrices)
+        && optional_map_is_empty(&data.exceptions)
+        && optional_map_is_empty(&data.quota_exceeded_errors)
+        && optional_map_is_empty(&data.ports)
+        && optional_map_is_empty(&data.transform_streams)
+        && optional_map_is_empty(&data.image_bitmaps)
+        && optional_map_is_empty(&data.transferred_image_bitmaps)
+        && optional_map_is_empty(&data.offscreen_canvases)
+        && optional_map_is_empty(&data.image_data)
+        && optional_map_is_empty(&data.crypto_keys)
+}
+
+fn exact_controlled_local_owner_identity_matches<Global, Pipeline, WebView>(
+    owner: (Global, Pipeline, WebView),
+    caller: (Global, Pipeline, WebView),
+) -> bool
+where
+    Global: Eq,
+    Pipeline: Eq,
+    WebView: Eq,
+{
+    owner == caller
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MessagePortTaskIngress {
+    GenericLocal,
+    ControlledLocal,
+    External,
+}
+
+#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
+enum MessagePortProvenance {
+    ExternalCapable,
+    ControlledLocal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
+pub(crate) enum MessagePortRouterOwnership {
+    /// Every managed port is same-global controlled-local state. No Constellation router exists.
+    ControlledLocalOnly,
+    /// Servo's inherited external-capable ownership, registered with Constellation.
+    External(MessagePortRouterId),
+}
+
+impl MessagePortRouterOwnership {
+    const fn router_id(self) -> Option<MessagePortRouterId> {
+        match self {
+            Self::ControlledLocalOnly => None,
+            Self::External(router_id) => Some(router_id),
+        }
+    }
+
+    const fn admits(self, provenance: MessagePortProvenance) -> bool {
+        matches!(
+            (self, provenance),
+            (
+                Self::ControlledLocalOnly,
+                MessagePortProvenance::ControlledLocal
+            ) | (Self::External(_), MessagePortProvenance::ExternalCapable)
+        )
+    }
+}
+
+fn controlled_local_port_retains_native_capacity(
+    provenance: MessagePortProvenance,
+    _explicitly_closed: bool,
+) -> bool {
+    // Explicit closure makes a port inert but does not remove its DOM/implementation entry until
+    // the later GC checkpoint. Count that retained entry so one synchronous script task cannot
+    // bypass the native-state bound by repeatedly constructing and closing channel pairs.
+    provenance == MessagePortProvenance::ControlledLocal
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MessagePortRouteDisposition {
+    Accept,
+    Reroute,
+    DropClosedControlledLocal,
+    RejectControlledLocalEscape,
+    RejectExternalIngress,
+}
+
+fn message_port_route_disposition(
+    ingress: MessagePortTaskIngress,
+    target: Option<MessagePortProvenance>,
+    reject_external_router_ingress: bool,
+) -> MessagePortRouteDisposition {
+    if reject_external_router_ingress && ingress == MessagePortTaskIngress::External {
+        return MessagePortRouteDisposition::RejectExternalIngress;
+    }
+    match (ingress, target) {
+        (MessagePortTaskIngress::ControlledLocal, Some(MessagePortProvenance::ControlledLocal)) => {
+            MessagePortRouteDisposition::Accept
+        },
+        (MessagePortTaskIngress::ControlledLocal, None) => {
+            MessagePortRouteDisposition::DropClosedControlledLocal
+        },
+        (MessagePortTaskIngress::ControlledLocal, Some(MessagePortProvenance::ExternalCapable)) => {
+            MessagePortRouteDisposition::RejectControlledLocalEscape
+        },
+        (_, Some(MessagePortProvenance::ControlledLocal)) => {
+            MessagePortRouteDisposition::RejectExternalIngress
+        },
+        (_, None) => MessagePortRouteDisposition::Reroute,
+        (_, Some(MessagePortProvenance::ExternalCapable)) => MessagePortRouteDisposition::Accept,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ControlledLocalPortPendingFacts {
+    pending: bool,
+    explicitly_closed: bool,
+    dom_detached: bool,
+    implementation_detached: bool,
+    transfer_in_progress: bool,
+    has_buffered_messages: bool,
+    has_queued_messages: bool,
+    locally_disentangled: bool,
+    dom_peer: Option<MessagePortId>,
+    implementation_peer: Option<MessagePortId>,
+}
+
+impl ControlledLocalPortPendingFacts {
+    fn can_be_quiescent(self) -> bool {
+        !self.pending
+            && !self.explicitly_closed
+            && !self.dom_detached
+            && !self.implementation_detached
+            && !self.transfer_in_progress
+            && !self.has_buffered_messages
+            && !self.has_queued_messages
+            && self.dom_peer == self.implementation_peer
+    }
+}
+
+fn controlled_local_port_is_quiescent(
+    id: MessagePortId,
+    port: ControlledLocalPortPendingFacts,
+    peer: Option<(MessagePortId, ControlledLocalPortPendingFacts)>,
+) -> bool {
+    if !port.can_be_quiescent() {
+        return false;
+    }
+    let Some(peer_id) = port.dom_peer else {
+        return port.locally_disentangled;
+    };
+    if peer_id == id {
+        return false;
+    }
+    peer.is_some_and(|(actual_peer_id, peer)| {
+        actual_peer_id == peer_id
+            && peer.can_be_quiescent()
+            && peer.dom_peer == Some(id)
+            && peer.implementation_peer == Some(id)
+    })
+}
+
+fn controlled_local_port_pending_source(
+    id: MessagePortId,
+    port: ControlledLocalPortPendingFacts,
+    peer: Option<(MessagePortId, ControlledLocalPortPendingFacts)>,
+) -> Option<MessagePortId> {
+    if controlled_local_port_is_quiescent(id, port, peer) {
+        return None;
+    }
+
+    let Some((peer_id, peer)) = peer else {
+        return Some(id);
+    };
+    let is_live_reciprocal_pair = peer_id != id
+        && !port.explicitly_closed
+        && !peer.explicitly_closed
+        && !port.locally_disentangled
+        && !peer.locally_disentangled
+        && port.dom_peer == Some(peer_id)
+        && port.implementation_peer == Some(peer_id)
+        && peer.dom_peer == Some(id)
+        && peer.implementation_peer == Some(id);
+    if !is_live_reciprocal_pair {
+        // A malformed or incomplete identity relationship must remain visible rather than being
+        // hidden by pair-level coalescing.
+        return Some(id);
+    }
+
+    let pair_identity = std::cmp::min(id, peer_id);
+    (id == pair_identity).then_some(pair_identity)
+}
+
+fn add_controlled_local_queued_message(
+    queued_messages: &mut FxHashMap<MessagePortId, usize>,
+    port_id: MessagePortId,
+) -> bool {
+    match queued_messages.entry(port_id) {
+        Entry::Vacant(entry) => {
+            entry.insert(1);
+            true
+        },
+        Entry::Occupied(mut entry) => {
+            let Some(next) = entry.get().checked_add(1) else {
+                return false;
+            };
+            *entry.get_mut() = next;
+            true
+        },
+    }
+}
+
+fn take_controlled_local_queued_message(
+    queued_messages: &mut FxHashMap<MessagePortId, usize>,
+    port_id: MessagePortId,
+) -> bool {
+    let Entry::Occupied(mut entry) = queued_messages.entry(port_id) else {
+        return false;
+    };
+    match *entry.get() {
+        0 => {
+            entry.remove();
+            false
+        },
+        1 => {
+            entry.remove();
+            true
+        },
+        count => {
+            *entry.get_mut() = count - 1;
+            true
+        },
+    }
+}
+
+fn controlled_local_message_accounting_total(
+    queued_counts: impl Iterator<Item = usize>,
+    buffered_counts: impl Iterator<Item = usize>,
+) -> Option<usize> {
+    queued_counts
+        .chain(buffered_counts)
+        .try_fold(0usize, usize::checked_add)
+}
+
+fn controlled_local_message_accounting_reconciles(
+    retained_messages: usize,
+    queued_counts: impl Iterator<Item = usize>,
+    buffered_counts: impl Iterator<Item = usize>,
+) -> bool {
+    controlled_local_message_accounting_total(queued_counts, buffered_counts)
+        == Some(retained_messages)
+}
+
 #[cfg(test)]
 mod pending_persistent_source_tests {
-    use servo_base::id::TEST_PIPELINE_ID;
+    use servo_base::id::{
+        Index as NamespaceIdIndex, MessagePortIndex, PipelineNamespaceId, TEST_PIPELINE_ID,
+    };
     use timers::{DocumentClockConfiguration, DocumentUnixTime};
 
     use super::*;
+
+    fn test_message_port_id(index: u32) -> MessagePortId {
+        MessagePortId {
+            namespace_id: PipelineNamespaceId(91),
+            index: NamespaceIdIndex::<MessagePortIndex>::new(index).unwrap(),
+        }
+    }
 
     #[test]
     fn canonical_inventory_sorts_and_rejects_duplicate_native_identity() {
@@ -336,6 +628,429 @@ mod pending_persistent_source_tests {
             assert_eq!(realtime.unsupported_surface(), None);
         }
     }
+
+    fn idle_local_port_facts(peer: Option<MessagePortId>) -> ControlledLocalPortPendingFacts {
+        ControlledLocalPortPendingFacts {
+            pending: false,
+            explicitly_closed: false,
+            dom_detached: false,
+            implementation_detached: false,
+            transfer_in_progress: false,
+            has_buffered_messages: false,
+            has_queued_messages: false,
+            locally_disentangled: false,
+            dom_peer: peer,
+            implementation_peer: peer,
+        }
+    }
+
+    #[test]
+    fn controlled_local_idle_requires_reciprocal_or_proven_terminal_state() {
+        let first = test_message_port_id(1);
+        let second = test_message_port_id(2);
+        let first_facts = idle_local_port_facts(Some(second));
+        let second_facts = idle_local_port_facts(Some(first));
+
+        assert!(controlled_local_port_is_quiescent(
+            first,
+            first_facts,
+            Some((second, second_facts)),
+        ));
+        assert!(!controlled_local_port_is_quiescent(
+            first,
+            first_facts,
+            None,
+        ));
+
+        let malformed_terminal = idle_local_port_facts(None);
+        assert!(!controlled_local_port_is_quiescent(
+            first,
+            malformed_terminal,
+            None,
+        ));
+        let proven_terminal = ControlledLocalPortPendingFacts {
+            locally_disentangled: true,
+            ..malformed_terminal
+        };
+        assert!(controlled_local_port_is_quiescent(
+            first,
+            proven_terminal,
+            None,
+        ));
+    }
+
+    #[test]
+    fn controlled_local_buffer_transfer_and_nonreciprocal_peer_remain_pending() {
+        let first = test_message_port_id(1);
+        let second = test_message_port_id(2);
+        let first_facts = idle_local_port_facts(Some(second));
+
+        let buffered_peer = ControlledLocalPortPendingFacts {
+            has_buffered_messages: true,
+            ..idle_local_port_facts(Some(first))
+        };
+        assert!(!controlled_local_port_is_quiescent(
+            first,
+            first_facts,
+            Some((second, buffered_peer)),
+        ));
+
+        let transferring_peer = ControlledLocalPortPendingFacts {
+            transfer_in_progress: true,
+            ..idle_local_port_facts(Some(first))
+        };
+        assert!(!controlled_local_port_is_quiescent(
+            first,
+            first_facts,
+            Some((second, transferring_peer)),
+        ));
+
+        let nonreciprocal_peer = idle_local_port_facts(Some(second));
+        assert!(!controlled_local_port_is_quiescent(
+            first,
+            first_facts,
+            Some((second, nonreciprocal_peer)),
+        ));
+    }
+
+    #[test]
+    fn controlled_local_pending_pair_projects_exactly_the_minimum_identity() {
+        let first = test_message_port_id(1);
+        let second = test_message_port_id(2);
+        let first_facts = idle_local_port_facts(Some(second));
+        let buffered_second = ControlledLocalPortPendingFacts {
+            has_buffered_messages: true,
+            ..idle_local_port_facts(Some(first))
+        };
+
+        assert_eq!(
+            controlled_local_port_pending_source(
+                first,
+                first_facts,
+                Some((second, buffered_second)),
+            ),
+            Some(first),
+        );
+        assert_eq!(
+            controlled_local_port_pending_source(
+                second,
+                buffered_second,
+                Some((first, first_facts)),
+            ),
+            None,
+        );
+
+        let queued_first = ControlledLocalPortPendingFacts {
+            has_queued_messages: true,
+            ..first_facts
+        };
+        assert_eq!(
+            controlled_local_port_pending_source(
+                second,
+                idle_local_port_facts(Some(first)),
+                Some((first, queued_first)),
+            ),
+            None,
+        );
+        assert_eq!(
+            controlled_local_port_pending_source(
+                first,
+                queued_first,
+                Some((second, idle_local_port_facts(Some(first)))),
+            ),
+            Some(first),
+        );
+    }
+
+    #[test]
+    fn controlled_local_malformed_pair_identities_each_remain_pending() {
+        let first = test_message_port_id(1);
+        let second = test_message_port_id(2);
+        let third = test_message_port_id(3);
+        let first_facts = idle_local_port_facts(Some(second));
+        let nonreciprocal_second = idle_local_port_facts(Some(third));
+
+        assert_eq!(
+            controlled_local_port_pending_source(
+                first,
+                first_facts,
+                Some((second, nonreciprocal_second)),
+            ),
+            Some(first),
+        );
+        assert_eq!(
+            controlled_local_port_pending_source(
+                second,
+                nonreciprocal_second,
+                Some((first, first_facts)),
+            ),
+            Some(second),
+        );
+        assert_eq!(
+            canonical_pending_persistent_sources(vec![
+                PendingPersistentSourceIdentity {
+                    pipeline_id: TEST_PIPELINE_ID,
+                    stable_id: PendingPersistentSourceStableId::MessagePort(first),
+                },
+                PendingPersistentSourceIdentity {
+                    pipeline_id: TEST_PIPELINE_ID,
+                    stable_id: PendingPersistentSourceStableId::MessagePort(second),
+                },
+            ])
+            .unwrap()
+            .len(),
+            2,
+        );
+        assert_eq!(
+            controlled_local_port_pending_source(first, first_facts, None),
+            Some(first),
+        );
+    }
+
+    #[test]
+    fn independent_queued_and_buffered_pairs_each_project_their_minimum_identity() {
+        let first = test_message_port_id(1);
+        let second = test_message_port_id(2);
+        let third = test_message_port_id(3);
+        let fourth = test_message_port_id(4);
+        let queued_second = ControlledLocalPortPendingFacts {
+            has_queued_messages: true,
+            ..idle_local_port_facts(Some(first))
+        };
+        let buffered_fourth = ControlledLocalPortPendingFacts {
+            has_buffered_messages: true,
+            ..idle_local_port_facts(Some(third))
+        };
+
+        let projected = [
+            controlled_local_port_pending_source(
+                first,
+                idle_local_port_facts(Some(second)),
+                Some((second, queued_second)),
+            ),
+            controlled_local_port_pending_source(
+                second,
+                queued_second,
+                Some((first, idle_local_port_facts(Some(second)))),
+            ),
+            controlled_local_port_pending_source(
+                third,
+                idle_local_port_facts(Some(fourth)),
+                Some((fourth, buffered_fourth)),
+            ),
+            controlled_local_port_pending_source(
+                fourth,
+                buffered_fourth,
+                Some((third, idle_local_port_facts(Some(fourth)))),
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+        assert_eq!(projected, vec![first, third]);
+    }
+
+    #[test]
+    fn controlled_local_route_never_accepts_external_or_cross_provenance_ingress() {
+        assert_eq!(
+            message_port_route_disposition(
+                MessagePortTaskIngress::ControlledLocal,
+                Some(MessagePortProvenance::ControlledLocal),
+                true,
+            ),
+            MessagePortRouteDisposition::Accept,
+        );
+        assert_eq!(
+            message_port_route_disposition(
+                MessagePortTaskIngress::External,
+                Some(MessagePortProvenance::ControlledLocal),
+                true,
+            ),
+            MessagePortRouteDisposition::RejectExternalIngress,
+        );
+        assert_eq!(
+            message_port_route_disposition(
+                MessagePortTaskIngress::ControlledLocal,
+                Some(MessagePortProvenance::ExternalCapable),
+                true,
+            ),
+            MessagePortRouteDisposition::RejectControlledLocalEscape,
+        );
+        assert_eq!(
+            message_port_route_disposition(MessagePortTaskIngress::ControlledLocal, None, true,),
+            MessagePortRouteDisposition::DropClosedControlledLocal,
+        );
+    }
+
+    #[test]
+    fn v2_router_ingress_rejects_unknown_and_external_capable_targets() {
+        assert_eq!(
+            message_port_route_disposition(MessagePortTaskIngress::External, None, true),
+            MessagePortRouteDisposition::RejectExternalIngress,
+        );
+        assert_eq!(
+            message_port_route_disposition(
+                MessagePortTaskIngress::External,
+                Some(MessagePortProvenance::ExternalCapable),
+                true,
+            ),
+            MessagePortRouteDisposition::RejectExternalIngress,
+        );
+
+        // The guard is additive to v2: ordinary realtime/v1 routing keeps its inherited behavior.
+        assert_eq!(
+            message_port_route_disposition(MessagePortTaskIngress::External, None, false),
+            MessagePortRouteDisposition::Reroute,
+        );
+        assert_eq!(
+            message_port_route_disposition(
+                MessagePortTaskIngress::External,
+                Some(MessagePortProvenance::ExternalCapable),
+                false,
+            ),
+            MessagePortRouteDisposition::Accept,
+        );
+    }
+
+    #[test]
+    fn controlled_local_router_ownership_has_no_router_and_rejects_mixed_registration() {
+        let local = MessagePortRouterOwnership::ControlledLocalOnly;
+        assert_eq!(local.router_id(), None);
+        assert!(local.admits(MessagePortProvenance::ControlledLocal));
+        assert!(!local.admits(MessagePortProvenance::ExternalCapable));
+
+        let external_router = MessagePortRouterId::new();
+        let external = MessagePortRouterOwnership::External(external_router);
+        assert_eq!(external.router_id(), Some(external_router));
+        assert!(external.admits(MessagePortProvenance::ExternalCapable));
+        assert!(!external.admits(MessagePortProvenance::ControlledLocal));
+    }
+
+    #[test]
+    fn controlled_local_owner_identity_rejects_every_cross_global_dimension() {
+        let owner = (1_u8, 2_u8, 3_u8);
+        assert!(exact_controlled_local_owner_identity_matches(owner, owner));
+        assert!(!exact_controlled_local_owner_identity_matches(
+            owner,
+            (9, 2, 3),
+        ));
+        assert!(!exact_controlled_local_owner_identity_matches(
+            owner,
+            (1, 9, 3),
+        ));
+        assert!(!exact_controlled_local_owner_identity_matches(
+            owner,
+            (1, 2, 9),
+        ));
+    }
+
+    #[test]
+    fn controlled_local_native_admission_bounds_are_exact() {
+        assert!(controlled_local_channel_capacity_admitted(
+            MAX_CONTROLLED_LOCAL_MESSAGE_PORTS - 2,
+        ));
+        assert!(!controlled_local_channel_capacity_admitted(
+            MAX_CONTROLLED_LOCAL_MESSAGE_PORTS - 1,
+        ));
+        assert!(!controlled_local_channel_capacity_admitted(usize::MAX));
+        assert!(controlled_local_port_retains_native_capacity(
+            MessagePortProvenance::ControlledLocal,
+            false,
+        ));
+        assert!(controlled_local_port_retains_native_capacity(
+            MessagePortProvenance::ControlledLocal,
+            true,
+        ));
+        assert!(!controlled_local_port_retains_native_capacity(
+            MessagePortProvenance::ExternalCapable,
+            false,
+        ));
+
+        assert_eq!(
+            next_controlled_local_retained_message_count(
+                MAX_CONTROLLED_LOCAL_RETAINED_MESSAGES - 1,
+            ),
+            Some(MAX_CONTROLLED_LOCAL_RETAINED_MESSAGES),
+        );
+        assert_eq!(
+            next_controlled_local_retained_message_count(MAX_CONTROLLED_LOCAL_RETAINED_MESSAGES,),
+            None,
+        );
+        assert_eq!(
+            next_controlled_local_retained_message_count(usize::MAX),
+            None,
+        );
+
+        let mut data = StructuredSerializedData {
+            serialized: vec![0; MAX_CONTROLLED_LOCAL_SERIALIZED_BYTES],
+            ..Default::default()
+        };
+        assert!(controlled_local_message_data_admitted(&data));
+        data.serialized.push(0);
+        assert!(!controlled_local_message_data_admitted(&data));
+
+        data.serialized.clear();
+        let port_id = test_message_port_id(3);
+        data.ports = Some(FxHashMap::default());
+        assert!(controlled_local_message_data_admitted(&data));
+        data.ports = Some(FxHashMap::from_iter([(
+            port_id,
+            MessagePortImpl::new(port_id),
+        )]));
+        assert!(!controlled_local_message_data_admitted(&data));
+    }
+
+    #[test]
+    fn queued_message_associations_are_exact_and_reconcile_with_native_buffers() {
+        let first = test_message_port_id(1);
+        let second = test_message_port_id(2);
+        let mut queued = FxHashMap::default();
+
+        assert!(add_controlled_local_queued_message(&mut queued, second));
+        assert!(add_controlled_local_queued_message(&mut queued, first));
+        assert!(add_controlled_local_queued_message(&mut queued, second));
+        assert_eq!(queued.get(&first), Some(&1));
+        assert_eq!(queued.get(&second), Some(&2));
+        assert_eq!(
+            controlled_local_message_accounting_total(
+                queued.values().copied(),
+                [2usize, 1].into_iter(),
+            ),
+            Some(6),
+        );
+        assert!(controlled_local_message_accounting_reconciles(
+            6,
+            queued.values().copied(),
+            [2usize, 1].into_iter(),
+        ));
+        assert!(!controlled_local_message_accounting_reconciles(
+            5,
+            queued.values().copied(),
+            [2usize, 1].into_iter(),
+        ));
+
+        assert!(take_controlled_local_queued_message(&mut queued, second));
+        assert_eq!(queued.get(&second), Some(&1));
+        assert!(take_controlled_local_queued_message(&mut queued, second));
+        assert!(!queued.contains_key(&second));
+        assert!(!take_controlled_local_queued_message(&mut queued, second));
+        assert!(take_controlled_local_queued_message(&mut queued, first));
+        assert!(queued.is_empty());
+
+        assert_eq!(
+            controlled_local_message_accounting_total(
+                [usize::MAX].into_iter(),
+                [1usize].into_iter(),
+            ),
+            None,
+        );
+        assert!(!controlled_local_message_accounting_reconciles(
+            usize::MAX,
+            [usize::MAX].into_iter(),
+            [1usize].into_iter(),
+        ));
+    }
 }
 
 impl Drop for AutoCloseWorker {
@@ -376,6 +1091,18 @@ pub(crate) struct GlobalScope {
 
     /// The message-port router id for this global, if it is managing ports.
     message_port_state: DomRefCell<MessagePortState>,
+
+    /// Controlled-local messages retained either in the PortMessage task source or in an
+    /// unstarted port's native buffer. This is a hard admission counter, independent of settle's
+    /// caller-selected task budget.
+    controlled_local_retained_message_count: Cell<usize>,
+
+    /// Per-destination ownership for controlled-local messages which have left a native disabled
+    /// port buffer and are retained by the ordinary PortMessage task source. The aggregate count
+    /// above remains the hard admission bound; this map makes every queued reservation attributable
+    /// to its exact local pair during passive pending observation.
+    #[no_trace]
+    controlled_local_queued_message_counts: RefCell<FxHashMap<MessagePortId, usize>>,
 
     /// The broadcast channels state this global, if it is managing any.
     broadcast_channel_state: DomRefCell<BroadcastChannelState>,
@@ -633,6 +1360,13 @@ pub(crate) struct ManagedMessagePort {
     /// without having to worry about rooting the dom-port.
     #[no_trace]
     port_impl: Option<MessagePortImpl>,
+    /// Whether this identifier may ever be owned or routed by Constellation.
+    #[no_trace]
+    provenance: MessagePortProvenance,
+    /// Set only when this global synchronously proves and disconnects both members of a
+    /// controlled-local pair. It distinguishes a safe terminal port from malformed missing-peer
+    /// state during pending inventory.
+    locally_disentangled: bool,
     /// We keep ports pending when they are first transfer-received,
     /// and only add them, and ask the constellation to complete the transfer,
     /// in a subsequent task if the port hasn't been re-transfered.
@@ -666,9 +1400,9 @@ pub(crate) enum BroadcastChannelState {
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) enum MessagePortState {
-    /// The message-port router id for this global, and a map of managed ports.
+    /// Typed router ownership for this global, and its map of managed ports.
     Managed(
-        #[no_trace] MessagePortRouterId,
+        #[no_trace] MessagePortRouterOwnership,
         HashMapTracedValues<MessagePortId, ManagedMessagePort, FxBuildHasher>,
     ),
     /// This global is not managing any ports at this time.
@@ -708,6 +1442,21 @@ impl MessageListener {
                     task!(process_complete_transfer: move |cx| {
                         let global = context.root();
 
+                        if global.reject_message_port_router_ingress() {
+                            // V2 never grants Constellation ownership of a MessagePort. Return
+                            // the complete batch as failed so rejection cannot strand router
+                            // state, but do not install, complete, or dispatch any transferred
+                            // port in this global.
+                            let _ = global.script_to_constellation_chan().send(
+                                ScriptToConstellationMessage::MessagePortTransferResult(
+                                    global.port_router_id(),
+                                    vec![],
+                                    ports,
+                                ),
+                            );
+                            return;
+                        }
+
                         let router_id = match global.port_router_id() {
                             Some(router_id) => router_id,
                             None => {
@@ -724,7 +1473,10 @@ impl MessageListener {
                         let mut failed = FxHashMap::default();
 
                         for (id, info) in ports.into_iter() {
-                            if global.is_managing_port(&id) {
+                            if global.is_controlled_local_port(&id) {
+                                global.latch_controlled_local_rejection();
+                                failed.insert(id, info);
+                            } else if global.is_managing_port(&id) {
                                 succeeded.push(id);
                                 global.complete_port_transfer(
                                     cx,
@@ -746,6 +1498,9 @@ impl MessageListener {
                 let context = self.context.clone();
                 self.task_source.queue(task!(complete_pending: move |cx| {
                     let global = context.root();
+                    if global.reject_message_port_router_ingress() {
+                        return;
+                    }
                     global.complete_port_transfer(cx, port_id, info.port_message_queue, info.disentangled);
                 }));
             },
@@ -754,6 +1509,9 @@ impl MessageListener {
                 self.task_source
                     .queue(task!(try_complete_disentanglement: move |cx| {
                         let global = context.root();
+                        if global.reject_message_port_router_ingress() {
+                            return;
+                        }
                         global.try_complete_disentanglement(cx, port_id);
                     }));
             },
@@ -761,7 +1519,10 @@ impl MessageListener {
                 let context = self.context.clone();
                 self.task_source.queue(task!(process_new_task: move |cx| {
                     let global = context.root();
-                    global.route_task_to_port(cx, port_id, task);
+                    if global.reject_message_port_router_ingress() {
+                        return;
+                    }
+                    global.route_task_to_port(cx, port_id, task, MessagePortTaskIngress::External);
                 }));
             },
         }
@@ -948,6 +1709,8 @@ impl GlobalScope {
     ) -> Self {
         Self {
             message_port_state: DomRefCell::new(MessagePortState::UnManaged),
+            controlled_local_retained_message_count: Cell::new(0),
+            controlled_local_queued_message_counts: RefCell::new(FxHashMap::default()),
             broadcast_channel_state: DomRefCell::new(BroadcastChannelState::UnManaged),
             constellation_interest_counts: RefCell::new(HashMap::new()),
             blob_state: Default::default(),
@@ -996,8 +1759,10 @@ impl GlobalScope {
 
     /// The message-port router Id of the global, if any
     fn port_router_id(&self) -> Option<MessagePortRouterId> {
-        if let MessagePortState::Managed(id, _message_ports) = &*self.message_port_state.borrow() {
-            Some(*id)
+        if let MessagePortState::Managed(ownership, _message_ports) =
+            &*self.message_port_state.borrow()
+        {
+            ownership.router_id()
         } else {
             None
         }
@@ -1011,6 +1776,295 @@ impl GlobalScope {
             return message_ports.contains_key(port_id);
         }
         false
+    }
+
+    fn is_controlled_local_port(&self, port_id: &MessagePortId) -> bool {
+        let MessagePortState::Managed(_, message_ports) = &*self.message_port_state.borrow() else {
+            return false;
+        };
+        message_ports
+            .get(port_id)
+            .is_some_and(|port| port.provenance == MessagePortProvenance::ControlledLocal)
+    }
+
+    pub(crate) fn controlled_local_execution_profile_selected(&self) -> bool {
+        self.document_clock().is_controlled()
+            && ScriptThread::current_document_control_profile()
+                == DocumentControlProfile::TopLevelSession
+            && ScriptThread::current_document_execution_profile()
+                == DocumentExecutionProfile::ControlledWebSessionV2
+    }
+
+    fn controlled_local_profile_enabled(&self) -> bool {
+        self.controlled_local_execution_profile_selected()
+            && self
+                .downcast::<Window>()
+                .is_some_and(ScriptThread::current_controlled_top_level_target_matches)
+    }
+
+    fn controlled_local_caller_matches_owner(&self, caller: &GlobalScope) -> bool {
+        exact_controlled_local_owner_identity_matches(
+            (
+                std::ptr::from_ref(self),
+                self.pipeline_id(),
+                self.webview_id(),
+            ),
+            (
+                std::ptr::from_ref(caller),
+                caller.pipeline_id(),
+                caller.webview_id(),
+            ),
+        )
+    }
+
+    fn controlled_local_rejection(&self, reason: &'static str) -> Error {
+        self.require_external_subscription()
+            .err()
+            .unwrap_or_else(|| Error::NotSupported(Some(reason.to_owned())))
+    }
+
+    fn latch_controlled_local_rejection(&self) {
+        let _ = self.require_external_subscription();
+    }
+
+    /// Reject every Constellation/router MessagePort callback while v2 owns the only admitted
+    /// MessagePort provenance. V1 and realtime globals retain Servo's inherited routing behavior.
+    fn reject_message_port_router_ingress(&self) -> bool {
+        if !self.controlled_local_execution_profile_selected() {
+            return false;
+        }
+        self.latch_controlled_local_rejection();
+        true
+    }
+
+    fn controlled_local_pair_is_well_formed(&self, port_id: MessagePortId) -> bool {
+        let MessagePortState::Managed(_, message_ports) = &*self.message_port_state.borrow() else {
+            return false;
+        };
+        let Some(port) = message_ports.get(&port_id) else {
+            return false;
+        };
+        if port.provenance != MessagePortProvenance::ControlledLocal
+            || port.pending
+            || port.explicitly_closed
+            || port.dom_port.detached()
+        {
+            return false;
+        }
+        let Some(port_impl) = port.port_impl.as_ref() else {
+            return false;
+        };
+        if port_impl.detached() || port_impl.transfer_in_progress() {
+            return false;
+        }
+        let Some(peer_id) = port.dom_port.entangled_port_id() else {
+            return false;
+        };
+        if peer_id == port_id || port_impl.entangled_port_id() != Some(peer_id) {
+            return false;
+        }
+        let Some(peer) = message_ports.get(&peer_id) else {
+            return false;
+        };
+        if peer.provenance != MessagePortProvenance::ControlledLocal
+            || peer.pending
+            || peer.explicitly_closed
+            || peer.dom_port.detached()
+        {
+            return false;
+        }
+        let Some(peer_impl) = peer.port_impl.as_ref() else {
+            return false;
+        };
+        !peer_impl.detached()
+            && !peer_impl.transfer_in_progress()
+            && peer.dom_port.entangled_port_id() == Some(port_id)
+            && peer_impl.entangled_port_id() == Some(port_id)
+    }
+
+    /// A controlled-local peer which was synchronously disentangled by this global has no target,
+    /// so the HTML post-message steps still clone the payload and then return without queueing. Do
+    /// not extend that no-op to an unknown, transferred, externally-owned, or merely malformed
+    /// missing-peer entry.
+    fn controlled_local_port_is_proven_terminal(&self, port_id: MessagePortId) -> bool {
+        let MessagePortState::Managed(ownership, message_ports) =
+            &*self.message_port_state.borrow()
+        else {
+            return false;
+        };
+        if *ownership != MessagePortRouterOwnership::ControlledLocalOnly {
+            return false;
+        }
+        let Some(port) = message_ports.get(&port_id) else {
+            return false;
+        };
+        if port.provenance != MessagePortProvenance::ControlledLocal
+            || !port.locally_disentangled
+            || port.pending
+            || port.explicitly_closed
+            || port.dom_port.detached()
+            || port.dom_port.entangled_port_id().is_some()
+        {
+            return false;
+        }
+        port.port_impl.as_ref().is_some_and(|port_impl| {
+            !port_impl.detached()
+                && !port_impl.transfer_in_progress()
+                && port_impl.entangled_port_id().is_none()
+        })
+    }
+
+    /// Admit the constructor either through ordinary realtime behavior or the explicit local-only
+    /// controlled profile. The boolean selects the provenance used for both newly-created ports.
+    pub(crate) fn admit_message_channel_constructor(
+        &self,
+        incumbent: Option<&GlobalScope>,
+    ) -> Fallible<bool> {
+        if !self.controlled_local_profile_enabled() {
+            self.require_external_subscription()?;
+            return Ok(false);
+        }
+        if incumbent.is_none_or(|caller| !self.controlled_local_caller_matches_owner(caller)) {
+            return Err(self.controlled_local_rejection(
+                "MessageChannel construction crosses the controlled-local global boundary",
+            ));
+        }
+
+        let retained_local_ports = match &*self.message_port_state.borrow() {
+            MessagePortState::Managed(ownership, ports) => {
+                if !ownership.admits(MessagePortProvenance::ControlledLocal) {
+                    return Err(self.controlled_local_rejection(
+                        "controlled-local MessageChannel cannot share an external router",
+                    ));
+                }
+                ports
+                    .values()
+                    .filter(|port| {
+                        controlled_local_port_retains_native_capacity(
+                            port.provenance,
+                            port.explicitly_closed,
+                        )
+                    })
+                    .count()
+            },
+            MessagePortState::UnManaged => 0,
+        };
+        if !controlled_local_channel_capacity_admitted(retained_local_ports) {
+            return Err(self.controlled_local_rejection(
+                "controlled-local MessageChannel retained-port limit exceeded",
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Preflight a post before structured serialization can detach any transfer-list member.
+    pub(crate) fn require_message_port_post(
+        &self,
+        port_id: MessagePortId,
+        transfer_list_is_empty: bool,
+        incumbent: Option<&GlobalScope>,
+    ) -> Fallible<()> {
+        if !self.document_clock().is_controlled() {
+            return Ok(());
+        }
+        if self.controlled_local_profile_enabled()
+            && incumbent.is_some_and(|caller| self.controlled_local_caller_matches_owner(caller))
+            && transfer_list_is_empty
+            && (self.controlled_local_pair_is_well_formed(port_id)
+                || self.controlled_local_port_is_proven_terminal(port_id))
+        {
+            return Ok(());
+        }
+        Err(self
+            .controlled_local_rejection("MessagePort post crosses the controlled-local boundary"))
+    }
+
+    /// Enforce the bounded structured-clone envelope after serialization and before retaining the
+    /// message in a task or native port buffer.
+    pub(crate) fn require_message_port_payload(
+        &self,
+        port_id: MessagePortId,
+        data: &StructuredSerializedData,
+    ) -> Fallible<()> {
+        if !self.document_clock().is_controlled() {
+            return Ok(());
+        }
+        if (self.controlled_local_pair_is_well_formed(port_id)
+            || self.controlled_local_port_is_proven_terminal(port_id))
+            && controlled_local_message_data_admitted(data)
+        {
+            return Ok(());
+        }
+        Err(self.controlled_local_rejection(
+            "MessagePort payload exceeds the controlled-local clone envelope",
+        ))
+    }
+
+    fn reserve_controlled_local_message(&self) -> Fallible<()> {
+        let retained = self.controlled_local_retained_message_count.get();
+        let Some(next) = next_controlled_local_retained_message_count(retained) else {
+            return Err(self.controlled_local_rejection(
+                "controlled-local MessageChannel retained-message limit exceeded",
+            ));
+        };
+        self.controlled_local_retained_message_count.set(next);
+        Ok(())
+    }
+
+    fn release_controlled_local_messages(&self, count: usize) {
+        let retained = self.controlled_local_retained_message_count.get();
+        let Some(remaining) = retained.checked_sub(count) else {
+            self.controlled_local_retained_message_count.set(0);
+            self.latch_controlled_local_rejection();
+            return;
+        };
+        self.controlled_local_retained_message_count.set(remaining);
+    }
+
+    /// Associate an already-admitted controlled-local reservation with the exact destination whose
+    /// PortMessage task now retains it. This does not change the global hard-bound count.
+    fn associate_controlled_local_queued_message(&self, port_id: MessagePortId) -> bool {
+        if !self.is_controlled_local_port(&port_id) {
+            self.latch_controlled_local_rejection();
+            return false;
+        }
+        let associated = add_controlled_local_queued_message(
+            &mut self.controlled_local_queued_message_counts.borrow_mut(),
+            port_id,
+        );
+        if !associated {
+            self.latch_controlled_local_rejection();
+        }
+        associated
+    }
+
+    fn has_controlled_local_queued_message(&self, port_id: MessagePortId) -> bool {
+        self.controlled_local_queued_message_counts
+            .borrow()
+            .get(&port_id)
+            .is_some_and(|count| *count > 0)
+    }
+
+    /// Remove one exact destination association while preserving the global reservation. This is
+    /// used only when routing moves the message back into the destination's native disabled buffer.
+    fn move_controlled_local_queued_message_to_buffer(&self, port_id: MessagePortId) -> bool {
+        let removed = take_controlled_local_queued_message(
+            &mut self.controlled_local_queued_message_counts.borrow_mut(),
+            port_id,
+        );
+        if !removed {
+            self.latch_controlled_local_rejection();
+        }
+        removed
+    }
+
+    /// Finish one queued reservation exactly once on dispatch, rejection, or drop.
+    fn finish_controlled_local_queued_message(&self, port_id: MessagePortId) -> bool {
+        if !self.move_controlled_local_queued_message_to_buffer(port_id) {
+            return false;
+        }
+        self.release_controlled_local_messages(1);
+        true
     }
 
     fn with_timers<T>(&self, f: impl FnOnce(&OneshotTimers) -> T) -> T {
@@ -1117,6 +2171,10 @@ impl GlobalScope {
         tasks: VecDeque<PortMessageTask>,
         disentangled: bool,
     ) {
+        if self.is_controlled_local_port(&port_id) {
+            self.latch_controlled_local_rejection();
+            return;
+        }
         let should_start = if let MessagePortState::Managed(_id, message_ports) =
             &mut *self.message_port_state.borrow_mut()
         {
@@ -1155,6 +2213,10 @@ impl GlobalScope {
         cx: &mut js::context::JSContext,
         port_id: MessagePortId,
     ) {
+        if self.is_controlled_local_port(&port_id) {
+            self.latch_controlled_local_rejection();
+            return;
+        }
         let dom_port = if let MessagePortState::Managed(_id, message_ports) =
             &mut *self.message_port_state.borrow_mut()
         {
@@ -1200,6 +2262,14 @@ impl GlobalScope {
     /// Remove the routers for ports and broadcast-channels.
     /// Drain the list of workers.
     pub(crate) fn remove_web_messaging_and_dedicated_workers_infra(&self) {
+        // Navigation/global teardown retires the complete old-generation owner, including canceled
+        // PortMessage tasks and native disabled-port buffers. No controlled-local reservation or
+        // destination identity may survive into a replacement document. Realtime globals keep
+        // these fields empty, so the reset does not alter their inherited router behavior.
+        self.controlled_local_queued_message_counts
+            .borrow_mut()
+            .clear();
+        self.controlled_local_retained_message_count.set(0);
         self.remove_message_ports_router();
         self.remove_broadcast_channel_router();
 
@@ -1215,11 +2285,12 @@ impl GlobalScope {
     /// Update our state to un-managed,
     /// and tell the constellation to drop the sender to our message-port router.
     fn remove_message_ports_router(&self) {
-        if let MessagePortState::Managed(router_id, _message_ports) =
+        if let MessagePortState::Managed(ownership, _message_ports) =
             &*self.message_port_state.borrow()
+            && let Some(router_id) = ownership.router_id()
         {
             let _ = self.script_to_constellation_chan().send(
-                ScriptToConstellationMessage::RemoveMessagePortRouter(*router_id),
+                ScriptToConstellationMessage::RemoveMessagePortRouter(router_id),
             );
         }
         *self.message_port_state.borrow_mut() = MessagePortState::UnManaged;
@@ -1244,6 +2315,53 @@ impl GlobalScope {
     /// <https://html.spec.whatwg.org/multipage/#disentangle>
     pub(crate) fn disentangle_port(&self, cx: &mut js::context::JSContext, port: &MessagePort) {
         let initiator_port = port.message_port_id();
+        let initiator_is_controlled_local = self.is_controlled_local_port(initiator_port);
+        let controlled_local_pair_is_proven = if initiator_is_controlled_local {
+            let state = self.message_port_state.borrow();
+            if let MessagePortState::Managed(_, message_ports) = &*state
+                && let Some(other_id) = port.entangled_port_id()
+                && let Some(initiator) = message_ports.get(initiator_port)
+                && let Some(other) = message_ports.get(&other_id)
+            {
+                initiator.provenance == MessagePortProvenance::ControlledLocal
+                    && other.provenance == MessagePortProvenance::ControlledLocal
+                    && initiator.port_impl.as_ref().is_some_and(|implementation| {
+                        implementation.entangled_port_id() == Some(other_id)
+                    })
+                    && other.dom_port.entangled_port_id() == Some(*initiator_port)
+                    && other.port_impl.as_ref().is_some_and(|implementation| {
+                        implementation.entangled_port_id() == Some(*initiator_port)
+                    })
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let controlled_local_terminal_is_proven = if initiator_is_controlled_local {
+            let state = self.message_port_state.borrow();
+            if let MessagePortState::Managed(_, message_ports) = &*state
+                && let Some(initiator) = message_ports.get(initiator_port)
+            {
+                initiator.provenance == MessagePortProvenance::ControlledLocal
+                    && initiator.locally_disentangled
+                    && initiator.dom_port.entangled_port_id().is_none()
+                    && initiator
+                        .port_impl
+                        .as_ref()
+                        .is_some_and(|implementation| implementation.entangled_port_id().is_none())
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if initiator_is_controlled_local
+            && !controlled_local_pair_is_proven
+            && !controlled_local_terminal_is_proven
+        {
+            self.latch_controlled_local_rejection();
+        }
         // Let otherPort be the MessagePort which initiatorPort was entangled with.
         let Some(other_port) = port.disentangle() else {
             // Assert: otherPort exists.
@@ -1270,6 +2388,9 @@ impl GlobalScope {
                             .expect("managed-port has no port-impl.");
                         managed_port.dom_port.disentangle();
                         port_impl.disentangle();
+                        if controlled_local_pair_is_proven {
+                            managed_port.locally_disentangled = true;
+                        }
 
                         if **port_id == other_port {
                             dom_port = Some(managed_port.dom_port.as_rooted())
@@ -1288,6 +2409,10 @@ impl GlobalScope {
             dom_port.upcast().fire_event(cx, atom!("close"));
         }
 
+        if initiator_is_controlled_local {
+            return;
+        }
+
         let chan = self.script_to_constellation_chan();
         let initiator_port = *initiator_port;
         self.task_manager()
@@ -1304,9 +2429,20 @@ impl GlobalScope {
 
     /// <https://html.spec.whatwg.org/multipage/#entangle>
     pub(crate) fn entangle_ports(&self, port1: MessagePortId, port2: MessagePortId) {
+        let controlled_local_pair;
         if let MessagePortState::Managed(_id, message_ports) =
             &mut *self.message_port_state.borrow_mut()
         {
+            let provenance1 = message_ports.get(&port1).map(|port| port.provenance);
+            let provenance2 = message_ports.get(&port2).map(|port| port.provenance);
+            controlled_local_pair = provenance1 == Some(MessagePortProvenance::ControlledLocal)
+                && provenance2 == Some(MessagePortProvenance::ControlledLocal);
+            let mixed_provenance = provenance1 == Some(MessagePortProvenance::ControlledLocal)
+                || provenance2 == Some(MessagePortProvenance::ControlledLocal);
+            if mixed_provenance && !controlled_local_pair {
+                self.latch_controlled_local_rejection();
+                return;
+            }
             for (port_id, entangled_id) in &[(port1, port2), (port2, port1)] {
                 match message_ports.get_mut(port_id) {
                     None => {
@@ -1316,6 +2452,7 @@ impl GlobalScope {
                         if let Some(port_impl) = managed_port.port_impl.as_mut() {
                             managed_port.dom_port.entangle(*entangled_id);
                             port_impl.entangle(*entangled_id);
+                            managed_port.locally_disentangled = false;
                         } else {
                             panic!("managed-port has no port-impl.");
                         }
@@ -1326,9 +2463,11 @@ impl GlobalScope {
             panic!("entangled_ports called on a global not managing any ports.");
         }
 
-        let _ = self
-            .script_to_constellation_chan()
-            .send(ScriptToConstellationMessage::EntanglePorts(port1, port2));
+        if !controlled_local_pair {
+            let _ = self
+                .script_to_constellation_chan()
+                .send(ScriptToConstellationMessage::EntanglePorts(port1, port2));
+        }
     }
 
     /// Handle the transfer of a port in the current task.
@@ -1361,44 +2500,85 @@ impl GlobalScope {
         cx: &mut js::context::JSContext,
         port_id: &MessagePortId,
     ) {
-        let (message_buffer, dom_port) = if let MessagePortState::Managed(_id, message_ports) =
-            &mut *self.message_port_state.borrow_mut()
-        {
-            let (message_buffer, dom_port) = match message_ports.get_mut(port_id) {
-                None => panic!("start_message_port called on a unknown port."),
-                Some(managed_port) => {
-                    if let Some(port_impl) = managed_port.port_impl.as_mut() {
-                        (port_impl.start(), managed_port.dom_port.as_rooted())
-                    } else {
-                        panic!("managed-port has no port-impl.");
+        let (message_buffer, dom_port, provenance) =
+            if let MessagePortState::Managed(_id, message_ports) =
+                &mut *self.message_port_state.borrow_mut()
+            {
+                let (message_buffer, dom_port, provenance) = match message_ports.get_mut(port_id) {
+                    None => panic!("start_message_port called on a unknown port."),
+                    Some(managed_port) => {
+                        if let Some(port_impl) = managed_port.port_impl.as_mut() {
+                            (
+                                port_impl.start(),
+                                managed_port.dom_port.as_rooted(),
+                                managed_port.provenance,
+                            )
+                        } else {
+                            panic!("managed-port has no port-impl.");
+                        }
+                    },
+                };
+                (message_buffer, dom_port, provenance)
+            } else {
+                return warn!("start_message_port called on a global not managing any ports.");
+            };
+        if let Some(message_buffer) = message_buffer {
+            match provenance {
+                MessagePortProvenance::ExternalCapable => {
+                    // Preserve Servo's inherited transfer/baseline behavior exactly. Its native
+                    // transfer buffer is drained by the task which completes or starts the port.
+                    for task in message_buffer {
+                        self.route_task_to_port(
+                            cx,
+                            *port_id,
+                            task,
+                            MessagePortTaskIngress::GenericLocal,
+                        );
+                    }
+                    if dom_port.disentangled() {
+                        // <https://html.spec.whatwg.org/multipage/#disentangle>
+                        // Fire an event named close at otherPort.
+                        dom_port.upcast().fire_event(cx, atom!("close"));
+
+                        let res = self.script_to_constellation_chan().send(
+                            ScriptToConstellationMessage::DisentanglePorts(*port_id, None),
+                        );
+                        if res.is_err() {
+                            warn!("Sending DisentanglePorts failed");
+                        }
                     }
                 },
-            };
-            (message_buffer, dom_port)
-        } else {
-            return warn!("start_message_port called on a global not managing any ports.");
-        };
-        if let Some(message_buffer) = message_buffer {
-            for task in message_buffer {
-                self.route_task_to_port(cx, *port_id, task);
-            }
-            if dom_port.disentangled() {
-                // <https://html.spec.whatwg.org/multipage/#disentangle>
-                // Fire an event named close at otherPort.
-                dom_port.upcast().fire_event(cx, atom!("close"));
+                MessagePortProvenance::ControlledLocal => {
+                    // Each buffered delivery re-enters the ordinary PortMessage task source. The
+                    // reservation made by postMessage remains held while moving from the native
+                    // buffer into this queue and is released exactly once by route_task_to_port
+                    // when that individual task dispatches or is dropped. Separate tasks also
+                    // guarantee a microtask checkpoint between message callbacks.
+                    for task in message_buffer {
+                        if self.associate_controlled_local_queued_message(*port_id) {
+                            self.queue_message_port_route(
+                                *port_id,
+                                task,
+                                MessagePortTaskIngress::ControlledLocal,
+                            );
+                        } else {
+                            // The task never entered the task source, so its existing native-buffer
+                            // reservation ends here. The association failure is already sticky.
+                            self.release_controlled_local_messages(1);
+                        }
+                    }
 
-                let res = self.script_to_constellation_chan().send(
-                    ScriptToConstellationMessage::DisentanglePorts(*port_id, None),
-                );
-                if res.is_err() {
-                    warn!("Sending DisentanglePorts failed");
-                }
+                    // A same-global controlled disentanglement already fired the peer's close
+                    // event synchronously in disentangle_port. Do not move or duplicate it ahead
+                    // of the re-queued buffered messages.
+                },
             }
         }
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-messageport-close>
     pub(crate) fn close_message_port(&self, port_id: &MessagePortId) {
+        let mut discarded_controlled_local_messages = 0;
         if let MessagePortState::Managed(_id, message_ports) =
             &mut *self.message_port_state.borrow_mut()
         {
@@ -1406,6 +2586,10 @@ impl GlobalScope {
                 None => panic!("close_message_port called on an unknown port."),
                 Some(managed_port) => {
                     if let Some(port_impl) = managed_port.port_impl.as_mut() {
+                        if managed_port.provenance == MessagePortProvenance::ControlledLocal {
+                            discarded_controlled_local_messages =
+                                port_impl.discard_buffered_messages();
+                        }
                         port_impl.close();
                         managed_port.explicitly_closed = true;
                     } else {
@@ -1416,39 +2600,109 @@ impl GlobalScope {
         } else {
             warn!("close_message_port called on a global not managing any ports.")
         }
+        self.release_controlled_local_messages(discarded_controlled_local_messages);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#message-port-post-message-steps>
     // Steps 6 and 7
-    pub(crate) fn post_messageport_msg(&self, port_id: MessagePortId, task: PortMessageTask) {
-        if let MessagePortState::Managed(_id, message_ports) =
+    pub(crate) fn post_messageport_msg(
+        &self,
+        port_id: MessagePortId,
+        task: PortMessageTask,
+    ) -> Fallible<()> {
+        let (entangled_port, provenance) = if let MessagePortState::Managed(_id, message_ports) =
             &mut *self.message_port_state.borrow_mut()
         {
-            let entangled_port = match message_ports.get_mut(&port_id) {
+            match message_ports.get_mut(&port_id) {
                 None => panic!("post_messageport_msg called on an unknown port."),
                 Some(managed_port) => {
                     if let Some(port_impl) = managed_port.port_impl.as_mut() {
-                        port_impl.entangled_port_id()
+                        (port_impl.entangled_port_id(), managed_port.provenance)
                     } else {
                         panic!("managed-port has no port-impl.");
                     }
                 },
-            };
-            if let Some(entangled_id) = entangled_port {
-                // Step 7
-                let this = Trusted::new(self);
-                self.task_manager()
-                    .port_message_queue()
-                    .queue(task!(post_message: move |cx| {
-                        let global = this.root();
-                        // Note: we do this in a task, as this will ensure the global and constellation
-                        // are aware of any transfer that might still take place in the current task.
-                        global.route_task_to_port(cx, entangled_id, task);
-                    }));
             }
         } else {
             warn!("post_messageport_msg called on a global not managing any ports.");
-        }
+            return Ok(());
+        };
+
+        let Some(entangled_id) = entangled_port else {
+            return Ok(());
+        };
+
+        let ingress = match provenance {
+            MessagePortProvenance::ExternalCapable => MessagePortTaskIngress::GenericLocal,
+            MessagePortProvenance::ControlledLocal => {
+                if !self.controlled_local_pair_is_well_formed(port_id)
+                    || !controlled_local_message_data_admitted(&task.data)
+                {
+                    return Err(self.controlled_local_rejection(
+                        "controlled-local MessagePort route lost its local provenance",
+                    ));
+                }
+                self.reserve_controlled_local_message()?;
+
+                // Admit directly into a disabled same-global target's native FIFO. If we queued
+                // a route task first, a later post followed by start() in the same script task
+                // could overtake an older buffered message. Enabled targets still enter the
+                // ordinary PortMessage task source one message at a time.
+                let incoming = if let MessagePortState::Managed(_, message_ports) =
+                    &mut *self.message_port_state.borrow_mut()
+                {
+                    message_ports
+                        .get_mut(&entangled_id)
+                        .and_then(|managed_port| managed_port.port_impl.as_mut())
+                        .map(|port_impl| port_impl.handle_controlled_local_incoming(task))
+                } else {
+                    None
+                };
+                match incoming {
+                    Some(MessagePortIncomingResult::Dispatch(task)) => {
+                        if !self.associate_controlled_local_queued_message(entangled_id) {
+                            self.release_controlled_local_messages(1);
+                            return Err(self.controlled_local_rejection(
+                                "controlled-local MessagePort task lost its destination identity",
+                            ));
+                        }
+                        self.queue_message_port_route(
+                            entangled_id,
+                            task,
+                            MessagePortTaskIngress::ControlledLocal,
+                        );
+                    },
+                    Some(MessagePortIncomingResult::Buffered) => {},
+                    Some(MessagePortIncomingResult::Dropped) | None => {
+                        self.release_controlled_local_messages(1);
+                        return Err(self.controlled_local_rejection(
+                            "controlled-local MessagePort target lost its local provenance",
+                        ));
+                    },
+                }
+                return Ok(());
+            },
+        };
+
+        // Step 7. Queueing through the ordinary PortMessage task source keeps recursive scheduler
+        // posts under the same controlled task/turn limits as every other script task.
+        self.queue_message_port_route(entangled_id, task, ingress);
+        Ok(())
+    }
+
+    fn queue_message_port_route(
+        &self,
+        port_id: MessagePortId,
+        task: PortMessageTask,
+        ingress: MessagePortTaskIngress,
+    ) {
+        let this = Trusted::new(self);
+        self.task_manager()
+            .port_message_queue()
+            .queue(task!(post_message: move |cx| {
+                let global = this.root();
+                global.route_task_to_port(cx, port_id, task, ingress);
+            }));
     }
 
     /// If we don't know about the port,
@@ -1641,34 +2895,114 @@ impl GlobalScope {
         cx: &mut js::context::JSContext,
         port_id: MessagePortId,
         task: PortMessageTask,
+        ingress: MessagePortTaskIngress,
     ) {
         rooted!(&in(cx) let mut cross_realm_transform = None);
 
-        let should_dispatch = if let MessagePortState::Managed(_id, message_ports) =
-            &mut *self.message_port_state.borrow_mut()
+        if ingress == MessagePortTaskIngress::ControlledLocal
+            && !self.has_controlled_local_queued_message(port_id)
         {
-            if !message_ports.contains_key(&port_id) {
+            // Never guess which global reservation a malformed or duplicated task owns. The exact
+            // destination association is installed before queueing and consumed once below.
+            self.latch_controlled_local_rejection();
+            return;
+        }
+
+        let target_provenance = match &*self.message_port_state.borrow() {
+            MessagePortState::Managed(_, message_ports) => {
+                message_ports.get(&port_id).map(|port| port.provenance)
+            },
+            MessagePortState::UnManaged => None,
+        };
+        match message_port_route_disposition(
+            ingress,
+            target_provenance,
+            self.controlled_local_execution_profile_selected(),
+        ) {
+            MessagePortRouteDisposition::Accept => {
+                if !controlled_local_message_data_admitted(&task.data) {
+                    if ingress == MessagePortTaskIngress::ControlledLocal {
+                        self.finish_controlled_local_queued_message(port_id);
+                        self.latch_controlled_local_rejection();
+                        return;
+                    }
+                }
+            },
+            MessagePortRouteDisposition::DropClosedControlledLocal => {
+                // A locally-reserved task may be dropped after its peer closes and is collected,
+                // but it may never escape to Constellation or another global.
+                self.finish_controlled_local_queued_message(port_id);
+                return;
+            },
+            MessagePortRouteDisposition::RejectControlledLocalEscape => {
+                self.finish_controlled_local_queued_message(port_id);
+                self.latch_controlled_local_rejection();
+                return;
+            },
+            MessagePortRouteDisposition::RejectExternalIngress => {
+                // Router/IPC ingress has no authority over a controlled-local identifier.
+                self.latch_controlled_local_rejection();
+                return;
+            },
+            MessagePortRouteDisposition::Reroute => {
                 self.re_route_port_task(port_id, task);
                 return;
-            }
-            match message_ports.get_mut(&port_id) {
-                None => panic!("route_task_to_port called for an unknown port."),
-                Some(managed_port) => {
-                    // If the port is not enabled yet, or if is awaiting the completion of it's transfer,
-                    // the task will be buffered and dispatched upon enablement or completion of the transfer.
-                    if let Some(port_impl) = managed_port.port_impl.as_mut() {
-                        let to_dispatch = port_impl.handle_incoming(task).map(|to_dispatch| {
-                            (DomRoot::from_ref(&*managed_port.dom_port), to_dispatch)
-                        });
+            },
+        }
+
+        let mut malformed_controlled_local_port = false;
+        let (should_dispatch, retains_controlled_reservation) =
+            if let MessagePortState::Managed(_id, message_ports) =
+                &mut *self.message_port_state.borrow_mut()
+            {
+                let managed_port = message_ports
+                    .get_mut(&port_id)
+                    .expect("target provenance was observed above");
+                match managed_port.port_impl.as_mut() {
+                    None if ingress == MessagePortTaskIngress::ControlledLocal => {
+                        malformed_controlled_local_port = true;
+                        (None, false)
+                    },
+                    None => panic!("managed-port has no port-impl."),
+                    Some(port_impl) => {
                         cross_realm_transform.set(managed_port.cross_realm_transform.clone());
-                        to_dispatch
-                    } else {
-                        panic!("managed-port has no port-impl.");
-                    }
-                },
+                        match ingress {
+                            MessagePortTaskIngress::ControlledLocal => {
+                                match port_impl.handle_controlled_local_incoming(task) {
+                                    MessagePortIncomingResult::Dispatch(task) => (
+                                        Some((DomRoot::from_ref(&*managed_port.dom_port), task)),
+                                        false,
+                                    ),
+                                    MessagePortIncomingResult::Buffered => (None, true),
+                                    MessagePortIncomingResult::Dropped => (None, false),
+                                }
+                            },
+                            MessagePortTaskIngress::GenericLocal
+                            | MessagePortTaskIngress::External => (
+                                port_impl
+                                    .handle_incoming(task)
+                                    .map(|task| (DomRoot::from_ref(&*managed_port.dom_port), task)),
+                                false,
+                            ),
+                        }
+                    },
+                }
+            } else {
+                unreachable!("target provenance was observed above");
+            };
+
+        if ingress == MessagePortTaskIngress::ControlledLocal {
+            let accounting_transition_succeeded = if retains_controlled_reservation {
+                self.move_controlled_local_queued_message_to_buffer(port_id)
+            } else {
+                self.finish_controlled_local_queued_message(port_id)
+            };
+            if !accounting_transition_succeeded {
+                return;
             }
-        } else {
-            self.re_route_port_task(port_id, task);
+        }
+        if malformed_controlled_local_port {
+            self.latch_controlled_local_rejection();
             return;
         };
 
@@ -1761,53 +3095,70 @@ impl GlobalScope {
     /// Check all ports that have been transfer-received in the previous task,
     /// and complete their transfer if they haven't been re-transferred.
     pub(crate) fn maybe_add_pending_ports(&self) {
-        if let MessagePortState::Managed(router_id, message_ports) =
-            &mut *self.message_port_state.borrow_mut()
-        {
-            let to_be_added: Vec<MessagePortId> = message_ports
-                .iter()
-                .filter_map(|(id, managed_port)| {
-                    if managed_port.pending {
-                        Some(*id)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            for id in to_be_added.iter() {
-                let managed_port = message_ports
-                    .get_mut(id)
-                    .expect("Collected port-id to match an entry");
-                if !managed_port.pending {
-                    panic!("Only pending ports should be found in to_be_added")
-                }
-                managed_port.pending = false;
-            }
-            let _ = self.script_to_constellation_chan().send(
-                ScriptToConstellationMessage::CompleteMessagePortTransfer(*router_id, to_be_added),
-            );
-        } else {
+        let mut current_state = self.message_port_state.borrow_mut();
+        let MessagePortState::Managed(ownership, message_ports) = &mut *current_state else {
             warn!("maybe_add_pending_ports called on a global not managing any ports.");
+            return;
+        };
+        let Some(router_id) = ownership.router_id() else {
+            // Controlled-local construction never queues this transfer-completion task. If mixed
+            // state somehow reached this path, retain no fiction that Constellation owns it.
+            drop(current_state);
+            self.latch_controlled_local_rejection();
+            return;
+        };
+        let to_be_added: Vec<MessagePortId> = message_ports
+            .iter()
+            .filter_map(|(id, managed_port)| {
+                if managed_port.pending {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for id in to_be_added.iter() {
+            let managed_port = message_ports
+                .get_mut(id)
+                .expect("Collected port-id to match an entry");
+            if !managed_port.pending {
+                panic!("Only pending ports should be found in to_be_added")
+            }
+            managed_port.pending = false;
         }
+        let _ = self.script_to_constellation_chan().send(
+            ScriptToConstellationMessage::CompleteMessagePortTransfer(router_id, to_be_added),
+        );
     }
 
     /// <https://html.spec.whatwg.org/multipage/#ports-and-garbage-collection>
     pub(crate) fn perform_a_message_port_garbage_collection_checkpoint(&self) {
-        let is_empty = if let MessagePortState::Managed(_id, message_ports) =
+        let retained_controlled_local_messages = self.controlled_local_retained_message_count.get();
+        let is_empty = if let MessagePortState::Managed(ownership, message_ports) =
             &mut *self.message_port_state.borrow_mut()
         {
-            let to_be_removed: Vec<MessagePortId> = message_ports
-                .iter()
-                .filter_map(|(id, managed_port)| {
-                    if managed_port.explicitly_closed {
-                        Some(*id)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            for id in to_be_removed {
-                message_ports.remove(&id);
+            // A controlled-local post reserves its message before its ordinary routing task runs.
+            // Keep closed entries as bounded tombstones until every such reservation drains, so
+            // pending observation always has a stable local identity and the task can only be
+            // dropped by the controlled route. The following task checkpoint prunes them once the
+            // retained count reaches zero.
+            let retain_closed_controlled_local_tombstones = *ownership
+                == MessagePortRouterOwnership::ControlledLocalOnly
+                && retained_controlled_local_messages > 0;
+            if !retain_closed_controlled_local_tombstones {
+                let to_be_removed: Vec<MessagePortId> = message_ports
+                    .iter()
+                    .filter_map(|(id, managed_port)| {
+                        if managed_port.explicitly_closed {
+                            Some(*id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for id in to_be_removed {
+                    message_ports.remove(&id);
+                }
             }
             // Note: ports are only removed throught explicit closure by script in this global.
             // TODO: #25772
@@ -1916,32 +3267,76 @@ impl GlobalScope {
         dom_port: &MessagePort,
         port_impl: Option<MessagePortImpl>,
     ) {
+        self.track_message_port_with_provenance(
+            dom_port,
+            port_impl,
+            MessagePortProvenance::ExternalCapable,
+        );
+    }
+
+    /// Track one constructor-created port whose peer is guaranteed to stay in this global.
+    pub(crate) fn track_controlled_local_message_port(&self, dom_port: &MessagePort) {
+        self.track_message_port_with_provenance(
+            dom_port,
+            None,
+            MessagePortProvenance::ControlledLocal,
+        );
+    }
+
+    fn track_message_port_with_provenance(
+        &self,
+        dom_port: &MessagePort,
+        port_impl: Option<MessagePortImpl>,
+        provenance: MessagePortProvenance,
+    ) {
+        if provenance == MessagePortProvenance::ControlledLocal && port_impl.is_some() {
+            self.latch_controlled_local_rejection();
+            return;
+        }
         let mut current_state = self.message_port_state.borrow_mut();
 
         if let MessagePortState::UnManaged = &*current_state {
-            // Setup a route for IPC, for messages from the constellation to our ports.
-            let context = Trusted::new(self);
-            let listener = MessageListener {
-                task_source: self.task_manager().port_message_queue().into(),
-                context,
-            };
-
-            let port_control_callback = GenericCallback::new(move |message| match message {
-                Ok(msg) => listener.notify(msg),
-                Err(err) => warn!("Error receiving a MessagePortMsg: {:?}", err),
-            })
-            .expect("Could not create callback");
-            let router_id = MessagePortRouterId::new();
-            *current_state = MessagePortState::Managed(router_id, HashMapTracedValues::new_fx());
-            let _ = self.script_to_constellation_chan().send(
-                ScriptToConstellationMessage::NewMessagePortRouter(
-                    router_id,
-                    port_control_callback,
-                ),
-            );
+            match provenance {
+                MessagePortProvenance::ControlledLocal => {
+                    *current_state = MessagePortState::Managed(
+                        MessagePortRouterOwnership::ControlledLocalOnly,
+                        HashMapTracedValues::new_fx(),
+                    );
+                },
+                MessagePortProvenance::ExternalCapable => {
+                    // Preserve Servo's inherited external/realtime router registration exactly.
+                    let context = Trusted::new(self);
+                    let listener = MessageListener {
+                        task_source: self.task_manager().port_message_queue().into(),
+                        context,
+                    };
+                    let port_control_callback =
+                        GenericCallback::new(move |message| match message {
+                            Ok(msg) => listener.notify(msg),
+                            Err(err) => warn!("Error receiving a MessagePortMsg: {:?}", err),
+                        })
+                        .expect("Could not create callback");
+                    let router_id = MessagePortRouterId::new();
+                    *current_state = MessagePortState::Managed(
+                        MessagePortRouterOwnership::External(router_id),
+                        HashMapTracedValues::new_fx(),
+                    );
+                    let _ = self.script_to_constellation_chan().send(
+                        ScriptToConstellationMessage::NewMessagePortRouter(
+                            router_id,
+                            port_control_callback,
+                        ),
+                    );
+                },
+            }
         }
 
-        if let MessagePortState::Managed(router_id, message_ports) = &mut *current_state {
+        if let MessagePortState::Managed(ownership, message_ports) = &mut *current_state {
+            if !ownership.admits(provenance) {
+                drop(current_state);
+                self.latch_controlled_local_rejection();
+                return;
+            }
             if let Some(port_impl) = port_impl {
                 // We keep transfer-received ports as "pending",
                 // and only ask the constellation to complete the transfer
@@ -1950,6 +3345,8 @@ impl GlobalScope {
                     *dom_port.message_port_id(),
                     ManagedMessagePort {
                         port_impl: Some(port_impl),
+                        provenance,
+                        locally_disentangled: false,
                         dom_port: Dom::from_ref(dom_port),
                         pending: true,
                         explicitly_closed: false,
@@ -1973,18 +3370,25 @@ impl GlobalScope {
                     *dom_port.message_port_id(),
                     ManagedMessagePort {
                         port_impl: Some(port_impl),
+                        provenance,
+                        locally_disentangled: false,
                         dom_port: Dom::from_ref(dom_port),
                         pending: false,
                         explicitly_closed: false,
                         cross_realm_transform: None,
                     },
                 );
-                let _ = self.script_to_constellation_chan().send(
-                    ScriptToConstellationMessage::NewMessagePort(
-                        *router_id,
-                        *dom_port.message_port_id(),
-                    ),
-                );
+                if provenance == MessagePortProvenance::ExternalCapable {
+                    let router_id = ownership
+                        .router_id()
+                        .expect("external-capable ownership always has a router");
+                    let _ = self.script_to_constellation_chan().send(
+                        ScriptToConstellationMessage::NewMessagePort(
+                            router_id,
+                            *dom_port.message_port_id(),
+                        ),
+                    );
+                }
             };
         } else {
             panic!("track_message_port should have first switched the state to managed.");
@@ -2599,21 +4003,138 @@ impl GlobalScope {
             }
         }
 
-        if let MessagePortState::Managed(_, message_ports) = &*self.message_port_state.borrow() {
+        let retained_controlled_local_messages = self.controlled_local_retained_message_count.get();
+        let message_port_state = self.message_port_state.borrow();
+        let queued_controlled_local_messages = self.controlled_local_queued_message_counts.borrow();
+        let controlled_local_accounting = (|| {
+            let MessagePortState::Managed(ownership, message_ports) = &*message_port_state else {
+                return (retained_controlled_local_messages == 0
+                    && queued_controlled_local_messages.is_empty())
+                .then_some(());
+            };
+            if message_ports
+                .values()
+                .any(|port| !ownership.admits(port.provenance))
+            {
+                return None;
+            }
+
+            // Every queued reservation must retain the exact controlled-local destination entry,
+            // including an explicitly-closed tombstone awaiting its routing task.
+            if queued_controlled_local_messages.iter().any(|(id, count)| {
+                *count == 0
+                    || message_ports.get(id).is_none_or(|port| {
+                        port.provenance != MessagePortProvenance::ControlledLocal
+                    })
+            }) {
+                return None;
+            }
+
+            let mut buffered_counts = Vec::new();
+            for port in message_ports.values() {
+                if port.provenance != MessagePortProvenance::ControlledLocal {
+                    continue;
+                }
+                let port_impl = port.port_impl.as_ref()?;
+                buffered_counts.push(port_impl.buffered_message_count());
+            }
+            controlled_local_message_accounting_reconciles(
+                retained_controlled_local_messages,
+                queued_controlled_local_messages.values().copied(),
+                buffered_counts.into_iter(),
+            )
+            .then_some(())
+        })();
+        if controlled_local_accounting.is_none() {
+            drop(queued_controlled_local_messages);
+            drop(message_port_state);
+            self.latch_controlled_local_rejection();
+            return Err(
+                PendingPersistentSourceObservationError::ControlledLocalMessageAccountingMismatch,
+            );
+        }
+
+        if let MessagePortState::Managed(_, message_ports) = &*message_port_state {
             for (id, port) in message_ports.iter() {
-                if !port.explicitly_closed
-                    && port
+                let queued_message_count = queued_controlled_local_messages
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0);
+                if port.explicitly_closed {
+                    match port.provenance {
+                        MessagePortProvenance::ExternalCapable => continue,
+                        MessagePortProvenance::ControlledLocal
+                            if queued_message_count == 0
+                                && port.port_impl.as_ref().is_some_and(|port_impl| {
+                                    !port_impl.has_buffered_messages()
+                                }) =>
+                        {
+                            continue;
+                        },
+                        MessagePortProvenance::ControlledLocal => {},
+                    }
+                }
+                let pending_source = match port.provenance {
+                    MessagePortProvenance::ExternalCapable => port
                         .port_impl
                         .as_ref()
                         .is_some_and(|port_impl| port_impl.entangled_port_id().is_some())
-                {
+                        .then_some(*id),
+                    MessagePortProvenance::ControlledLocal => {
+                        let port_impl = port
+                            .port_impl
+                            .as_ref()
+                            .expect("controlled-local accounting validated every implementation");
+                        let facts = ControlledLocalPortPendingFacts {
+                            pending: port.pending,
+                            explicitly_closed: port.explicitly_closed,
+                            dom_detached: port.dom_port.detached(),
+                            implementation_detached: port_impl.detached(),
+                            transfer_in_progress: port_impl.transfer_in_progress(),
+                            has_buffered_messages: port_impl.has_buffered_messages(),
+                            has_queued_messages: queued_message_count > 0,
+                            locally_disentangled: port.locally_disentangled,
+                            dom_peer: port.dom_port.entangled_port_id(),
+                            implementation_peer: port_impl.entangled_port_id(),
+                        };
+                        let peer = facts.dom_peer.and_then(|peer_id| {
+                            if facts.implementation_peer != Some(peer_id) {
+                                return None;
+                            }
+                            let peer = message_ports.get(&peer_id)?;
+                            if peer.provenance != MessagePortProvenance::ControlledLocal {
+                                return None;
+                            }
+                            let peer_impl = peer.port_impl.as_ref()?;
+                            let peer_facts = ControlledLocalPortPendingFacts {
+                                pending: peer.pending,
+                                explicitly_closed: peer.explicitly_closed,
+                                dom_detached: peer.dom_port.detached(),
+                                implementation_detached: peer_impl.detached(),
+                                transfer_in_progress: peer_impl.transfer_in_progress(),
+                                has_buffered_messages: peer_impl.has_buffered_messages(),
+                                has_queued_messages: queued_controlled_local_messages
+                                    .get(&peer_id)
+                                    .is_some_and(|count| *count > 0),
+                                locally_disentangled: peer.locally_disentangled,
+                                dom_peer: peer.dom_port.entangled_port_id(),
+                                implementation_peer: peer_impl.entangled_port_id(),
+                            };
+                            Some((peer_id, peer_facts))
+                        });
+                        controlled_local_port_pending_source(*id, facts, peer)
+                    },
+                };
+                if let Some(pending_id) = pending_source {
                     sources.push(PendingPersistentSourceIdentity {
                         pipeline_id,
-                        stable_id: PendingPersistentSourceStableId::MessagePort(*id),
+                        stable_id: PendingPersistentSourceStableId::MessagePort(pending_id),
                     });
                 }
             }
         }
+        drop(queued_controlled_local_messages);
+        drop(message_port_state);
 
         if !self.list_auto_close_worker.borrow().is_empty() {
             sources.push(PendingPersistentSourceIdentity {

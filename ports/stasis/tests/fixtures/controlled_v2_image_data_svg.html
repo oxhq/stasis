@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled v2 direct data SVG completion</title>
+<img id="image" alt="controlled data SVG">
+<output id="result">waiting</output>
+<script>
+  const image = document.querySelector("#image");
+  const result = document.querySelector("#result");
+  const events = [];
+  const source = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%222%22%20height%3D%222%22%3E%3Crect%20width%3D%222%22%20height%3D%222%22%20fill%3D%22green%22%2F%3E%3C%2Fsvg%3E";
+
+  for (const type of ["load", "error", "loadend"]) {
+    image.addEventListener(type, (event) => {
+      events.push(`${event.type}:${event.timeStamp}`);
+      result.textContent = `${events.join(">")}|now:${performance.now()}`;
+    });
+  }
+
+  image.src = source;
+</script>

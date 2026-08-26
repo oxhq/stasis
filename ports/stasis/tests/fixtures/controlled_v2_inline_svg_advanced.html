@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled v2 inline SVG rendering after advance</title>
+<button id="start">schedule inline SVG</button>
+<output id="result">idle</output>
+<script>
+  const result = document.querySelector("#result");
+
+  document.querySelector("#start").onclick = () => {
+    setTimeout(() => {
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("width", "119");
+      svg.setAttribute("height", "48");
+      svg.setAttribute("viewBox", "0 0 119 48");
+
+      const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      rect.setAttribute("width", "119");
+      rect.setAttribute("height", "48");
+      rect.setAttribute("rx", "6");
+      rect.setAttribute("fill", "#19a974");
+      svg.append(rect);
+
+      let loadEvents = 0;
+      svg.addEventListener("load", () => {
+        loadEvents += 1;
+        result.textContent = `inline-svg:${performance.now()}|load-events:${loadEvents}`;
+      });
+
+      document.body.append(svg);
+      result.textContent = `inline-svg:${performance.now()}|load-events:${loadEvents}`;
+    }, 5);
+  };
+</script>

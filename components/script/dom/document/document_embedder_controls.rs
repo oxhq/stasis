@@ -6,8 +6,9 @@ use std::cell::Cell;
 
 use embedder_traits::{
     ContextMenuAction, ContextMenuElementInformation, ContextMenuElementInformationFlags,
-    ContextMenuItem, ContextMenuRequest, EditingActionEvent, EmbedderControlId,
-    EmbedderControlRequest, EmbedderControlResponse, EmbedderMsg,
+    ContextMenuItem, ContextMenuRequest, DocumentControlProfile, DocumentExecutionProfile,
+    EditingActionEvent, EmbedderControlId, EmbedderControlRequest, EmbedderControlResponse,
+    EmbedderMsg, InputMethodType,
 };
 use euclid::{Point2D, Rect, Size2D};
 use js::context::{JSContext, NoGC};
@@ -38,6 +39,7 @@ use crate::dom::types::{
     Element, HTMLAnchorElement, HTMLElement, HTMLImageElement, HTMLInputElement, HTMLSelectElement,
     HTMLTextAreaElement, Window,
 };
+use crate::event_loop::script_thread::ScriptThread;
 use crate::messaging::MainThreadScriptMsg;
 use crate::navigation::navigate;
 
@@ -98,8 +100,30 @@ fn begin_semantic_automation_focus(active: &Cell<bool>) -> SemanticAutomationFoc
     SemanticAutomationFocusGuard { active, previous }
 }
 
-fn suppress_for_semantic_automation_focus(active: bool, request: &EmbedderControlRequest) -> bool {
-    active && matches!(request, EmbedderControlRequest::InputMethod(_))
+fn suppress_input_method_embedder_control(
+    semantic_automation_focus_active: bool,
+    controlled_clock: bool,
+    control_profile: DocumentControlProfile,
+    execution_profile: DocumentExecutionProfile,
+    top_level: bool,
+    request: &EmbedderControlRequest,
+) -> bool {
+    let EmbedderControlRequest::InputMethod(input_method) = request else {
+        return false;
+    };
+    if semantic_automation_focus_active {
+        return true;
+    }
+
+    let controlled_session_v2 = controlled_clock
+        && control_profile == DocumentControlProfile::TopLevelSession
+        && execution_profile == DocumentExecutionProfile::ControlledWebSessionV2
+        && top_level;
+
+    controlled_session_v2
+        && input_method.input_method_type == InputMethodType::Text
+        && !input_method.multiline
+        && !input_method.allow_virtual_keyboard
 }
 
 impl DocumentEmbedderControls {
@@ -135,12 +159,21 @@ impl DocumentEmbedderControls {
         request: EmbedderControlRequest,
         point: Option<DevicePoint>,
     ) -> Option<EmbedderControlId> {
-        if suppress_for_semantic_automation_focus(
+        if suppress_input_method_embedder_control(
             self.semantic_automation_focus_active.get(),
+            self.window
+                .as_global_scope()
+                .document_clock()
+                .is_controlled(),
+            ScriptThread::current_document_control_profile(),
+            ScriptThread::current_document_execution_profile(),
+            self.window.is_top_level(),
             &request,
         ) {
-            // A semantic focus command needs DOM focus/event behavior but does not expose or wait
-            // on a native IME. Do not touch the controlled clock or publish a visible owner.
+            // Semantic automation and controlled-web-session-v2's passive, single-line text
+            // autofocus both need DOM focus, event, value, and selection behavior without
+            // exposing or awaiting a native IME. Do not touch the controlled clock or publish a
+            // visible owner.
             return None;
         }
         if !matches!(&request, EmbedderControlRequest::FilePicker(_))
@@ -465,44 +498,77 @@ impl DocumentEmbedderControls {
 }
 
 #[cfg(test)]
-mod semantic_automation_focus_tests {
+mod input_method_embedder_control_tests {
     use std::cell::Cell;
 
+    use super::{begin_semantic_automation_focus, suppress_input_method_embedder_control};
     use embedder_traits::{
-        EmbedderControlRequest, InputMethodRequest, InputMethodType, SelectElementRequest,
+        DocumentControlProfile, DocumentExecutionProfile, EmbedderControlRequest,
+        InputMethodRequest, InputMethodType, SelectElementRequest,
     };
 
-    use super::{begin_semantic_automation_focus, suppress_for_semantic_automation_focus};
+    fn input_method_request(
+        input_method_type: InputMethodType,
+        multiline: bool,
+        allow_virtual_keyboard: bool,
+    ) -> EmbedderControlRequest {
+        EmbedderControlRequest::InputMethod(InputMethodRequest {
+            input_method_type,
+            text: String::new(),
+            insertion_point: None,
+            multiline,
+            allow_virtual_keyboard,
+        })
+    }
+
+    fn select() -> EmbedderControlRequest {
+        EmbedderControlRequest::SelectElement(SelectElementRequest {
+            options: Vec::new(),
+            selected_options: Vec::new(),
+            allow_select_multiple: false,
+        })
+    }
 
     #[test]
     fn scope_restores_and_only_suppresses_input_method_controls() {
         let active = Cell::new(false);
-        let input_method = EmbedderControlRequest::InputMethod(InputMethodRequest {
-            input_method_type: InputMethodType::Text,
-            text: String::new(),
-            insertion_point: None,
-            multiline: false,
-            allow_virtual_keyboard: false,
-        });
-        let select = EmbedderControlRequest::SelectElement(SelectElementRequest {
-            options: Vec::new(),
-            selected_options: Vec::new(),
-            allow_select_multiple: false,
-        });
+        let input_method = input_method_request(InputMethodType::Text, false, false);
+        let unrestricted_input_method = input_method_request(InputMethodType::Number, true, true);
+        let select = select();
 
-        assert!(!suppress_for_semantic_automation_focus(
+        assert!(!suppress_input_method_embedder_control(
+            false,
+            false,
+            DocumentControlProfile::SingleDocument,
+            DocumentExecutionProfile::Baseline,
             false,
             &input_method
         ));
         {
             let _outer = begin_semantic_automation_focus(&active);
             assert!(active.get());
-            assert!(suppress_for_semantic_automation_focus(
+            assert!(suppress_input_method_embedder_control(
                 active.get(),
+                false,
+                DocumentControlProfile::SingleDocument,
+                DocumentExecutionProfile::Baseline,
+                false,
                 &input_method
             ));
-            assert!(!suppress_for_semantic_automation_focus(
+            assert!(suppress_input_method_embedder_control(
                 active.get(),
+                false,
+                DocumentControlProfile::SingleDocument,
+                DocumentExecutionProfile::Baseline,
+                false,
+                &unrestricted_input_method,
+            ));
+            assert!(!suppress_input_method_embedder_control(
+                active.get(),
+                true,
+                DocumentControlProfile::TopLevelSession,
+                DocumentExecutionProfile::ControlledWebSessionV2,
+                true,
                 &select
             ));
             {
@@ -512,6 +578,78 @@ mod semantic_automation_focus_tests {
             assert!(active.get());
         }
         assert!(!active.get());
+    }
+
+    #[test]
+    fn controlled_session_v2_suppresses_only_top_level_controlled_input_method() {
+        let input_method = input_method_request(InputMethodType::Text, false, false);
+        let non_text = input_method_request(InputMethodType::Number, false, false);
+        let multiline = input_method_request(InputMethodType::Text, true, false);
+        let virtual_keyboard = input_method_request(InputMethodType::Text, false, true);
+        let select = select();
+
+        assert!(suppress_input_method_embedder_control(
+            false,
+            true,
+            DocumentControlProfile::TopLevelSession,
+            DocumentExecutionProfile::ControlledWebSessionV2,
+            true,
+            &input_method,
+        ));
+        assert!(!suppress_input_method_embedder_control(
+            false,
+            true,
+            DocumentControlProfile::TopLevelSession,
+            DocumentExecutionProfile::ControlledWebSessionV2,
+            true,
+            &select,
+        ));
+        for request in [&non_text, &multiline, &virtual_keyboard] {
+            assert!(!suppress_input_method_embedder_control(
+                false,
+                true,
+                DocumentControlProfile::TopLevelSession,
+                DocumentExecutionProfile::ControlledWebSessionV2,
+                true,
+                request,
+            ));
+        }
+
+        for (controlled_clock, control_profile, execution_profile, top_level) in [
+            (
+                false,
+                DocumentControlProfile::TopLevelSession,
+                DocumentExecutionProfile::ControlledWebSessionV2,
+                true,
+            ),
+            (
+                true,
+                DocumentControlProfile::SingleDocument,
+                DocumentExecutionProfile::ControlledWebSessionV2,
+                true,
+            ),
+            (
+                true,
+                DocumentControlProfile::TopLevelSession,
+                DocumentExecutionProfile::Baseline,
+                true,
+            ),
+            (
+                true,
+                DocumentControlProfile::TopLevelSession,
+                DocumentExecutionProfile::ControlledWebSessionV2,
+                false,
+            ),
+        ] {
+            assert!(!suppress_input_method_embedder_control(
+                false,
+                controlled_clock,
+                control_profile,
+                execution_profile,
+                top_level,
+                &input_method,
+            ));
+        }
     }
 }
 

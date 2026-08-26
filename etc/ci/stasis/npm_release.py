@@ -27,6 +27,7 @@ VERSION_RE = re.compile(
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 POSITIVE_INTEGER_RE = re.compile(r"[1-9][0-9]*")
+CANONICAL_NONNEGATIVE_INTEGER_RE = re.compile(r"(?:0|[1-9][0-9]*)")
 PACKAGE_NAME = "@oxhq/stasis"
 REPOSITORY = "https://github.com/oxhq/stasis.git"
 GATE_NAME = "sdk-act-settle-inspect"
@@ -59,6 +60,18 @@ UPSTREAM_IDENTITIES = {
     "pliego_revision": "556c774242b272b11bc60999449c5debff1ad20f",
     "pliego_servo_merge_base": "313b6d5ecc113b08010ce434140db3ca5abcc71c",
 }
+V2_AUTOMATION_CONTROLLED_TRACE = (
+    "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>check:input:5>"
+    "check:change:5>"
+    "select:input:5>select:change:5>invalid:invalid:5>submit:submit:5>"
+    "submit:formdata:5|not-read"
+)
+V2_AUTOMATION_SCRIPT_TRACE = (
+    "5|fill:input:5>activate:click:5>reset:reset:5>check:click:5>check:input:5>"
+    "check:change:5>"
+    "select:input:5>select:change:5>invalid:invalid:5>submit:submit:5>"
+    "submit:formdata:5>script-trigger:click:5|0,0,0,0,0"
+)
 
 
 class NpmReleaseError(RuntimeError):
@@ -477,6 +490,393 @@ def verify_tarball(package: Path, version: str) -> None:
         )
 
 
+def require_v2_message_channel_proof(
+    value: object, description: str
+) -> dict[str, object]:
+    expected_fields = {
+        "profile",
+        "idleOutcome",
+        "idleMessagePortSources",
+        "idleRuntimeFailures",
+        "bufferActionRotatedStateToken",
+        "pendingPreservedBufferedStateToken",
+        "pendingMessagePortSources",
+        "pendingRuntimeFailures",
+        "startActionRotatedStateToken",
+        "drainedOutcome",
+        "drainedMessagePortSources",
+        "drainedRuntimeFailures",
+        "aggregateProcessedOrdinaryTasks",
+        "trace",
+        "evidenceProfile",
+        "unsupportedWork",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    }
+    if type(value) is not dict or set(value) != expected_fields:
+        raise NpmReleaseError(f"{description} has an unexpected schema")
+    for field in (
+        "profile",
+        "idleOutcome",
+        "idleMessagePortSources",
+        "idleRuntimeFailures",
+        "pendingMessagePortSources",
+        "pendingRuntimeFailures",
+        "drainedOutcome",
+        "drainedMessagePortSources",
+        "drainedRuntimeFailures",
+        "aggregateProcessedOrdinaryTasks",
+        "trace",
+        "evidenceProfile",
+        "unsupportedWork",
+    ):
+        require_json_string(value.get(field), f"{description} {field}")
+    expected_values = {
+        "profile": "controlled-web-session-v2",
+        "idleOutcome": "quiescent",
+        "idleMessagePortSources": "0",
+        "idleRuntimeFailures": "0",
+        "pendingMessagePortSources": "1",
+        "pendingRuntimeFailures": "0",
+        "drainedOutcome": "quiescent",
+        "drainedMessagePortSources": "0",
+        "drainedRuntimeFailures": "0",
+        "trace": "callback1>microtask1>callback2>microtask2",
+        "evidenceProfile": "controlled-web-session-v2",
+        "unsupportedWork": "0",
+    }
+    for field, expected in expected_values.items():
+        if value[field] != expected:
+            raise NpmReleaseError(f"{description} field does not match: {field}")
+    for field in (
+        "bufferActionRotatedStateToken",
+        "pendingPreservedBufferedStateToken",
+        "startActionRotatedStateToken",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    ):
+        if value.get(field) is not True:
+            raise NpmReleaseError(f"{description} field is not true: {field}")
+    fullmatch(
+        CANONICAL_NONNEGATIVE_INTEGER_RE,
+        value["aggregateProcessedOrdinaryTasks"],
+        f"{description} aggregate processed ordinary-task count",
+    )
+    if int(value["aggregateProcessedOrdinaryTasks"]) < 2:
+        raise NpmReleaseError(f"{description} processed fewer than two ordinary tasks")
+    return value
+
+
+def require_v2_direct_data_svg_proof(
+    value: object, description: str
+) -> dict[str, object]:
+    expected_fields = {
+        "profile",
+        "navigationBoundary",
+        "outcome",
+        "producerPending",
+        "producerTerminal",
+        "pendingImages",
+        "runtimeFailures",
+        "unsupportedWork",
+        "externalIo",
+        "completionTrace",
+        "evidenceProfile",
+        "sameControlledSession",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    }
+    if type(value) is not dict or set(value) != expected_fields:
+        raise NpmReleaseError(f"{description} has an unexpected schema")
+    expected_values = {
+        "profile": "controlled-web-session-v2",
+        "navigationBoundary": "controlled_ready",
+        "outcome": "quiescent",
+        "producerPending": "0",
+        "pendingImages": "0",
+        "runtimeFailures": "0",
+        "unsupportedWork": "0",
+        "externalIo": "0",
+        "completionTrace": "load:0>loadend:0|now:0",
+        "evidenceProfile": "controlled-web-session-v2",
+    }
+    for field, expected in expected_values.items():
+        if require_json_string(value.get(field), f"{description} {field}") != expected:
+            raise NpmReleaseError(f"{description} field does not match: {field}")
+    if value.get("producerTerminal") is not False:
+        raise NpmReleaseError(f"{description} field is not false: producerTerminal")
+    for field in (
+        "sameControlledSession",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    ):
+        if value.get(field) is not True:
+            raise NpmReleaseError(f"{description} field is not true: {field}")
+    return value
+
+
+def require_v2_inline_svg_rendering_proof(
+    value: object, description: str
+) -> dict[str, object]:
+    expected_fields = {
+        "profile",
+        "navigationBoundary",
+        "outcome",
+        "producerPending",
+        "producerTerminal",
+        "pendingImages",
+        "runtimeFailures",
+        "unsupportedWork",
+        "externalIo",
+        "fixtureTrace",
+        "domCompletionEvents",
+        "evidenceProfile",
+        "sameControlledSession",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    }
+    if type(value) is not dict or set(value) != expected_fields:
+        raise NpmReleaseError(f"{description} has an unexpected schema")
+    expected_values = {
+        "profile": "controlled-web-session-v2",
+        "navigationBoundary": "controlled_ready",
+        "outcome": "quiescent",
+        "producerPending": "0",
+        "pendingImages": "0",
+        "runtimeFailures": "0",
+        "unsupportedWork": "0",
+        "externalIo": "0",
+        "fixtureTrace": "inline-svg:4x3|events:0|now:0",
+        "domCompletionEvents": "0",
+        "evidenceProfile": "controlled-web-session-v2",
+    }
+    for field, expected in expected_values.items():
+        if require_json_string(value.get(field), f"{description} {field}") != expected:
+            raise NpmReleaseError(f"{description} field does not match: {field}")
+    if value.get("producerTerminal") is not False:
+        raise NpmReleaseError(f"{description} field is not false: producerTerminal")
+    for field in (
+        "sameControlledSession",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    ):
+        if value.get(field) is not True:
+            raise NpmReleaseError(f"{description} field is not true: {field}")
+    return value
+
+
+def require_v2_input_method_focus_proof(
+    value: object, description: str
+) -> dict[str, object]:
+    expected_fields = {
+        "profile",
+        "navigationBoundary",
+        "outcome",
+        "producerPending",
+        "producerTerminal",
+        "runtimeFailures",
+        "unsupportedWork",
+        "externalIo",
+        "completionTrace",
+        "evidenceProfile",
+        "sameControlledSession",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    }
+    if type(value) is not dict or set(value) != expected_fields:
+        raise NpmReleaseError(f"{description} has an unexpected schema")
+    expected_values = {
+        "profile": "controlled-web-session-v2",
+        "navigationBoundary": "controlled_ready",
+        "outcome": "quiescent",
+        "producerPending": "0",
+        "runtimeFailures": "0",
+        "unsupportedWork": "0",
+        "externalIo": "0",
+        "completionTrace": (
+            "blurred|4|focus:trusted:0>focusin:trusted:0>blur:trusted:0>"
+            "focusout:trusted:0|rwa-value|2:5"
+        ),
+        "evidenceProfile": "controlled-web-session-v2",
+    }
+    for field, expected in expected_values.items():
+        if require_json_string(value.get(field), f"{description} {field}") != expected:
+            raise NpmReleaseError(f"{description} field does not match: {field}")
+    if value.get("producerTerminal") is not False:
+        raise NpmReleaseError(f"{description} field is not false: producerTerminal")
+    for field in (
+        "sameControlledSession",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    ):
+        if value.get(field) is not True:
+            raise NpmReleaseError(f"{description} field is not true: {field}")
+    return value
+
+
+def require_v2_automation_event_timestamps_proof(
+    value: object, description: str
+) -> dict[str, object]:
+    expected_fields = {
+        "profile",
+        "navigationBoundary",
+        "initialOutcome",
+        "advancedVirtualTimeNs",
+        "dispatchedVirtualTimeNs",
+        "controlledEventCount",
+        "controlledTrace",
+        "browserEventCountAfterScriptProbe",
+        "scriptCreatedConstructorCount",
+        "scriptCreatedTrace",
+        "rejectedOutcome",
+        "failureCode",
+        "unsupportedKind",
+        "unsupportedCount",
+        "unsupportedReason",
+        "unsupportedTimeSurface",
+        "evidenceProfile",
+        "sameControlledSession",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    }
+    if type(value) is not dict or set(value) != expected_fields:
+        raise NpmReleaseError(f"{description} has an unexpected schema")
+    expected_values = {
+        "profile": "controlled-web-session-v2",
+        "navigationBoundary": "controlled_ready",
+        "initialOutcome": "quiescent",
+        "advancedVirtualTimeNs": "5000000",
+        "dispatchedVirtualTimeNs": "5000000",
+        "controlledEventCount": "11",
+        "controlledTrace": V2_AUTOMATION_CONTROLLED_TRACE,
+        "browserEventCountAfterScriptProbe": "12",
+        "scriptCreatedConstructorCount": "5",
+        "scriptCreatedTrace": "0,0,0,0,0",
+        "rejectedOutcome": "unsupported_work",
+        "failureCode": "unsupported_clock_surface",
+        "unsupportedKind": "other",
+        "unsupportedCount": "1",
+        "unsupportedReason": "time_surface",
+        "unsupportedTimeSurface": "host_timestamp",
+        "evidenceProfile": "controlled-web-session-v2",
+    }
+    for field, expected in expected_values.items():
+        if require_json_string(value.get(field), f"{description} {field}") != expected:
+            raise NpmReleaseError(f"{description} field does not match: {field}")
+    for field in (
+        "sameControlledSession",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    ):
+        if value.get(field) is not True:
+            raise NpmReleaseError(f"{description} field is not true: {field}")
+    return value
+
+
+def require_v2_css_animation_event_timestamps_proof(
+    value: object, description: str
+) -> dict[str, object]:
+    expected_fields = {
+        "profile",
+        "initialOutcome",
+        "settledVirtualTimeNs",
+        "controlledOutcome",
+        "controlledEventCount",
+        "controlledEventKinds",
+        "controlledOwnedEventCount",
+        "controlledDispatchTimeCount",
+        "controlledRuntimeFailures",
+        "controlledUnsupportedWork",
+        "controlledExternalIo",
+        "pendingAnimationEvents",
+        "finiteAnimations",
+        "infiniteAnimations",
+        "unsupportedAnimations",
+        "producerPending",
+        "producerTerminal",
+        "processedRenderingOpportunities",
+        "scriptCreatedConstructorCount",
+        "scriptCreatedTrace",
+        "rejectedOutcome",
+        "failureCode",
+        "unsupportedKind",
+        "unsupportedCount",
+        "unsupportedReason",
+        "unsupportedTimeSurface",
+        "evidenceProfile",
+        "publicNonAuxiliaryControlledTarget",
+        "sameControlledSession",
+        "freshExactBinaryProcess",
+        "managedRuntimeFallbackAccesses",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    }
+    if type(value) is not dict or set(value) != expected_fields:
+        raise NpmReleaseError(f"{description} has an unexpected schema")
+    expected_values = {
+        "profile": "controlled-web-session-v2",
+        "initialOutcome": "quiescent",
+        "settledVirtualTimeNs": "5000000",
+        "controlledOutcome": "quiescent",
+        "controlledEventCount": "2",
+        "controlledEventKinds": "animationend,animationstart",
+        "controlledOwnedEventCount": "2",
+        "controlledRuntimeFailures": "0",
+        "controlledUnsupportedWork": "0",
+        "controlledExternalIo": "0",
+        "pendingAnimationEvents": "0",
+        "finiteAnimations": "0",
+        "infiniteAnimations": "0",
+        "unsupportedAnimations": "0",
+        "producerPending": "0",
+        "scriptCreatedConstructorCount": "2",
+        "scriptCreatedTrace": "script:0,0",
+        "rejectedOutcome": "unsupported_work",
+        "failureCode": "unsupported_clock_surface",
+        "unsupportedKind": "other",
+        "unsupportedCount": "1",
+        "unsupportedReason": "time_surface",
+        "unsupportedTimeSurface": "host_timestamp",
+        "evidenceProfile": "controlled-web-session-v2",
+        "managedRuntimeFallbackAccesses": "0",
+    }
+    for field, expected in expected_values.items():
+        if require_json_string(value.get(field), f"{description} {field}") != expected:
+            raise NpmReleaseError(f"{description} field does not match: {field}")
+    if value.get("producerTerminal") is not False:
+        raise NpmReleaseError(f"{description} field is not false: producerTerminal")
+    for field in (
+        "publicNonAuxiliaryControlledTarget",
+        "sameControlledSession",
+        "freshExactBinaryProcess",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    ):
+        if value.get(field) is not True:
+            raise NpmReleaseError(f"{description} field is not true: {field}")
+    dispatch_count = require_json_string(
+        value.get("controlledDispatchTimeCount"),
+        f"{description} controlledDispatchTimeCount",
+    )
+    fullmatch(
+        POSITIVE_INTEGER_RE,
+        dispatch_count,
+        f"{description} controlled CSS dispatch-time count",
+    )
+    if int(dispatch_count) > 2:
+        raise NpmReleaseError(f"{description} observed more dispatch times than events")
+    rendering_opportunities = require_json_string(
+        value.get("processedRenderingOpportunities"),
+        f"{description} processedRenderingOpportunities",
+    )
+    fullmatch(
+        POSITIVE_INTEGER_RE,
+        rendering_opportunities,
+        f"{description} processed rendering-opportunity count",
+    )
+    return value
+
+
 def parse_gate_log(
     gate_log: Path, package: Path, version: str, revision: str
 ) -> dict[str, object]:
@@ -508,6 +908,12 @@ def parse_gate_log(
         "virtualElapsedNs",
         "wallElapsedMs",
         "closeResponseAndEof",
+        "v2MessageChannel",
+        "v2DirectDataSvg",
+        "v2InlineSvgRendering",
+        "v2InputMethodFocus",
+        "v2AutomationEventTimestamps",
+        "v2CssAnimationEventTimestamps",
     }
     if set(value) != required:
         raise NpmReleaseError("SDK gate success has an unexpected schema")
@@ -533,6 +939,27 @@ def parse_gate_log(
     if not value["binary"]:
         raise NpmReleaseError("SDK gate did not identify the tested native executable")
     fullmatch(SHA256_RE, value["binarySha256"], "tested native binary SHA-256")
+    require_v2_message_channel_proof(
+        value.get("v2MessageChannel"), "SDK gate v2 MessageChannel proof"
+    )
+    require_v2_direct_data_svg_proof(
+        value.get("v2DirectDataSvg"), "SDK gate v2 direct data-SVG proof"
+    )
+    require_v2_inline_svg_rendering_proof(
+        value.get("v2InlineSvgRendering"),
+        "SDK gate v2 inline SVG rendering proof",
+    )
+    require_v2_input_method_focus_proof(
+        value.get("v2InputMethodFocus"), "SDK gate v2 InputMethod focus proof"
+    )
+    require_v2_automation_event_timestamps_proof(
+        value.get("v2AutomationEventTimestamps"),
+        "SDK gate v2 automation event-timestamps proof",
+    )
+    require_v2_css_animation_event_timestamps_proof(
+        value.get("v2CssAnimationEventTimestamps"),
+        "SDK gate v2 CSS animation-event timestamps proof",
+    )
     return value
 
 
@@ -556,7 +983,7 @@ def create_proof(
     if gate["binarySha256"] != native_binary_sha256:
         raise NpmReleaseError("SDK gate tested a different native binary digest")
     document: dict[str, object] = {
-        "schema": 2,
+        "schema": 6,
         "gate": GATE_NAME,
         "package": f"{PACKAGE_NAME}@{version}",
         "revision": revision,
@@ -566,6 +993,12 @@ def create_proof(
         "tarball": gate["tarball"],
         "nativeBinarySha256": native_binary_sha256,
         "gateLogSha256": hash_file(gate_log, "sha256"),
+        "v2MessageChannel": gate["v2MessageChannel"],
+        "v2DirectDataSvg": gate["v2DirectDataSvg"],
+        "v2InlineSvgRendering": gate["v2InlineSvgRendering"],
+        "v2InputMethodFocus": gate["v2InputMethodFocus"],
+        "v2AutomationEventTimestamps": gate["v2AutomationEventTimestamps"],
+        "v2CssAnimationEventTimestamps": gate["v2CssAnimationEventTimestamps"],
     }
     if output.exists():
         raise NpmReleaseError(f"refusing to overwrite SDK gate proof: {output}")
@@ -621,6 +1054,12 @@ def verify_proof(
         "tarball",
         "nativeBinarySha256",
         "gateLogSha256",
+        "v2MessageChannel",
+        "v2DirectDataSvg",
+        "v2InlineSvgRendering",
+        "v2InputMethodFocus",
+        "v2AutomationEventTimestamps",
+        "v2CssAnimationEventTimestamps",
     }
     if not isinstance(document, dict) or set(document) != expected_keys:
         raise NpmReleaseError("SDK gate proof has an unexpected schema")
@@ -642,8 +1081,30 @@ def verify_proof(
     require_tarball_binding(
         document.get("tarball"), tarball_binding(package), "SDK gate proof tarball binding"
     )
+    require_v2_message_channel_proof(
+        document.get("v2MessageChannel"), "SDK gate proof v2 MessageChannel proof"
+    )
+    require_v2_direct_data_svg_proof(
+        document.get("v2DirectDataSvg"), "SDK gate proof v2 direct data-SVG proof"
+    )
+    require_v2_inline_svg_rendering_proof(
+        document.get("v2InlineSvgRendering"),
+        "SDK gate proof v2 inline SVG rendering proof",
+    )
+    require_v2_input_method_focus_proof(
+        document.get("v2InputMethodFocus"),
+        "SDK gate proof v2 InputMethod focus proof",
+    )
+    require_v2_automation_event_timestamps_proof(
+        document.get("v2AutomationEventTimestamps"),
+        "SDK gate proof v2 automation event-timestamps proof",
+    )
+    require_v2_css_animation_event_timestamps_proof(
+        document.get("v2CssAnimationEventTimestamps"),
+        "SDK gate proof v2 CSS animation-event timestamps proof",
+    )
     expected = {
-        "schema": 2,
+        "schema": 6,
         "gate": GATE_NAME,
         "package": f"{PACKAGE_NAME}@{version}",
         "revision": revision,
@@ -726,6 +1187,134 @@ def self_test() -> None:
             "virtualElapsedNs": "10000000000",
             "wallElapsedMs": 5.0,
             "closeResponseAndEof": True,
+            "v2MessageChannel": {
+                "profile": "controlled-web-session-v2",
+                "idleOutcome": "quiescent",
+                "idleMessagePortSources": "0",
+                "idleRuntimeFailures": "0",
+                "bufferActionRotatedStateToken": True,
+                "pendingPreservedBufferedStateToken": True,
+                "pendingMessagePortSources": "1",
+                "pendingRuntimeFailures": "0",
+                "startActionRotatedStateToken": True,
+                "drainedOutcome": "quiescent",
+                "drainedMessagePortSources": "0",
+                "drainedRuntimeFailures": "0",
+                "aggregateProcessedOrdinaryTasks": "3",
+                "trace": "callback1>microtask1>callback2>microtask2",
+                "evidenceProfile": "controlled-web-session-v2",
+                "unsupportedWork": "0",
+                "exactBinaryLaunch": True,
+                "closeResponseAndEof": True,
+            },
+            "v2DirectDataSvg": {
+                "profile": "controlled-web-session-v2",
+                "navigationBoundary": "controlled_ready",
+                "outcome": "quiescent",
+                "producerPending": "0",
+                "producerTerminal": False,
+                "pendingImages": "0",
+                "runtimeFailures": "0",
+                "unsupportedWork": "0",
+                "externalIo": "0",
+                "completionTrace": "load:0>loadend:0|now:0",
+                "evidenceProfile": "controlled-web-session-v2",
+                "sameControlledSession": True,
+                "exactBinaryLaunch": True,
+                "closeResponseAndEof": True,
+            },
+            "v2InlineSvgRendering": {
+                "profile": "controlled-web-session-v2",
+                "navigationBoundary": "controlled_ready",
+                "outcome": "quiescent",
+                "producerPending": "0",
+                "producerTerminal": False,
+                "pendingImages": "0",
+                "runtimeFailures": "0",
+                "unsupportedWork": "0",
+                "externalIo": "0",
+                "fixtureTrace": "inline-svg:4x3|events:0|now:0",
+                "domCompletionEvents": "0",
+                "evidenceProfile": "controlled-web-session-v2",
+                "sameControlledSession": True,
+                "exactBinaryLaunch": True,
+                "closeResponseAndEof": True,
+            },
+            "v2InputMethodFocus": {
+                "profile": "controlled-web-session-v2",
+                "navigationBoundary": "controlled_ready",
+                "outcome": "quiescent",
+                "producerPending": "0",
+                "producerTerminal": False,
+                "runtimeFailures": "0",
+                "unsupportedWork": "0",
+                "externalIo": "0",
+                "completionTrace": (
+                    "blurred|4|focus:trusted:0>focusin:trusted:0>blur:trusted:0>"
+                    "focusout:trusted:0|rwa-value|2:5"
+                ),
+                "evidenceProfile": "controlled-web-session-v2",
+                "sameControlledSession": True,
+                "exactBinaryLaunch": True,
+                "closeResponseAndEof": True,
+            },
+            "v2AutomationEventTimestamps": {
+                "profile": "controlled-web-session-v2",
+                "navigationBoundary": "controlled_ready",
+                "initialOutcome": "quiescent",
+                "advancedVirtualTimeNs": "5000000",
+                "dispatchedVirtualTimeNs": "5000000",
+                "controlledEventCount": "11",
+                "controlledTrace": V2_AUTOMATION_CONTROLLED_TRACE,
+                "browserEventCountAfterScriptProbe": "12",
+                "scriptCreatedConstructorCount": "5",
+                "scriptCreatedTrace": "0,0,0,0,0",
+                "rejectedOutcome": "unsupported_work",
+                "failureCode": "unsupported_clock_surface",
+                "unsupportedKind": "other",
+                "unsupportedCount": "1",
+                "unsupportedReason": "time_surface",
+                "unsupportedTimeSurface": "host_timestamp",
+                "evidenceProfile": "controlled-web-session-v2",
+                "sameControlledSession": True,
+                "exactBinaryLaunch": True,
+                "closeResponseAndEof": True,
+            },
+            "v2CssAnimationEventTimestamps": {
+                "profile": "controlled-web-session-v2",
+                "initialOutcome": "quiescent",
+                "settledVirtualTimeNs": "5000000",
+                "controlledOutcome": "quiescent",
+                "controlledEventCount": "2",
+                "controlledEventKinds": "animationend,animationstart",
+                "controlledOwnedEventCount": "2",
+                "controlledDispatchTimeCount": "2",
+                "controlledRuntimeFailures": "0",
+                "controlledUnsupportedWork": "0",
+                "controlledExternalIo": "0",
+                "pendingAnimationEvents": "0",
+                "finiteAnimations": "0",
+                "infiniteAnimations": "0",
+                "unsupportedAnimations": "0",
+                "producerPending": "0",
+                "producerTerminal": False,
+                "processedRenderingOpportunities": "3",
+                "scriptCreatedConstructorCount": "2",
+                "scriptCreatedTrace": "script:0,0",
+                "rejectedOutcome": "unsupported_work",
+                "failureCode": "unsupported_clock_surface",
+                "unsupportedKind": "other",
+                "unsupportedCount": "1",
+                "unsupportedReason": "time_surface",
+                "unsupportedTimeSurface": "host_timestamp",
+                "evidenceProfile": "controlled-web-session-v2",
+                "publicNonAuxiliaryControlledTarget": True,
+                "sameControlledSession": True,
+                "freshExactBinaryProcess": True,
+                "managedRuntimeFallbackAccesses": "0",
+                "exactBinaryLaunch": True,
+                "closeResponseAndEof": True,
+            },
         }
         gate_log = root / "gate.log"
         gate_log.write_text(
@@ -743,8 +1332,20 @@ def self_test() -> None:
             run_id="123",
             run_attempt="1",
         )
-        assert document["schema"] == 2
+        assert document["schema"] == 6
         assert document["tarball"] == gate_record["tarball"]
+        assert document["v2MessageChannel"] == gate_record["v2MessageChannel"]
+        assert document["v2DirectDataSvg"] == gate_record["v2DirectDataSvg"]
+        assert document["v2InlineSvgRendering"] == gate_record["v2InlineSvgRendering"]
+        assert document["v2InputMethodFocus"] == gate_record["v2InputMethodFocus"]
+        assert (
+            document["v2AutomationEventTimestamps"]
+            == gate_record["v2AutomationEventTimestamps"]
+        )
+        assert (
+            document["v2CssAnimationEventTimestamps"]
+            == gate_record["v2CssAnimationEventTimestamps"]
+        )
         verify_proof(
             directory=artifact,
             version=version,
@@ -880,8 +1481,650 @@ def self_test() -> None:
             lambda: parse_gate_log(numeric_digest_gate_log, package, version, revision),
         )
 
+        base_v2_message_channel = gate_record["v2MessageChannel"]
+        assert isinstance(base_v2_message_channel, dict)
+        v2_field_mutations = [
+            ("wrong profile", "profile", "controlled-web-session-v1"),
+            ("nonquiescent idle outcome", "idleOutcome", "pending"),
+            ("nonzero idle MessagePort sources", "idleMessagePortSources", "1"),
+            ("nonzero idle runtime failures", "idleRuntimeFailures", "1"),
+            ("unrotated buffer action token", "bufferActionRotatedStateToken", False),
+            (
+                "unpreserved pending buffer token",
+                "pendingPreservedBufferedStateToken",
+                False,
+            ),
+            ("zero pending MessagePort sources", "pendingMessagePortSources", "0"),
+            ("two pending MessagePort sources", "pendingMessagePortSources", "2"),
+            ("numeric pending MessagePort sources", "pendingMessagePortSources", 1),
+            ("nonzero pending runtime failures", "pendingRuntimeFailures", "1"),
+            ("unrotated start action token", "startActionRotatedStateToken", False),
+            ("nonquiescent drained outcome", "drainedOutcome", "pending"),
+            ("nonzero drained MessagePort sources", "drainedMessagePortSources", "1"),
+            ("nonzero drained runtime failures", "drainedRuntimeFailures", "1"),
+            (
+                "insufficient aggregate ordinary tasks",
+                "aggregateProcessedOrdinaryTasks",
+                "1",
+            ),
+            (
+                "noncanonical aggregate ordinary tasks",
+                "aggregateProcessedOrdinaryTasks",
+                "02",
+            ),
+            (
+                "numeric aggregate ordinary tasks",
+                "aggregateProcessedOrdinaryTasks",
+                2,
+            ),
+            (
+                "wrong callback and microtask trace",
+                "trace",
+                "callback2>microtask2>callback1>microtask1",
+            ),
+            (
+                "wrong evidence profile",
+                "evidenceProfile",
+                "controlled-web-session-v1",
+            ),
+            ("nonzero unsupported work", "unsupportedWork", "1"),
+            ("false exact-binary launch", "exactBinaryLaunch", False),
+            ("numeric exact-binary launch", "exactBinaryLaunch", 1),
+            ("false close proof", "closeResponseAndEof", False),
+            ("numeric close proof", "closeResponseAndEof", 1),
+        ]
+        v2_record_mutations = [
+            (
+                "missing lifecycle field",
+                {
+                    key: value
+                    for key, value in base_v2_message_channel.items()
+                    if key != "idleMessagePortSources"
+                },
+            ),
+            (
+                "extra lifecycle field",
+                {**base_v2_message_channel, "iframeContextTree": "supported"},
+            ),
+            *[
+                (label, {**base_v2_message_channel, field: value})
+                for label, field, value in v2_field_mutations
+            ],
+        ]
+        v2_gate_mutations = [
+            (
+                "missing v2 MessageChannel proof",
+                {key: value for key, value in gate_record.items() if key != "v2MessageChannel"},
+            ),
+            *[
+                (label, {**gate_record, "v2MessageChannel": mutation})
+                for label, mutation in v2_record_mutations
+            ],
+        ]
+        for index, (label, mutated_gate) in enumerate(v2_gate_mutations):
+            mutated_gate_log = root / f"v2-gate-mutation-{index}.log"
+            mutated_gate_log.write_text(
+                strict_json_dumps(mutated_gate, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            expect_error(
+                label,
+                lambda gate_log=mutated_gate_log: parse_gate_log(
+                    gate_log, package, version, revision
+                ),
+            )
+
+        base_v2_direct_data_svg = gate_record["v2DirectDataSvg"]
+        assert isinstance(base_v2_direct_data_svg, dict)
+        v2_direct_data_svg_record_mutations = [
+            (
+                "missing direct data-SVG lifecycle field",
+                {
+                    key: value
+                    for key, value in base_v2_direct_data_svg.items()
+                    if key != "pendingImages"
+                },
+            ),
+            (
+                "extra direct data-SVG lifecycle field",
+                {**base_v2_direct_data_svg, "hostFallback": True},
+            ),
+            *[
+                (label, {**base_v2_direct_data_svg, field: value})
+                for label, field, value in (
+                    ("wrong direct data-SVG profile", "profile", "controlled-webapp-v1"),
+                    ("wrong image navigation boundary", "navigationBoundary", "unsupported"),
+                    ("nonquiescent image outcome", "outcome", "unsupported_work"),
+                    ("pending image producer", "producerPending", "1"),
+                    ("numeric image producer count", "producerPending", 0),
+                    ("terminal image producer", "producerTerminal", True),
+                    ("numeric image producer terminal", "producerTerminal", 0),
+                    ("pending rendering image", "pendingImages", "1"),
+                    ("image runtime failure", "runtimeFailures", "1"),
+                    ("image unsupported work", "unsupportedWork", "1"),
+                    ("image external I/O", "externalIo", "1"),
+                    ("wrong image completion trace", "completionTrace", "load:1"),
+                    (
+                        "wrong image evidence profile",
+                        "evidenceProfile",
+                        "controlled-webapp-v1",
+                    ),
+                    ("image not in same session", "sameControlledSession", False),
+                    ("image not exact binary", "exactBinaryLaunch", False),
+                    ("image missing close proof", "closeResponseAndEof", False),
+                )
+            ],
+        ]
+
+        base_v2_inline_svg_rendering = gate_record["v2InlineSvgRendering"]
+        assert isinstance(base_v2_inline_svg_rendering, dict)
+        v2_inline_svg_rendering_record_mutations = [
+            (
+                "missing inline SVG rendering lifecycle field",
+                {
+                    key: value
+                    for key, value in base_v2_inline_svg_rendering.items()
+                    if key != "domCompletionEvents"
+                },
+            ),
+            (
+                "extra inline SVG rendering lifecycle field",
+                {**base_v2_inline_svg_rendering, "generalSvgSupported": True},
+            ),
+            *[
+                (label, {**base_v2_inline_svg_rendering, field: value})
+                for label, field, value in (
+                    ("wrong inline SVG profile", "profile", "controlled-webapp-v1"),
+                    (
+                        "wrong inline SVG navigation boundary",
+                        "navigationBoundary",
+                        "unsupported",
+                    ),
+                    ("nonquiescent inline SVG outcome", "outcome", "unsupported_work"),
+                    ("pending inline SVG producer", "producerPending", "1"),
+                    ("numeric inline SVG producer count", "producerPending", 0),
+                    ("terminal inline SVG producer", "producerTerminal", True),
+                    ("numeric inline SVG producer terminal", "producerTerminal", 0),
+                    ("pending inline SVG rendering image", "pendingImages", "1"),
+                    ("inline SVG runtime failure", "runtimeFailures", "1"),
+                    ("inline SVG unsupported work", "unsupportedWork", "1"),
+                    ("inline SVG external I/O", "externalIo", "1"),
+                    ("wrong inline SVG fixture trace", "fixtureTrace", "inline-svg"),
+                    ("invented inline SVG DOM event", "domCompletionEvents", "1"),
+                    (
+                        "numeric inline SVG DOM event count",
+                        "domCompletionEvents",
+                        0,
+                    ),
+                    (
+                        "wrong inline SVG evidence profile",
+                        "evidenceProfile",
+                        "controlled-webapp-v1",
+                    ),
+                    ("inline SVG not in same session", "sameControlledSession", False),
+                    ("inline SVG not exact binary", "exactBinaryLaunch", False),
+                    ("inline SVG missing close proof", "closeResponseAndEof", False),
+                )
+            ],
+        ]
+
+        base_v2_input_method_focus = gate_record["v2InputMethodFocus"]
+        assert isinstance(base_v2_input_method_focus, dict)
+        v2_input_method_focus_record_mutations = [
+            (
+                "missing InputMethod focus lifecycle field",
+                {
+                    key: value
+                    for key, value in base_v2_input_method_focus.items()
+                    if key != "completionTrace"
+                },
+            ),
+            (
+                "extra InputMethod focus lifecycle field",
+                {**base_v2_input_method_focus, "hostTimestamp": True},
+            ),
+            *[
+                (label, {**base_v2_input_method_focus, field: value})
+                for label, field, value in (
+                    ("wrong focus profile", "profile", "controlled-webapp-v1"),
+                    ("wrong focus navigation boundary", "navigationBoundary", "unsupported"),
+                    ("nonquiescent focus outcome", "outcome", "unsupported_work"),
+                    ("pending focus producer", "producerPending", "1"),
+                    ("numeric focus producer count", "producerPending", 0),
+                    ("terminal focus producer", "producerTerminal", True),
+                    ("numeric focus producer terminal", "producerTerminal", 0),
+                    ("focus runtime failure", "runtimeFailures", "1"),
+                    ("focus unsupported work", "unsupportedWork", "1"),
+                    ("focus external I/O", "externalIo", "1"),
+                    ("wrong focus completion trace", "completionTrace", "focused"),
+                    (
+                        "wrong focus evidence profile",
+                        "evidenceProfile",
+                        "controlled-webapp-v1",
+                    ),
+                    ("focus not in same session", "sameControlledSession", False),
+                    ("focus not exact binary", "exactBinaryLaunch", False),
+                    ("focus missing close proof", "closeResponseAndEof", False),
+                )
+            ],
+        ]
+
+        base_v2_automation_event_timestamps = gate_record[
+            "v2AutomationEventTimestamps"
+        ]
+        assert isinstance(base_v2_automation_event_timestamps, dict)
+        v2_automation_event_timestamps_record_mutations = [
+            (
+                "missing automation event-timestamps lifecycle field",
+                {
+                    key: value
+                    for key, value in base_v2_automation_event_timestamps.items()
+                    if key != "controlledEventCount"
+                },
+            ),
+            (
+                "extra automation event-timestamps lifecycle field",
+                {
+                    **base_v2_automation_event_timestamps,
+                    "scriptCreatedEventsControlled": True,
+                },
+            ),
+            *[
+                (label, {**base_v2_automation_event_timestamps, field: value})
+                for label, field, value in (
+                    (
+                        "wrong automation timestamp profile",
+                        "profile",
+                        "controlled-web-session-v1",
+                    ),
+                    (
+                        "wrong automation navigation boundary",
+                        "navigationBoundary",
+                        "unsupported",
+                    ),
+                    ("nonquiescent automation initial outcome", "initialOutcome", "pending"),
+                    (
+                        "wrong automation advanced virtual time",
+                        "advancedVirtualTimeNs",
+                        "0",
+                    ),
+                    (
+                        "numeric automation advanced virtual time",
+                        "advancedVirtualTimeNs",
+                        5000000,
+                    ),
+                    (
+                        "wrong automation dispatch virtual time",
+                        "dispatchedVirtualTimeNs",
+                        "0",
+                    ),
+                    ("wrong controlled automation event count", "controlledEventCount", "10"),
+                    ("numeric controlled automation event count", "controlledEventCount", 11),
+                    ("wrong controlled automation trace", "controlledTrace", "5|not-owned"),
+                    (
+                        "wrong browser event count after script probe",
+                        "browserEventCountAfterScriptProbe",
+                        "11",
+                    ),
+                    (
+                        "wrong script-created constructor count",
+                        "scriptCreatedConstructorCount",
+                        "4",
+                    ),
+                    (
+                        "wrong script-created timestamp trace",
+                        "scriptCreatedTrace",
+                        "5,5,5,5,5",
+                    ),
+                    (
+                        "script-created events falsely settle",
+                        "rejectedOutcome",
+                        "quiescent",
+                    ),
+                    (
+                        "wrong script-created failure code",
+                        "failureCode",
+                        "unsupported_work",
+                    ),
+                    ("wrong timestamp unsupported kind", "unsupportedKind", "timer"),
+                    ("wrong timestamp unsupported count", "unsupportedCount", "0"),
+                    ("numeric timestamp unsupported count", "unsupportedCount", 1),
+                    (
+                        "wrong timestamp unsupported reason",
+                        "unsupportedReason",
+                        "external_io",
+                    ),
+                    (
+                        "wrong unsupported time surface",
+                        "unsupportedTimeSurface",
+                        "document_timestamp",
+                    ),
+                    (
+                        "wrong automation evidence profile",
+                        "evidenceProfile",
+                        "controlled-web-session-v1",
+                    ),
+                    (
+                        "automation timestamps not in same session",
+                        "sameControlledSession",
+                        False,
+                    ),
+                    (
+                        "automation timestamps not exact binary",
+                        "exactBinaryLaunch",
+                        False,
+                    ),
+                    (
+                        "automation timestamps missing close proof",
+                        "closeResponseAndEof",
+                        False,
+                    ),
+                )
+            ],
+        ]
+
+        base_v2_css_animation_event_timestamps = gate_record[
+            "v2CssAnimationEventTimestamps"
+        ]
+        assert isinstance(base_v2_css_animation_event_timestamps, dict)
+        v2_css_animation_event_timestamps_record_mutations = [
+            (
+                "missing CSS animation-event timestamp lifecycle field",
+                {
+                    key: value
+                    for key, value in base_v2_css_animation_event_timestamps.items()
+                    if key != "controlledDispatchTimeCount"
+                },
+            ),
+            (
+                "extra CSS animation-event timestamp lifecycle field",
+                {
+                    **base_v2_css_animation_event_timestamps,
+                    "generalAnimationEventConstructorsControlled": True,
+                },
+            ),
+            *[
+                (label, {**base_v2_css_animation_event_timestamps, field: value})
+                for label, field, value in (
+                    (
+                        "wrong CSS animation timestamp profile",
+                        "profile",
+                        "controlled-web-session-v1",
+                    ),
+                    ("nonquiescent CSS initial outcome", "initialOutcome", "pending"),
+                    ("wrong CSS settled virtual time", "settledVirtualTimeNs", "0"),
+                    (
+                        "numeric CSS settled virtual time",
+                        "settledVirtualTimeNs",
+                        5000000,
+                    ),
+                    ("nonquiescent CSS controlled outcome", "controlledOutcome", "pending"),
+                    ("wrong CSS controlled event count", "controlledEventCount", "4"),
+                    ("wrong CSS controlled event kinds", "controlledEventKinds", "animationstart"),
+                    ("partly unowned CSS event set", "controlledOwnedEventCount", "4"),
+                    ("zero CSS dispatch-time count", "controlledDispatchTimeCount", "0"),
+                    ("too many CSS dispatch times", "controlledDispatchTimeCount", "6"),
+                    (
+                        "noncanonical CSS dispatch-time count",
+                        "controlledDispatchTimeCount",
+                        "02",
+                    ),
+                    ("numeric CSS dispatch-time count", "controlledDispatchTimeCount", 2),
+                    ("CSS runtime failure", "controlledRuntimeFailures", "1"),
+                    ("CSS unsupported work before script probe", "controlledUnsupportedWork", "1"),
+                    ("CSS external I/O", "controlledExternalIo", "1"),
+                    ("pending CSS events after settlement", "pendingAnimationEvents", "1"),
+                    ("finite CSS animation after settlement", "finiteAnimations", "1"),
+                    ("infinite CSS animation", "infiniteAnimations", "1"),
+                    ("unsupported CSS animation", "unsupportedAnimations", "1"),
+                    ("pending CSS producer", "producerPending", "1"),
+                    ("terminal CSS producer", "producerTerminal", True),
+                    ("numeric CSS producer terminal", "producerTerminal", 0),
+                    (
+                        "zero processed rendering opportunities",
+                        "processedRenderingOpportunities",
+                        "0",
+                    ),
+                    (
+                        "noncanonical processed rendering opportunities",
+                        "processedRenderingOpportunities",
+                        "03",
+                    ),
+                    (
+                        "numeric processed rendering opportunities",
+                        "processedRenderingOpportunities",
+                        3,
+                    ),
+                    ("wrong CSS constructor count", "scriptCreatedConstructorCount", "1"),
+                    ("controlled script CSS constructors", "scriptCreatedTrace", "script:5,5"),
+                    ("script CSS events falsely settle", "rejectedOutcome", "quiescent"),
+                    ("wrong script CSS failure code", "failureCode", "unsupported_work"),
+                    ("wrong CSS unsupported kind", "unsupportedKind", "rendering"),
+                    ("wrong CSS unsupported count", "unsupportedCount", "0"),
+                    ("wrong CSS unsupported reason", "unsupportedReason", "external_io"),
+                    (
+                        "wrong CSS unsupported time surface",
+                        "unsupportedTimeSurface",
+                        "document_timestamp",
+                    ),
+                    (
+                        "wrong CSS evidence profile",
+                        "evidenceProfile",
+                        "controlled-web-session-v1",
+                    ),
+                    (
+                        "auxiliary CSS target falsely accepted",
+                        "publicNonAuxiliaryControlledTarget",
+                        False,
+                    ),
+                    ("CSS proof not in one session", "sameControlledSession", False),
+                    ("CSS proof reused a tainted process", "freshExactBinaryProcess", False),
+                    (
+                        "CSS proof used managed runtime fallback",
+                        "managedRuntimeFallbackAccesses",
+                        "1",
+                    ),
+                    ("CSS proof not exact binary", "exactBinaryLaunch", False),
+                    ("CSS proof missing close and EOF", "closeResponseAndEof", False),
+                )
+            ],
+        ]
+
+        v2_fixture_gate_mutations = [
+            (
+                "missing v2 direct data-SVG proof",
+                {
+                    key: value
+                    for key, value in gate_record.items()
+                    if key != "v2DirectDataSvg"
+                },
+            ),
+            *[
+                (label, {**gate_record, "v2DirectDataSvg": mutation})
+                for label, mutation in v2_direct_data_svg_record_mutations
+            ],
+            (
+                "missing v2 inline SVG rendering proof",
+                {
+                    key: value
+                    for key, value in gate_record.items()
+                    if key != "v2InlineSvgRendering"
+                },
+            ),
+            *[
+                (label, {**gate_record, "v2InlineSvgRendering": mutation})
+                for label, mutation in v2_inline_svg_rendering_record_mutations
+            ],
+            (
+                "missing v2 InputMethod focus proof",
+                {
+                    key: value
+                    for key, value in gate_record.items()
+                    if key != "v2InputMethodFocus"
+                },
+            ),
+            *[
+                (label, {**gate_record, "v2InputMethodFocus": mutation})
+                for label, mutation in v2_input_method_focus_record_mutations
+            ],
+            (
+                "missing v2 automation event-timestamps proof",
+                {
+                    key: value
+                    for key, value in gate_record.items()
+                    if key != "v2AutomationEventTimestamps"
+                },
+            ),
+            *[
+                (label, {**gate_record, "v2AutomationEventTimestamps": mutation})
+                for label, mutation in v2_automation_event_timestamps_record_mutations
+            ],
+            (
+                "missing v2 CSS animation-event timestamps proof",
+                {
+                    key: value
+                    for key, value in gate_record.items()
+                    if key != "v2CssAnimationEventTimestamps"
+                },
+            ),
+            *[
+                (label, {**gate_record, "v2CssAnimationEventTimestamps": mutation})
+                for label, mutation in v2_css_animation_event_timestamps_record_mutations
+            ],
+        ]
+        for index, (label, mutated_gate) in enumerate(v2_fixture_gate_mutations):
+            mutated_gate_log = root / f"v2-fixture-gate-mutation-{index}.log"
+            mutated_gate_log.write_text(
+                strict_json_dumps(mutated_gate, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            expect_error(
+                label,
+                lambda gate_log=mutated_gate_log: parse_gate_log(
+                    gate_log, package, version, revision
+                ),
+            )
+
         proof_text = proof.read_text(encoding="utf-8")
-        proof.write_text('{"schema":2,' + proof_text.lstrip()[1:], encoding="utf-8")
+        proof_document = strict_json_loads(proof_text, "self-test SDK gate proof")
+        assert isinstance(proof_document, dict)
+        v2_proof_mutations = [
+            (
+                "missing durable v2 MessageChannel proof",
+                {
+                    key: value
+                    for key, value in proof_document.items()
+                    if key != "v2MessageChannel"
+                },
+            ),
+            *[
+                (label, {**proof_document, "v2MessageChannel": mutation})
+                for label, mutation in v2_record_mutations
+            ],
+        ]
+        for label, mutated_proof in v2_proof_mutations:
+            proof.write_text(
+                strict_json_dumps(mutated_proof, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            expect_error(
+                f"durable proof {label}",
+                lambda: verify_proof(
+                    directory=artifact,
+                    version=version,
+                    revision=revision,
+                    native_binary_sha256=binary_digest,
+                    run_id="123",
+                    run_attempt="1",
+                ),
+            )
+        v2_fixture_proof_mutations = [
+            (
+                "missing durable v2 direct data-SVG proof",
+                {
+                    key: value
+                    for key, value in proof_document.items()
+                    if key != "v2DirectDataSvg"
+                },
+            ),
+            *[
+                (label, {**proof_document, "v2DirectDataSvg": mutation})
+                for label, mutation in v2_direct_data_svg_record_mutations
+            ],
+            (
+                "missing durable v2 inline SVG rendering proof",
+                {
+                    key: value
+                    for key, value in proof_document.items()
+                    if key != "v2InlineSvgRendering"
+                },
+            ),
+            *[
+                (label, {**proof_document, "v2InlineSvgRendering": mutation})
+                for label, mutation in v2_inline_svg_rendering_record_mutations
+            ],
+            (
+                "missing durable v2 InputMethod focus proof",
+                {
+                    key: value
+                    for key, value in proof_document.items()
+                    if key != "v2InputMethodFocus"
+                },
+            ),
+            *[
+                (label, {**proof_document, "v2InputMethodFocus": mutation})
+                for label, mutation in v2_input_method_focus_record_mutations
+            ],
+            (
+                "missing durable v2 automation event-timestamps proof",
+                {
+                    key: value
+                    for key, value in proof_document.items()
+                    if key != "v2AutomationEventTimestamps"
+                },
+            ),
+            *[
+                (
+                    label,
+                    {**proof_document, "v2AutomationEventTimestamps": mutation},
+                )
+                for label, mutation in v2_automation_event_timestamps_record_mutations
+            ],
+            (
+                "missing durable v2 CSS animation-event timestamps proof",
+                {
+                    key: value
+                    for key, value in proof_document.items()
+                    if key != "v2CssAnimationEventTimestamps"
+                },
+            ),
+            *[
+                (
+                    label,
+                    {**proof_document, "v2CssAnimationEventTimestamps": mutation},
+                )
+                for label, mutation in v2_css_animation_event_timestamps_record_mutations
+            ],
+        ]
+        for label, mutated_proof in v2_fixture_proof_mutations:
+            proof.write_text(
+                strict_json_dumps(mutated_proof, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            expect_error(
+                f"durable proof {label}",
+                lambda: verify_proof(
+                    directory=artifact,
+                    version=version,
+                    revision=revision,
+                    native_binary_sha256=binary_digest,
+                    run_id="123",
+                    run_attempt="1",
+                ),
+            )
+        proof.write_text(proof_text, encoding="utf-8")
+
+        proof.write_text('{"schema":6,' + proof_text.lstrip()[1:], encoding="utf-8")
         expect_error(
             "duplicate proof key",
             lambda: verify_proof(
@@ -894,7 +2137,7 @@ def self_test() -> None:
             ),
         )
         proof.write_text(
-            proof_text.replace('"schema": 2', '"schema": 1e400'), encoding="utf-8"
+            proof_text.replace('"schema": 6', '"schema": 1e400'), encoding="utf-8"
         )
         expect_error(
             "non-finite proof number",
@@ -908,7 +2151,7 @@ def self_test() -> None:
             ),
         )
         proof.write_text(
-            proof_text.replace('"schema": 2', '"schema": 2.0'), encoding="utf-8"
+            proof_text.replace('"schema": 6', '"schema": 6.0'), encoding="utf-8"
         )
         expect_error(
             "floating-point proof schema",

@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled v2 HTTP image remains outside owned slice</title>
+<img id="image" alt="HTTP SVG">
+<output id="result">waiting</output>
+<script>
+  const image = document.querySelector("#image");
+  const result = document.querySelector("#result");
+  for (const type of ["load", "error", "loadend"]) {
+    image.addEventListener(type, (event) => {
+      result.textContent = `${event.type}:${event.timeStamp}`;
+    });
+  }
+  image.src = "/controlled-v2-http-image.svg";
+</script>

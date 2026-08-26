@@ -1,0 +1,37 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled buffered MessageChannel fixture</title>
+<button id="buffer">buffer</button>
+<button id="start">start</button>
+<output id="result">buffered</output>
+<script>
+  const result = document.querySelector("#result");
+  const channel = new MessageChannel();
+  const driver = new MessageChannel();
+  const events = [];
+
+  // Force the later post and start into a subsequent PortMessage task. Under the old route-first
+  // implementation, message 2 was queued before start() re-queued the already buffered message 1.
+  driver.port1.onmessage = () => {
+    channel.port2.postMessage(2);
+    channel.port1.start();
+  };
+
+  // Create the retained work after session.open so the test can observe it through
+  // runtime.pending before explicitly starting the destination port.
+  document.querySelector("#buffer").onclick = () => {
+    channel.port2.postMessage(1);
+    result.textContent = "buffered";
+  };
+
+  document.querySelector("#start").onclick = () => {
+    channel.port1.addEventListener("message", (event) => {
+      events.push(`callback${event.data}`);
+      queueMicrotask(() => {
+        events.push(`microtask${event.data}`);
+        result.textContent = events.join(">");
+      });
+    });
+    driver.port2.postMessage("start");
+  };
+</script>

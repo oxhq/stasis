@@ -44,6 +44,7 @@ use strum::IntoEnumIterator;
 
 use crate::dom::bindings::conversions::root_from_object;
 use crate::dom::bindings::error::{Error, Fallible};
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::serializable::{Serializable, StorageKey};
 use crate::dom::bindings::transferable::Transferable;
@@ -800,6 +801,63 @@ pub(crate) struct StructuredDataWriter {
     pub(crate) crypto_keys: Option<FxHashMap<CryptoKeyId, SerializableCryptoKey>>,
 }
 
+fn preflight_transfer_entries<T, E>(
+    entries: &[T],
+    mut require_admission: impl FnMut(&T) -> Result<(), E>,
+) -> Result<(), E> {
+    for entry in entries {
+        require_admission(entry)?;
+    }
+    Ok(())
+}
+
+fn require_port_backed_transfer_admission(
+    cx: &mut JSContext,
+    object: *mut JSObject,
+) -> Fallible<()> {
+    if let Ok(port) = unsafe { root_from_object::<MessagePort>(cx, object) } {
+        return if port
+            .global()
+            .controlled_local_execution_profile_selected()
+        {
+            port.require_transfer_admission()
+        } else {
+            Ok(())
+        };
+    }
+    if let Ok(stream) = unsafe { root_from_object::<ReadableStream>(cx, object) } {
+        return if stream
+            .global()
+            .controlled_local_execution_profile_selected()
+        {
+            stream.require_transfer_admission()
+        } else {
+            Ok(())
+        };
+    }
+    if let Ok(stream) = unsafe { root_from_object::<WritableStream>(cx, object) } {
+        return if stream
+            .global()
+            .controlled_local_execution_profile_selected()
+        {
+            stream.require_transfer_admission()
+        } else {
+            Ok(())
+        };
+    }
+    if let Ok(stream) = unsafe { root_from_object::<TransformStream>(cx, object) } {
+        return if stream
+            .global()
+            .controlled_local_execution_profile_selected()
+        {
+            stream.require_transfer_admission()
+        } else {
+            Ok(())
+        };
+    }
+    Ok(())
+}
+
 /// Writes a structured clone. Returns a `DataClone` error if that fails.
 pub(crate) fn write(
     cx: &mut JSContext,
@@ -807,6 +865,16 @@ pub(crate) fn write(
     transfer: Option<CustomAutoRooterGuard<Vec<*mut JSObject>>>,
 ) -> Fallible<StructuredSerializedData> {
     unsafe {
+        // MessagePort and the transferable stream interfaces can reject their port-backed transfer
+        // under a controlled document profile. Scan the complete list before SpiderMonkey begins
+        // any transfer step so a preceding ArrayBuffer or other transferable cannot be detached
+        // before that checked rejection is observed.
+        if let Some(transfer) = transfer.as_ref() {
+            preflight_transfer_entries(transfer.as_slice(), |&object| {
+                require_port_backed_transfer_admission(cx, object)
+            })?;
+        }
+
         rooted!(&in(cx) let mut val = UndefinedValue());
         if let Some(transfer) = transfer {
             transfer.safe_to_jsval(cx, val.handle_mut());
@@ -966,6 +1034,42 @@ mod tests {
     use servo_base::id::{MessagePortIndex, PipelineNamespaceId};
 
     use super::*;
+
+    #[test]
+    fn late_port_backed_transfer_rejection_precedes_every_transfer_step() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Entry {
+            ArrayBuffer,
+            ImageBitmap,
+            ControlledMessagePort,
+            ControlledReadableStream,
+            ControlledWritableStream,
+            ControlledTransformStream,
+        }
+
+        for rejected in [
+            Entry::ControlledMessagePort,
+            Entry::ControlledReadableStream,
+            Entry::ControlledWritableStream,
+            Entry::ControlledTransformStream,
+        ] {
+            let entries = [Entry::ArrayBuffer, Entry::ImageBitmap, rejected];
+            let mut visited = Vec::new();
+            let result = preflight_transfer_entries(&entries, |entry| {
+                visited.push(*entry);
+                if *entry == rejected {
+                    Err("controlled port-backed transfer")
+                } else {
+                    Ok(())
+                }
+            });
+
+            assert_eq!(result, Err("controlled port-backed transfer"));
+            assert_eq!(visited, entries);
+            // The production caller enters JS_WriteStructuredClone, where detachment begins, only
+            // after this result succeeds.
+        }
+    }
 
     fn message_port_id(index: u32) -> MessagePortId {
         MessagePortId {

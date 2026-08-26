@@ -722,6 +722,9 @@ impl AutomationDom for ServoAutomationDom<'_> {
             DOMString::from("insertReplacementText"),
         );
         let event = event.upcast::<Event>();
+        if let Some(time_stamp) = window.synchronous_automation_event_time() {
+            event.set_creation_time_stamp(time_stamp);
+        }
         event.set_composed(true);
         event.fire(self.cx, element.upcast::<EventTarget>());
         Ok(())

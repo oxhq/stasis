@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled stream transfer preflight fixture</title>
+<button id="start">start</button>
+<div id="result">idle</div>
+<script>
+  document.querySelector("#start").onclick = () => {
+    const cases = [
+      ["readable", () => new ReadableStream()],
+      ["writable", () => new WritableStream()],
+      ["transform", () => new TransformStream()],
+    ];
+    const outcomes = [];
+
+    for (const [name, makeStream] of cases) {
+      const buffer = new ArrayBuffer(16);
+      const stream = makeStream();
+      let errorName = "no-error";
+      try {
+        structuredClone(
+          { buffer, stream },
+          { transfer: [buffer, stream] },
+        );
+      } catch (error) {
+        errorName = error.name;
+      }
+      outcomes.push(`${name}:${errorName}:buffer:${buffer.byteLength}`);
+    }
+
+    document.querySelector("#result").textContent = outcomes.join("|");
+  };
+</script>

@@ -43,6 +43,7 @@ use crate::dom::html::htmlslotelement::HTMLSlotElement;
 use crate::dom::mouseevent::MouseEvent;
 use crate::dom::node::virtualmethods::vtable_for;
 use crate::dom::node::{Node, NodeTraits};
+use crate::dom::performance::performanceentry::PerformanceEntryTime;
 use crate::dom::shadowroot::ShadowRoot;
 use crate::dom::types::{KeyboardEvent, PointerEvent, UserActivation};
 use crate::dom::window::Window;
@@ -79,8 +80,9 @@ pub(crate) struct Event {
     is_trusted: Cell<bool>,
 
     /// <https://dom.spec.whatwg.org/#dom-event-timestamp>
+    #[ignore_malloc_size_of = "Cross-process and document timestamps contain no owned allocation"]
     #[no_trace]
-    time_stamp: CrossProcessInstant,
+    time_stamp: Cell<PerformanceEntryTime>,
 
     /// <https://dom.spec.whatwg.org/#event-path>
     path: DomRefCell<Vec<EventPathSegment>>,
@@ -124,7 +126,7 @@ impl Event {
             cancelable: Cell::new(false),
             bubbles: Cell::new(false),
             is_trusted: Cell::new(false),
-            time_stamp: CrossProcessInstant::now(),
+            time_stamp: Cell::new(PerformanceEntryTime::Host(CrossProcessInstant::now())),
             path: DomRefCell::default(),
             related_target: Default::default(),
         }
@@ -223,6 +225,13 @@ impl Event {
 
     pub(crate) fn set_related_target(&self, related_target: Option<&EventTarget>) {
         self.related_target.set(related_target);
+    }
+
+    /// Replace the creation timestamp with one already sampled in this event's document-clock
+    /// domain. Callers must do this while constructing the event; later writes would violate the
+    /// immutable timestamp required by the DOM event model.
+    pub(crate) fn set_creation_time_stamp(&self, time_stamp: PerformanceEntryTime) {
+        self.time_stamp.set(time_stamp);
     }
 
     pub(crate) fn related_target(&self) -> Option<DomRoot<EventTarget>> {
@@ -1069,7 +1078,7 @@ impl EventMethods<crate::DomTypeHolder> for Event {
     fn TimeStamp(&self, cx: &mut JSContext) -> DOMHighResTimeStamp {
         self.global()
             .performance(cx)
-            .to_dom_high_res_time_stamp(self.time_stamp)
+            .entry_time_to_dom_high_res_time_stamp(self.time_stamp.get())
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-initevent>

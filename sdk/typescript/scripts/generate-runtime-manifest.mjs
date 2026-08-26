@@ -26,6 +26,8 @@ export const ARCHIVE_FILES = [
   "STASIS_UPSTREAM.toml",
   "THIRD_PARTY_LICENSES.html",
   "VERSION.txt",
+  "controlled-web-session-v2.json",
+  "session-v0.3-candidate.md",
   "stasis",
 ];
 export const PLATFORMS = {
@@ -84,7 +86,7 @@ export function validateRuntimeManifest(manifest) {
       fail(`${platformKey} archive size is outside the release bound`);
     }
     if (!SHA256.test(artifact.archiveSha256) || !SHA256.test(artifact.executableSha256)) fail(`${platformKey} has an invalid SHA-256`);
-    if (JSON.stringify(artifact.archiveFiles) !== JSON.stringify(ARCHIVE_FILES)) fail(`${platformKey} must bind the exact stable archive inventory`);
+    if (JSON.stringify(artifact.archiveFiles) !== JSON.stringify(ARCHIVE_FILES)) fail(`${platformKey} must bind the exact release archive inventory`);
     const url = new URL(string(artifact.archiveUrl, `${platformKey}.archiveUrl`));
     const expectedPath = `/oxhq/stasis/releases/download/${manifest.releaseTag}/${root}.tar.gz`;
     if (url.protocol !== "https:" || url.hostname !== "github.com" || url.port || url.username || url.password || url.hash || url.search || url.pathname !== expectedPath) {

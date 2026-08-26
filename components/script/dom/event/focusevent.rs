@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use embedder_traits::{DocumentControlProfile, DocumentExecutionProfile};
 use js::context::JSContext;
 use js::rust::HandleObject;
 use script_bindings::reflector::reflect_dom_object_with_proto;
@@ -11,14 +12,17 @@ use style::Atom;
 use crate::dom::bindings::codegen::Bindings::FocusEventBinding;
 use crate::dom::bindings::codegen::Bindings::FocusEventBinding::FocusEventMethods;
 use crate::dom::bindings::codegen::Bindings::UIEventBinding::UIEventMethods;
+use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
+use crate::dom::performance::performanceentry::PerformanceEntryTime;
 use crate::dom::uievent::UIEvent;
 use crate::dom::window::Window;
+use crate::event_loop::script_thread::ScriptThread;
 
 /// The type of a [`FocusEvent`].
 pub(crate) enum FocusEventType {
@@ -67,7 +71,7 @@ impl FocusEvent {
         detail: i32,
         related_target: Option<&EventTarget>,
     ) -> DomRoot<FocusEvent> {
-        Self::new_with_proto(
+        let event = Self::new_with_proto(
             cx,
             window,
             None,
@@ -77,7 +81,24 @@ impl FocusEvent {
             view,
             detail,
             related_target,
-        )
+        );
+        if ScriptThread::current_document_control_profile()
+            == DocumentControlProfile::TopLevelSession
+            && ScriptThread::current_document_execution_profile()
+                == DocumentExecutionProfile::ControlledWebSessionV2
+            && window.is_top_level()
+            && let Ok(time_stamp @ PerformanceEntryTime::Document(_)) =
+                window.Performance(cx).current_entry_time()
+        {
+            // Engine-generated focus transitions are same-event-loop work in the controlled
+            // top-level document. Stamp them at creation from that document clock so React's
+            // Event.timeStamp observation cannot import a host monotonic instant. Script-created
+            // FocusEvent objects and every predecessor profile retain the explicit host boundary.
+            event
+                .upcast::<Event>()
+                .set_creation_time_stamp(time_stamp);
+        }
+        event
     }
 
     #[expect(clippy::too_many_arguments)]

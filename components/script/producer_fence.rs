@@ -164,7 +164,8 @@ pub(crate) fn fence_image_callback(
     )
 }
 
-/// Own the logical image response stream until a terminal response is committed to the queue.
+/// Own the logical image response stream until a terminal response is committed to the queue or
+/// the cache authoritatively retires the callback.
 ///
 /// The stream lease is deliberately separate from each queued-message lease. That lets a callback
 /// report a closed queue by returning the rejected envelope while this adapter still owns the
@@ -196,7 +197,11 @@ impl ImageStreamProducer {
 
 impl Drop for ImageStreamProducer {
     fn drop(&mut self) {
-        self.abandon();
+        // Dropping the cache callback is the cache's cancellation boundary: once the callback is
+        // gone, that stream can no longer enqueue document work. Treat that owned cancellation as
+        // an ordinary completion. Actual transport loss, admission failure, and unwind paths call
+        // `abandon` explicitly before this destructor runs and remain sticky terminals.
+        self.complete();
     }
 }
 
@@ -527,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_an_image_listener_before_terminal_latches_abandonment() {
+    fn dropping_an_image_listener_before_terminal_is_owned_cancellation() {
         let fence = DocumentProducerFence::default();
         let callback = fence_image_callback(&fence, |envelope| {
             drop(envelope);
@@ -544,12 +549,11 @@ mod tests {
 
         drop(callback);
 
-        assert_image_abandoned(&fence);
+        let snapshot = fence.snapshot();
+        assert!(snapshot.is_empty());
+        assert_eq!(snapshot.terminal_error(), None);
         assert_eq!(
-            fence
-                .snapshot()
-                .for_kind(DocumentProducerKind::Image)
-                .completed(),
+            snapshot.for_kind(DocumentProducerKind::Image).completed(),
             1
         );
     }

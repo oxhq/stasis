@@ -35,10 +35,10 @@ use stasis_shell::{settle, wire};
 use url::Url;
 
 use crate::engine::{
-    ControlOutcomeDisposition, DocumentControlProfile, EngineClockMode, EngineControlPoll,
-    EngineNavigationPoll, EngineSession, EngineSessionOpenOptions, NavigationOperationCompletion,
-    NavigationOperationKind, SessionNavigationAuthority, SessionNavigationError,
-    SessionNavigationId,
+    ControlOutcomeDisposition, DocumentControlProfile, DocumentExecutionProfile, EngineClockMode,
+    EngineControlPoll, EngineNavigationPoll, EngineSession, EngineSessionOpenOptions,
+    NavigationOperationCompletion, NavigationOperationKind, SessionNavigationAuthority,
+    SessionNavigationError, SessionNavigationId,
 };
 use crate::protocol::{
     DEFAULT_ORDINARY_LANE_CAPACITY, OrdinaryRequestRemoval, ProtocolError, ProtocolWriter,
@@ -50,7 +50,11 @@ const SOURCE_IDENTITIES: &str = include_str!("../../../STASIS_UPSTREAM.toml");
 const SESSION_ID: &str = "s-1";
 const CONTROLLED_WEBAPP_V1_PROFILE: &str = "controlled-webapp-v1";
 const CONTROLLED_WEB_SESSION_V1_PROFILE: &str = "controlled-web-session-v1";
+const CONTROLLED_WEB_SESSION_V2_PROFILE: &str = "controlled-web-session-v2";
 const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+// Stay below the public SDK's 30-second command timeout so a native controlled-open failure can
+// retain its typed protocol identity instead of being masked by the caller's generic timeout.
+const CONTROLLED_OPEN_WALL_TIMEOUT: Duration = Duration::from_secs(25);
 const CONTROLLED_OPEN_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const OWNER_LOOP_SAFETY_TIMEOUT: Duration = Duration::from_secs(86_400);
 const DEFAULT_SESSION_AUDIT_PAGE_ITEMS: usize = 256;
@@ -64,6 +68,7 @@ fn earliest_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<In
 enum SessionProfile {
     ControlledWebappV1,
     ControlledWebSessionV1,
+    ControlledWebSessionV2,
 }
 
 impl SessionProfile {
@@ -71,14 +76,33 @@ impl SessionProfile {
         match self {
             Self::ControlledWebappV1 => CONTROLLED_WEBAPP_V1_PROFILE,
             Self::ControlledWebSessionV1 => CONTROLLED_WEB_SESSION_V1_PROFILE,
+            Self::ControlledWebSessionV2 => CONTROLLED_WEB_SESSION_V2_PROFILE,
         }
     }
 
     const fn document_control_profile(self) -> DocumentControlProfile {
         match self {
             Self::ControlledWebappV1 => DocumentControlProfile::SingleDocument,
-            Self::ControlledWebSessionV1 => DocumentControlProfile::TopLevelSession,
+            Self::ControlledWebSessionV1 | Self::ControlledWebSessionV2 => {
+                DocumentControlProfile::TopLevelSession
+            },
         }
+    }
+
+    const fn document_execution_profile(self) -> DocumentExecutionProfile {
+        match self {
+            Self::ControlledWebappV1 | Self::ControlledWebSessionV1 => {
+                DocumentExecutionProfile::Baseline
+            },
+            Self::ControlledWebSessionV2 => DocumentExecutionProfile::ControlledWebSessionV2,
+        }
+    }
+
+    const fn supports_session_api(self) -> bool {
+        matches!(
+            self,
+            Self::ControlledWebSessionV1 | Self::ControlledWebSessionV2
+        )
     }
 }
 
@@ -143,6 +167,7 @@ trait EnginePort: Sized {
     fn url(&self) -> Option<Url>;
     fn clock_mode(&self) -> EngineClockMode;
     fn document_control_profile(&self) -> DocumentControlProfile;
+    fn document_execution_profile(&self) -> DocumentExecutionProfile;
     fn evaluate(&self, expression: &str) -> Result<Value, ProtocolError>;
     fn submit_document_control(
         &mut self,
@@ -306,6 +331,10 @@ impl EnginePort for EngineSession {
 
     fn document_control_profile(&self) -> DocumentControlProfile {
         Self::document_control_profile(self)
+    }
+
+    fn document_execution_profile(&self) -> DocumentExecutionProfile {
+        Self::document_execution_profile(self)
     }
 
     fn evaluate(&self, expression: &str) -> Result<Value, ProtocolError> {
@@ -532,6 +561,29 @@ enum ActiveOperation {
     Audit(AuditState),
     Navigate(NavigateState),
     SessionProjection(SessionProjectionState),
+}
+
+impl ActiveOperation {
+    fn controlled_open_wall_authority(&self) -> Option<(SessionProfile, Instant)> {
+        match self {
+            Self::ControlledOpen(state) => Some((state.profile, state.deadline)),
+            Self::Settle(SettleState {
+                response:
+                    SettleResponse::ControlledOpen {
+                        profile, deadline, ..
+                    },
+                ..
+            }) => Some((*profile, *deadline)),
+            Self::SessionProjection(SessionProjectionState {
+                kind:
+                    SessionProjectionKind::ControlledOpen {
+                        profile, deadline, ..
+                    },
+                ..
+            }) => Some((*profile, *deadline)),
+            _ => None,
+        }
+    }
 }
 
 struct AuditState {
@@ -792,6 +844,49 @@ struct ActiveFailure {
     fail_stop: bool,
 }
 
+fn controlled_open_timeout_failure(profile: SessionProfile) -> ActiveFailure {
+    if profile.supports_session_api() {
+        ActiveFailure {
+            error: fatal_operation(
+                "controlled_open_timeout",
+                "the controlled session did not become ready before the wall deadline",
+                "indeterminate",
+            ),
+            fail_stop: true,
+        }
+    } else {
+        ActiveFailure {
+            error: ProtocolError::operation(
+                "controlled_open_timeout",
+                "the controlled document did not become ready before the wall deadline",
+                "none",
+            ),
+            fail_stop: false,
+        }
+    }
+}
+
+fn active_control_command_timeout(
+    operation: &ActiveOperation,
+    now: Instant,
+) -> Result<Duration, ActiveFailure> {
+    let Some((profile, deadline)) = operation.controlled_open_wall_authority() else {
+        return Ok(CONTROL_COMMAND_TIMEOUT);
+    };
+    controlled_open_command_timeout(profile, deadline, now)
+}
+
+fn controlled_open_command_timeout(
+    profile: SessionProfile,
+    deadline: Instant,
+    now: Instant,
+) -> Result<Duration, ActiveFailure> {
+    if now >= deadline {
+        return Err(controlled_open_timeout_failure(profile));
+    }
+    Ok(CONTROL_COMMAND_TIMEOUT.min(deadline.duration_since(now)))
+}
+
 impl<W: io::Write, E: EnginePort> Shell<W, E> {
     fn run(&mut self) -> Result<(), String> {
         let mut input_closed = false;
@@ -828,13 +923,20 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             progressed |= navigation_progress;
             control_deadline = earliest_deadline(control_deadline, navigation_deadline);
 
+            // Poll both typed response lanes before consulting the overall open deadline. A
+            // response which was already ready at the boundary is therefore consumed exactly
+            // once and may complete the open; only unfinished continuation work times out.
+            if self.service_controlled_open_deadline(Instant::now())? {
+                continue;
+            }
+
             let before_pump = self.checked_wake_snapshot()?;
             let force_initial_pump = self
                 .active
                 .as_ref()
                 .is_some_and(|active| active.needs_initial_pump);
-            if self.engine.is_some()
-                && should_pump_servo(
+            if self.engine.is_some() &&
+                should_pump_servo(
                     self.active.as_ref(),
                     force_initial_pump,
                     before_pump.servo_changed_since(self.servo_cursor),
@@ -857,6 +959,10 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 let (post_nav_progress, post_nav_deadline) = self.poll_active_navigation()?;
                 progressed |= post_nav_progress;
                 control_deadline = earliest_deadline(control_deadline, post_nav_deadline);
+
+                if self.service_controlled_open_deadline(Instant::now())? {
+                    continue;
+                }
             }
 
             let after_pump = self.checked_wake_snapshot()?;
@@ -924,8 +1030,8 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         // Reject a self-targeting cancellation before duplicate-active-id enforcement. A cancel
         // frame cannot make its own id ambiguous with the target it names, even when that id also
         // happens to be active.
-        if request.method == "protocol.cancel"
-            && parse_params::<CancelParams>(&request)
+        if request.method == "protocol.cancel" &&
+            parse_params::<CancelParams>(&request)
                 .is_ok_and(|params| params.request_id == request.id)
         {
             self.write_method_result(
@@ -982,16 +1088,16 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         }
         if matches!(
             method.as_str(),
-            "action.activate"
-                | "action.fill"
-                | "action.focus"
-                | "action.check"
-                | "action.uncheck"
-                | "action.select"
-                | "action.submit"
-                | "dom.query"
-                | "dom.text"
-                | "dom.extract"
+            "action.activate" |
+                "action.fill" |
+                "action.focus" |
+                "action.check" |
+                "action.uncheck" |
+                "action.select" |
+                "action.submit" |
+                "dom.query" |
+                "dom.text" |
+                "dom.extract"
         ) {
             return self.begin_automation_request(request).map(|()| false);
         }
@@ -1000,12 +1106,12 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         }
         if matches!(
             method.as_str(),
-            "session.cookies.get"
-                | "session.cookies.set"
-                | "session.storage.get"
-                | "session.storage.set"
-                | "session.state.export"
-                | "session.state.import"
+            "session.cookies.get" |
+                "session.cookies.set" |
+                "session.storage.get" |
+                "session.storage.set" |
+                "session.state.export" |
+                "session.state.import"
         ) {
             return self.handle_session_state_request(request);
         }
@@ -1060,7 +1166,8 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                         }
                         None
                     },
-                    SessionProfile::ControlledWebSessionV1 => {
+                    SessionProfile::ControlledWebSessionV1 |
+                    SessionProfile::ControlledWebSessionV2 => {
                         match parse_params::<wire::SessionRuntimeAdvanceToNextParams>(&request) {
                             Ok(params) => Some(params.expected_state_token),
                             Err(error) => return self.write_method_result(&request, Err(error)),
@@ -1072,7 +1179,7 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                         expected_state_token,
                         navigation: None,
                     }),
-                    if profile == SessionProfile::ControlledWebSessionV1 {
+                    if profile.supports_session_api() {
                         ActiveTransition::SubmitSessionNavigationObservation {
                             allow_servo_pump: true,
                         }
@@ -1095,7 +1202,8 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                                 })
                         })
                     },
-                    SessionProfile::ControlledWebSessionV1 => parse_params::<
+                    SessionProfile::ControlledWebSessionV1 |
+                    SessionProfile::ControlledWebSessionV2 => parse_params::<
                         wire::SessionRuntimeSettleParams,
                     >(&request)
                     .and_then(|params| {
@@ -1212,38 +1320,42 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     "none",
                 )),
             },
-            SessionProfile::ControlledWebSessionV1 => match request.method.as_str() {
-                "action.activate" => parse_params::<wire::SessionActionActivateParams>(&request)
-                    .and_then(|params| params.resolve().map_err(invalid))
-                    .map(UnresolvedAutomationParams::Session),
-                "action.fill" => parse_params::<wire::SessionActionFillParams>(&request)
-                    .and_then(|params| params.resolve().map_err(invalid))
-                    .map(UnresolvedAutomationParams::Session),
-                "action.focus" => parse_params::<wire::SessionActionFocusParams>(&request)
-                    .and_then(|params| params.resolve().map_err(invalid))
-                    .map(UnresolvedAutomationParams::Session),
-                "action.check" => parse_params::<wire::SessionActionCheckParams>(&request)
-                    .and_then(|params| params.resolve().map_err(invalid))
-                    .map(UnresolvedAutomationParams::Session),
-                "action.uncheck" => parse_params::<wire::SessionActionUncheckParams>(&request)
-                    .and_then(|params| params.resolve().map_err(invalid))
-                    .map(UnresolvedAutomationParams::Session),
-                "action.select" => parse_params::<wire::SessionActionSelectParams>(&request)
-                    .and_then(|params| params.resolve().map_err(invalid))
-                    .map(UnresolvedAutomationParams::Session),
-                "action.submit" => parse_params::<wire::SessionActionSubmitParams>(&request)
-                    .and_then(|params| params.resolve().map_err(invalid))
-                    .map(UnresolvedAutomationParams::Session),
-                "dom.query" => parse_params::<wire::SessionDomQueryParams>(&request)
-                    .and_then(|params| params.resolve().map_err(invalid))
-                    .map(UnresolvedAutomationParams::Session),
-                "dom.text" => parse_params::<wire::SessionDomTextParams>(&request)
-                    .and_then(|params| params.resolve().map_err(invalid))
-                    .map(UnresolvedAutomationParams::Session),
-                "dom.extract" => parse_params::<wire::SessionDomExtractParams>(&request)
-                    .and_then(|params| params.resolve().map_err(invalid))
-                    .map(UnresolvedAutomationParams::Session),
-                _ => unreachable!("automation method was filtered by the dispatcher"),
+            SessionProfile::ControlledWebSessionV1 | SessionProfile::ControlledWebSessionV2 => {
+                match request.method.as_str() {
+                    "action.activate" => {
+                        parse_params::<wire::SessionActionActivateParams>(&request)
+                            .and_then(|params| params.resolve().map_err(invalid))
+                            .map(UnresolvedAutomationParams::Session)
+                    },
+                    "action.fill" => parse_params::<wire::SessionActionFillParams>(&request)
+                        .and_then(|params| params.resolve().map_err(invalid))
+                        .map(UnresolvedAutomationParams::Session),
+                    "action.focus" => parse_params::<wire::SessionActionFocusParams>(&request)
+                        .and_then(|params| params.resolve().map_err(invalid))
+                        .map(UnresolvedAutomationParams::Session),
+                    "action.check" => parse_params::<wire::SessionActionCheckParams>(&request)
+                        .and_then(|params| params.resolve().map_err(invalid))
+                        .map(UnresolvedAutomationParams::Session),
+                    "action.uncheck" => parse_params::<wire::SessionActionUncheckParams>(&request)
+                        .and_then(|params| params.resolve().map_err(invalid))
+                        .map(UnresolvedAutomationParams::Session),
+                    "action.select" => parse_params::<wire::SessionActionSelectParams>(&request)
+                        .and_then(|params| params.resolve().map_err(invalid))
+                        .map(UnresolvedAutomationParams::Session),
+                    "action.submit" => parse_params::<wire::SessionActionSubmitParams>(&request)
+                        .and_then(|params| params.resolve().map_err(invalid))
+                        .map(UnresolvedAutomationParams::Session),
+                    "dom.query" => parse_params::<wire::SessionDomQueryParams>(&request)
+                        .and_then(|params| params.resolve().map_err(invalid))
+                        .map(UnresolvedAutomationParams::Session),
+                    "dom.text" => parse_params::<wire::SessionDomTextParams>(&request)
+                        .and_then(|params| params.resolve().map_err(invalid))
+                        .map(UnresolvedAutomationParams::Session),
+                    "dom.extract" => parse_params::<wire::SessionDomExtractParams>(&request)
+                        .and_then(|params| params.resolve().map_err(invalid))
+                        .map(UnresolvedAutomationParams::Session),
+                    _ => unreachable!("automation method was filtered by the dispatcher"),
+                }
             },
         };
         let resolved = match resolved {
@@ -1272,7 +1384,7 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         };
         self.apply_active_transition(
             active,
-            if profile == SessionProfile::ControlledWebSessionV1 {
+            if profile.supports_session_api() {
                 ActiveTransition::SubmitSessionNavigationObservation {
                     allow_servo_pump: true,
                 }
@@ -1286,12 +1398,17 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         if let Err(error) = self.require_controlled_session(&request) {
             return self.write_method_result(&request, Err(error));
         }
-        if self.profile != Some(SessionProfile::ControlledWebSessionV1) {
+        if !self
+            .profile
+            .is_some_and(SessionProfile::supports_session_api)
+        {
             return self.write_method_result(
                 &request,
                 Err(ProtocolError::operation(
                     "unsupported_profile_method",
-                    format!("session.navigate requires {CONTROLLED_WEB_SESSION_V1_PROFILE}"),
+                    format!(
+                        "session.navigate requires {CONTROLLED_WEB_SESSION_V1_PROFILE} or {CONTROLLED_WEB_SESSION_V2_PROFILE}"
+                    ),
                     "none",
                 )),
             );
@@ -1324,9 +1441,12 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         let effective_policy = wire::RuntimeSettleParams::default()
             .resolve(settle::SettlePolicy::default())
             .expect("the product default settlement policy is valid");
+        let profile = self
+            .profile
+            .expect("a session navigation has a validated session profile");
         let active = ActiveRequest {
             request,
-            profile: Some(SessionProfile::ControlledWebSessionV1),
+            profile: Some(profile),
             operation: ActiveOperation::Navigate(NavigateState {
                 requested_url,
                 phase: NavigatePhase::AwaitingAuthority {
@@ -1445,9 +1565,12 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             Ok(value) => value,
             Err(error) => return self.write_method_result(&request, Err(error)),
         };
+        let profile = self
+            .profile
+            .expect("a session audit has a validated session profile");
         let active = ActiveRequest {
             request,
-            profile: Some(SessionProfile::ControlledWebSessionV1),
+            profile: Some(profile),
             operation: ActiveOperation::Audit(AuditState { value: Some(value) }),
             started_at: Instant::now(),
             in_flight: None,
@@ -1463,11 +1586,14 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
 
     fn require_controlled_web_session(&self, request: &Request) -> Result<(), ProtocolError> {
         self.require_controlled_session(request)?;
-        if self.profile != Some(SessionProfile::ControlledWebSessionV1) {
+        if !self
+            .profile
+            .is_some_and(SessionProfile::supports_session_api)
+        {
             return Err(ProtocolError::operation(
                 "unsupported_profile_method",
                 format!(
-                    "{} requires {CONTROLLED_WEB_SESSION_V1_PROFILE}",
+                    "{} requires {CONTROLLED_WEB_SESSION_V1_PROFILE} or {CONTROLLED_WEB_SESSION_V2_PROFILE}",
                     request.method
                 ),
                 "none",
@@ -1512,31 +1638,32 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     .take()
                     .expect("active request tracked its in-flight command");
                 active.needs_initial_pump = false;
-                if let ActiveOperation::ControlledOpen(state) = &mut active.operation
-                    && let Some(url) = self.engine.as_ref().and_then(|engine| engine.url())
+                if let ActiveOperation::ControlledOpen(state) = &mut active.operation &&
+                    let Some(url) = self.engine.as_ref().and_then(|engine| engine.url())
                 {
                     state.current_url = url;
                 }
-                if let ActiveOperation::Settle(state) = &mut active.operation
-                    && let Some(target) = receive_outcome_pending_target(&completion.outcome)
+                if let ActiveOperation::Settle(state) = &mut active.operation &&
+                    let Some(target) = receive_outcome_pending_target(&completion.outcome)
                 {
                     state.latest_pending_target = Some(Box::new(target.clone()));
                 }
-                let replacement_source = if completion.disposition
-                    == ControlOutcomeDisposition::Indeterminate
-                    && command == DocumentControlCommand::DriveOneTurn
-                    && let DocumentControlReceiveOutcome::CommandOutcome(
+                let replacement_source = if completion.disposition ==
+                    ControlOutcomeDisposition::Indeterminate &&
+                    command == DocumentControlCommand::DriveOneTurn &&
+                    let DocumentControlReceiveOutcome::CommandOutcome(
                         DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate { target },
-                    ) = &completion.outcome
-                    && let ActiveOperation::Settle(SettleState {
-                        profile: SessionProfile::ControlledWebSessionV1,
+                    ) = &completion.outcome &&
+                    let ActiveOperation::Settle(SettleState {
+                        profile,
                         authorizing_document_state: None,
                         authorizing_observation: None,
                         authorizing_navigation: Some(source),
                         replacement: None,
                         ..
-                    }) = &active.operation
-                    && source.target() == target.as_ref()
+                    }) = &active.operation &&
+                    profile.supports_session_api() &&
+                    source.target() == target.as_ref()
                 {
                     Some(source.clone())
                 } else {
@@ -1575,12 +1702,14 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     )?;
                     return Ok((true, None));
                 }
-                if active.profile == Some(SessionProfile::ControlledWebSessionV1)
-                    && matches!(
+                if active
+                    .profile
+                    .is_some_and(SessionProfile::supports_session_api) &&
+                    matches!(
                         &completion.outcome,
-                        DocumentControlReceiveOutcome::ObserveTransportFailure(_)
-                            | DocumentControlReceiveOutcome::AutomationTransportFailure(_)
-                            | DocumentControlReceiveOutcome::DriveOneTurnOutcomeIndeterminate(_)
+                        DocumentControlReceiveOutcome::ObserveTransportFailure(_) |
+                            DocumentControlReceiveOutcome::AutomationTransportFailure(_) |
+                            DocumentControlReceiveOutcome::DriveOneTurnOutcomeIndeterminate(_)
                     )
                 {
                     self.apply_active_transition(
@@ -1596,11 +1725,13 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     )?;
                     return Ok((true, None));
                 }
-                if active.profile == Some(SessionProfile::ControlledWebSessionV1)
-                    && completion.disposition == ControlOutcomeDisposition::Completed
-                    && let DocumentControlCommand::AdvanceTo(token) = &command
-                    && receive_outcome_virtual_time_ns(&completion.outcome)
-                        != Some(token.deadline().deadline.as_nanos())
+                if active
+                    .profile
+                    .is_some_and(SessionProfile::supports_session_api) &&
+                    completion.disposition == ControlOutcomeDisposition::Completed &&
+                    let DocumentControlCommand::AdvanceTo(token) = &command &&
+                    receive_outcome_virtual_time_ns(&completion.outcome) !=
+                        Some(token.deadline().deadline.as_nanos())
                 {
                     self.apply_active_transition(
                         active,
@@ -1615,16 +1746,16 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     )?;
                     return Ok((true, None));
                 }
-                if completion.disposition == ControlOutcomeDisposition::Completed
-                    && command_is_mutating(&command)
+                if completion.disposition == ControlOutcomeDisposition::Completed &&
+                    command_is_mutating(&command)
                 {
                     active.state_effect = RequestStateEffect::Partial;
                 }
                 // Never stage v2 network time from command intent. A rejected advance must
                 // reobserve at the old clock; a completed advance reaches this point with its
                 // exact deadline attested, before a later controlled Drive can run page work.
-                if let Some(virtual_time_ns) = receive_outcome_virtual_time_ns(&completion.outcome)
-                    && let Err(mut error) = self
+                if let Some(virtual_time_ns) = receive_outcome_virtual_time_ns(&completion.outcome) &&
+                    let Err(mut error) = self
                         .engine
                         .as_ref()
                         .expect("a completed control operation has an engine")
@@ -1729,8 +1860,8 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                                         ..
                                     }),
                                 ..
-                            }) if completion.kind() == NavigationOperationKind::Observe
-                                && explicit_navigation_reached_controlled_ready(
+                            }) if completion.kind() == NavigationOperationKind::Observe &&
+                                explicit_navigation_reached_controlled_ready(
                                     source,
                                     admitted,
                                     &navigation,
@@ -1813,8 +1944,8 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                                         }
                                         if self.last_navigation_authority.as_ref().is_none_or(
                                             |previous| {
-                                                previous.navigation_id()
-                                                    != navigation.navigation_id()
+                                                previous.navigation_id() !=
+                                                    navigation.navigation_id()
                                             },
                                         ) {
                                             engine.record_navigation_started(&navigation);
@@ -1848,37 +1979,37 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                                             self.apply_active_transition(active, transition)?;
                                             return Ok((true, None));
                                         }
-                                        if settle_resume.is_none()
-                                            || self.last_navigation_authority.as_ref().is_none_or(
+                                        if settle_resume.is_none() ||
+                                            self.last_navigation_authority.as_ref().is_none_or(
                                                 |previous| {
-                                                    previous.navigation_id()
-                                                        != navigation.navigation_id()
+                                                    previous.navigation_id() !=
+                                                        navigation.navigation_id()
                                                 },
                                             )
                                         {
                                             engine.record_navigation_committed(&navigation);
                                         }
-                                        if admitted.history_revision()
-                                            != navigation.history_revision()
+                                        if admitted.history_revision() !=
+                                            navigation.history_revision()
                                         {
                                             engine
                                                 .record_same_document_history_changed(&navigation);
                                         }
                                         engine.record_settlement_terminal(&navigation);
                                     },
-                                    SessionProjectionKind::Automation { .. }
-                                    | SessionProjectionKind::Value { .. } => {
+                                    SessionProjectionKind::Automation { .. } |
+                                    SessionProjectionKind::Value { .. } => {
                                         if let Some(previous) =
                                             self.last_navigation_authority.as_ref()
                                         {
-                                            if previous.navigation_id()
-                                                != navigation.navigation_id()
+                                            if previous.navigation_id() !=
+                                                navigation.navigation_id()
                                             {
                                                 engine.record_navigation_started(&navigation);
                                                 engine.record_navigation_committed(&navigation);
                                             }
-                                            if previous.history_revision()
-                                                != navigation.history_revision()
+                                            if previous.history_revision() !=
+                                                navigation.history_revision()
                                             {
                                                 engine.record_same_document_history_changed(
                                                     &navigation,
@@ -1942,8 +2073,8 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         let Some(active) = self.active.as_ref() else {
             return Ok(false);
         };
-        if let ActiveOperation::ControlledOpen(state) = &active.operation
-            && let Some(wait) = state.readiness_waiting.as_ref()
+        if let ActiveOperation::ControlledOpen(state) = &active.operation &&
+            let Some(wait) = state.readiness_waiting.as_ref()
         {
             let deadline_expired = now >= state.deadline;
             let retry_ready = now >= wait.retry_at;
@@ -1961,23 +2092,7 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             };
             state.readiness_waiting = None;
             let transition = if deadline_expired {
-                let v2 = state.profile == SessionProfile::ControlledWebSessionV1;
-                ActiveTransition::Fail(ActiveFailure {
-                    error: if v2 {
-                        fatal_operation(
-                            "controlled_open_timeout",
-                            "the controlled session did not become ready before the wall deadline",
-                            "indeterminate",
-                        )
-                    } else {
-                        ProtocolError::operation(
-                            "controlled_open_timeout",
-                            "the controlled document did not become ready before the wall deadline",
-                            "none",
-                        )
-                    },
-                    fail_stop: v2,
-                })
+                ActiveTransition::Fail(controlled_open_timeout_failure(state.profile))
             } else {
                 ActiveTransition::Submit(DocumentControlCommand::Observe)
             };
@@ -2129,18 +2244,41 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         Ok(true)
     }
 
+    fn service_controlled_open_deadline(&mut self, now: Instant) -> Result<bool, String> {
+        let Some((profile, deadline)) = self
+            .active
+            .as_ref()
+            .and_then(|active| active.operation.controlled_open_wall_authority())
+        else {
+            return Ok(false);
+        };
+        if now < deadline {
+            return Ok(false);
+        }
+
+        let active = self
+            .active
+            .take()
+            .expect("controlled-open wall authority was observed");
+        self.apply_active_transition(
+            active,
+            ActiveTransition::Fail(controlled_open_timeout_failure(profile)),
+        )?;
+        Ok(true)
+    }
+
     fn apply_active_transition(
         &mut self,
         mut active: ActiveRequest,
         transition: ActiveTransition,
     ) -> Result<(), String> {
-        if !matches!(&transition, ActiveTransition::Fail(_))
-            && !matches!(&active.operation, ActiveOperation::Audit(_))
-            && let Some(snapshot) = self
+        if !matches!(&transition, ActiveTransition::Fail(_)) &&
+            !matches!(&active.operation, ActiveOperation::Audit(_)) &&
+            let Some(snapshot) = self
                 .engine
                 .as_ref()
-                .and_then(EnginePort::controlled_network_snapshot)
-            && let Some(mut failure) = controlled_network_failure(snapshot, active.state_effect)
+                .and_then(EnginePort::controlled_network_snapshot) &&
+            let Some(mut failure) = controlled_network_failure(snapshot, active.state_effect)
         {
             if matches!(&active.operation, ActiveOperation::ControlledOpen(_)) {
                 failure.error.fatal = true;
@@ -2150,36 +2288,15 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         }
         match transition {
             ActiveTransition::Submit(command) => {
-                let controlled_open =
-                    matches!(&active.operation, ActiveOperation::ControlledOpen(_));
-                let timeout = if let ActiveOperation::ControlledOpen(state) = &active.operation {
-                    let v2 = state.profile == SessionProfile::ControlledWebSessionV1;
-                    let Some(remaining) = state.deadline.checked_duration_since(Instant::now())
-                    else {
-                        return self.apply_active_transition(
-                            active,
-                            ActiveTransition::Fail(ActiveFailure {
-                                error: if v2 {
-                                    fatal_operation(
-                                        "controlled_open_timeout",
-                                        "the controlled session did not become ready before the wall deadline",
-                                        "indeterminate",
-                                    )
-                                } else {
-                                    ProtocolError::operation(
-                                        "controlled_open_timeout",
-                                        "the controlled document did not become ready before the wall deadline",
-                                        "none",
-                                    )
-                                },
-                                fail_stop: v2,
-                            }),
-                        );
+                let controlled_open = active.operation.controlled_open_wall_authority().is_some();
+                let timeout =
+                    match active_control_command_timeout(&active.operation, Instant::now()) {
+                        Ok(timeout) => timeout,
+                        Err(failure) => {
+                            return self
+                                .apply_active_transition(active, ActiveTransition::Fail(failure));
+                        },
                     };
-                    remaining
-                } else {
-                    CONTROL_COMMAND_TIMEOUT
-                };
                 let control_turn_observed = self.checked_wake_snapshot()?;
                 let submission = self
                     .engine
@@ -2194,8 +2311,8 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                         if let ActiveOperation::Settle(state) = &mut active.operation {
                             state.waiting = None;
                         }
-                        if let ActiveOperation::ControlledOpen(state) = &mut active.operation
-                            && let Some(settlement) = state.settlement.as_mut()
+                        if let ActiveOperation::ControlledOpen(state) = &mut active.operation &&
+                            let Some(settlement) = state.settlement.as_mut()
                         {
                             settlement.waiting = None;
                         }
@@ -2207,7 +2324,9 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     },
                     Err(mut error) => {
                         error.state_effect = active.state_effect.as_protocol_str();
-                        let v2 = active.profile == Some(SessionProfile::ControlledWebSessionV1);
+                        let v2 = active
+                            .profile
+                            .is_some_and(SessionProfile::supports_session_api);
                         if v2 {
                             error.fatal = true;
                         }
@@ -2232,11 +2351,19 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 }
             },
             ActiveTransition::SubmitSessionNavigationObservation { allow_servo_pump } => {
+                let timeout =
+                    match active_control_command_timeout(&active.operation, Instant::now()) {
+                        Ok(timeout) => timeout,
+                        Err(failure) => {
+                            return self
+                                .apply_active_transition(active, ActiveTransition::Fail(failure));
+                        },
+                    };
                 let submission = self
                     .engine
                     .as_mut()
                     .expect("controlled-session request has an engine")
-                    .submit_session_navigation_observation(CONTROL_COMMAND_TIMEOUT);
+                    .submit_session_navigation_observation(timeout);
                 match submission {
                     Ok(()) => {
                         active.needs_initial_pump = allow_servo_pump;
@@ -2245,7 +2372,9 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     },
                     Err(mut error) => {
                         error.state_effect = active.state_effect.as_protocol_str();
-                        let v2 = active.profile == Some(SessionProfile::ControlledWebSessionV1);
+                        let v2 = active
+                            .profile
+                            .is_some_and(SessionProfile::supports_session_api);
                         if v2 {
                             error.fatal = true;
                         }
@@ -2263,11 +2392,19 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 }
             },
             ActiveTransition::SubmitSessionNavigation { expected, url } => {
+                let timeout =
+                    match active_control_command_timeout(&active.operation, Instant::now()) {
+                        Ok(timeout) => timeout,
+                        Err(failure) => {
+                            return self
+                                .apply_active_transition(active, ActiveTransition::Fail(failure));
+                        },
+                    };
                 let submission = self
                     .engine
                     .as_mut()
                     .expect("controlled-session request has an engine")
-                    .submit_session_navigation(expected, url, CONTROL_COMMAND_TIMEOUT);
+                    .submit_session_navigation(expected, url, timeout);
                 match submission {
                     Ok(()) => {
                         active.needs_initial_pump = true;
@@ -2290,6 +2427,9 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             },
             ActiveTransition::WaitForControlledOpen => {
                 let now = Instant::now();
+                if let Err(failure) = active_control_command_timeout(&active.operation, now) {
+                    return self.apply_active_transition(active, ActiveTransition::Fail(failure));
+                }
                 let ActiveOperation::ControlledOpen(state) = &mut active.operation else {
                     return self.apply_active_transition(
                         active,
@@ -2315,6 +2455,17 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             ActiveTransition::Wait(wait) => {
                 let state_effect = active.state_effect;
                 let now = Instant::now();
+                let controlled_open_deadline =
+                    match active.operation.controlled_open_wall_authority() {
+                        Some((profile, deadline)) if now >= deadline => {
+                            return self.apply_active_transition(
+                                active,
+                                ActiveTransition::Fail(controlled_open_timeout_failure(profile)),
+                            );
+                        },
+                        Some((_, deadline)) => Some(deadline),
+                        None => None,
+                    };
                 let deadline = match wait {
                     settle::SettleWait::ForegroundExternalIo {
                         remaining_wall_time,
@@ -2333,7 +2484,9 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                                 }),
                             );
                         };
-                        Some(deadline)
+                        Some(controlled_open_deadline.map_or(deadline, |open_deadline| {
+                            Instant::min(deadline, open_deadline)
+                        }))
                     },
                     settle::SettleWait::ProducerHandoff {
                         remaining_wall_time,
@@ -2352,7 +2505,9 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                                 }),
                             );
                         };
-                        Some(deadline)
+                        Some(controlled_open_deadline.map_or(deadline, |open_deadline| {
+                            Instant::min(deadline, open_deadline)
+                        }))
                     },
                 };
                 let host_wait = active.settle_host_wait(self.servo_cursor, now, deadline);
@@ -2517,7 +2672,10 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             .engine
             .as_mut()
             .and_then(|engine| engine.cancel_session_navigation());
-        if active.profile == Some(SessionProfile::ControlledWebSessionV1) {
+        if active
+            .profile
+            .is_some_and(SessionProfile::supports_session_api)
+        {
             return ActiveFailure {
                 error: fatal_operation(
                     "outcome_indeterminate",
@@ -2527,13 +2685,13 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 fail_stop: true,
             };
         }
-        if command_is_mutating
-            || completion.as_ref().is_some_and(|completion| {
+        if command_is_mutating ||
+            completion.as_ref().is_some_and(|completion| {
                 completion.disposition == ControlOutcomeDisposition::Indeterminate
-            })
-            || navigation_completion.as_ref().is_some_and(|completion| {
-                completion.kind() == NavigationOperationKind::Navigate
-                    && !completion.response_received()
+            }) ||
+            navigation_completion.as_ref().is_some_and(|completion| {
+                completion.kind() == NavigationOperationKind::Navigate &&
+                    !completion.response_received()
             })
         {
             return ActiveFailure {
@@ -2605,35 +2763,35 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
 
     fn next_wait_deadline(&self, control_deadline: Option<Instant>, now: Instant) -> Instant {
         let safety = now.checked_add(OWNER_LOOP_SAFETY_TIMEOUT).unwrap_or(now);
-        let host_wait = self
-            .active
-            .as_ref()
-            .and_then(|active| match &active.operation {
-                ActiveOperation::ControlledOpen(state) => {
-                    state.readiness_waiting.as_ref().map_or_else(
-                        || {
-                            state
-                                .settlement
-                                .as_ref()
-                                .and_then(|settlement| settlement.waiting.as_ref())
-                                .and_then(|wait| wait.deadline)
-                        },
-                        |wait| Some(Instant::min(wait.retry_at, state.deadline)),
-                    )
+        let active = self.active.as_ref();
+        let host_wait = active.and_then(|active| match &active.operation {
+            ActiveOperation::ControlledOpen(state) => state.readiness_waiting.as_ref().map_or_else(
+                || {
+                    state
+                        .settlement
+                        .as_ref()
+                        .and_then(|settlement| settlement.waiting.as_ref())
+                        .and_then(|wait| wait.deadline)
                 },
-                ActiveOperation::Settle(state) => {
-                    state.waiting.as_ref().and_then(|wait| wait.deadline)
-                },
-                ActiveOperation::Navigate(state) => {
-                    state.waiting.as_ref().and_then(|wait| wait.deadline)
-                },
-                ActiveOperation::Pending
-                | ActiveOperation::AdvanceToNext(_)
-                | ActiveOperation::Automation(_)
-                | ActiveOperation::Audit(_)
-                | ActiveOperation::SessionProjection(_) => None,
-            });
-        [control_deadline, host_wait]
+                |wait| Some(Instant::min(wait.retry_at, state.deadline)),
+            ),
+            ActiveOperation::Settle(state) => state.waiting.as_ref().and_then(|wait| wait.deadline),
+            ActiveOperation::Navigate(state) => {
+                state.waiting.as_ref().and_then(|wait| wait.deadline)
+            },
+            ActiveOperation::Pending |
+            ActiveOperation::AdvanceToNext(_) |
+            ActiveOperation::Automation(_) |
+            ActiveOperation::Audit(_) |
+            ActiveOperation::SessionProjection(_) => None,
+        });
+        let controlled_open_deadline = active.and_then(|active| {
+            active
+                .operation
+                .controlled_open_wall_authority()
+                .map(|(_, deadline)| deadline)
+        });
+        [control_deadline, host_wait, controlled_open_deadline]
             .into_iter()
             .flatten()
             .fold(safety, Instant::min)
@@ -2655,8 +2813,8 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             ));
         }
         let params: InitializeParams = parse_params(request)?;
-        if let Some(client) = params.client
-            && (client.name.is_empty() || client.version.is_empty())
+        if let Some(client) = params.client &&
+            (client.name.is_empty() || client.version.is_empty())
         {
             return Err(ProtocolError::invalid_request(
                 "client name and version must not be empty",
@@ -2701,7 +2859,11 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     "session.close"
                 ],
                 "clockModes": ["real", "controlled"],
-                "profiles": [CONTROLLED_WEBAPP_V1_PROFILE, CONTROLLED_WEB_SESSION_V1_PROFILE],
+                "profiles": [
+                    CONTROLLED_WEBAPP_V1_PROFILE,
+                    CONTROLLED_WEB_SESSION_V1_PROFILE,
+                    CONTROLLED_WEB_SESSION_V2_PROFILE
+                ],
                 "settlement": true,
                 "settlementLimits": [
                     "maxVirtualTimeNs",
@@ -2751,8 +2913,10 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             Ok(configuration) => configuration,
             Err(error) => return self.write_method_result(&request, Err(error)),
         };
-        if configuration.profile == Some(SessionProfile::ControlledWebSessionV1)
-            && !matches!(url.scheme(), "http" | "https")
+        if configuration
+            .profile
+            .is_some_and(SessionProfile::supports_session_api) &&
+            !matches!(url.scheme(), "http" | "https")
         {
             return self.write_method_result(
                 &request,
@@ -2767,18 +2931,55 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             DocumentControlProfile::SingleDocument,
             SessionProfile::document_control_profile,
         );
+        let document_execution_profile = configuration.profile.map_or(
+            DocumentExecutionProfile::Baseline,
+            SessionProfile::document_execution_profile,
+        );
+        let controlled_open_timing = if configuration.clock_mode.is_controlled() {
+            let started_at = Instant::now();
+            let Some(deadline) = started_at.checked_add(CONTROLLED_OPEN_WALL_TIMEOUT) else {
+                return self.write_method_result(
+                    &request,
+                    Err(ProtocolError::operation(
+                        "controlled_open_deadline_overflow",
+                        "the controlled-open wall deadline overflowed",
+                        "none",
+                    )),
+                );
+            };
+            Some((started_at, deadline))
+        } else {
+            None
+        };
         let mut engine = match E::open_session(
             url.clone(),
             self.waker.clone(),
             EngineSessionOpenOptions {
                 clock_mode: configuration.clock_mode,
                 document_control_profile,
+                document_execution_profile,
                 state: configuration.state,
                 network: configuration.network,
             },
         ) {
             Ok(engine) => engine,
             Err(error) => {
+                if let Some((_, deadline)) = controlled_open_timing &&
+                    Instant::now() >= deadline
+                {
+                    let profile = configuration
+                        .profile
+                        .expect("a controlled open has a validated support profile");
+                    let failure = controlled_open_timeout_failure(profile);
+                    self.write_method_result(&request, Err(failure.error))?;
+                    if failure.fail_stop {
+                        self.state = ShellState::Closed;
+                        return Err(
+                            "runtime outcome is indeterminate; session was fail-stopped".into()
+                        );
+                    }
+                    return Ok(());
+                }
                 let fatal = error.fatal;
                 self.write_method_result(&request, Err(error))?;
                 if fatal {
@@ -2796,6 +2997,18 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             let profile = configuration
                 .profile
                 .expect("a controlled open has a validated support profile");
+            let (started_at, deadline) = controlled_open_timing
+                .expect("a controlled open established its wall deadline before engine creation");
+            if Instant::now() >= deadline {
+                engine.close();
+                let failure = controlled_open_timeout_failure(profile);
+                self.write_method_result(&request, Err(failure.error))?;
+                if failure.fail_stop {
+                    self.state = ShellState::Closed;
+                    return Err("runtime outcome is indeterminate; session was fail-stopped".into());
+                }
+                return Ok(());
+            }
             if engine.document_control_profile() != profile.document_control_profile() {
                 engine.close();
                 return self.write_method_result(
@@ -2807,23 +3020,36 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                     )),
                 );
             }
-            let started_at = Instant::now();
-            let Some(deadline) = started_at.checked_add(CONTROL_COMMAND_TIMEOUT) else {
+            if engine.document_execution_profile() != profile.document_execution_profile() {
                 engine.close();
                 return self.write_method_result(
                     &request,
-                    Err(ProtocolError::operation(
-                        "controlled_open_deadline_overflow",
-                        "the controlled-open wall deadline overflowed",
+                    Err(fatal_operation(
+                        "internal_runtime_failure",
+                        "engine opened with a different document-execution profile",
                         "none",
                     )),
                 );
-            };
+            }
+            let initial_timeout =
+                match controlled_open_command_timeout(profile, deadline, Instant::now()) {
+                    Ok(timeout) => timeout,
+                    Err(failure) => {
+                        engine.close();
+                        self.write_method_result(&request, Err(failure.error))?;
+                        if failure.fail_stop {
+                            self.state = ShellState::Closed;
+                            return Err(
+                                "runtime outcome is indeterminate; session was fail-stopped".into(),
+                            );
+                        }
+                        return Ok(());
+                    },
+                };
             let control_turn_observed = self.checked_wake_snapshot()?;
-            if let Err(mut error) = engine.submit_document_control(
-                DocumentControlCommand::Observe,
-                deadline.saturating_duration_since(Instant::now()),
-            ) {
+            if let Err(mut error) =
+                engine.submit_document_control(DocumentControlCommand::Observe, initial_timeout)
+            {
                 error.state_effect = "none";
                 engine.close();
                 return self.write_method_result(&request, Err(error));
@@ -3059,7 +3285,7 @@ fn transition_from_control_completion(
                     });
                 },
             };
-            if state.profile == SessionProfile::ControlledWebSessionV1 {
+            if state.profile.supports_session_api() {
                 let response = SettleResponse::ControlledOpen {
                     requested_url: state.requested_url.clone(),
                     current_url: state.current_url.clone(),
@@ -3089,7 +3315,7 @@ fn transition_from_control_completion(
                     },
                 };
                 active.operation = ActiveOperation::Settle(SettleState {
-                    profile: SessionProfile::ControlledWebSessionV1,
+                    profile: state.profile,
                     authorizing_document_state: None,
                     authorizing_observation: None,
                     authorizing_navigation: None,
@@ -3123,8 +3349,8 @@ fn transition_from_control_completion(
             };
             let result = wire::RuntimePendingResult::project(observation.pending(), projection);
             match active_profile {
-                Some(SessionProfile::ControlledWebSessionV1) => {
-                    project_session_pending(result, observation.pending(), state_effect)
+                Some(profile) if profile.supports_session_api() => {
+                    project_session_pending(profile, result, observation.pending(), state_effect)
                 },
                 _ => serialize_result(result, state_effect),
             }
@@ -3174,12 +3400,14 @@ fn transition_from_control_completion(
                             projection,
                         );
                         return match active_profile {
-                            Some(SessionProfile::ControlledWebSessionV1) => project_session_value(
-                                result,
-                                observation.pending(),
-                                true,
-                                state_effect,
-                            ),
+                            Some(profile) if profile.supports_session_api() => {
+                                project_session_value(
+                                    result,
+                                    observation.pending(),
+                                    true,
+                                    state_effect,
+                                )
+                            },
                             _ => serialize_result(result, state_effect),
                         };
                     }
@@ -3210,7 +3438,7 @@ fn transition_from_control_completion(
                         projection,
                     );
                     match active_profile {
-                        Some(SessionProfile::ControlledWebSessionV1) => {
+                        Some(profile) if profile.supports_session_api() => {
                             project_session_value(result, observation.pending(), true, state_effect)
                         },
                         _ => serialize_result(result, state_effect),
@@ -3272,8 +3500,7 @@ fn transition_from_control_completion(
                         Ok(completion) => completion,
                         Err(failure) => return ActiveTransition::Fail(failure),
                     };
-                if state.profile == SessionProfile::ControlledWebSessionV1
-                    && public_automation_is_mutating(state.kind)
+                if state.profile.supports_session_api() && public_automation_is_mutating(state.kind)
                 {
                     if state.completed.is_some() {
                         return ActiveTransition::Fail(ActiveFailure {
@@ -3315,7 +3542,8 @@ fn transition_from_control_completion(
                 };
                 match state.profile {
                     SessionProfile::ControlledWebappV1 => serialize_result(result, state_effect),
-                    SessionProfile::ControlledWebSessionV1 => {
+                    SessionProfile::ControlledWebSessionV1 |
+                    SessionProfile::ControlledWebSessionV2 => {
                         project_session_value(result, observation.pending(), false, state_effect)
                     },
                 }
@@ -3441,11 +3669,11 @@ fn transition_from_control_completion(
                 }
                 if let DocumentControlReceiveOutcome::CommandOutcome(
                     command_outcome @ DocumentControlOutcome::Rejected(
-                        DocumentControlError::TargetChanged { .. }
-                        | DocumentControlError::ReplacementPipelineBootstrapRequired { .. },
+                        DocumentControlError::TargetChanged { .. } |
+                        DocumentControlError::ReplacementPipelineBootstrapRequired { .. },
                     ),
-                ) = &outcome
-                    && command_outcome.validate_for_command(&command).is_ok()
+                ) = &outcome &&
+                    command_outcome.validate_for_command(&command).is_ok()
                 {
                     return latch_and_reject_stale_settle_authority(
                         projection,
@@ -3460,8 +3688,8 @@ fn transition_from_control_completion(
                 let Some(navigation) = state.authorizing_navigation.as_ref() else {
                     return missing_navigation_authority("runtime.settle");
                 };
-                if !expected_authority.matches_navigation(navigation)
-                    || observation.pending().target != *expected_authority.target()
+                if !expected_authority.matches_navigation(navigation) ||
+                    observation.pending().target != *expected_authority.target()
                 {
                     return latch_and_reject_stale_settle_authority(
                         projection,
@@ -3577,10 +3805,10 @@ fn transition_from_control_completion(
                 });
             };
             let navigation = navigation.clone();
-            if command == DocumentControlCommand::Observe
-                && session_projection_allows_replacement_rearm(&state.kind)
-                && session_projection_settle_resume(&state.kind).is_some()
-                && let DocumentControlReceiveOutcome::CommandOutcome(
+            if command == DocumentControlCommand::Observe &&
+                session_projection_allows_replacement_rearm(&state.kind) &&
+                session_projection_settle_resume(&state.kind).is_some() &&
+                let DocumentControlReceiveOutcome::CommandOutcome(
                     DocumentControlOutcome::Rejected(
                         DocumentControlError::ReplacementPipelineBootstrapRequired {
                             source_pipeline_id,
@@ -3589,15 +3817,15 @@ fn transition_from_control_completion(
                     ),
                 ) = &outcome
             {
-                let source_shape_is_exact = state.pending.target == *navigation.target()
-                    && navigation
+                let source_shape_is_exact = state.pending.target == *navigation.target() &&
+                    navigation
                         .target()
                         .active_top_level
-                        .is_some_and(|active| active.pipeline_id == *source_pipeline_id)
-                    && navigation.target().pipelines() == [*source_pipeline_id]
-                    && navigation.target().fully_active_pipelines() == [*source_pipeline_id]
-                    && navigation.target().pending_top_level_pipelines().is_empty()
-                    && source_pipeline_id != pipeline_id;
+                        .is_some_and(|active| active.pipeline_id == *source_pipeline_id) &&
+                    navigation.target().pipelines() == [*source_pipeline_id] &&
+                    navigation.target().fully_active_pipelines() == [*source_pipeline_id] &&
+                    navigation.target().pending_top_level_pipelines().is_empty() &&
+                    source_pipeline_id != pipeline_id;
                 if !source_shape_is_exact {
                     return navigation_activation_failure(state_effect, true);
                 }
@@ -3627,13 +3855,13 @@ fn transition_from_control_completion(
             let pending = Box::new(observation.pending().clone());
             let raw_automation_projection =
                 matches!(&state.kind, SessionProjectionKind::Automation { .. });
-            let exact_action_refresh = raw_automation_projection
-                && session_projection_settle_resume(&state.kind)
+            let exact_action_refresh = raw_automation_projection &&
+                session_projection_settle_resume(&state.kind)
                     .and_then(|resume| resume.authorizing_navigation.as_ref())
                     .is_some_and(|source| {
                         classify_same_document_session_transition(source, &navigation).is_some()
-                    })
-                && navigation.target() == &pending.target;
+                    }) &&
+                navigation.target() == &pending.target;
             if pending.as_ref() != state.pending.as_ref() && !exact_action_refresh {
                 let restart = restart_session_projection_after_drift(&state.kind, state_effect);
                 return match restart {
@@ -3670,19 +3898,19 @@ fn controlled_network_blocks_virtual_advance(
     profile: Option<SessionProfile>,
     active_operations: usize,
 ) -> bool {
-    profile == Some(SessionProfile::ControlledWebSessionV1) && active_operations != 0
+    profile.is_some_and(SessionProfile::supports_session_api) && active_operations != 0
 }
 
 fn public_automation_is_mutating(kind: wire::PublicAutomationKind) -> bool {
     matches!(
         kind,
-        wire::PublicAutomationKind::Activate
-            | wire::PublicAutomationKind::Fill
-            | wire::PublicAutomationKind::Focus
-            | wire::PublicAutomationKind::Check
-            | wire::PublicAutomationKind::Uncheck
-            | wire::PublicAutomationKind::Select
-            | wire::PublicAutomationKind::Submit
+        wire::PublicAutomationKind::Activate |
+            wire::PublicAutomationKind::Fill |
+            wire::PublicAutomationKind::Focus |
+            wire::PublicAutomationKind::Check |
+            wire::PublicAutomationKind::Uncheck |
+            wire::PublicAutomationKind::Select |
+            wire::PublicAutomationKind::Submit
     )
 }
 
@@ -3711,8 +3939,8 @@ fn active_expects_navigation_response(operation: &ActiveOperation) -> bool {
         ActiveOperation::Settle(SettleState {
             replacement:
                 Some(
-                    SettleReplacementPhase::AwaitingAdmission { .. }
-                    | SettleReplacementPhase::AwaitingActivation { .. },
+                    SettleReplacementPhase::AwaitingAdmission { .. } |
+                    SettleReplacementPhase::AwaitingActivation { .. },
                 ),
             ..
         }) => true,
@@ -3721,25 +3949,25 @@ fn active_expects_navigation_response(operation: &ActiveOperation) -> bool {
             ..
         }) => true,
         ActiveOperation::Automation(AutomationState {
-            profile: SessionProfile::ControlledWebSessionV1,
+            profile,
             unresolved: Some(_),
             authorizing_navigation: None,
             ..
-        }) => true,
+        }) if profile.supports_session_api() => true,
         ActiveOperation::Automation(AutomationState {
-            profile: SessionProfile::ControlledWebSessionV1,
+            profile,
             completed: Some(_),
             ..
-        }) => true,
+        }) if profile.supports_session_api() => true,
         ActiveOperation::Navigate(NavigateState {
             phase: NavigatePhase::AwaitingAuthority { .. } | NavigatePhase::AwaitingAdmission { .. },
             ..
         }) => true,
         ActiveOperation::SessionProjection(SessionProjectionState {
             phase:
-                SessionProjectionPhase::AwaitingInitialNavigation
-                | SessionProjectionPhase::AwaitingReplacementAdmission { .. }
-                | SessionProjectionPhase::AwaitingStableNavigation { .. },
+                SessionProjectionPhase::AwaitingInitialNavigation |
+                SessionProjectionPhase::AwaitingReplacementAdmission { .. } |
+                SessionProjectionPhase::AwaitingStableNavigation { .. },
             ..
         }) => true,
         _ => false,
@@ -3782,8 +4010,8 @@ fn transition_from_navigation_completion(
                     authorizing_navigation: None,
                     authorizing_observation: None,
                     ..
-                })
-                | ActiveOperation::Settle(SettleState {
+                }) |
+                ActiveOperation::Settle(SettleState {
                     authorizing_document_state: Some(expected),
                     authorizing_navigation: Some(_),
                     authorizing_observation: Some(_),
@@ -3815,8 +4043,8 @@ fn transition_from_navigation_completion(
             ActiveTransition::Submit(DocumentControlCommand::Observe)
         },
         ActiveOperation::Settle(state)
-            if kind == NavigationOperationKind::Observe
-                && state.authority_bound_command.is_some() =>
+            if kind == NavigationOperationKind::Observe &&
+                state.authority_bound_command.is_some() =>
         {
             let Some(expected_target) = state.latest_pending_target.as_ref() else {
                 return ActiveTransition::Fail(ActiveFailure {
@@ -3828,13 +4056,13 @@ fn transition_from_navigation_completion(
                     fail_stop: true,
                 });
             };
-            let initial_open_bind = state.authorizing_navigation.is_none()
-                && matches!(state.response, SettleResponse::ControlledOpen { .. });
+            let initial_open_bind = state.authorizing_navigation.is_none() &&
+                matches!(state.response, SettleResponse::ControlledOpen { .. });
             if initial_open_bind {
-                if navigation.terminal().is_some()
-                    || !matches!(navigation.url().scheme(), "http" | "https")
-                    || navigation.target().webview_id != expected_target.webview_id
-                    || navigation.target().event_loop_id != expected_target.event_loop_id
+                if navigation.terminal().is_some() ||
+                    !matches!(navigation.url().scheme(), "http" | "https") ||
+                    navigation.target().webview_id != expected_target.webview_id ||
+                    navigation.target().event_loop_id != expected_target.event_loop_id
                 {
                     return navigation_activation_failure(active.state_effect, true);
                 }
@@ -3854,8 +4082,8 @@ fn transition_from_navigation_completion(
                             .map(|admission| (source.clone(), admission))
                     });
                 if let Some((source, admission)) = queued_replacement_admission {
-                    if state.authority_bound_command.as_ref()
-                        != Some(&DocumentControlCommand::DriveOneTurn)
+                    if state.authority_bound_command.as_ref() !=
+                        Some(&DocumentControlCommand::DriveOneTurn)
                     {
                         return ActiveTransition::Fail(ActiveFailure {
                             error: fatal_operation(
@@ -3936,18 +4164,18 @@ fn transition_from_navigation_completion(
                         state.replacement = None;
                         replacement_became_ready = true;
                     },
-                    ReplacementActivationObservation::Pending
-                    | ReplacementActivationObservation::ActivatedAwaitingSourceExit => {},
+                    ReplacementActivationObservation::Pending |
+                    ReplacementActivationObservation::ActivatedAwaitingSourceExit => {},
                     ReplacementActivationObservation::Invalid => {
                         return navigation_activation_failure(active.state_effect, true);
                     },
                 }
             }
-            if !replacement_became_ready
-                && state.replacement.is_none()
-                && state.authorizing_navigation.as_ref().is_some_and(|source| {
-                    session_navigation_reached_controlled_ready(source)
-                        && classify_same_document_session_transition(source, &navigation).is_none()
+            if !replacement_became_ready &&
+                state.replacement.is_none() &&
+                state.authorizing_navigation.as_ref().is_some_and(|source| {
+                    session_navigation_reached_controlled_ready(source) &&
+                        classify_same_document_session_transition(source, &navigation).is_none()
                 })
             {
                 return navigation_activation_failure(active.state_effect, true);
@@ -3959,8 +4187,8 @@ fn transition_from_navigation_completion(
             ActiveTransition::Submit(command)
         },
         ActiveOperation::Settle(state)
-            if kind == NavigationOperationKind::Observe
-                && matches!(
+            if kind == NavigationOperationKind::Observe &&
+                matches!(
                     state.replacement.as_ref(),
                     Some(SettleReplacementPhase::AwaitingAdmission { .. })
                 ) =>
@@ -4041,8 +4269,8 @@ fn transition_from_navigation_completion(
             }
         },
         ActiveOperation::Settle(state)
-            if kind == NavigationOperationKind::Observe
-                && matches!(
+            if kind == NavigationOperationKind::Observe &&
+                matches!(
                     state.replacement.as_ref(),
                     Some(SettleReplacementPhase::AwaitingActivation { .. })
                 ) =>
@@ -4086,8 +4314,8 @@ fn transition_from_navigation_completion(
                             Some(SettleReplacementPhase::Activating { source, admitted });
                     }
                 },
-                ReplacementActivationObservation::Pending
-                | ReplacementActivationObservation::ActivatedAwaitingSourceExit => {
+                ReplacementActivationObservation::Pending |
+                ReplacementActivationObservation::ActivatedAwaitingSourceExit => {
                     // An incomplete replacement is settlement foreground work. Consume the exact
                     // held outcome through the existing coordinator so all subsequent drives,
                     // waits, wall-I/O expiry, and control-turn limits remain on one ledger.
@@ -4121,10 +4349,10 @@ fn transition_from_navigation_completion(
             }
         },
         ActiveOperation::Settle(state)
-            if kind == NavigationOperationKind::Observe
-                && state.authorizing_document_state.is_some()
-                && state.authorizing_observation.is_some()
-                && state.authorizing_navigation.is_some() =>
+            if kind == NavigationOperationKind::Observe &&
+                state.authorizing_document_state.is_some() &&
+                state.authorizing_observation.is_some() &&
+                state.authorizing_navigation.is_some() =>
         {
             let expected_authority = state
                 .authorizing_document_state
@@ -4138,10 +4366,10 @@ fn transition_from_navigation_completion(
                 .authorizing_navigation
                 .as_ref()
                 .expect("the settlement N2 phase retained N1");
-            if &navigation != n1
-                || !expected_authority.matches_navigation(&navigation)
-                || observation.pending().target != *expected_authority.target()
-                || navigation.target() != &observation.pending().target
+            if &navigation != n1 ||
+                !expected_authority.matches_navigation(&navigation) ||
+                observation.pending().target != *expected_authority.target() ||
+                navigation.target() != &observation.pending().target
             {
                 return latch_and_reject_stale_settle_authority(
                     projection,
@@ -4204,19 +4432,20 @@ fn transition_from_navigation_completion(
             ActiveTransition::Submit(DocumentControlCommand::Observe)
         },
         ActiveOperation::Automation(AutomationState {
-            profile: SessionProfile::ControlledWebSessionV1,
+            profile,
             unresolved: Some(_),
             authorizing_navigation: slot @ None,
             ..
-        }) if kind == NavigationOperationKind::Observe => {
+        }) if profile.supports_session_api() && kind == NavigationOperationKind::Observe => {
             *slot = Some(navigation);
             ActiveTransition::Submit(DocumentControlCommand::Observe)
         },
         ActiveOperation::Automation(state)
-            if state.profile == SessionProfile::ControlledWebSessionV1
-                && state.completed.is_some()
-                && kind == NavigationOperationKind::Observe =>
+            if state.profile.supports_session_api() &&
+                state.completed.is_some() &&
+                kind == NavigationOperationKind::Observe =>
         {
+            let profile = state.profile;
             let Some(source) = state.authorizing_navigation.clone() else {
                 return missing_navigation_authority("completed session automation");
             };
@@ -4232,8 +4461,8 @@ fn transition_from_navigation_completion(
                 kind: action_kind,
                 result: completed.result,
             };
-            if synchronous_navigation_emitted
-                && let Some(admission) = exact_replacement_admission(&source, &navigation)
+            if synchronous_navigation_emitted &&
+                let Some(admission) = exact_replacement_admission(&source, &navigation)
             {
                 let bootstrap = DocumentControlCommand::BootstrapReplacementPipeline {
                     source_pipeline_id: admission.source_pipeline_id,
@@ -4262,7 +4491,7 @@ fn transition_from_navigation_completion(
                     },
                 };
                 active.operation = ActiveOperation::Settle(SettleState {
-                    profile: SessionProfile::ControlledWebSessionV1,
+                    profile,
                     authorizing_document_state: None,
                     authorizing_observation: None,
                     authorizing_navigation: Some(source.clone()),
@@ -4282,8 +4511,8 @@ fn transition_from_navigation_completion(
                 ActiveTransition::Submit(command)
             } else if classify_same_document_session_transition(&source, &navigation).is_some_and(
                 |transition| {
-                    synchronous_navigation_emitted
-                        || transition == SameDocumentSessionTransition::Unchanged
+                    synchronous_navigation_emitted ||
+                        transition == SameDocumentSessionTransition::Unchanged
                 },
             ) {
                 active.operation = ActiveOperation::SessionProjection(SessionProjectionState {
@@ -4293,7 +4522,7 @@ fn transition_from_navigation_completion(
                     pending: completed.pending,
                     kind: SessionProjectionKind::Automation {
                         settle_resume: SettleProjectionResume {
-                            profile: SessionProfile::ControlledWebSessionV1,
+                            profile,
                             effective_policy: default_resolved_settle_policy(),
                             cumulative_external_io_wall_time: Duration::ZERO,
                             authorizing_navigation: Some(navigation.clone()),
@@ -4321,6 +4550,9 @@ fn transition_from_navigation_completion(
             NavigatePhase::AwaitingAdmission { source }
                 if kind == NavigationOperationKind::Navigate =>
             {
+                let profile = active
+                    .profile
+                    .expect("session navigation retains its selected session profile");
                 active.state_effect = RequestStateEffect::Partial;
                 let Some(admission) = exact_replacement_admission(source, &navigation) else {
                     return navigation_activation_failure(active.state_effect, true);
@@ -4355,7 +4587,7 @@ fn transition_from_navigation_completion(
                     },
                 };
                 active.operation = ActiveOperation::Settle(SettleState {
-                    profile: SessionProfile::ControlledWebSessionV1,
+                    profile,
                     authorizing_document_state: None,
                     authorizing_observation: None,
                     authorizing_navigation: Some(source.clone()),
@@ -4389,8 +4621,8 @@ fn transition_from_navigation_completion(
                 SessionProjectionPhase::AwaitingStableNavigation { navigation } => {
                     Some(navigation.clone())
                 },
-                SessionProjectionPhase::AwaitingPendingObservation { .. }
-                | SessionProjectionPhase::AwaitingReplacementAdmission { .. } => None,
+                SessionProjectionPhase::AwaitingPendingObservation { .. } |
+                SessionProjectionPhase::AwaitingReplacementAdmission { .. } => None,
             };
             if let SessionProjectionPhase::AwaitingReplacementAdmission {
                 source,
@@ -4401,8 +4633,8 @@ fn transition_from_navigation_completion(
                 let Some(admission) = exact_replacement_admission(source, &navigation) else {
                     return navigation_activation_failure(active.state_effect, true);
                 };
-                if admission.source_pipeline_id != *source_pipeline_id
-                    || admission.pipeline_id != *pipeline_id
+                if admission.source_pipeline_id != *source_pipeline_id ||
+                    admission.pipeline_id != *pipeline_id
                 {
                     return navigation_activation_failure(active.state_effect, true);
                 }
@@ -4427,9 +4659,9 @@ fn transition_from_navigation_completion(
                     Err(failure) => ActiveTransition::Fail(failure),
                 };
             }
-            if let (Some(resume), Some(source)) = (resume.as_ref(), replacement_source)
-                && session_projection_allows_replacement_rearm(&state.kind)
-                && exact_replacement_admission(&source, &navigation).is_some()
+            if let (Some(resume), Some(source)) = (resume.as_ref(), replacement_source) &&
+                session_projection_allows_replacement_rearm(&state.kind) &&
+                exact_replacement_admission(&source, &navigation).is_some()
             {
                 let restart = resume_session_projection_at_replacement(
                     resume,
@@ -4460,8 +4692,8 @@ fn transition_from_navigation_completion(
                 SessionProjectionPhase::AwaitingStableNavigation { navigation: before }
                     if before != &navigation =>
                 {
-                    if session_projection_allows_replacement_rearm(&state.kind)
-                        && classify_same_document_session_transition(before, &navigation).is_some()
+                    if session_projection_allows_replacement_rearm(&state.kind) &&
+                        classify_same_document_session_transition(before, &navigation).is_some()
                     {
                         if let Some(resume) = session_projection_settle_resume_mut(&mut state.kind)
                         {
@@ -4600,7 +4832,7 @@ fn transition_from_navigation_completion(
                 SessionProjectionKind::ControlledOpen {
                     requested_url,
                     current_url,
-                    profile: _,
+                    profile,
                     deadline: _,
                     bootstrap_attempted: _,
                     cumulative_external_io_wall_time: _,
@@ -4628,7 +4860,7 @@ fn transition_from_navigation_completion(
                         "url": navigation.url().to_string(),
                         "boundary": "controlled_ready",
                         "clockMode": "controlled",
-                        "profile": CONTROLLED_WEB_SESSION_V1_PROFILE,
+                        "profile": profile.id(),
                         "stateToken": token,
                         "sessionStateToken": session_state_token,
                     }))
@@ -4725,8 +4957,8 @@ fn session_navigation_failure(
             ),
             fail_stop: true,
         }),
-        SessionNavigationError::NotTopLevelSession
-        | SessionNavigationError::TargetUnavailable(_) => ActiveTransition::Fail(ActiveFailure {
+        SessionNavigationError::NotTopLevelSession |
+        SessionNavigationError::TargetUnavailable(_) => ActiveTransition::Fail(ActiveFailure {
             error: fatal_operation(
                 "session_navigation_authority_unavailable",
                 format!("engine could not capture controlled-session authority: {error:?}"),
@@ -5022,9 +5254,9 @@ fn completed_observation(
                     ),
                     fail_stop: false,
                 }),
-                DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate { .. }
-                | DocumentControlOutcome::AdvanceOutcomeIndeterminate { .. }
-                | DocumentControlOutcome::AutomationOutcomeIndeterminate { .. } => {
+                DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate { .. } |
+                DocumentControlOutcome::AdvanceOutcomeIndeterminate { .. } |
+                DocumentControlOutcome::AutomationOutcomeIndeterminate { .. } => {
                     Err(ActiveFailure {
                         error: fatal_operation(
                             "outcome_indeterminate",
@@ -5131,18 +5363,16 @@ fn completed_automation(
                         fail_stop: true,
                     })
                 },
-                DocumentControlOutcome::Completed(_)
-                | DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate { .. }
-                | DocumentControlOutcome::AdvanceOutcomeIndeterminate { .. } => {
-                    Err(ActiveFailure {
-                        error: fatal_operation(
-                            "internal_runtime_failure",
-                            "a non-automation outcome was delivered for an automation command",
-                            state_effect.as_protocol_str(),
-                        ),
-                        fail_stop: true,
-                    })
-                },
+                DocumentControlOutcome::Completed(_) |
+                DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate { .. } |
+                DocumentControlOutcome::AdvanceOutcomeIndeterminate { .. } => Err(ActiveFailure {
+                    error: fatal_operation(
+                        "internal_runtime_failure",
+                        "a non-automation outcome was delivered for an automation command",
+                        state_effect.as_protocol_str(),
+                    ),
+                    fail_stop: true,
+                }),
             }
         },
         DocumentControlReceiveOutcome::AutomationTransportFailure(error) => Err(ActiveFailure {
@@ -5307,11 +5537,11 @@ fn transition_from_settle_progress_for_active(
             }
         },
         settle::SettleProgress::Command(command)
-            if state.profile == SessionProfile::ControlledWebSessionV1
-                && command == DocumentControlCommand::DriveOneTurn =>
+            if state.profile.supports_session_api() &&
+                command == DocumentControlCommand::DriveOneTurn =>
         {
-            if state.authority_bound_command.replace(command).is_some()
-                || state.latest_pending_target.is_none()
+            if state.authority_bound_command.replace(command).is_some() ||
+                state.latest_pending_target.is_none()
             {
                 return ActiveTransition::Fail(ActiveFailure {
                     error: fatal_operation(
@@ -5330,7 +5560,9 @@ fn transition_from_settle_progress_for_active(
         settle::SettleProgress::Wait(wait) => ActiveTransition::Wait(wait),
         settle::SettleProgress::Complete(completion) => match &state.response {
             SettleResponse::Runtime => {
-                let pending = (state.profile == SessionProfile::ControlledWebSessionV1)
+                let pending = state
+                    .profile
+                    .supports_session_api()
                     .then(|| completion.pending().clone());
                 let result = wire::RuntimeSettleResult::project(
                     completion,
@@ -5496,8 +5728,8 @@ fn controlled_ready_pending(
     fail_stop: bool,
 ) -> Result<Box<servo::document_pending::RawPendingSnapshot>, ActiveFailure> {
     let (pending, code, message, details) = match completion {
-        settle::SettleCompletion::Quiescent { pending, .. }
-        | settle::SettleCompletion::QuiescentWithPersistentWork { pending, .. } => {
+        settle::SettleCompletion::Quiescent { pending, .. } |
+        settle::SettleCompletion::QuiescentWithPersistentWork { pending, .. } => {
             return Ok(pending);
         },
         settle::SettleCompletion::BlockedOnExternalIo {
@@ -5720,16 +5952,16 @@ fn restart_session_projection_after_drift(
             SessionProjectionKind::ControlledOpen {
                 settle_resume: Some(_),
                 ..
-            }
-            | SessionProjectionKind::Navigate {
+            } |
+            SessionProjectionKind::Navigate {
                 settle_resume: Some(_),
                 ..
-            }
-            | SessionProjectionKind::Value {
+            } |
+            SessionProjectionKind::Value {
                 settle_resume: Some(_),
                 ..
-            }
-            | SessionProjectionKind::Automation { .. } => {
+            } |
+            SessionProjectionKind::Automation { .. } => {
                 unreachable!("projection resume was handled before legacy restart")
             },
         }
@@ -5742,9 +5974,9 @@ fn session_projection_settle_resume(
 ) -> Option<&SettleProjectionResume> {
     match kind {
         SessionProjectionKind::Automation { settle_resume, .. } => Some(settle_resume),
-        SessionProjectionKind::Value { settle_resume, .. }
-        | SessionProjectionKind::Navigate { settle_resume, .. }
-        | SessionProjectionKind::ControlledOpen { settle_resume, .. } => settle_resume.as_ref(),
+        SessionProjectionKind::Value { settle_resume, .. } |
+        SessionProjectionKind::Navigate { settle_resume, .. } |
+        SessionProjectionKind::ControlledOpen { settle_resume, .. } => settle_resume.as_ref(),
     }
 }
 
@@ -5753,9 +5985,9 @@ fn session_projection_settle_resume_mut(
 ) -> Option<&mut SettleProjectionResume> {
     match kind {
         SessionProjectionKind::Automation { settle_resume, .. } => Some(settle_resume),
-        SessionProjectionKind::Value { settle_resume, .. }
-        | SessionProjectionKind::Navigate { settle_resume, .. }
-        | SessionProjectionKind::ControlledOpen { settle_resume, .. } => settle_resume.as_mut(),
+        SessionProjectionKind::Value { settle_resume, .. } |
+        SessionProjectionKind::Navigate { settle_resume, .. } |
+        SessionProjectionKind::ControlledOpen { settle_resume, .. } => settle_resume.as_mut(),
     }
 }
 
@@ -5774,16 +6006,16 @@ fn should_pump_servo(
     force_initial_pump: bool,
     servo_changed: bool,
 ) -> bool {
-    !active.is_some_and(|active| active_operation_suppresses_servo_pump(&active.operation))
-        && (force_initial_pump || servo_changed)
+    !active.is_some_and(|active| active_operation_suppresses_servo_pump(&active.operation)) &&
+        (force_initial_pump || servo_changed)
 }
 
 fn active_operation_suppresses_servo_pump(operation: &ActiveOperation) -> bool {
     matches!(
         operation,
         ActiveOperation::SessionProjection(SessionProjectionState {
-            phase: SessionProjectionPhase::AwaitingStableNavigation { .. }
-                | SessionProjectionPhase::AwaitingReplacementAdmission { .. },
+            phase: SessionProjectionPhase::AwaitingStableNavigation { .. } |
+                SessionProjectionPhase::AwaitingReplacementAdmission { .. },
             ..
         }) | ActiveOperation::SessionProjection(SessionProjectionState {
             phase: SessionProjectionPhase::AwaitingInitialNavigation,
@@ -5801,8 +6033,8 @@ fn active_operation_suppresses_servo_pump(operation: &ActiveOperation) -> bool {
             ..
         }) | ActiveOperation::Settle(SettleState {
             replacement: Some(
-                SettleReplacementPhase::AwaitingAdmission { .. }
-                    | SettleReplacementPhase::AwaitingActivation { .. }
+                SettleReplacementPhase::AwaitingAdmission { .. } |
+                    SettleReplacementPhase::AwaitingActivation { .. }
             ),
             ..
         }) | ActiveOperation::Settle(SettleState {
@@ -5910,13 +6142,13 @@ fn exact_replacement_admission(
     source: &SessionNavigationAuthority,
     admitted: &SessionNavigationAuthority,
 ) -> Option<ReplacementAdmission> {
-    if source.terminal().is_some()
-        || admitted.terminal().is_some()
-        || admitted.url().scheme() != "http" && admitted.url().scheme() != "https"
-        || admitted.document_epoch() != source.document_epoch()
-        || admitted.successful_document_replacements() != source.successful_document_replacements()
-        || admitted.history_revision() < source.history_revision()
-        || admitted.navigation_id().get() != source.navigation_id().get().checked_add(1)?
+    if source.terminal().is_some() ||
+        admitted.terminal().is_some() ||
+        admitted.url().scheme() != "http" && admitted.url().scheme() != "https" ||
+        admitted.document_epoch() != source.document_epoch() ||
+        admitted.successful_document_replacements() != source.successful_document_replacements() ||
+        admitted.history_revision() < source.history_revision() ||
+        admitted.navigation_id().get() != source.navigation_id().get().checked_add(1)?
     {
         return None;
     }
@@ -5933,20 +6165,20 @@ fn exact_replacement_admission(
     let [pipeline_id] = after.pending_top_level_pipelines() else {
         return None;
     };
-    if source_active.pipeline_id != *source_pipeline_id
-        || *fully_active_source != *source_pipeline_id
-        || !before.pending_top_level_pipelines().is_empty()
-        || *pipeline_id == *source_pipeline_id
-        || after.webview_id != before.webview_id
-        || after.event_loop_id != before.event_loop_id
-        || after.unsupported_time_surface != before.unsupported_time_surface
-        || after.active_top_level != Some(source_active)
-        || after.fully_active_pipelines() != [*source_pipeline_id]
-        || after.pipelines().len() != 2
-        || !after.contains_pipeline(*source_pipeline_id)
-        || !after.contains_pipeline(*pipeline_id)
-        || before.navigation_revision.checked_next()? != after.navigation_revision
-        || before.pipeline_membership_revision.checked_next()? != after.pipeline_membership_revision
+    if source_active.pipeline_id != *source_pipeline_id ||
+        *fully_active_source != *source_pipeline_id ||
+        !before.pending_top_level_pipelines().is_empty() ||
+        *pipeline_id == *source_pipeline_id ||
+        after.webview_id != before.webview_id ||
+        after.event_loop_id != before.event_loop_id ||
+        after.unsupported_time_surface != before.unsupported_time_surface ||
+        after.active_top_level != Some(source_active) ||
+        after.fully_active_pipelines() != [*source_pipeline_id] ||
+        after.pipelines().len() != 2 ||
+        !after.contains_pipeline(*source_pipeline_id) ||
+        !after.contains_pipeline(*pipeline_id) ||
+        before.navigation_revision.checked_next()? != after.navigation_revision ||
+        before.pipeline_membership_revision.checked_next()? != after.pipeline_membership_revision
     {
         return None;
     }
@@ -5958,32 +6190,32 @@ fn exact_replacement_admission(
 }
 
 fn initial_navigation_reached_controlled_ready(navigation: &SessionNavigationAuthority) -> bool {
-    navigation.navigation_id().get() == 0
-        && navigation.document_epoch().get() == 1
-        && navigation.successful_document_replacements() == 0
-        && navigation.terminal().is_none()
+    navigation.navigation_id().get() == 0 &&
+        navigation.document_epoch().get() == 1 &&
+        navigation.successful_document_replacements() == 0 &&
+        navigation.terminal().is_none()
 }
 
 fn session_navigation_reached_controlled_ready(navigation: &SessionNavigationAuthority) -> bool {
     let target = navigation.target();
-    navigation.document_epoch().get() >= 1
-        && navigation.terminal().is_none()
-        && matches!(navigation.url().scheme(), "http" | "https")
-        && target.active_top_level.is_some()
-        && target.pipelines().len() == 1
-        && target.fully_active_pipelines() == target.pipelines()
-        && target.pending_top_level_pipelines().is_empty()
+    navigation.document_epoch().get() >= 1 &&
+        navigation.terminal().is_none() &&
+        matches!(navigation.url().scheme(), "http" | "https") &&
+        target.active_top_level.is_some() &&
+        target.pipelines().len() == 1 &&
+        target.fully_active_pipelines() == target.pipelines() &&
+        target.pending_top_level_pipelines().is_empty()
 }
 
 fn explicit_navigation_chain_reached_controlled_ready(
     source: &SessionNavigationAuthority,
     navigation: &SessionNavigationAuthority,
 ) -> bool {
-    session_navigation_reached_controlled_ready(navigation)
-        && navigation.target().webview_id == source.target().webview_id
-        && navigation.target().event_loop_id == source.target().event_loop_id
-        && navigation.document_epoch() > source.document_epoch()
-        && navigation.successful_document_replacements() > source.successful_document_replacements()
+    session_navigation_reached_controlled_ready(navigation) &&
+        navigation.target().webview_id == source.target().webview_id &&
+        navigation.target().event_loop_id == source.target().event_loop_id &&
+        navigation.document_epoch() > source.document_epoch() &&
+        navigation.successful_document_replacements() > source.successful_document_replacements()
 }
 
 fn explicit_navigation_reached_controlled_ready(
@@ -6003,29 +6235,29 @@ fn explicit_navigation_reached_controlled_ready(
     };
     let before = admitted.target();
     let after = observed.target();
-    observed.navigation_id() == admitted.navigation_id()
-        && observed.document_epoch().get() == expected_document_epoch
-        && observed.successful_document_replacements() == expected_replacements
-        && observed.history_revision() >= admitted.history_revision()
-        && matches!(observed.url().scheme(), "http" | "https")
-        && observed.terminal().is_none()
-        && after.webview_id == before.webview_id
-        && after.event_loop_id == before.event_loop_id
-        && after.unsupported_time_surface == before.unsupported_time_surface
-        && after.active_top_level.is_some_and(|active| {
-            active.pipeline_id == admission.pipeline_id
-                && active.pipeline_id != admission.source_pipeline_id
-        })
-        && after.pipelines() == [admission.pipeline_id]
-        && after.fully_active_pipelines() == [admission.pipeline_id]
-        && after.pending_top_level_pipelines().is_empty()
-        && before
+    observed.navigation_id() == admitted.navigation_id() &&
+        observed.document_epoch().get() == expected_document_epoch &&
+        observed.successful_document_replacements() == expected_replacements &&
+        observed.history_revision() >= admitted.history_revision() &&
+        matches!(observed.url().scheme(), "http" | "https") &&
+        observed.terminal().is_none() &&
+        after.webview_id == before.webview_id &&
+        after.event_loop_id == before.event_loop_id &&
+        after.unsupported_time_surface == before.unsupported_time_surface &&
+        after.active_top_level.is_some_and(|active| {
+            active.pipeline_id == admission.pipeline_id &&
+                active.pipeline_id != admission.source_pipeline_id
+        }) &&
+        after.pipelines() == [admission.pipeline_id] &&
+        after.fully_active_pipelines() == [admission.pipeline_id] &&
+        after.pending_top_level_pipelines().is_empty() &&
+        before
             .navigation_revision
             .checked_next()
-            .and_then(|revision| revision.checked_next())
-            == Some(after.navigation_revision)
-        && before.pipeline_membership_revision.checked_next()
-            == Some(after.pipeline_membership_revision)
+            .and_then(|revision| revision.checked_next()) ==
+            Some(after.navigation_revision) &&
+        before.pipeline_membership_revision.checked_next() ==
+            Some(after.pipeline_membership_revision)
 }
 
 /// Recognize the sole valid activation state before the asynchronously exiting source pipeline
@@ -6040,24 +6272,24 @@ fn explicit_navigation_activation_target_awaiting_source_exit(
         return false;
     };
     let before = admitted.target();
-    after.webview_id == before.webview_id
-        && after.event_loop_id == before.event_loop_id
-        && after.unsupported_time_surface == before.unsupported_time_surface
-        && after.active_top_level.is_some_and(|active| {
-            active.pipeline_id == admission.pipeline_id
-                && active.pipeline_id != admission.source_pipeline_id
-        })
-        && after.pipelines().len() == 2
-        && after.contains_pipeline(admission.source_pipeline_id)
-        && after.contains_pipeline(admission.pipeline_id)
-        && after.fully_active_pipelines() == [admission.pipeline_id]
-        && after.pending_top_level_pipelines().is_empty()
-        && before
+    after.webview_id == before.webview_id &&
+        after.event_loop_id == before.event_loop_id &&
+        after.unsupported_time_surface == before.unsupported_time_surface &&
+        after.active_top_level.is_some_and(|active| {
+            active.pipeline_id == admission.pipeline_id &&
+                active.pipeline_id != admission.source_pipeline_id
+        }) &&
+        after.pipelines().len() == 2 &&
+        after.contains_pipeline(admission.source_pipeline_id) &&
+        after.contains_pipeline(admission.pipeline_id) &&
+        after.fully_active_pipelines() == [admission.pipeline_id] &&
+        after.pending_top_level_pipelines().is_empty() &&
+        before
             .navigation_revision
             .checked_next()
-            .and_then(|revision| revision.checked_next())
-            == Some(after.navigation_revision)
-        && before.pipeline_membership_revision == after.pipeline_membership_revision
+            .and_then(|revision| revision.checked_next()) ==
+            Some(after.navigation_revision) &&
+        before.pipeline_membership_revision == after.pipeline_membership_revision
 }
 
 fn explicit_navigation_activated_awaiting_source_exit(
@@ -6072,13 +6304,13 @@ fn explicit_navigation_activated_awaiting_source_exit(
     else {
         return false;
     };
-    observed.navigation_id() == admitted.navigation_id()
-        && observed.document_epoch().get() == expected_document_epoch
-        && observed.successful_document_replacements() == expected_replacements
-        && observed.history_revision() >= admitted.history_revision()
-        && matches!(observed.url().scheme(), "http" | "https")
-        && observed.terminal().is_none()
-        && explicit_navigation_activation_target_awaiting_source_exit(
+    observed.navigation_id() == admitted.navigation_id() &&
+        observed.document_epoch().get() == expected_document_epoch &&
+        observed.successful_document_replacements() == expected_replacements &&
+        observed.history_revision() >= admitted.history_revision() &&
+        matches!(observed.url().scheme(), "http" | "https") &&
+        observed.terminal().is_none() &&
+        explicit_navigation_activation_target_awaiting_source_exit(
             source,
             admitted,
             observed.target(),
@@ -6112,8 +6344,8 @@ fn held_drive_replacement_target_progressed(
             before == admitted.target()
         },
         ReplacementActivationObservation::ControlledReady => {
-            before == admitted.target()
-                || explicit_navigation_activation_target_awaiting_source_exit(
+            before == admitted.target() ||
+                explicit_navigation_activation_target_awaiting_source_exit(
                     source, admitted, before,
                 )
         },
@@ -6146,6 +6378,7 @@ fn project_session_value<T: serde::Serialize>(
 }
 
 fn project_session_pending(
+    profile: SessionProfile,
     result: wire::RuntimePendingResult,
     pending: &servo::document_pending::RawPendingSnapshot,
     state_effect: RequestStateEffect,
@@ -6157,7 +6390,7 @@ fn project_session_pending(
         false,
         state_effect,
         Some(SettleProjectionResume {
-            profile: SessionProfile::ControlledWebSessionV1,
+            profile,
             effective_policy,
             cumulative_external_io_wall_time: Duration::ZERO,
             authorizing_navigation: None,
@@ -6219,16 +6452,16 @@ fn settle_failure(
     let mutating = command.is_some_and(command_is_mutating);
     let indeterminate = matches!(
         &error,
-        settle::SettleFailure::DriveOneTurnOutcomeIndeterminate(_)
-            | settle::SettleFailure::DriveOutcomeIndeterminate(_)
-            | settle::SettleFailure::AdvanceOutcomeIndeterminate(_)
-    ) || (mutating
-        && matches!(&error, settle::SettleFailure::InvalidControlOutcome(_)));
+        settle::SettleFailure::DriveOneTurnOutcomeIndeterminate(_) |
+            settle::SettleFailure::DriveOutcomeIndeterminate(_) |
+            settle::SettleFailure::AdvanceOutcomeIndeterminate(_)
+    ) || (mutating &&
+        matches!(&error, settle::SettleFailure::InvalidControlOutcome(_)));
     let internal = matches!(
         &error,
-        settle::SettleFailure::InvalidCoordinatorState(_)
-            | settle::SettleFailure::InvalidControlOutcome(_)
-            | settle::SettleFailure::ExternalIoWallTimeRegressed { .. }
+        settle::SettleFailure::InvalidCoordinatorState(_) |
+            settle::SettleFailure::InvalidControlOutcome(_) |
+            settle::SettleFailure::ExternalIoWallTimeRegressed { .. }
     );
     ActiveFailure {
         error: if indeterminate {
@@ -6283,10 +6516,10 @@ fn harden_continuation_failure(
 fn command_is_mutating(command: &DocumentControlCommand) -> bool {
     match command {
         DocumentControlCommand::Observe => false,
-        DocumentControlCommand::DriveOneTurn
-        | DocumentControlCommand::BootstrapInitialPipeline { .. }
-        | DocumentControlCommand::BootstrapReplacementPipeline { .. }
-        | DocumentControlCommand::AdvanceTo(_) => true,
+        DocumentControlCommand::DriveOneTurn |
+        DocumentControlCommand::BootstrapInitialPipeline { .. } |
+        DocumentControlCommand::BootstrapReplacementPipeline { .. } |
+        DocumentControlCommand::AdvanceTo(_) => true,
         DocumentControlCommand::Automate(request) => {
             DocumentControlAutomationKind::from_request(request).is_mutating()
         },
@@ -6297,8 +6530,8 @@ fn receive_outcome_virtual_time_ns(outcome: &DocumentControlReceiveOutcome) -> O
     match outcome {
         DocumentControlReceiveOutcome::CommandOutcome(DocumentControlOutcome::Completed(
             observation,
-        ))
-        | DocumentControlReceiveOutcome::CommandOutcome(
+        )) |
+        DocumentControlReceiveOutcome::CommandOutcome(
             DocumentControlOutcome::AutomationCompleted { observation, .. },
         ) => Some(observation.pending().clock.now.as_nanos()),
         _ => None,
@@ -6311,8 +6544,8 @@ fn receive_outcome_pending_target(
     match outcome {
         DocumentControlReceiveOutcome::CommandOutcome(DocumentControlOutcome::Completed(
             observation,
-        ))
-        | DocumentControlReceiveOutcome::CommandOutcome(
+        )) |
+        DocumentControlReceiveOutcome::CommandOutcome(
             DocumentControlOutcome::AutomationCompleted { observation, .. },
         ) => Some(&observation.pending().target),
         _ => None,
@@ -6329,20 +6562,20 @@ fn session_state_protocol_error(error: SessionStateError) -> ProtocolError {
         "session-state operation was rejected",
         match error {
             SessionStateError::BackendRejected(
-                stasis_shell::session_state::SessionStateBackendStage::CookieReplace
-                | stasis_shell::session_state::SessionStateBackendStage::WebStorageReplace,
+                stasis_shell::session_state::SessionStateBackendStage::CookieReplace |
+                stasis_shell::session_state::SessionStateBackendStage::WebStorageReplace,
             ) => "indeterminate",
             _ => "none",
         },
     );
     if matches!(
         error,
-        SessionStateError::TokenEntropyUnavailable
-            | SessionStateError::TokenSpaceExhausted
-            | SessionStateError::BackendRevisionRegressed
-            | SessionStateError::BackendRejected(
-                stasis_shell::session_state::SessionStateBackendStage::CookieReplace
-                    | stasis_shell::session_state::SessionStateBackendStage::WebStorageReplace
+        SessionStateError::TokenEntropyUnavailable |
+            SessionStateError::TokenSpaceExhausted |
+            SessionStateError::BackendRevisionRegressed |
+            SessionStateError::BackendRejected(
+                stasis_shell::session_state::SessionStateBackendStage::CookieReplace |
+                    stasis_shell::session_state::SessionStateBackendStage::WebStorageReplace
             )
     ) {
         protocol.fatal = true;
@@ -6351,15 +6584,15 @@ fn session_state_protocol_error(error: SessionStateError) -> ProtocolError {
 }
 
 fn harden_session_state_mutation_error(method: &str, mut error: ProtocolError) -> ProtocolError {
-    if matches!(method, "session.cookies.set" | "session.storage.set")
-        && matches!(
+    if matches!(method, "session.cookies.set" | "session.storage.set") &&
+        matches!(
             error.code,
-            "session_state_backend_observe_failed"
-                | "session_state_cookie_replace_failed"
-                | "session_state_web_storage_replace_failed"
-                | "session_state_backend_revision_regressed"
-                | "session_state_token_entropy_unavailable"
-                | "session_state_token_space_exhausted"
+            "session_state_backend_observe_failed" |
+                "session_state_cookie_replace_failed" |
+                "session_state_web_storage_replace_failed" |
+                "session_state_backend_revision_regressed" |
+                "session_state_token_entropy_unavailable" |
+                "session_state_token_space_exhausted"
         )
     {
         error.fatal = true;
@@ -6466,9 +6699,9 @@ fn controlled_network_failure(
             ),
             false,
         ),
-        ControlledNetworkFailure::EvidenceLedgerFailure
-        | ControlledNetworkFailure::LifecycleInvariant
-        | ControlledNetworkFailure::VirtualTimeRegressed => (
+        ControlledNetworkFailure::EvidenceLedgerFailure |
+        ControlledNetworkFailure::LifecycleInvariant |
+        ControlledNetworkFailure::VirtualTimeRegressed => (
             fatal_operation(
                 "internal_runtime_failure",
                 format!("controlled-network authority failed: {failure:?}"),
@@ -6553,11 +6786,11 @@ impl OpenParams {
     fn configuration(self) -> Result<OpenConfiguration, ProtocolError> {
         match self.clock_mode {
             OpenClockMode::Real => {
-                if self.initial_virtual_time_ns.is_some()
-                    || self.unix_time_origin_ns.is_some()
-                    || self.profile.is_some()
-                    || self.state.is_some()
-                    || self.network.is_some()
+                if self.initial_virtual_time_ns.is_some() ||
+                    self.unix_time_origin_ns.is_some() ||
+                    self.profile.is_some() ||
+                    self.state.is_some() ||
+                    self.network.is_some()
                 {
                     return Err(ProtocolError::invalid_request(
                         "controlled time, profile, state, and network fields require clockMode controlled",
@@ -6577,9 +6810,12 @@ impl OpenParams {
                     Some(CONTROLLED_WEB_SESSION_V1_PROFILE) => {
                         SessionProfile::ControlledWebSessionV1
                     },
+                    Some(CONTROLLED_WEB_SESSION_V2_PROFILE) => {
+                        SessionProfile::ControlledWebSessionV2
+                    },
                     _ => {
                         return Err(ProtocolError::invalid_request(format!(
-                            "controlled sessions require profile {CONTROLLED_WEBAPP_V1_PROFILE} or {CONTROLLED_WEB_SESSION_V1_PROFILE}",
+                            "controlled sessions require profile {CONTROLLED_WEBAPP_V1_PROFILE}, {CONTROLLED_WEB_SESSION_V1_PROFILE}, or {CONTROLLED_WEB_SESSION_V2_PROFILE}",
                         )));
                     },
                 };
@@ -6592,11 +6828,11 @@ impl OpenParams {
                         "unixTimeOriginNs must be 0 in the controlled MVP",
                     ));
                 }
-                if profile != SessionProfile::ControlledWebSessionV1
-                    && (self.state.is_some() || self.network.is_some())
+                if !profile.supports_session_api() &&
+                    (self.state.is_some() || self.network.is_some())
                 {
                     return Err(ProtocolError::invalid_request(format!(
-                        "state and network require profile {CONTROLLED_WEB_SESSION_V1_PROFILE}",
+                        "state and network require profile {CONTROLLED_WEB_SESSION_V1_PROFILE} or {CONTROLLED_WEB_SESSION_V2_PROFILE}",
                     )));
                 }
                 Ok(OpenConfiguration {
@@ -6791,6 +7027,7 @@ mod tests {
     struct FakeEngine {
         clock_mode: EngineClockMode,
         document_control_profile: DocumentControlProfile,
+        document_execution_profile: DocumentExecutionProfile,
         pump_calls: usize,
         cancel_calls: usize,
         navigation_cancel_calls: usize,
@@ -6810,6 +7047,7 @@ mod tests {
             Self {
                 clock_mode: EngineClockMode::Controlled { initial_time_ns: 0 },
                 document_control_profile: DocumentControlProfile::SingleDocument,
+                document_execution_profile: DocumentExecutionProfile::Baseline,
                 pump_calls: 0,
                 cancel_calls: 0,
                 navigation_cancel_calls: 0,
@@ -6830,6 +7068,12 @@ mod tests {
             engine.document_control_profile = DocumentControlProfile::TopLevelSession;
             engine
         }
+
+        fn controlled_session_v2() -> Self {
+            let mut engine = Self::controlled_session();
+            engine.document_execution_profile = DocumentExecutionProfile::ControlledWebSessionV2;
+            engine
+        }
     }
 
     impl EnginePort for FakeEngine {
@@ -6841,6 +7085,7 @@ mod tests {
             Ok(Self {
                 clock_mode: options.clock_mode,
                 document_control_profile: options.document_control_profile,
+                document_execution_profile: options.document_execution_profile,
                 pump_calls: 0,
                 cancel_calls: 0,
                 navigation_cancel_calls: 0,
@@ -6870,6 +7115,10 @@ mod tests {
 
         fn document_control_profile(&self) -> DocumentControlProfile {
             self.document_control_profile
+        }
+
+        fn document_execution_profile(&self) -> DocumentExecutionProfile {
+            self.document_execution_profile
         }
 
         fn evaluate(&self, _expression: &str) -> Result<Value, ProtocolError> {
@@ -7586,14 +7835,20 @@ mod tests {
         let waker = ShellWaker::default();
         let cursor = waker.snapshot_checked().unwrap();
         let profile = engine.as_ref().and_then(|engine| {
-            (engine.document_control_profile == DocumentControlProfile::TopLevelSession)
-                .then_some(SessionProfile::ControlledWebSessionV1)
-                .or_else(|| {
-                    engine
-                        .clock_mode
-                        .is_controlled()
-                        .then_some(SessionProfile::ControlledWebappV1)
-                })
+            match (
+                engine.document_control_profile,
+                engine.document_execution_profile,
+            ) {
+                (
+                    DocumentControlProfile::TopLevelSession,
+                    DocumentExecutionProfile::ControlledWebSessionV2,
+                ) => Some(SessionProfile::ControlledWebSessionV2),
+                (DocumentControlProfile::TopLevelSession, DocumentExecutionProfile::Baseline) => {
+                    Some(SessionProfile::ControlledWebSessionV1)
+                },
+                _ if engine.clock_mode.is_controlled() => Some(SessionProfile::ControlledWebappV1),
+                _ => None,
+            }
         });
         Shell {
             state,
@@ -7636,20 +7891,20 @@ mod tests {
     }
 
     #[test]
-    fn initialize_advertises_the_frozen_v2_profile_and_methods() {
+    fn initialize_advertises_profiles_in_append_only_order_and_session_methods() {
         let mut bytes = Vec::new();
         {
             let mut shell = shell(&mut bytes, ShellState::Spawned, None);
             assert!(!shell.handle(request("protocol.initialize", None)).unwrap());
         }
         let response = frames(&bytes).pop().unwrap();
-        let profiles = response["result"]["capabilities"]["profiles"]
-            .as_array()
-            .unwrap();
-        assert!(
-            profiles
-                .iter()
-                .any(|value| { value.as_str() == Some(CONTROLLED_WEB_SESSION_V1_PROFILE) })
+        assert_eq!(
+            response["result"]["capabilities"]["profiles"],
+            json!([
+                CONTROLLED_WEBAPP_V1_PROFILE,
+                CONTROLLED_WEB_SESSION_V1_PROFILE,
+                CONTROLLED_WEB_SESSION_V2_PROFILE,
+            ])
         );
         let methods = response["result"]["capabilities"]["methods"]
             .as_array()
@@ -7670,6 +7925,34 @@ mod tests {
                 "initialize omitted {method}",
             );
         }
+    }
+
+    #[test]
+    fn named_session_profiles_select_exact_native_execution_policy() {
+        assert_eq!(
+            SessionProfile::ControlledWebSessionV1.document_control_profile(),
+            DocumentControlProfile::TopLevelSession,
+        );
+        assert_eq!(
+            SessionProfile::ControlledWebSessionV1.document_execution_profile(),
+            DocumentExecutionProfile::Baseline,
+        );
+        assert_eq!(
+            SessionProfile::ControlledWebSessionV2.document_control_profile(),
+            DocumentControlProfile::TopLevelSession,
+        );
+        assert_eq!(
+            SessionProfile::ControlledWebSessionV2.document_execution_profile(),
+            DocumentExecutionProfile::ControlledWebSessionV2,
+        );
+
+        let mut output = Vec::new();
+        let shell = shell(
+            &mut output,
+            ShellState::Open,
+            Some(FakeEngine::controlled_session_v2()),
+        );
+        assert_eq!(shell.profile, Some(SessionProfile::ControlledWebSessionV2));
     }
 
     #[test]
@@ -7882,6 +8165,19 @@ mod tests {
             Some(SessionProfile::ControlledWebSessionV1)
         );
 
+        let session_v2: OpenParams = serde_json::from_value(json!({
+            "url": "about:blank",
+            "clockMode": "controlled",
+            "profile": CONTROLLED_WEB_SESSION_V2_PROFILE,
+            "initialVirtualTimeNs": "42",
+            "unixTimeOriginNs": "0"
+        }))
+        .unwrap();
+        assert_eq!(
+            session_v2.configuration().unwrap().profile,
+            Some(SessionProfile::ControlledWebSessionV2)
+        );
+
         let unsupported: OpenParams = serde_json::from_value(json!({
             "url": "about:blank",
             "clockMode": "controlled",
@@ -7986,6 +8282,126 @@ mod tests {
         }
 
         assert!(frames(&bytes).is_empty());
+    }
+
+    #[test]
+    fn controlled_open_wall_deadline_survives_the_settle_phase() {
+        let mut bytes = Vec::new();
+        {
+            let mut shell = shell(
+                &mut bytes,
+                ShellState::Open,
+                Some(FakeEngine::controlled_session_v2()),
+            );
+            let profile = SessionProfile::ControlledWebSessionV2;
+            let deadline = Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap();
+            let effective_policy = default_resolved_settle_policy();
+            shell.active = Some(ActiveRequest {
+                request: request("session.open", None),
+                profile: Some(profile),
+                operation: ActiveOperation::Settle(SettleState {
+                    profile,
+                    authorizing_document_state: None,
+                    authorizing_observation: None,
+                    authorizing_navigation: None,
+                    replacement: None,
+                    authority_bound_command: None,
+                    latest_pending_target: None,
+                    response: SettleResponse::ControlledOpen {
+                        requested_url: Url::parse("https://example.test/").unwrap(),
+                        current_url: Url::parse("https://example.test/").unwrap(),
+                        profile,
+                        deadline,
+                        bootstrap_attempted: false,
+                    },
+                    coordinator: settle::SettleCoordinator::new(effective_policy.engine),
+                    effective_policy,
+                    cumulative_external_io_wall_time: Duration::ZERO,
+                    waiting: None,
+                }),
+                started_at: deadline,
+                in_flight: None,
+                control_turn_observed: None,
+                needs_initial_pump: false,
+                state_effect: RequestStateEffect::None,
+            });
+
+            assert_eq!(shell.next_wait_deadline(None, Instant::now()), deadline,);
+            assert!(
+                shell
+                    .service_controlled_open_deadline(Instant::now())
+                    .unwrap_err()
+                    .contains("fail-stopped")
+            );
+            assert!(shell.active.is_none());
+            assert!(shell.engine.is_none());
+            assert_eq!(shell.state, ShellState::Closed);
+        }
+
+        let response = frames(&bytes).pop().unwrap();
+        assert_eq!(response["error"]["code"], "controlled_open_timeout");
+        assert_eq!(response["error"]["fatal"], true);
+        assert_eq!(response["error"]["stateEffect"], "indeterminate");
+        assert!(response["sessionId"].is_null());
+    }
+
+    #[test]
+    fn controlled_open_wall_deadline_survives_session_projection() {
+        let mut bytes = Vec::new();
+        {
+            let mut shell = shell(
+                &mut bytes,
+                ShellState::Open,
+                Some(FakeEngine::controlled_session_v2()),
+            );
+            let profile = SessionProfile::ControlledWebSessionV2;
+            let deadline = Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap();
+            let navigation = session_authority(1, 1, 0, 0);
+            shell.active = Some(ActiveRequest {
+                request: request("session.open", None),
+                profile: Some(profile),
+                operation: ActiveOperation::SessionProjection(SessionProjectionState {
+                    pending: Box::new(pending_for_authority(&navigation, 1)),
+                    kind: SessionProjectionKind::ControlledOpen {
+                        requested_url: Url::parse("https://example.test/").unwrap(),
+                        current_url: Url::parse("https://example.test/").unwrap(),
+                        profile,
+                        deadline,
+                        bootstrap_attempted: false,
+                        cumulative_external_io_wall_time: Duration::ZERO,
+                        session_state_token: None,
+                        settle_resume: None,
+                    },
+                    phase: SessionProjectionPhase::AwaitingInitialNavigation,
+                }),
+                started_at: deadline,
+                in_flight: None,
+                control_turn_observed: None,
+                needs_initial_pump: false,
+                state_effect: RequestStateEffect::None,
+            });
+
+            assert_eq!(shell.next_wait_deadline(None, Instant::now()), deadline,);
+            assert!(
+                shell
+                    .service_controlled_open_deadline(Instant::now())
+                    .unwrap_err()
+                    .contains("fail-stopped")
+            );
+            assert!(shell.active.is_none());
+            assert!(shell.engine.is_none());
+            assert_eq!(shell.state, ShellState::Closed);
+        }
+
+        let response = frames(&bytes).pop().unwrap();
+        assert_eq!(response["error"]["code"], "controlled_open_timeout");
+        assert_eq!(response["error"]["fatal"], true);
+        assert_eq!(response["error"]["stateEffect"], "indeterminate");
+        assert!(response["sessionId"].is_null());
     }
 
     #[test]
@@ -8147,6 +8563,7 @@ mod tests {
             let real = FakeEngine {
                 clock_mode: EngineClockMode::Real,
                 document_control_profile: DocumentControlProfile::SingleDocument,
+                document_execution_profile: DocumentExecutionProfile::Baseline,
                 pump_calls: 0,
                 cancel_calls: 0,
                 navigation_cancel_calls: 0,

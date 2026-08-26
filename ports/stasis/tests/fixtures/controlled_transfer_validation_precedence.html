@@ -1,0 +1,50 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled transfer validation precedence fixture</title>
+<button id="start">start</button>
+<div id="result">idle</div>
+<script>
+  document.querySelector("#start").onclick = () => {
+    const cases = [
+      ["message-port", () => {
+        const channel = new MessageChannel();
+        channel.port1.close();
+        return [channel.port1, () => channel.port2.close()];
+      }],
+      ["readable", () => {
+        const stream = new ReadableStream();
+        const reader = stream.getReader();
+        return [stream, () => reader.releaseLock()];
+      }],
+      ["writable", () => {
+        const stream = new WritableStream();
+        const writer = stream.getWriter();
+        return [stream, () => writer.releaseLock()];
+      }],
+      ["transform", () => {
+        const stream = new TransformStream();
+        const reader = stream.readable.getReader();
+        return [stream, () => reader.releaseLock()];
+      }],
+    ];
+    const outcomes = [];
+
+    for (const [name, makeTransferable] of cases) {
+      const buffer = new ArrayBuffer(16);
+      const [transferable, cleanup] = makeTransferable();
+      let errorName = "no-error";
+      try {
+        structuredClone(
+          { buffer, transferable },
+          { transfer: [buffer, transferable] },
+        );
+      } catch (error) {
+        errorName = error.name;
+      }
+      cleanup();
+      outcomes.push(`${name}:${errorName}:buffer:${buffer.byteLength}`);
+    }
+
+    document.querySelector("#result").textContent = outcomes.join("|");
+  };
+</script>

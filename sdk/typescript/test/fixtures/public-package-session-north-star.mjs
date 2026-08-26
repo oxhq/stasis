@@ -337,8 +337,8 @@ async function inspectManagedRuntimeCacheProof(proof) {
   const marker = JSON.parse(await readFile(markerEntry.absolutePath, "utf8"));
   assert.equal(marker.schema, 1);
   assert.equal(marker.packageName, "@oxhq/stasis");
-  assert.equal(marker.sdkVersion, "0.2.1");
-  assert.equal(marker.releaseTag, "v0.2.1");
+  assert.equal(marker.sdkVersion, "0.3.0");
+  assert.equal(marker.releaseTag, "v0.3.0");
   assert.equal(marker.implementation?.name, "stasis-shell");
   assert.equal(marker.executablePath, "stasis");
   const expectedReleasePlatform =
@@ -369,7 +369,7 @@ async function inspectManagedRuntimeCacheProof(proof) {
     markerEntry.relativePath,
     join(
       "runtime-v1",
-      "0.2.1",
+      "0.3.0",
       `${process.platform}-${process.arch}`,
       marker.archiveSha256,
       ".stasis-runtime.json",
@@ -379,7 +379,7 @@ async function inspectManagedRuntimeCacheProof(proof) {
   const archiveUrl = new URL(marker.archiveUrl);
   assert.equal(
     archiveUrl.href,
-    `https://github.com/oxhq/stasis/releases/download/v0.2.1/stasis-0.2.1-${expectedReleasePlatform}.tar.gz`,
+    `https://github.com/oxhq/stasis/releases/download/v0.3.0/stasis-0.3.0-${expectedReleasePlatform}.tar.gz`,
   );
 
   const executable = join(dirname(markerEntry.absolutePath), marker.executablePath);
@@ -1017,7 +1017,7 @@ async function proveReferenceCrawler(server) {
 
 function assertV02Capabilities(runtime) {
   assert.equal(runtime.info.implementation.name, "stasis-shell");
-  assert.equal(runtime.info.implementation.version, "0.2.1");
+  assert.equal(runtime.info.implementation.version, "0.3.0");
   if (runtimeCacheProof.expectedRevision !== undefined) {
     assert.equal(
       runtime.info.implementation.source?.stasis_revision,

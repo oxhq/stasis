@@ -10,11 +10,13 @@ single FIFO protocol lane.
 pnpm add @oxhq/stasis
 ```
 
-Select the current stable patch exactly with `pnpm add @oxhq/stasis@0.2.1`.
+This source/package train is versioned `0.3.0`; install those immutable bytes explicitly with
+`pnpm add @oxhq/stasis@0.3.0` after the registry, release, provenance, and anonymous-consumer
+gates have published them. Untagged source alone does not prove that publication occurred.
+`@oxhq/stasis@0.2.1` remains the immutable stable predecessor.
 
-The release pairs `@oxhq/stasis@0.2.1` with native implementation
-`stasis-shell` version `0.2.1`, sourced from
-`https://github.com/oxhq/stasis.git`. Node.js 20 or newer is required. The
+An exact stable package pairs the TypeScript package with the same-version native
+`stasis-shell`, sourced from `https://github.com/oxhq/stasis.git`. Node.js 20 or newer is required. The
 SDK has no install lifecycle scripts or runtime dependencies. On the release's
 macOS Apple Silicon and Linux x86-64 targets, `launch()` downloads the exact release
 archive on first use, verifies its declared size, archive SHA-256, complete
@@ -22,6 +24,10 @@ file inventory, and executable SHA-256, then installs it atomically in a
 digest-keyed per-user cache. Unsupported hosts fail closed and can use an
 explicit compatible executable. The SDK always starts it directly with
 `shell: false`.
+
+The source identity is never a registry or release claim by itself. Before promotion, the exact
+tag, package, provenance, publication, and anonymous-consumer gates must complete; after
+promotion, verify the immutable tag and registry bytes rather than inferring status from this text.
 
 ## Use: controlled web sessions (v0.2)
 
@@ -85,6 +91,82 @@ request/evidence pages. `createStasisSessionPool()` and `crawlWithStasis()` add
 process-isolated concurrency and a same-origin crawler without weakening the
 one-session-per-process boundary.
 
+## Candidate modern-web session profile (v0.3)
+
+The source tree also exposes the explicitly selected `controlled-web-session-v2` candidate. This
+is not a publication claim: the native runtime must advertise v2, and omitting `profile` still
+selects stable v1.
+
+```ts
+import {
+  CONTROLLED_WEB_SESSION_V2_PROFILE,
+  launch,
+} from "@oxhq/stasis";
+
+const runtime = await launch({ executablePath: "/path/to/a/v2-capable/stasis" });
+const session = await runtime.openSession("https://app.example.test/", {
+  profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+});
+try {
+  const settled = await session.settle(session.stateToken);
+  console.log(session.settlementEvidence(settled));
+} finally {
+  await session.close();
+}
+```
+
+V2 adds bounded same-global, untransferred `MessageChannel` delivery; a bounded direct
+`HTMLImageElement.src` `data:image/svg+xml` cache/decode completion path; a distinct bounded inline
+`<svg>` path for its exact cached internally serialized data-SVG request and cache-ID owner; and
+suppression of only
+page-driven, single-line text InputMethod presentation when no virtual keyboard is requested in the
+exact public non-auxiliary controlled top-level document. The image path requires direct `src` selection without
+`srcset`/`picture`/environment changes, exact `image/svg+xml` from the canonical data-URL parser, a
+serialized URL no larger than 65,536 bytes, the same ScriptThread/ImageCache, and room within the
+512-record retained controlled-ownership cap. Its cache-hit or finite asynchronous completion is
+producer-fenced, and one document-clock timestamp is shared across the engine-generated image
+completion events. Cache-owned callback retirement completes its Image stream as owned cancellation,
+as does a dequeued response whose closed-pipeline tombstone proves that navigation retired its
+Window. A normal live handler rejection keeps the owner or key pending, completes the scoped
+message guard, and settles as typed `unsupported_rendering`; admission, enqueue, producer callback
+panic, actual handler unwind, pre-handler authority, target-invariant or clock failure, and guarded transport loss
+explicitly abandon the stream and retain a terminal. Either terminal or ordinary completion must
+match the exact live fence/sequence and registered Image class.
+The inline path additionally requires an internal request and the same
+canonical MIME/URL bound; its decode/vector work is fenced, but it creates no DOM load event.
+
+Local-channel authority is not borrowed through a same-origin wrapper. Construction requires the
+exact active public top-level target and an incumbent matching the owner global, pipeline, and
+WebView before either port is published. `postMessage()` performs the same check before structured
+cloning, so a missing or foreign incumbent, replaced/discarded target, or auxiliary owner is rejected
+before serialization or transfer detachment.
+
+Programmatic focus, including React `autoFocus`, preserves DOM events, value, and selection in that
+exact public target; its engine-generated focus transitions expose document-clock `Event.timeStamp`. Public mutating
+automation also samples the document Performance clock once before each action and shares it with
+every browser-created event constructed synchronously during that action. The fill, activation,
+reset, check/uncheck, select, invalid, submit, and formdata proof is representative, not an event-name
+allowlist. Each nonempty owned CSS animation pending-event dispatch batch also samples the document
+Performance clock once and stamps only internal `AnimationEvent` or `TransitionEvent` records owned
+by the exact public non-auxiliary controlled top-level WebView/document. The `TransitionEvent` adapter is conditional
+on an existing owned transition record reaching that queue; general transition settlement is not
+claimed. Auxiliary top-level WebViews remain host-stamped. Literal HTML `autofocus`, script-created event
+timestamps including `new AnimationEvent(...)` and `new TransitionEvent(...)`, other InputMethod
+shapes, and embedder controls remain unsupported, as do transferred, cross-global,
+cross-event-loop, worker, BroadcastChannel, and external channels. HTTP/HTTPS/blob/file and non-SVG image sources, responsive-image selection,
+CSS/background/generated-content ownership, animated images, general or nested/external SVG
+resource semantics, and cross-context image work receive no new v2 authority; baseline and v1 SVG
+behavior, CSS animation semantics and limits, and predecessor rejection authorities remain in force.
+When pending animation events still have a live scheduled opportunity, settlement treats them as
+finite demand for guarded `AdvanceTo` at the exact retained scheduler head; only an unscheduled
+batch is `Drive`-ready. This is a liveness correction, not another task source or limit.
+It reuses the `controlled-web-session-v1` cookie/Web Storage artifact, so exported
+`state.profile` intentionally remains `controlled-web-session-v1`; settlement evidence instead
+carries the runtime-bound selected execution-profile identity. One-argument
+`settlementEvidence(settled)` preserves that binding for SDK-produced results, and contradictory
+explicit profile claims are rejected. See the
+[candidate contract](../../docs/stasis/session-v0.3-candidate.md).
+
 ## Legacy controlled document (v0.1)
 
 `Runtime.open()` is the frozen legacy v1 document API. It remains available for
@@ -113,7 +195,8 @@ stored under the operating system's per-user cache directory
 (`~/Library/Caches/oxhq/stasis` on macOS). Acquisition requires HTTPS and an
 exact SDK-version/platform manifest match; cache hits are rehashed before use.
 
-`openSession()` is always controlled and selects `controlled-web-session-v1`.
+`openSession()` is always controlled and defaults to `controlled-web-session-v1`; a candidate
+session profile must be selected explicitly and advertised by the runtime.
 For the legacy `open()` API, omitting `clock` selects Controlled mode and the
 frozen `controlled-webapp-v1` profile; select Real mode explicitly with
 `{ clock: { mode: "real" } }`. `evaluate()` is available only through that
@@ -159,8 +242,8 @@ replay, and time-travel methods are not part of the v0.2 surface.
 ## Development
 
 `pnpm pack` fails closed unless the checked-in generated runtime manifest is
-canonically bound to the exact stable package version, both supported native
-platforms, and the ten-file stable archive inventory. Release automation must
+canonically bound to the exact source package version, both supported native
+platforms, and the twelve-file release archive inventory. Release automation must
 generate that manifest from the gated native artifacts before packing.
 
 ```sh

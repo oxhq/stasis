@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Unsupported multiline textarea InputMethod focus</title>
+<output id="result">not-focused</output>
+<textarea id="multiline-input">rwa-value</textarea>
+<script>
+// Exercise the same page-driven focus path as React autoFocus with a multiline text control.
+const textarea = document.querySelector("#multiline-input");
+textarea.addEventListener("focus", () => {
+  document.querySelector("#result").textContent =
+    document.activeElement === textarea ? "focused-textarea" : "blurred-textarea";
+});
+textarea.focus();
+</script>

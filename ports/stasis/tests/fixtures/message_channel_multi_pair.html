@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>MessageChannel multi-pair accounting fixture</title>
+<button id="prime" type="button">Prime queued and buffered pairs</button>
+<button id="start-buffered" type="button">Start buffered pair</button>
+<div id="result">idle</div>
+<script>
+const result = document.querySelector("#result");
+const trace = [];
+
+document.querySelector("#prime").addEventListener("click", () => {
+  const queued = new MessageChannel();
+  const buffered = new MessageChannel();
+  globalThis.multiPairChannels = { queued, buffered };
+
+  queued.port1.onmessage = (event) => {
+    trace.push(`queued:${event.data}`);
+    queued.port1.close();
+    queued.port2.close();
+    result.textContent = trace.join(">");
+  };
+
+  // addEventListener does not start the port, so this second pair retains its message in the
+  // native disabled-port buffer while the first pair retains an ordinary PortMessage task.
+  buffered.port1.addEventListener("message", (event) => {
+    trace.push(`buffered:${event.data}`);
+    buffered.port1.close();
+    buffered.port2.close();
+    globalThis.multiPairChannels = null;
+    result.textContent = trace.join(">");
+  });
+
+  queued.port2.postMessage("one");
+  buffered.port2.postMessage("two");
+  result.textContent = "primed";
+});
+
+document.querySelector("#start-buffered").addEventListener("click", () => {
+  globalThis.multiPairChannels.buffered.port1.start();
+  result.textContent = "started";
+});
+</script>

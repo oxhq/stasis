@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled MessageChannel serialized-payload boundary fixture</title>
+<button id="start" type="button">Test serialized payload boundary</button>
+<div id="result">idle</div>
+<script>
+// SpiderMonkey structured-clones a Latin-1 string as two eight-byte framing words followed by
+// its one-byte code units, padded to an eight-byte word. Therefore these inputs serialize to:
+//
+//   16 + 65,520                         = 65,536 bytes (accepted)
+//   16 + roundUpToWord(65,521)          = 65,544 bytes (typed rejection)
+//
+// A 65,537-byte clone cannot be emitted by this word-framed format. Using adjacent JavaScript
+// input sizes proves the exact 65,536-byte admission edge and its first representable overflow.
+const acceptedInputCodeUnits = 65_520;
+const rejectedInputCodeUnits = acceptedInputCodeUnits + 1;
+const result = document.querySelector("#result");
+
+document.querySelector("#start").addEventListener("click", () => {
+  const channel = new MessageChannel();
+  let accepted = false;
+  let rejected = "no-error";
+
+  try {
+    channel.port2.postMessage("x".repeat(acceptedInputCodeUnits));
+    accepted = true;
+  } catch (error) {
+    accepted = error.name;
+  }
+
+  try {
+    channel.port2.postMessage("x".repeat(rejectedInputCodeUnits));
+  } catch (error) {
+    rejected = error.name;
+  }
+
+  channel.port1.close();
+  channel.port2.close();
+  result.textContent = `serialized:65536=${accepted}|serialized:65544=${rejected}`;
+});
+</script>

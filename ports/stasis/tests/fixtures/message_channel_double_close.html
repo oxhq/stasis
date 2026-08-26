@@ -1,0 +1,51 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled MessagePort idempotent close fixture</title>
+<button id="first">first close</button>
+<button id="second">second close</button>
+<button id="post-close-both">post then close both</button>
+<button id="allocate-after-drain">allocate after drain</button>
+<div id="result">idle</div>
+<script>
+  const channel = new MessageChannel();
+  const result = document.querySelector("#result");
+
+  document.querySelector("#first").onclick = () => {
+    channel.port1.close();
+    try {
+      channel.port2.postMessage("ignored");
+      result.textContent = "closed-peer-post:no-op";
+    } catch (error) {
+      result.textContent = `closed-peer-post:${error.name}`;
+    }
+  };
+
+  document.querySelector("#second").onclick = () => {
+    channel.port1.close();
+    channel.port2.close();
+    result.textContent = "closed:second";
+  };
+
+  document.querySelector("#post-close-both").onclick = () => {
+    const closing = new MessageChannel();
+    closing.port1.onmessage = () => {
+      result.textContent = "unexpected-delivery";
+    };
+    closing.port2.postMessage("reserved-before-close");
+    closing.port1.close();
+    closing.port2.close();
+    result.textContent = "posted-and-closed";
+  };
+
+  document.querySelector("#allocate-after-drain").onclick = () => {
+    window.retainedPairs = [];
+    try {
+      for (let index = 0; index < 16; index += 1) {
+        window.retainedPairs.push(new MessageChannel());
+      }
+      result.textContent = `allocated:${window.retainedPairs.length}`;
+    } catch (error) {
+      result.textContent = `allocation-error:${error.name}:${window.retainedPairs.length}`;
+    }
+  };
+</script>

@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled v2 data SVG cache-hit attribution</title>
+<output id="result">waiting</output>
+<script>
+  const result = document.querySelector("#result");
+  let firstLoadTime = null;
+  const source = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%222%22%20height%3D%222%22%3E%3Cpath%20d%3D%22M0%200h2v2H0z%22%20fill%3D%22purple%22%2F%3E%3C%2Fsvg%3E";
+
+  const first = new Image();
+  first.addEventListener("load", (event) => {
+    firstLoadTime = event.timeStamp;
+
+    // This second direct-src request observes the same decoded entry. Its ownership and time
+    // sample must remain tied to its own generation rather than to the first element.
+    const second = new Image();
+    second.addEventListener("load", (secondEvent) => {
+      result.textContent = `first:${firstLoadTime}|second:${secondEvent.timeStamp}|now:${performance.now()}`;
+    });
+    second.addEventListener("error", (secondEvent) => {
+      result.textContent = `unexpected-second-error:${secondEvent.timeStamp}`;
+    });
+    document.body.append(second);
+    second.src = source;
+  });
+  first.addEventListener("error", (event) => {
+    result.textContent = `unexpected-first-error:${event.timeStamp}`;
+  });
+  document.body.append(first);
+  first.src = source;
+</script>

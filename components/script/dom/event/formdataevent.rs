@@ -34,7 +34,12 @@ impl FormDataEvent {
         cancelable: EventCancelable,
         form_data: &FormData,
     ) -> DomRoot<FormDataEvent> {
-        Self::new_with_proto(cx, window, None, type_, can_bubble, cancelable, form_data)
+        let event =
+            Self::new_with_proto(cx, window, None, type_, can_bubble, cancelable, form_data);
+        if let Some(time_stamp) = window.synchronous_automation_event_time() {
+            event.upcast::<Event>().set_creation_time_stamp(time_stamp);
+        }
+        event
     }
 
     fn new_with_proto(

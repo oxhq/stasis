@@ -52,6 +52,18 @@ enum MessagePortState {
     Disabled(bool),
 }
 
+/// The disposition of a message admitted through the controlled-local routing path.
+///
+/// The ordinary API predates retained-message accounting and intentionally keeps its `Option`
+/// result. This explicit result lets the local owner release a reservation on dispatch/drop while
+/// retaining it for an unstarted port buffer.
+#[derive(Debug)]
+pub enum MessagePortIncomingResult {
+    Dispatch(PortMessageTask),
+    Buffered,
+    Dropped,
+}
+
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 /// The data and logic backing the DOM managed MessagePort.
 pub struct MessagePortImpl {
@@ -87,6 +99,43 @@ impl MessagePortImpl {
     /// Maybe get the Id of the entangled port.
     pub fn entangled_port_id(&self) -> Option<MessagePortId> {
         self.entangled_port
+    }
+
+    /// Whether this port is waiting for Constellation to complete a transfer.
+    ///
+    /// Controlled local message-channel pairs never enter this state. Exposing the bit lets the
+    /// script owner prove that an apparently local pair has no outstanding external owner before
+    /// omitting it from pending-work inventory.
+    pub fn transfer_in_progress(&self) -> bool {
+        matches!(
+            self.state,
+            MessagePortState::Enabled(true) | MessagePortState::Disabled(true)
+        )
+    }
+
+    /// Whether the port has been detached or explicitly closed.
+    pub fn detached(&self) -> bool {
+        matches!(self.state, MessagePortState::Detached)
+    }
+
+    /// Whether this port retains messages which have not yet been dispatched.
+    ///
+    /// In particular, posting to an unstarted port buffers the message here. Such a port is not an
+    /// idle controlled-local source and must not be reported as quiescent.
+    pub fn has_buffered_messages(&self) -> bool {
+        self.message_buffer
+            .as_ref()
+            .is_some_and(|messages| !messages.is_empty())
+    }
+
+    /// Number of messages currently retained by an unstarted or transferring port.
+    pub fn buffered_message_count(&self) -> usize {
+        self.message_buffer.as_ref().map_or(0, VecDeque::len)
+    }
+
+    /// Drop messages retained by a controlled-local port which is being explicitly closed.
+    pub fn discard_buffered_messages(&mut self) -> usize {
+        self.message_buffer.take().map_or(0, |buffer| buffer.len())
     }
 
     /// <https://html.spec.whatwg.org/multipage/#disentangle>
@@ -162,6 +211,28 @@ impl MessagePortImpl {
                 },
             }
             None
+        }
+    }
+
+    /// Handle an already-admitted controlled-local message while preserving its retained-message
+    /// reservation until it either dispatches, is dropped, or leaves the native buffer.
+    pub fn handle_controlled_local_incoming(
+        &mut self,
+        task: PortMessageTask,
+    ) -> MessagePortIncomingResult {
+        let should_dispatch = match self.state {
+            MessagePortState::Detached => return MessagePortIncomingResult::Dropped,
+            MessagePortState::Enabled(in_transfer) => !in_transfer,
+            MessagePortState::Disabled(_) => false,
+        };
+
+        if should_dispatch {
+            MessagePortIncomingResult::Dispatch(task)
+        } else {
+            self.message_buffer
+                .get_or_insert_with(VecDeque::new)
+                .push_back(task);
+            MessagePortIncomingResult::Buffered
         }
     }
 
