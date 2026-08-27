@@ -4943,14 +4943,16 @@ mod tests {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>(),
-            "b42c0a588b4b01007b7df82d32e06877918e54879b2aaa1773f9c4b6ed4cec07",
-            "the candidate test must be closed over every advertised profile field",
+            "d9855ee01844e0fae796a9925c87a936281d47fc480b9d047da74d4a3afcd989",
+            "the stable profile test must be closed over every advertised field",
         );
         let profile: Value = serde_json::from_slice(profile_bytes)
-            .expect("the controlled-web-session-v2 candidate profile must be valid JSON");
+            .expect("the controlled-web-session-v2 stable profile must be valid JSON");
 
         assert_eq!(profile["schemaVersion"], 1);
         assert_eq!(profile["id"], "controlled-web-session-v2");
+        assert_eq!(profile["releaseStatus"], "stable_contract");
+        assert_eq!(profile["targetRelease"], "0.3.0");
         assert_eq!(profile["compatibility"]["predecessor"], "controlled-web-session-v1");
         assert_eq!(
             profile["compatibility"]["predecessorProfileSha256"],
@@ -5101,17 +5103,22 @@ mod tests {
         assert_eq!(
             profile["execution"]["controlledImageElement"],
             json!({
-                "mode": "controlled_top_level_direct_data_svg",
+                "mode": "controlled_top_level_direct_data_svg_and_initial_url_retained_ownership_bounded_http_https",
                 "selection": {
                     "interface": "HTMLImageElement",
                     "scope": "exact_public_controlled_non_auxiliary_top_level_WebView_document_global",
                     "source": "direct_src_selected_without_srcset_picture_or_environment_change",
-                    "parser": "canonical_DataUrl",
-                    "mimeType": "image/svg+xml",
-                    "maximumSerializedUrlBytes": 65536,
+                    "urlSchemes": ["http", "https", "data"],
+                    "httpHttps": "content_format_agnostic_at_initial_selection_with_resource_IO_separately_owned",
+                    "httpHttpsOrigin": "same_and_cross_origin_source_ownership_response_determinism_governed_by_session_network_policy",
+                    "httpHttpsRedirects": "resource_owned_final_URL_not_rechecked_against_initial_selected_URL_limit",
+                    "dataUrlParser": "canonical_DataUrl",
+                    "dataUrlMimeType": "image/svg+xml",
+                    "maximumInitialSelectedCanonicalUrlBytes": 65536,
                     "requestProvenance": "captured_at_selection_and_carried_with_request_generation",
                     "retainedVectorAuthority": "controlled_cache_id_stored_on_request_only_after_successful_registration_or_synchronous_exact_owner_retain",
-                    "executionDomain": "same_ScriptThread_and_ImageCache",
+                    "executionDomain": "same_ScriptThread_and_per_pipeline_ImageCacheStore",
+                    "cacheReuseProofBoundary": "same_pipeline_store_under_immutable_session_fixture_routes",
                 },
                 "retention": {
                     "maximumRetainedControlledOwnershipRecordsPerWindow": 512,
@@ -5147,16 +5154,19 @@ mod tests {
                     "preHandlerMismatchOrAbandonment": "sticky_producer_terminal_without_baseline_fallback",
                     "requestAuthorityLifecycle": "pending_to_current_move_preserves_exact_cache_id_and_abort_replace_or_different_id_releases_exact_owner",
                     "sameIdAbaProtection": "stale_generation_releases_only_when_neither_request_slot_owns_exact_cache_id",
+                    "multipartMixedReplace": "post_metadata_explicit_unsupported_provenance_retires_controlled_Image_producer_and_reports_unsupported_rendering_image_load_after_finite_resource_IO_drains_while_endless_resource_IO_remains_external",
+                    "inflightHttpDocumentReplacement": "fatal_blocked_on_external_io_before_cross_document_successor_authority",
                     "decoderResourceBudget": "not_claimed_existing_wall_task_and_rendering_limits_only",
                 },
                 "pending": {
                     "logicalIdentity": "union_of_callback_and_layout_PendingImageId_plus_exact_image_id_size_rasterization_keys",
                     "layoutOwnerProvenance": "captured_per_exact_cache_id_DOM_owner_at_first_post_reflow_retention",
-                    "controlledClassification": "image_id_controlled_only_when_every_retained_callback_is_controlled_and_no_retained_layout_owner_is_baseline",
+                    "controlledClassification": "image_id_controlled_only_when_every_retained_callback_is_controlled_and_no_retained_owner_is_baseline_or_explicit_Unsupported",
                     "mixedLayoutOwnership": "baseline_layout_owner_globally_downgrades_cache_id_and_live_raster_keys_and_delivery_mismatch_rejects_before_any_callback_while_retained_as_unsupported_rendering",
-                    "mixedMissingOrBaseline": "unsupported_pending_rendering_image_load",
+                    "mixedMissingOrBaseline": "missing_baseline_or_explicit_Unsupported_is_unsupported_pending_rendering_image_load",
                     "controlledProjection": "Image_producer_fence_not_pending_rendering_image_load",
                     "reservationReconciliation": "live_controlled_records_equal_retained_controlled_callbacks_plus_exact_cache_id_DOM_owner_identities_plus_controlled_rasterization_keys",
+                    "unsupportedReservationReconciliation": "explicit_Unsupported_records_retain_exact_logical_ID_without_controlled_capacity_reservations",
                     "producerReconciliation": "pending_Image_producers_greater_than_or_equal_to_controlled_logical_work_absent_terminal",
                 },
                 "eventTimestamp": {
@@ -5172,13 +5182,14 @@ mod tests {
                     "predecessorBehavior": "controlled_web_session_v1_unchanged",
                 },
                 "unsupported": {
-                    "httpHttpsBlobFileAndNonSvgDataUrls": "not_admitted_baseline_image_authorities_unchanged",
+                    "blobFileAndNonSvgDataUrls": "not_admitted_baseline_image_authorities_unchanged",
                     "oversizeUrl": "not_admitted_baseline_image_authorities_unchanged",
                     "srcsetPictureAndEnvironmentChange": "not_admitted_baseline_image_authorities_unchanged",
                     "cssBackgroundListStyleAndContent": "not_admitted_unless_joining_a_retained_exact_cache_id_DOM_owner_identity",
                     "faviconAndVideoPoster": "not_admitted_baseline_image_authorities_unchanged",
                     "imageBitmapAndCanvasUpload": "not_admitted_baseline_image_authorities_unchanged",
                     "animatedImages": "not_admitted_by_this_slice_existing_rendering_authority_unchanged",
+                    "multipartMixedReplace": "post_metadata_typed_unsupported_rendering_image_load_after_finite_resource_IO_drains_without_streaming_semantics",
                     "iframeWorkerWorkletAndCrossLoop": "not_admitted_existing_context_boundaries_unchanged",
                     "unadmittedSharedVectorCacheIdentity": "remove_all_controlled_owners_and_downgrade_live_raster_keys_to_baseline",
                     "nestedOrExternalSvgResources": "not_content_inspected_not_proven_by_this_slice",
@@ -5291,6 +5302,17 @@ mod tests {
             image_product_surfaces,
             ["bounded_controlled_top_level_direct_data_svg_HTMLImageElement_completion"]
         );
+        let http_image_product_surfaces: Vec<_> = profile["supportedProductSurface"]
+            .as_array()
+            .expect("supportedProductSurface must be an array")
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|surface| surface.contains("direct_http_https_HTMLImageElement"))
+            .collect();
+        assert_eq!(
+            http_image_product_surfaces,
+            ["initial_url_and_retained_ownership_bounded_controlled_top_level_direct_http_https_HTMLImageElement_completion"]
+        );
         let inline_svg_product_surfaces: Vec<_> = profile["supportedProductSurface"]
             .as_array()
             .expect("supportedProductSurface must be an array")
@@ -5331,6 +5353,7 @@ mod tests {
             profile["unsupportedClasses"]["imageElement"],
             json!({
                 "admittedDirectDataSvg": "owned_bounded_Image_producer_work",
+                "admittedDirectHttpHttps": "owned_Image_producer_work_with_initial_URL_and_retained_ownership_bounds_and_resource_IO_separately_owned",
                 "baselineMixedOrUnownedRetainedWork": "unsupported_rendering_image_load",
                 "excludedSynchronousCacheHit": "predecessor_behavior_no_universal_new_typed_rejection",
                 "nestedOrExternalSvgResources": "not_proven",

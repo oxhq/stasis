@@ -230,6 +230,9 @@ const CONTROLLED_V2_IMAGE_RETAINED_RECORD_LIMIT: usize = 512;
 enum PendingImageProvenance {
     Baseline,
     ControlledV2Fenced,
+    /// A post-admission response boundary that must remain visible but must never receive either
+    /// baseline or controlled callback delivery.
+    Unsupported,
 }
 
 /// Delivery authority passed from ScriptThread to an image response callback.
@@ -268,6 +271,13 @@ impl ImageCallbackDelivery {
             Self::ControlledV2Fenced { .. } => PendingImageProvenance::ControlledV2Fenced,
         }
     }
+}
+
+fn retained_image_provenance_accepts_delivery(
+    retained: PendingImageProvenance,
+    delivery: PendingImageProvenance,
+) -> bool {
+    retained != PendingImageProvenance::Unsupported && retained == delivery
 }
 
 /// One non-cloneable retained-registration slot owned by a Window collection entry.
@@ -499,7 +509,9 @@ fn observe_pending_nonanimated_images(
     for (id, provenance) in callback_registrations {
         let counts = callback_provenances.entry(id).or_default();
         match provenance {
-            PendingImageProvenance::Baseline => counts.0 = counts.0.saturating_add(1),
+            PendingImageProvenance::Baseline | PendingImageProvenance::Unsupported => {
+                counts.0 = counts.0.saturating_add(1)
+            },
             PendingImageProvenance::ControlledV2Fenced => {
                 counts.1 = counts.1.saturating_add(1);
                 retained_controlled_registrations =
@@ -511,7 +523,9 @@ fn observe_pending_nonanimated_images(
     for (id, provenance) in layout_registrations {
         let counts = layout_provenances.entry(id).or_default();
         match provenance {
-            PendingImageProvenance::Baseline => counts.0 = counts.0.saturating_add(1),
+            PendingImageProvenance::Baseline | PendingImageProvenance::Unsupported => {
+                counts.0 = counts.0.saturating_add(1)
+            },
             PendingImageProvenance::ControlledV2Fenced => counts.1 = counts.1.saturating_add(1),
         }
     }
@@ -798,6 +812,39 @@ mod pending_nonanimated_image_observation_tests {
     }
 
     #[test]
+    fn explicitly_unsupported_shared_id_is_exact_inventory_and_matches_no_delivery_set() {
+        let retained = [
+            PendingImageProvenance::Unsupported,
+            PendingImageProvenance::Baseline,
+        ];
+        let observation = observe(
+            &[(1, retained[0]), (1, retained[1])],
+            &[(1, PendingImageProvenance::Unsupported)],
+            &[],
+            0,
+            0,
+        );
+
+        assert_eq!(observation.retained_work_items, Some(1));
+        assert_eq!(observation.controlled_work_items, Some(0));
+        assert_eq!(observation.unsupported_work_items, Some(1));
+        assert!(observation.controlled_retained_record_inventory_matches);
+
+        for delivery in [
+            PendingImageProvenance::Baseline,
+            PendingImageProvenance::ControlledV2Fenced,
+        ] {
+            assert!(retained.iter().any(|provenance| {
+                !retained_image_provenance_accepts_delivery(*provenance, delivery)
+            }));
+            assert!(!retained_image_provenance_accepts_delivery(
+                PendingImageProvenance::Unsupported,
+                delivery,
+            ));
+        }
+    }
+
+    #[test]
     fn controlled_registration_capacity_is_raii_and_fails_closed_at_513() {
         let count = Rc::new(Cell::new(0));
         let fence = timers::DocumentProducerFence::default();
@@ -878,6 +925,11 @@ struct PendingImageRasterizationEntry {
 impl PendingImageRasterizationEntry {
     fn downgrade_to_baseline(&mut self) {
         self.provenance = PendingImageProvenance::Baseline;
+        self.reservation = None;
+    }
+
+    fn mark_unsupported(&mut self) {
+        self.provenance = PendingImageProvenance::Unsupported;
         self.reservation = None;
     }
 }
@@ -1409,9 +1461,10 @@ impl Window {
 
     /// Register one explicitly selected same-document controlled-v2 image callback.
     ///
-    /// The caller owns policy selection (for v0.3 this is the bounded top-level HTMLImage data-URL
-    /// slice). This method owns transport, retained-registration capacity, and producer fencing;
-    /// admission failure is sticky and never falls back to the baseline sender.
+    /// The caller owns policy selection (for v0.3 this is the top-level direct data-SVG or
+    /// initial-URL-bounded HTTP(S) HTMLImage slice). This method owns transport,
+    /// retained-registration capacity, and producer fencing; admission failure is sticky and never
+    /// falls back to the baseline sender.
     pub(crate) fn register_controlled_v2_image_cache_listener(
         &self,
         id: PendingImageId,
@@ -1585,8 +1638,41 @@ impl Window {
             .borrow_mut()
             .iter_mut()
         {
-            if *candidate_id == id {
+            if *candidate_id == id && entry.provenance != PendingImageProvenance::Unsupported {
                 entry.downgrade_to_baseline();
+            }
+        }
+    }
+
+    /// Fail closed a response format discovered only after a controlled image request starts.
+    ///
+    /// The fenced cache transport remains installed so its terminal response retires the Image
+    /// producer. Reclassifying the retained callback first makes delivery reject on provenance
+    /// mismatch and preserves one unsupported cache record for the pending snapshot to report as
+    /// typed `unsupported_rendering` / `image_load` work.
+    pub(crate) fn mark_controlled_v2_image_cache_id_unsupported(&self, id: PendingImageId) {
+        // Drop every controlled capacity reservation while preserving the exact logical ID as an
+        // unsupported pending fact. The producer lease is independent and remains on the cache
+        // transport until the caller injects its terminal response.
+        self.controlled_image_identities.borrow_mut().remove(&id);
+        if let Some(callbacks) = self.pending_image_callbacks.borrow_mut().get_mut(&id) {
+            for callback in callbacks {
+                callback.provenance = PendingImageProvenance::Unsupported;
+                callback._reservation = None;
+            }
+        }
+        if let Some(owners) = self.pending_layout_images.borrow_mut().get_mut(&id) {
+            for owner in owners {
+                owner.provenance = PendingImageProvenance::Unsupported;
+            }
+        }
+        for ((candidate_id, _), entry) in self
+            .pending_images_for_rasterization
+            .borrow_mut()
+            .iter_mut()
+        {
+            if *candidate_id == id {
+                entry.mark_unsupported();
             }
         }
     }
@@ -1664,7 +1750,9 @@ impl Window {
         id: PendingImageId,
         owner: &Node,
     ) -> PendingImageProvenance {
-        if self
+        if self.image_id_has_explicitly_unsupported_retained_work(id) {
+            PendingImageProvenance::Unsupported
+        } else if self
             .controlled_image_identities
             .borrow()
             .get(&id)
@@ -1681,14 +1769,14 @@ impl Window {
         }
     }
 
-    fn image_id_has_baseline_retained_work(&self, id: PendingImageId) -> bool {
+    fn image_id_has_explicitly_unsupported_retained_work(&self, id: PendingImageId) -> bool {
         self.pending_image_callbacks
             .borrow()
             .get(&id)
             .is_some_and(|callbacks| {
                 callbacks
                     .iter()
-                    .any(|callback| callback.provenance == PendingImageProvenance::Baseline)
+                    .any(|callback| callback.provenance == PendingImageProvenance::Unsupported)
             }) ||
             self.pending_layout_images
                 .borrow()
@@ -1696,11 +1784,41 @@ impl Window {
                 .is_some_and(|owners| {
                     owners
                         .iter()
-                        .any(|owner| owner.provenance == PendingImageProvenance::Baseline)
+                        .any(|owner| owner.provenance == PendingImageProvenance::Unsupported)
                 }) ||
             self.pending_images_for_rasterization.borrow().iter().any(
                 |((candidate_id, _), entry)| {
-                    *candidate_id == id && entry.provenance == PendingImageProvenance::Baseline
+                    *candidate_id == id &&
+                        entry.provenance == PendingImageProvenance::Unsupported
+                },
+            )
+    }
+
+    fn image_id_has_baseline_retained_work(&self, id: PendingImageId) -> bool {
+        self.pending_image_callbacks
+            .borrow()
+            .get(&id)
+            .is_some_and(|callbacks| {
+                callbacks
+                    .iter()
+                    .any(|callback| {
+                        callback.provenance != PendingImageProvenance::ControlledV2Fenced
+                    })
+            }) ||
+            self.pending_layout_images
+                .borrow()
+                .get(&id)
+                .is_some_and(|owners| {
+                    owners
+                        .iter()
+                        .any(|owner| {
+                            owner.provenance != PendingImageProvenance::ControlledV2Fenced
+                        })
+                }) ||
+            self.pending_images_for_rasterization.borrow().iter().any(
+                |((candidate_id, _), entry)| {
+                    *candidate_id == id &&
+                        entry.provenance != PendingImageProvenance::ControlledV2Fenced
                 },
             )
     }
@@ -1759,6 +1877,9 @@ impl Window {
                 let transport = self.controlled_v2_image_cache_transport(&producer_fence)?;
                 (Some(reservation), transport)
             },
+            PendingImageProvenance::Unsupported => {
+                unreachable!("unsupported image IDs cannot admit rasterization listeners")
+            },
         };
         Ok((
             PendingImageRasterizationEntry {
@@ -1786,6 +1907,9 @@ impl Window {
         let key = (image_id, requested_size);
         let mut entries = self.pending_images_for_rasterization.borrow_mut();
         if let Some(entry) = entries.get_mut(&key) {
+            if entry.provenance == PendingImageProvenance::Unsupported {
+                return None;
+            }
             entry.downgrade_to_baseline();
             entry
                 .callbacks
@@ -1890,7 +2014,12 @@ impl Window {
             .is_some_and(|owners| {
                 owners
                     .iter()
-                    .any(|owner| owner.provenance != delivery_provenance)
+                    .any(|owner| {
+                        !retained_image_provenance_accepts_delivery(
+                            owner.provenance,
+                            delivery_provenance,
+                        )
+                    })
             })
         {
             return Err(());
@@ -1911,7 +2040,12 @@ impl Window {
         if callbacks
             .get()
             .iter()
-            .any(|callback| callback.provenance != delivery_provenance)
+            .any(|callback| {
+                !retained_image_provenance_accepts_delivery(
+                    callback.provenance,
+                    delivery_provenance,
+                )
+            })
         {
             let _ = std::mem::replace(&mut *self.pending_image_callbacks.borrow_mut(), images);
             return Err(());
@@ -4960,6 +5094,11 @@ impl Window {
         for image in pending_images {
             let id = image.id;
             let node = unsafe { from_untrusted_node_address(image.node) };
+            if self.image_id_has_explicitly_unsupported_retained_work(id) {
+                // The exact ID is already retained as typed unsupported work. Do not attach a
+                // baseline listener or issue another request that could revive its callbacks.
+                continue;
+            }
             let is_new_owner = !self
                 .pending_layout_images
                 .borrow()
@@ -5112,6 +5251,11 @@ impl Window {
                         };
                         sender
                     },
+                    PendingImageProvenance::Unsupported => {
+                        // Filtered by the exact-ID guard above; keep this arm fail closed if a
+                        // future caller changes the retention order.
+                        continue;
+                    },
                 };
 
                 image_cache.add_listener(ImageLoadListener::new(sender, pipeline_id, id));
@@ -5129,6 +5273,9 @@ impl Window {
         }
 
         for image in pending_rasterization_images {
+            if self.image_id_has_explicitly_unsupported_retained_work(image.id) {
+                continue;
+            }
             let node = unsafe { from_untrusted_node_address(image.node) };
             let key = (image.id, image.size);
             let mut provenance = self.retained_image_provenance(image.id, &node);

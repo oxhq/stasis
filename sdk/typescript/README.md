@@ -91,11 +91,11 @@ request/evidence pages. `createStasisSessionPool()` and `crawlWithStasis()` add
 process-isolated concurrency and a same-origin crawler without weakening the
 one-session-per-process boundary.
 
-## Candidate modern-web session profile (v0.3)
+## Modern-web session profile (v0.3)
 
-The source tree also exposes the explicitly selected `controlled-web-session-v2` candidate. This
+Version 0.3 exposes the explicitly selected `controlled-web-session-v2` profile. Checked-in source
 is not a publication claim: the native runtime must advertise v2, and omitting `profile` still
-selects stable v1.
+selects v1.
 
 ```ts
 import {
@@ -116,23 +116,35 @@ try {
 ```
 
 V2 adds bounded same-global, untransferred `MessageChannel` delivery; a bounded direct
-`HTMLImageElement.src` `data:image/svg+xml` cache/decode completion path; a distinct bounded inline
+`HTMLImageElement.src` cache/decode completion path for canonical data SVG and direct HTTP(S)
+selection; a distinct bounded inline
 `<svg>` path for its exact cached internally serialized data-SVG request and cache-ID owner; and
 suppression of only
 page-driven, single-line text InputMethod presentation when no virtual keyboard is requested in the
 exact public non-auxiliary controlled top-level document. It also adds controlled in-memory
 persistent-cookie expiry and bounded schemeful SameSite request selection. The image path requires direct `src` selection without
-`srcset`/`picture`/environment changes, exact `image/svg+xml` from the canonical data-URL parser, a
-serialized URL no larger than 65,536 bytes, the same ScriptThread/ImageCache, and room within the
-512-record retained controlled-ownership cap. Its cache-hit or finite asynchronous completion is
-producer-fenced, and one document-clock timestamp is shared across the engine-generated image
-completion events. Cache-owned callback retirement completes its Image stream as owned cancellation,
+`srcset`/`picture`/environment changes, an initial serialized URL no larger than 65,536 bytes, the
+same ScriptThread/ImageCache, and room within the
+512-record retained controlled-ownership cap. An admitted synchronous cache hit is owned in the
+current Script turn and queues its existing ordinary DOM callback without inventing an asynchronous
+`Image` producer lease. Finite asynchronous cache/decode completion is producer-fenced, and one
+document-clock timestamp is shared across the engine-generated image completion events. Cache-owned
+callback retirement completes its Image stream as owned cancellation,
 as does a dequeued response whose closed-pipeline tombstone proves that navigation retired its
 Window. A normal live handler rejection keeps the owner or key pending, completes the scoped
 message guard, and settles as typed `unsupported_rendering`; admission, enqueue, producer callback
 panic, actual handler unwind, pre-handler authority, target-invariant or clock failure, and guarded transport loss
 explicitly abandon the stream and retain a terminal. Either terminal or ordinary completion must
 match the exact live fence/sequence and registered Image class.
+Canonical data URLs must be exact `image/svg+xml`. A direct HTTP(S) URL is admitted from its
+initially selected scheme before response metadata or decoded format is known; network I/O remains
+separately owned, and finite decode failure is an owned error completion. A post-metadata
+`multipart/x-mixed-replace` response remains typed unsupported after separately owned finite
+Resource I/O drains, without baseline callback fallback; an endless response remains blocked on
+that external I/O. Cache reuse is proven within one pipeline's image-cache store and immutable fixture
+routes, not as a deterministic claim for live or mutable HTTP content. Public document replacement
+while HTTP image resource I/O remains active retains fatal `blocked_on_external_io`; v2 does not
+claim cross-document replacement through that state.
 The inline path additionally requires an internal request and the same
 canonical MIME/URL bound; its decode/vector work is fenced, but it creates no DOM load event.
 
@@ -154,7 +166,7 @@ on an existing owned transition record reaching that queue; general transition s
 claimed. Auxiliary top-level WebViews remain host-stamped. Literal HTML `autofocus`, script-created event
 timestamps including `new AnimationEvent(...)` and `new TransitionEvent(...)`, other InputMethod
 shapes, and embedder controls remain unsupported, as do transferred, cross-global,
-cross-event-loop, worker, BroadcastChannel, and external channels. HTTP/HTTPS/blob/file and non-SVG image sources, responsive-image selection,
+cross-event-loop, worker, BroadcastChannel, and external channels. Blob/file and non-SVG data image sources, responsive-image selection,
 CSS/background/generated-content ownership, animated images, general or nested/external SVG
 resource semantics, and cross-context image work receive no new v2 authority; baseline and v1 SVG
 behavior, CSS animation semantics and limits, and predecessor rejection authorities remain in force.
@@ -179,7 +191,7 @@ and exports profile-specific. A v2 artifact keeps `schemaVersion: 1` but has lit
 `profile: "controlled-web-session-v2"` and `expiresUnixTimeNs: bigint | null`. It is portable only
 through explicit export and initial import; no v1 migration or disk-backed browser jar is implied.
 `ReferenceCrawlerOptions` likewise defaults to v1. Its optional `profile` member remains source
-compatible for existing v1 annotations. A standalone candidate annotation can therefore describe
+compatible for existing v1 annotations. A standalone v2 annotation can therefore describe
 an incompletely constructed value, but it cannot be passed to `crawlWithStasis()` until it carries
 `profile: CONTROLLED_WEB_SESSION_V2_PROFILE`; at that call boundary the explicit profile is inferred
 and a v1 state artifact is rejected.
@@ -187,7 +199,7 @@ Settlement evidence
 carries the runtime-bound selected profile identity. One-argument
 `settlementEvidence(settled)` preserves that binding for SDK-produced results, and contradictory
 explicit profile claims are rejected. See the
-[candidate contract](../../docs/stasis/session-v0.3-candidate.md).
+[v2 contract](../../docs/stasis/session-v0.3-candidate.md).
 
 ## Legacy controlled document (v0.1)
 
@@ -217,7 +229,7 @@ stored under the operating system's per-user cache directory
 (`~/Library/Caches/oxhq/stasis` on macOS). Acquisition requires HTTPS and an
 exact SDK-version/platform manifest match; cache hits are rehashed before use.
 
-`openSession()` is always controlled and defaults to `controlled-web-session-v1`; a candidate
+`openSession()` is always controlled and defaults to `controlled-web-session-v1`; an explicit v2
 session profile must be selected explicitly and advertised by the runtime.
 For the legacy `open()` API, omitting `clock` selects Controlled mode and the
 frozen `controlled-webapp-v1` profile; select Real mode explicitly with

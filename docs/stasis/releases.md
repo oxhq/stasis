@@ -1,4 +1,4 @@
-# Stasis 0.3 candidate train
+# Stasis 0.3 release train
 
 The source tree, native `stasis-shell` crate, TypeScript package metadata, and
 release validators are aligned to exact version `0.3.0`. Source version is not
@@ -8,15 +8,22 @@ published immutably, published to npm with provenance, and verified from
 anonymous managed-runtime bytes. After promotion, verify those public artifacts;
 do not infer current registry state from this checked-in text.
 
-The candidate adds the explicitly selected `controlled-web-session-v2` profile
+Version 0.3 adds the explicitly selected `controlled-web-session-v2` profile
 for bounded same-global, untransferred `MessageChannel` work, a bounded direct top-level
-`HTMLImageElement.src` `data:image/svg+xml` cache/decode completion path, a distinct bounded inline
+`HTMLImageElement.src` cache/decode completion path for canonical data SVG and direct HTTP(S)
+selection, a distinct bounded inline
 `<svg>` path in the controlled top-level document for its exact cached internally serialized
 data-SVG request and cache-ID owner, and the narrow exact public non-auxiliary controlled
 top-level single-line `InputMethodType::Text` presentation boundary when `multiline = false` and no
-virtual keyboard is requested. The image slice admits only canonical exact-MIME direct-source work
-within its 65,536-byte URL and 512 retained-ownership-record bounds on the same
-ScriptThread/ImageCache. The inline slice additionally requires an internal request and exact
+virtual keyboard is requested. The image slice admits only direct-source work within its
+65,536-byte initial selected-URL and 512 retained-ownership-record bounds on the same
+ScriptThread/ImageCache. Data URLs require canonical exact `image/svg+xml`; HTTP(S) is admitted by
+the initially selected scheme before response format is known, and finite decode failure remains
+owned. Post-metadata `multipart/x-mixed-replace` is retained as typed
+`unsupported_rendering` / `image_load` after separately owned finite Resource I/O drains, without
+baseline delivery fallback; an endless response remains blocked on that external I/O. A public document
+replacement while HTTP image resource I/O is active retains fatal `blocked_on_external_io`; this
+slice does not claim cross-document replacement through in-flight external I/O. The inline slice additionally requires an internal request and exact
 cached-URL/cache-ID join, fences decode and raster completion, and emits no new DOM load event;
 excluded image paths receive no new authority. Cache-owned callback retirement and a dequeued
 response whose closed-pipeline tombstone proves that navigation retired its Window complete
@@ -41,7 +48,7 @@ settlement is not claimed. Scheduled pending animation-event work uses guarded `
 exact retained scheduler head, including an exact-`now` deadline; only an unscheduled batch is
 `Drive`-ready. This corrects liveness without adding a task source or limit. Auxiliary top-level WebViews remain host-stamped. Script-created events,
 including the WebIDL animation
-and transition event constructors, excluded image, general SVG/resource, and other
+and transition event constructors, excluded image sources, general SVG/resource, and other
 unlisted host-stamped paths remain unsupported or retain predecessor behavior. Baseline and v1 SVG
 behavior and the existing CSS animation authority, semantics, and limits are unchanged. It keeps
 `controlled-web-session-v1` frozen and as the default. Candidate package runs
@@ -49,9 +56,9 @@ must execute the complete `baseline_protocol` integration target on macOS
 arm64, Linux x86-64 under Xvfb, and the Windows x86-64 CI job, in addition to
 the existing controlled-session and release-artifact gates. Windows remains a
 CI-only bundle and is not admitted to the managed release manifest. Each 0.3
-macOS/Linux candidate archive has twelve files: the historical ten-file
+macOS/Linux archive has twelve files: the historical ten-file
 runtime/source inventory plus `controlled-web-session-v2.json` and
-`session-v0.3-candidate.md`, both byte-bound to the candidate source revision.
+`session-v0.3-candidate.md`, both byte-bound to the exact source revision.
 
 The seventh slice owns persistent cookies in memory for the exact v2 session. Expiry uses
 controlled Unix nanoseconds with origin zero, valid `Max-Age` takes precedence over `Expires`,
@@ -67,9 +74,9 @@ hardens the same code to fatal fail-stop. Partitioned cookies and
 CookieStore read/getAll/delete remain unsupported.
 
 The checked-out release and npm workflows accept only exact `v0.3.0` for new
-promotion/publication work. They do not authorize rebuilding or replacing any
-published `0.2.x` bytes. Do not describe `0.3.0` as released until its hosted
-promotion and public-consumer evidence exists.
+promotion/publication work. They do not authorize rebuilding or replacing any published `0.2.x`
+bytes. Checked-in version text is not release evidence: verify the immutable tag, hosted promotion,
+npm provenance, and anonymous public-consumer result.
 
 # Stasis 0.2 release history (immutable predecessor)
 
@@ -93,7 +100,7 @@ every other stable or prerelease identity. The native matrix remains deliberatel
 bounded to Linux x86-64 and macOS arm64, with the same compatibility,
 ten-member archive, checksum, source-identity, and provenance contracts used by
 the first stable train. The helper at the `v0.2.1` tag accepted only `0.2.1`;
-the current main helper accepts only the `0.3.0` candidate and cannot alter or
+the current main helper accepts only `0.3.0` and cannot alter or
 re-authorize historical `v0.2.1`, `v0.2.0`, or `0.1.x` bytes.
 
 ## Windows x86-64 CI-only proof artifact
@@ -110,7 +117,7 @@ Windows stdio protocol-isolation tests.
 The job creates an unsigned, attempt-qualified Windows CI ZIP. The ZIP has one
 root directory containing `stasis.exe`, the ANGLE `libEGL.dll` and
 `libGLESv2.dll` rendering runtime, the source and license documents, the
-canonical v2 profile and candidate contract, and the
+canonical v2 profile and versioned contract, and the
 app-local x86-64 MSVC runtime DLL closure derived from the native files' PE
 imports. The job writes archive and executable SHA-256 sidecars, extracts the
 ZIP into a fresh directory, verifies every extracted member, and runs the
@@ -152,10 +159,10 @@ The npm tarball and its SDK proof remain attempt-qualified Actions artifacts,
 not GitHub release assets. Build provenance covers all release assets and the
 SDK package/proof. The SDK's checked-in generated runtime-manifest module is an
 intentionally mismatched historical alpha placeholder: local `prepack` fails
-closed until the credential-free package job generates the exact candidate
+closed until the credential-free package job generates the exact 0.3
 `v0.3.0` manifest from both verified native archives.
 
-## 0.3 candidate package and product gates
+## 0.3 package and product gates
 
 The credential boundaries and attempt-specific producer selection remain the
 same as the 0.1 train: native macOS and Linux producers are resolved
@@ -190,7 +197,9 @@ extracted release binary:
 The packed-SDK exact-binary gate also opens `controlled-web-session-v2` explicitly. In one fresh
 controlled session it proves idle and buffered local MessageChannel ownership, navigates to a
 direct data-SVG fixture and observes the exact document-clock `load`/`loadend` completion trace,
-then navigates to an inline-SVG fixture and proves quiescence with no invented DOM load event before
+navigates to a cross-origin direct HTTP fixture and proves owned success, owned decode failure, and
+a same-pipeline cache hit with zero residual Image producers or pending images, then navigates to an
+inline-SVG fixture and proves quiescence with no invented DOM load event before
 navigating to the programmatic-focus fixture and observing the exact trusted focus-transition
 trace. Finally it advances document time to 5 ms, proves the exact synchronous browser-event trace
 for fill, activate, reset, check, select, invalid and valid submission, then proves that five
@@ -205,9 +214,15 @@ without an import and proves neither an ambient request cookie nor cookie state 
 process opens at u64 max, advances beyond it, and proves a post-open request fails as
 `unsupported_cookie_time_range` before reaching the server. Every exact-binary child receives an
 explicit runtime-only environment
-allowlist rather than workflow or registry credentials. Its schema-7 proof binds all seven
-candidate slices to the same package, native
+allowlist rather than workflow or registry credentials. Its schema-7 proof binds all seven v2
+slices to the same package, native
 digest, source revision, clean close responses, and protocol EOFs.
+
+For direct HTTP(S) images, the 65,536-byte admission limit applies to the initially selected
+canonical URL. A final redirect URL is not rechecked against that initial limit: its fetch remains
+separately owned Resource I/O and the immutable session network policy remains authoritative. Cache
+reuse proof is limited to one pipeline's image-cache store under immutable fixture routes; it is not
+a deterministic claim for cross-pipeline, live, or mutable HTTP content.
 
 The frozen v0.2 story and complete native `baseline_protocol` target also run
 against each exact production-stripped native
@@ -241,7 +256,7 @@ gh workflow run stasis-package.yml \
   -f release_tag=v0.3.0
 ```
 
-Run that promotion only after the candidate's hosted package gates pass. After
+Run that promotion only after the exact source's hosted package gates pass. After
 the exact draft is inspected and published as an immutable,
 non-prerelease GitHub release, the release event may publish only
 `@oxhq/stasis@0.3.0` with npm trusted publishing and provenance. The expected
@@ -424,7 +439,7 @@ both tips again and repeats that tree identity check immediately before release
 creation.
 
 The protected `release` environment receives only those staged files. Its job
-does not check out or execute candidate source. It rechecks inventories, hashes,
+does not check out or execute source code. It rechecks inventories, hashes,
 proofs, source/run identities, runtime-manifest bindings, and provenance before
 creating a lightweight `v0.1.0` tag and a draft stable release. It refuses to
 mutate a published or mismatched release, or a tag at another object. A retry

@@ -1,16 +1,22 @@
 # Stasis
 
 Stasis is an experimental Servo-based runtime for executing a supported web
-application as a controlled event system. The stable v0.2 release extends the
-`open -> act -> settle -> inspect` loop across bounded top-level navigation while preserving
-document authority, cookies, Web Storage, and redacted execution evidence through the native
-NDJSON shell and matching `@oxhq/stasis` TypeScript client. The frozen v0.1 controlled-document
-profile remains available through the legacy API.
+application as a controlled event system. The checked-in native and TypeScript package sources
+target the 0.3.0 train. They retain frozen `controlled-webapp-v1` and
+`controlled-web-session-v1` behavior, with `controlled-web-session-v1` still the default, and add
+the separately selected, versioned
+[`controlled-web-session-v2` contract](docs/stasis/session-v0.3-candidate.md).
+
+Source version and package CI are not publication proof. `v0.2.1` and
+`@oxhq/stasis@0.2.1` are the immutable predecessor; 0.3.0 is the stable successor only when its
+exact tag, release, registry package, provenance, and anonymous public-consumer evidence exist.
+Verify those public artifacts rather than inferring release status from this checkout.
 
 Start with [STASIS.md](STASIS.md) for the product boundary,
-[the v0.2 session contract](docs/stasis/session-v0.2.md) for the stable session surface,
-and [the v0.1 protocol](docs/stasis/protocol-v1.md) for the frozen legacy methods. Build
-and release operators should also read [the release runbook](docs/stasis/releases.md).
+[the v0.3 controlled-session contract](docs/stasis/session-v0.3-candidate.md) for the explicit v2
+surface, [the frozen v0.2 session contract](docs/stasis/session-v0.2.md) for the default v1 session,
+and [the v0.1 protocol](docs/stasis/protocol-v1.md) for the frozen legacy methods. Build and release
+operators should also read [the release runbook](docs/stasis/releases.md).
 
 ## Servo foundation
 

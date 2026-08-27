@@ -5,7 +5,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{ChildStdin, Command, Stdio};
-use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 use std::time::Duration;
 
@@ -84,7 +84,11 @@ const CONTROLLED_V2_IMAGE_IDENTITY_REUSE_FIXTURE: &[u8] =
     include_bytes!("fixtures/controlled_v2_image_identity_reuse.html");
 const CONTROLLED_V2_IMAGE_HTTP_FIXTURE: &[u8] =
     include_bytes!("fixtures/controlled_v2_image_http.html");
+const CONTROLLED_V2_IMAGE_HTTP_MULTIPART_FIXTURE: &[u8] =
+    include_bytes!("fixtures/controlled_v2_image_http_multipart.html");
 const CONTROLLED_V2_HTTP_IMAGE: &[u8] = include_bytes!("fixtures/controlled_v2_http_image.svg");
+const CONTROLLED_V2_INVALID_HTTP_IMAGE: &[u8] = b"not an image";
+const CONTROLLED_V2_MULTIPART_HTTP_IMAGE: &[u8] = b"--stasis-image\r\nContent-Type: image/svg+xml\r\n\r\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\"/>\r\n--stasis-image--\r\n";
 const CONTROLLED_V2_INLINE_SVG_FIXTURE: &[u8] =
     include_bytes!("fixtures/controlled_v2_inline_svg.html");
 const CONTROLLED_V2_INLINE_SVG_ADVANCED_FIXTURE: &[u8] =
@@ -810,9 +814,16 @@ fn controlled_session_v2_reuses_image_identity_capacity_across_520_requests() {
 }
 
 #[test]
-fn controlled_session_v2_http_image_remains_outside_owned_slice() {
-    let document_url = "https://controlled-image-http.example.test/";
-    let image_url = "https://controlled-image-http.example.test/controlled-v2-http-image.svg";
+fn controlled_session_v2_http_image_success_and_failure_are_owned_without_v1_promotion() {
+    exercise_controlled_http_image_profile("controlled-web-session-v2", "http-v2", true);
+    exercise_controlled_http_image_profile("controlled-web-session-v1", "http-v1", false);
+}
+
+#[test]
+fn controlled_session_v2_http_multipart_finite_response_retires_to_typed_image_load_unsupported() {
+    let document_url = "https://controlled-image-multipart.example.test/";
+    let image_url =
+        "https://controlled-image-assets.example.test/controlled-v2-http-image.multipart";
     let mut child = Command::new(env!("CARGO_BIN_EXE_stasis"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -827,19 +838,22 @@ fn controlled_session_v2_http_image_remains_outside_owned_slice() {
         json!({
             "v": 1,
             "type": "request",
-            "id": "init-controlled-image-http",
+            "id": "init-controlled-image-multipart",
             "method": "protocol.initialize",
             "params": {"client": {"name": "integration-test", "version": "0.0.0"}},
         }),
     );
-    assert_eq!(receive(&responses)["id"], "init-controlled-image-http");
+    assert_eq!(
+        receive(&responses)["id"],
+        "init-controlled-image-multipart"
+    );
 
     send(
         &mut input,
         json!({
             "v": 1,
             "type": "request",
-            "id": "open-controlled-image-http",
+            "id": "open-controlled-image-multipart",
             "method": "session.open",
             "params": {
                 "url": document_url,
@@ -854,8 +868,9 @@ fn controlled_session_v2_http_image_remains_outside_owned_slice() {
                                 "status": 200,
                                 "headers": [["content-type", "text/html; charset=utf-8"]],
                                 "body": {
-                                    "utf8": std::str::from_utf8(CONTROLLED_V2_IMAGE_HTTP_FIXTURE)
-                                        .unwrap()
+                                    "utf8": std::str::from_utf8(
+                                        CONTROLLED_V2_IMAGE_HTTP_MULTIPART_FIXTURE
+                                    ).unwrap()
                                 },
                             },
                         },
@@ -863,9 +878,14 @@ fn controlled_session_v2_http_image_remains_outside_owned_slice() {
                             "match": {"method": "GET", "url": {"exact": image_url}},
                             "fulfill": {
                                 "status": 200,
-                                "headers": [["content-type", "image/svg+xml"]],
+                                "headers": [[
+                                    "content-type",
+                                    "multipart/x-mixed-replace; boundary=stasis-image"
+                                ]],
                                 "body": {
-                                    "utf8": std::str::from_utf8(CONTROLLED_V2_HTTP_IMAGE).unwrap()
+                                    "utf8": std::str::from_utf8(
+                                        CONTROLLED_V2_MULTIPART_HTTP_IMAGE
+                                    ).unwrap()
                                 },
                             },
                         },
@@ -875,28 +895,731 @@ fn controlled_session_v2_http_image_remains_outside_owned_slice() {
         }),
     );
     let opened = receive(&responses);
-    assert_eq!(opened["id"], "open-controlled-image-http", "{opened:#}");
+    assert_eq!(opened["id"], "open-controlled-image-multipart", "{opened:#}");
     assert_eq!(opened["error"]["code"], "unsupported_work", "{opened:#}");
     assert_eq!(opened["error"]["fatal"], true, "{opened:#}");
-    let failure_code = opened["error"]["details"]["failure"]["code"]
-        .as_str()
-        .expect("HTTP image rejection must carry a typed failure code");
-    assert!(
-        matches!(
-            failure_code,
-            "unsupported_rendering" | "unsupported_clock_surface"
-        ),
-        "HTTP image must fail through an unchanged typed baseline authority: {opened:#}",
+    assert_eq!(opened["error"]["stateEffect"], "partial", "{opened:#}");
+    assert_eq!(
+        opened["error"]["details"]["failure"]["code"],
+        "unsupported_rendering",
+        "multipart must fail from retained rendering evidence, never a handoff timeout: {opened:#}",
+    );
+    assert_eq!(
+        opened["error"]["details"]["unsupportedWork"],
+        json!([{
+            "kind": "tracked_presence",
+            "count": "1",
+            "reason": "image_load",
+        }]),
+        "multipart must retain its exact typed image boundary: {opened:#}",
     );
 
     drop(input);
     let status = child
         .wait()
-        .expect("failed to wait for rejected HTTP image process");
+        .expect("failed to wait for rejected multipart image process");
     assert_eq!(
         status.code(),
         Some(70),
-        "fatal HTTP image rejection must use the documented exit code: {status}",
+        "fatal multipart image rejection must use the documented exit code: {status}",
+    );
+}
+
+#[test]
+fn controlled_session_v2_http_same_id_aba_ignores_stale_generations() {
+    let (asset_url, observed, release_a, release_b, b_flushed, asset_thread) =
+        start_controlled_image_aba_server();
+    let a_url = format!("{asset_url}a.svg");
+    let b_url = format!("{asset_url}b.svg");
+    let page = format!(
+        r##"<!doctype html>
+<meta charset="utf-8">
+<button id="a">A</button><button id="b">B</button><button id="a-again">A again</button>
+<img id="image" alt="controlled HTTP ABA">
+<output id="result">waiting</output>
+<script>
+  const image = document.querySelector("#image");
+  const result = document.querySelector("#result");
+  const mutations = [];
+  const events = [];
+  for (const type of ["load", "error", "loadend"]) {{
+    image.addEventListener(type, (event) => {{
+      events.push(`${{event.type}}:${{event.timeStamp}}`);
+      if (event.type === "loadend") {{
+        result.textContent = `${{mutations.join(">")}}|${{events.join(">")}}|${{image.currentSrc}}|now:${{performance.now()}}`;
+      }}
+    }});
+  }}
+  document.querySelector("#a").addEventListener("click", () => {{ mutations.push("A"); image.src = "{a_url}"; }});
+  document.querySelector("#b").addEventListener("click", () => {{ mutations.push("B"); image.src = "{b_url}"; }});
+  document.querySelector("#a-again").addEventListener("click", () => {{ mutations.push("A"); image.src = "{a_url}"; }});
+</script>"##,
+    );
+    let (document_url, document_thread) = start_static_document_server(page.into_bytes());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_stasis"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn stasis");
+    let mut input = child.stdin.take().expect("missing child stdin");
+    let responses = spawn_response_reader(child.stdout.take().expect("missing child stdout"));
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "init-controlled-image-aba",
+            "method": "protocol.initialize",
+            "params": {"client": {"name": "integration-test", "version": "0.0.0"}},
+        }),
+    );
+    assert_eq!(receive(&responses)["id"], "init-controlled-image-aba");
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "open-controlled-image-aba",
+            "method": "session.open",
+            "params": {
+                "url": document_url,
+                "clockMode": "controlled",
+                "profile": "controlled-web-session-v2",
+                "network": {
+                    "mode": "mixed",
+                    "routes": [],
+                },
+            },
+        }),
+    );
+    let opened = receive(&responses);
+    assert_eq!(opened["id"], "open-controlled-image-aba", "{opened:#}");
+    assert_eq!(
+        opened["result"]["boundary"],
+        "controlled_ready",
+        "controlled HTTP ABA document did not become ready: {opened:#}",
+    );
+    let mut token = state_token(&opened, "controlled HTTP ABA open");
+
+    let ready_settlement = call_session(
+        &mut input,
+        &responses,
+        "settle-controlled-image-aba-ready",
+        "runtime.settle",
+        json!({"expectedStateToken": token}),
+    );
+    assert_eq!(
+        ready_settlement["result"]["outcome"],
+        "quiescent",
+        "the no-image ABA document must settle before its actions run: {ready_settlement:#}",
+    );
+    token = state_token(&ready_settlement, "controlled HTTP ABA ready settlement");
+
+    let body = call_session(
+        &mut input,
+        &responses,
+        "text-controlled-image-aba-body",
+        "dom.text",
+        json!({"selector": "body", "expectedStateToken": token}),
+    );
+    assert!(
+        body["result"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("waiting")),
+        "the controlled HTTP ABA fixture body was not installed: {body:#}",
+    );
+    token = state_token(&body, "controlled HTTP ABA ready body");
+
+    let ready = call_session(
+        &mut input,
+        &responses,
+        "text-controlled-image-aba-ready",
+        "dom.text",
+        json!({"selector": "#result", "expectedStateToken": token}),
+    );
+    assert_eq!(
+        ready["result"]["value"],
+        "waiting",
+        "the held-response ABA page must be installed before its actions run: {ready:#}",
+    );
+    token = state_token(&ready, "controlled HTTP ABA ready page");
+
+    let (_, next_token) = call_controlled_action(
+        &mut input,
+        &responses,
+        "select-controlled-image-aba-a",
+        "action.activate",
+        json!({"selector": "#a"}),
+        &token,
+    );
+    token = next_token;
+    assert_eq!(
+        observed.recv_timeout(RESPONSE_TIMEOUT).unwrap(),
+        "/a.svg",
+        "the first A request must be live before selecting B",
+    );
+
+    let (_, next_token) = call_controlled_action(
+        &mut input,
+        &responses,
+        "select-controlled-image-aba-b",
+        "action.activate",
+        json!({"selector": "#b"}),
+        &token,
+    );
+    token = next_token;
+    assert_eq!(
+        observed.recv_timeout(RESPONSE_TIMEOUT).unwrap(),
+        "/b.svg",
+        "the B request must be live before selecting A again",
+    );
+
+    let (_, _next_token) = call_controlled_action(
+        &mut input,
+        &responses,
+        "select-controlled-image-aba-a-again",
+        "action.activate",
+        json!({"selector": "#a-again"}),
+        &token,
+    );
+
+    let asset_authority = asset_url
+        .strip_prefix("http://")
+        .and_then(|value| value.strip_suffix('/'))
+        .expect("controlled HTTP ABA asset URL must be a canonical HTTP authority");
+    let mut probe = TcpStream::connect(asset_authority)
+        .expect("failed to connect the controlled HTTP ABA request-order probe");
+    write!(
+        probe,
+        "GET /probe HTTP/1.1\r\nHost: {asset_authority}\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    probe.flush().unwrap();
+    assert_eq!(
+        observed.recv_timeout(RESPONSE_TIMEOUT).unwrap(),
+        "/probe",
+        "the final A selection must join the first pending cache ID instead of issuing a third request",
+    );
+
+    let pending = call_session(
+        &mut input,
+        &responses,
+        "pending-controlled-image-aba-two-requests",
+        "runtime.pending",
+        json!({}),
+    );
+    assert!(
+        !pending["result"]["network"]["active"]
+            .as_array()
+            .expect("ABA pending snapshot must carry active network operations")
+            .is_empty(),
+        "held A and B responses must retain external-I/O authority: {pending:#}",
+    );
+    let held_producers = pending["result"]["producers"]["pending"]
+        .as_str()
+        .expect("held ABA producer count must be canonical decimal")
+        .parse::<u128>()
+        .expect("held ABA producer count must be canonical decimal");
+    assert_ne!(
+        held_producers,
+        0,
+        "held A and B responses must remain producer-owned: {pending:#}",
+    );
+    assert_ne!(
+        pending["result"]["producers"]["stability"],
+        "stable_empty",
+        "held A and B responses cannot publish stable-empty producers: {pending:#}",
+    );
+    token = state_token(&pending, "controlled HTTP ABA pending snapshot");
+
+    release_b.send(()).unwrap();
+    b_flushed
+        .recv_timeout(RESPONSE_TIMEOUT)
+        .expect("B response did not flush while A remained held");
+    release_a.send(()).unwrap();
+    let settled = call_session(
+        &mut input,
+        &responses,
+        "settle-controlled-image-aba",
+        "runtime.settle",
+        json!({"expectedStateToken": token}),
+    );
+    assert_eq!(settled["result"]["outcome"], "quiescent", "{settled:#}");
+    assert_eq!(settled["result"]["unsupportedWork"], json!([]), "{settled:#}");
+    assert_eq!(settled["result"]["externalIo"], json!([]), "{settled:#}");
+    assert_eq!(
+        settled["result"]["snapshot"]["producers"]["pending"],
+        "0",
+        "{settled:#}",
+    );
+    assert_eq!(
+        settled["result"]["snapshot"]["rendering"]["pendingImages"],
+        "0",
+        "{settled:#}",
+    );
+    token = state_token(&settled, "controlled HTTP ABA settlement");
+
+    let text = call_session(
+        &mut input,
+        &responses,
+        "text-controlled-image-aba",
+        "dom.text",
+        json!({"selector": "#result", "expectedStateToken": token}),
+    );
+    assert_eq!(
+        text["result"]["value"],
+        format!("A>B>A|load:0>loadend:0|{a_url}|now:0"),
+        "B and the stale first-A generation must not deliver into the live final-A request: {text:#}",
+    );
+
+    let closed = call_session(
+        &mut input,
+        &responses,
+        "close-controlled-image-aba",
+        "session.close",
+        json!({}),
+    );
+    assert_eq!(closed["id"], "close-controlled-image-aba");
+    drop(input);
+    let status = child
+        .wait()
+        .expect("failed to wait for controlled HTTP ABA process");
+    assert!(status.success(), "controlled HTTP ABA process exited with {status}");
+    document_thread
+        .join()
+        .expect("controlled HTTP ABA document server panicked");
+    asset_thread.join().expect("controlled HTTP ABA server panicked");
+}
+
+#[test]
+fn controlled_session_v2_http_redirect_completion_is_owned() {
+    let (asset_url, asset_thread) = start_controlled_image_redirect_server();
+    let page = format!(
+        r##"<!doctype html>
+<meta charset="utf-8">
+<img id="image" alt="redirected controlled HTTP image">
+<output id="result">waiting</output>
+<script>
+  const image = document.querySelector("#image");
+  const events = [];
+  for (const type of ["load", "error", "loadend"]) {{
+    image.addEventListener(type, (event) => {{
+      events.push(`${{event.type}}:${{event.timeStamp}}`);
+      if (event.type === "loadend") {{
+        document.querySelector("#result").textContent = `${{events.join(">")}}|now:${{performance.now()}}`;
+      }}
+    }});
+  }}
+  image.src = "{asset_url}redirect.svg";
+</script>"##,
+    );
+    let (document_url, document_thread) = start_static_document_server(page.into_bytes());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_stasis"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn stasis");
+    let mut input = child.stdin.take().expect("missing child stdin");
+    let responses = spawn_response_reader(child.stdout.take().expect("missing child stdout"));
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "init-controlled-image-redirect",
+            "method": "protocol.initialize",
+            "params": {"client": {"name": "integration-test", "version": "0.0.0"}},
+        }),
+    );
+    assert_eq!(receive(&responses)["id"], "init-controlled-image-redirect");
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "open-controlled-image-redirect",
+            "method": "session.open",
+            "params": {
+                "url": document_url,
+                "clockMode": "controlled",
+                "profile": "controlled-web-session-v2",
+                "network": {"mode": "mixed", "routes": []},
+            },
+        }),
+    );
+    let opened = receive(&responses);
+    assert_eq!(opened["result"]["boundary"], "controlled_ready", "{opened:#}");
+    let token = state_token(&opened, "controlled HTTP redirect open");
+    let settled = call_session(
+        &mut input,
+        &responses,
+        "settle-controlled-image-redirect",
+        "runtime.settle",
+        json!({"expectedStateToken": token}),
+    );
+    assert_eq!(settled["result"]["outcome"], "quiescent", "{settled:#}");
+    assert_eq!(settled["result"]["unsupportedWork"], json!([]), "{settled:#}");
+    assert_eq!(settled["result"]["externalIo"], json!([]), "{settled:#}");
+    assert_eq!(
+        settled["result"]["snapshot"]["producers"]["pending"],
+        "0",
+        "{settled:#}",
+    );
+    assert_eq!(
+        settled["result"]["snapshot"]["rendering"]["pendingImages"],
+        "0",
+        "{settled:#}",
+    );
+    let token = state_token(&settled, "controlled HTTP redirect settlement");
+    let text = call_session(
+        &mut input,
+        &responses,
+        "text-controlled-image-redirect",
+        "dom.text",
+        json!({"selector": "#result", "expectedStateToken": token}),
+    );
+    assert_eq!(
+        text["result"]["value"],
+        "load:0>loadend:0|now:0",
+        "redirect response and final decode must share owned terminal image authority: {text:#}",
+    );
+    let closed = call_session(
+        &mut input,
+        &responses,
+        "close-controlled-image-redirect",
+        "session.close",
+        json!({}),
+    );
+    assert_eq!(closed["id"], "close-controlled-image-redirect");
+    drop(input);
+    let status = child
+        .wait()
+        .expect("failed to wait for controlled HTTP redirect process");
+    assert!(status.success(), "controlled HTTP redirect process exited with {status}");
+    document_thread
+        .join()
+        .expect("controlled HTTP redirect document server panicked");
+    asset_thread
+        .join()
+        .expect("controlled HTTP redirect asset server panicked");
+}
+
+#[test]
+fn controlled_session_v2_inflight_http_image_blocks_document_replacement() {
+    let (asset_url, asset_observed, release_asset, asset_flushed, asset_thread) =
+        start_held_controlled_image_server();
+    let (document_url, replacement_url, replacement_flushed, document_thread) =
+        start_controlled_image_replacement_server(&asset_url);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_stasis"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn stasis");
+    let mut input = child.stdin.take().expect("missing child stdin");
+    let responses = spawn_response_reader(child.stdout.take().expect("missing child stdout"));
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "init-controlled-image-replacement",
+            "method": "protocol.initialize",
+            "params": {"client": {"name": "integration-test", "version": "0.0.0"}},
+        }),
+    );
+    assert_eq!(receive(&responses)["id"], "init-controlled-image-replacement");
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "open-controlled-image-replacement",
+            "method": "session.open",
+            "params": {
+                "url": document_url,
+                "clockMode": "controlled",
+                "profile": "controlled-web-session-v2",
+                "network": {"mode": "mixed", "routes": []},
+            },
+        }),
+    );
+    let opened = receive(&responses);
+    assert_eq!(opened["result"]["boundary"], "controlled_ready", "{opened:#}");
+    let token = state_token(&opened, "controlled HTTP replacement open");
+    let ready = call_session(
+        &mut input,
+        &responses,
+        "settle-controlled-image-replacement-ready",
+        "runtime.settle",
+        json!({"expectedStateToken": token}),
+    );
+    assert_eq!(ready["result"]["outcome"], "quiescent", "{ready:#}");
+    let token = state_token(&ready, "controlled HTTP replacement ready");
+    let (_, token) = call_controlled_action(
+        &mut input,
+        &responses,
+        "start-controlled-image-before-replacement",
+        "action.activate",
+        json!({"selector": "#start"}),
+        &token,
+    );
+    assert_eq!(
+        asset_observed.recv_timeout(RESPONSE_TIMEOUT).unwrap(),
+        "/held.svg",
+        "the old document image must be in flight before replacement",
+    );
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "navigate-controlled-image-replacement",
+            "sessionId": "s-1",
+            "method": "session.navigate",
+            "params": {"url": replacement_url, "expectedStateToken": token},
+        }),
+    );
+    replacement_flushed
+        .recv_timeout(RESPONSE_TIMEOUT)
+        .expect("replacement document did not flush while the old image remained held");
+    release_asset.send(()).unwrap();
+    asset_flushed
+        .recv_timeout(RESPONSE_TIMEOUT)
+        .expect("held old-document image response did not flush");
+    let navigated = receive(&responses);
+    assert_eq!(
+        navigated["error"]["code"],
+        "blocked_on_external_io",
+        "replacement must fail closed instead of declaring authority across an in-flight old-document image: {navigated:#}",
+    );
+    assert_eq!(navigated["error"]["fatal"], true, "{navigated:#}");
+    drop(input);
+    let status = child
+        .wait()
+        .expect("failed to wait for controlled HTTP replacement process");
+    assert_eq!(
+        status.code(),
+        Some(70),
+        "fatal replacement rejection must use the documented exit code: {status}",
+    );
+    document_thread
+        .join()
+        .expect("controlled HTTP replacement document server panicked");
+    asset_thread
+        .join()
+        .expect("controlled HTTP replacement asset server panicked");
+}
+
+fn exercise_controlled_http_image_profile(profile: &str, case_id: &str, supported: bool) {
+    let document_url = format!("https://controlled-image-{case_id}.example.test/");
+    let image_url =
+        "https://controlled-image-assets.example.test/controlled-v2-http-image.svg";
+    let invalid_image_url =
+        "https://controlled-image-assets.example.test/controlled-v2-http-image.invalid";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_stasis"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn stasis");
+    let mut input = child.stdin.take().expect("missing child stdin");
+    let responses = spawn_response_reader(child.stdout.take().expect("missing child stdout"));
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": format!("init-controlled-image-{case_id}"),
+            "method": "protocol.initialize",
+            "params": {"client": {"name": "integration-test", "version": "0.0.0"}},
+        }),
+    );
+    assert_eq!(
+        receive(&responses)["id"],
+        format!("init-controlled-image-{case_id}"),
+    );
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": format!("open-controlled-image-{case_id}"),
+            "method": "session.open",
+            "params": {
+                "url": document_url.as_str(),
+                "clockMode": "controlled",
+                "profile": profile,
+                "network": {
+                    "mode": "fixtures_only",
+                    "routes": [
+                        {
+                            "match": {
+                                "method": "GET",
+                                "url": {"exact": document_url.as_str()}
+                            },
+                            "fulfill": {
+                                "status": 200,
+                                "headers": [["content-type", "text/html; charset=utf-8"]],
+                                "body": {
+                                    "utf8": std::str::from_utf8(CONTROLLED_V2_IMAGE_HTTP_FIXTURE)
+                                        .unwrap()
+                                },
+                            },
+                        },
+                        {
+                            "match": {
+                                "method": "GET",
+                                "url": {"exact": image_url}
+                            },
+                            "fulfill": {
+                                "status": 200,
+                                "headers": [["content-type", "image/svg+xml"]],
+                                "body": {
+                                    "utf8": std::str::from_utf8(CONTROLLED_V2_HTTP_IMAGE).unwrap()
+                                },
+                            },
+                        },
+                        {
+                            "match": {
+                                "method": "GET",
+                                "url": {"exact": invalid_image_url}
+                            },
+                            "fulfill": {
+                                "status": 200,
+                                "headers": [["content-type", "image/png"]],
+                                "body": {
+                                    "utf8": std::str::from_utf8(
+                                        CONTROLLED_V2_INVALID_HTTP_IMAGE
+                                    ).unwrap()
+                                },
+                            },
+                        },
+                    ],
+                },
+            },
+        }),
+    );
+    let opened = receive(&responses);
+    assert_eq!(
+        opened["id"],
+        format!("open-controlled-image-{case_id}"),
+        "{opened:#}",
+    );
+
+    if !supported {
+        assert_eq!(opened["error"]["code"], "unsupported_work", "{opened:#}");
+        assert_eq!(opened["error"]["fatal"], true, "{opened:#}");
+        let failure_code = opened["error"]["details"]["failure"]["code"]
+            .as_str()
+            .expect("v1 HTTP image rejection must carry a typed failure code");
+        assert!(
+            matches!(
+                failure_code,
+                "unsupported_rendering" | "unsupported_clock_surface"
+            ),
+            "frozen v1 must retain its HTTP image authority boundary: {opened:#}",
+        );
+        drop(input);
+        let status = child
+            .wait()
+            .expect("failed to wait for rejected v1 HTTP image process");
+        assert_eq!(
+            status.code(),
+            Some(70),
+            "fatal v1 HTTP image rejection must use the documented exit code: {status}",
+        );
+        return;
+    }
+
+    assert_eq!(opened["sessionId"], "s-1", "{opened:#}");
+    let open_token = opened["result"]["stateToken"]
+        .as_str()
+        .expect("controlled HTTP image open result must carry stateToken")
+        .to_owned();
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": format!("settle-controlled-image-{case_id}"),
+            "sessionId": "s-1",
+            "method": "runtime.settle",
+            "params": {"expectedStateToken": open_token},
+        }),
+    );
+    let settled = receive(&responses);
+    assert_eq!(
+        settled["id"],
+        format!("settle-controlled-image-{case_id}"),
+        "{settled:#}",
+    );
+    assert_eq!(settled["result"]["outcome"], "quiescent", "{settled:#}");
+    assert_eq!(settled["result"]["unsupportedWork"], json!([]), "{settled:#}");
+    assert_eq!(settled["result"]["externalIo"], json!([]), "{settled:#}");
+    assert_eq!(
+        settled["result"]["snapshot"]["producers"]["pending"], "0",
+        "{settled:#}",
+    );
+    assert_eq!(
+        settled["result"]["snapshot"]["rendering"]["pendingImages"], "0",
+        "{settled:#}",
+    );
+    let settled_token = settled["result"]["stateToken"]
+        .as_str()
+        .expect("controlled HTTP image settlement must carry stateToken")
+        .to_owned();
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": format!("text-controlled-image-{case_id}"),
+            "sessionId": "s-1",
+            "method": "dom.text",
+            "params": {"selector": "#result", "expectedStateToken": settled_token},
+        }),
+    );
+    let text = receive(&responses);
+    assert_eq!(
+        text["result"]["value"],
+        "loaded:load:0>loadend:0|failed:error:0>loadend:0|cached:load:0|now:0",
+        "HTTP success, decode failure, and a same-pipeline cache hit must all drain through owned callbacks: {text:#}",
+    );
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": format!("close-controlled-image-{case_id}"),
+            "sessionId": "s-1",
+            "method": "session.close",
+            "params": {},
+        }),
+    );
+    assert_eq!(
+        receive(&responses)["id"],
+        format!("close-controlled-image-{case_id}"),
+    );
+    drop(input);
+    let status = child
+        .wait()
+        .expect("failed to wait for controlled HTTP image process");
+    assert!(
+        status.success(),
+        "controlled HTTP image process exited with {status}",
     );
 }
 
@@ -5830,6 +6553,308 @@ fn receive(responses: &Receiver<String>) -> Value {
         .recv_timeout(RESPONSE_TIMEOUT)
         .expect("timed out waiting for protocol response");
     serde_json::from_str(&line).expect("stdout contained a non-JSON protocol line")
+}
+
+fn start_controlled_image_aba_server() -> (
+    String,
+    Receiver<String>,
+    SyncSender<()>,
+    SyncSender<()>,
+    Receiver<()>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .expect("failed to bind controlled HTTP ABA image server");
+    let address = listener.local_addr().unwrap();
+    let (observed_sender, observed_receiver) = sync_channel(3);
+    let (release_a_sender, release_a_receiver) = sync_channel(1);
+    let (release_b_sender, release_b_receiver) = sync_channel(1);
+    let (b_flushed_sender, b_flushed_receiver) = sync_channel(1);
+    let handle = thread::spawn(move || {
+        let mut release_a = Some(release_a_receiver);
+        let mut release_b = Some(release_b_receiver);
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("failed to accept controlled HTTP ABA image request");
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .expect("failed to read controlled HTTP ABA image request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .expect("controlled HTTP ABA request has no path")
+                .to_owned();
+            observed_sender
+                .send(path.clone())
+                .expect("controlled HTTP ABA observer dropped");
+            let release = match path.as_str() {
+                "/a.svg" => release_a
+                    .take()
+                    .expect("controlled HTTP ABA issued a second A resource request"),
+                "/b.svg" => release_b
+                    .take()
+                    .expect("controlled HTTP ABA issued a second B resource request"),
+                _ => panic!("unexpected controlled HTTP ABA request path: {path}"),
+            };
+            let is_b = path == "/b.svg";
+            let b_flushed_sender = b_flushed_sender.clone();
+            workers.push(thread::spawn(move || {
+                release
+                    .recv_timeout(RESPONSE_TIMEOUT)
+                    .expect("controlled HTTP ABA response was not released");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    CONTROLLED_V2_HTTP_IMAGE.len(),
+                )
+                .unwrap();
+                stream.write_all(CONTROLLED_V2_HTTP_IMAGE).unwrap();
+                stream.flush().unwrap();
+                if is_b {
+                    b_flushed_sender
+                        .send(())
+                        .expect("controlled HTTP ABA B-flush observer dropped");
+                }
+            }));
+        }
+        let (mut probe, _) = listener
+            .accept()
+            .expect("failed to accept controlled HTTP ABA request-order probe");
+        let mut request = [0_u8; 4096];
+        let read = probe
+            .read(&mut request)
+            .expect("failed to read controlled HTTP ABA request-order probe");
+        let request = String::from_utf8_lossy(&request[..read]);
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("controlled HTTP ABA request-order probe has no path");
+        observed_sender
+            .send(path.to_owned())
+            .expect("controlled HTTP ABA observer dropped");
+        assert_eq!(
+            path, "/probe",
+            "the final A selection issued a third HTTP request instead of joining its pending cache ID",
+        );
+        write!(
+            probe,
+            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        probe.flush().unwrap();
+        assert!(release_a.is_none(), "controlled HTTP ABA never requested A");
+        assert!(release_b.is_none(), "controlled HTTP ABA never requested B");
+        for worker in workers {
+            worker.join().expect("controlled HTTP ABA response worker panicked");
+        }
+    });
+    (
+        format!("http://{address}/"),
+        observed_receiver,
+        release_a_sender,
+        release_b_sender,
+        b_flushed_receiver,
+        handle,
+    )
+}
+
+fn start_static_document_server(body: Vec<u8>) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .expect("failed to bind controlled HTTP document server");
+    let address = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("failed to accept controlled HTTP document request");
+        let mut request = [0_u8; 4096];
+        stream
+            .read(&mut request)
+            .expect("failed to read controlled HTTP document request");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
+        )
+        .unwrap();
+        stream.write_all(&body).unwrap();
+        stream.flush().unwrap();
+    });
+    (format!("http://{address}/"), handle)
+}
+
+fn start_controlled_image_redirect_server() -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .expect("failed to bind controlled HTTP image redirect server");
+    let address = listener.local_addr().unwrap();
+    let base_url = format!("http://{address}/");
+    let thread_url = base_url.clone();
+    let handle = thread::spawn(move || {
+        for expected_path in ["/redirect.svg", "/final.svg"] {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("failed to accept controlled HTTP image redirect request");
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .expect("failed to read controlled HTTP image redirect request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .expect("controlled HTTP image redirect request has no path");
+            assert_eq!(path, expected_path, "unexpected image redirect request order");
+            if path == "/redirect.svg" {
+                write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\nLocation: {thread_url}final.svg\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            } else {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    CONTROLLED_V2_HTTP_IMAGE.len(),
+                )
+                .unwrap();
+                stream.write_all(CONTROLLED_V2_HTTP_IMAGE).unwrap();
+            }
+            stream.flush().unwrap();
+        }
+    });
+    (base_url, handle)
+}
+
+fn start_held_controlled_image_server() -> (
+    String,
+    Receiver<String>,
+    SyncSender<()>,
+    Receiver<()>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .expect("failed to bind held controlled HTTP image server");
+    let address = listener.local_addr().unwrap();
+    let (observed_sender, observed_receiver) = sync_channel(1);
+    let (release_sender, release_receiver) = sync_channel(1);
+    let (flushed_sender, flushed_receiver) = sync_channel(1);
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("failed to accept held controlled HTTP image request");
+        let mut request = [0_u8; 4096];
+        let read = stream
+            .read(&mut request)
+            .expect("failed to read held controlled HTTP image request");
+        let request = String::from_utf8_lossy(&request[..read]);
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("held controlled HTTP image request has no path")
+            .to_owned();
+        observed_sender
+            .send(path)
+            .expect("held controlled HTTP image observer dropped");
+        release_receiver
+            .recv_timeout(RESPONSE_TIMEOUT)
+            .expect("held controlled HTTP image response was not released");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            CONTROLLED_V2_HTTP_IMAGE.len(),
+        )
+        .unwrap();
+        stream.write_all(CONTROLLED_V2_HTTP_IMAGE).unwrap();
+        stream.flush().unwrap();
+        flushed_sender
+            .send(())
+            .expect("held controlled HTTP image flush observer dropped");
+    });
+    (
+        format!("http://{address}/"),
+        observed_receiver,
+        release_sender,
+        flushed_receiver,
+        handle,
+    )
+}
+
+fn start_controlled_image_replacement_server(
+    asset_url: &str,
+) -> (String, String, Receiver<()>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .expect("failed to bind controlled HTTP image replacement server");
+    let address = listener.local_addr().unwrap();
+    let base_url = format!("http://{address}/");
+    let source_url = format!("{base_url}a");
+    let replacement_url = format!("{base_url}b");
+    let source = format!(
+        r##"<!doctype html>
+<meta charset="utf-8">
+<button id="start">start held image</button>
+<img id="image" alt="held controlled HTTP image">
+<script>
+  const image = document.querySelector("#image");
+  for (const type of ["load", "error"]) {{
+    image.addEventListener(type, () => {{ document.cookie = "stale-image=delivered; Path=/"; }});
+  }}
+  document.querySelector("#start").addEventListener("click", () => {{ image.src = "{asset_url}held.svg"; }});
+</script>"##,
+    )
+    .into_bytes();
+    let replacement = br##"<!doctype html>
+<meta charset="utf-8">
+<output id="result">waiting</output>
+<script>
+  document.querySelector("#result").textContent =
+    document.cookie.includes("stale-image=delivered") ? "stale" : "replacement";
+</script>"##
+        .to_vec();
+    let (replacement_flushed_sender, replacement_flushed_receiver) = sync_channel(1);
+    let handle = thread::spawn(move || {
+        for (expected_path, body) in [("/a", source), ("/b", replacement)] {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("failed to accept controlled HTTP image replacement request");
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .expect("failed to read controlled HTTP image replacement request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .expect("controlled HTTP image replacement request has no path");
+            assert_eq!(path, expected_path, "unexpected replacement request order");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+            stream.flush().unwrap();
+            if expected_path == "/b" {
+                replacement_flushed_sender
+                    .send(())
+                    .expect("controlled HTTP replacement flush observer dropped");
+            }
+        }
+    });
+    (
+        source_url,
+        replacement_url,
+        replacement_flushed_receiver,
+        handle,
+    )
 }
 
 fn start_redirect_fixture() -> (String, thread::JoinHandle<()>) {

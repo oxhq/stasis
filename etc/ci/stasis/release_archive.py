@@ -26,127 +26,83 @@ REVISION_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 RUN_ID_RE = re.compile(r"[1-9][0-9]*")
 FROZEN_V1_PROFILE = Path("profiles/controlled-webapp-v1.json")
-FROZEN_V1_PROFILE_SHA256 = (
-    "6e262edf0f8be11a1cece28f68f00d59fdac68b79b0a670ac891d36998720100"
-)
+FROZEN_V1_PROFILE_SHA256 = "6e262edf0f8be11a1cece28f68f00d59fdac68b79b0a670ac891d36998720100"
 FROZEN_V2_PROFILE = Path("profiles/controlled-web-session-v1.json")
-FROZEN_V2_PROFILE_SHA256 = (
-    "9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a"
-)
+FROZEN_V2_PROFILE_SHA256 = "9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a"
 CANDIDATE_V2_PROFILE = Path("profiles/controlled-web-session-v2.json")
-CANDIDATE_V2_PROFILE_SHA256 = (
-    "b42c0a588b4b01007b7df82d32e06877918e54879b2aaa1773f9c4b6ed4cec07"
-)
+CANDIDATE_V2_PROFILE_SHA256 = "d9855ee01844e0fae796a9925c87a936281d47fc480b9d047da74d4a3afcd989"
 CANDIDATE_V2_CONTRACT = Path("docs/stasis/session-v0.3-candidate.md")
-CANDIDATE_V2_CONTRACT_SHA256 = (
-    "e403337eaa8893815157d6f4e1cef58da050ee4245c98efd800f28318f291816"
-)
-MESSAGE_CHANNEL_LIMITS_SOURCE = Path(
-    "components/script/dom/globalscope/globalscope.rs"
-)
+CANDIDATE_V2_CONTRACT_SHA256 = "47116a08cd3917466ca57f2a51bc74f0b4052688af878f0ee493e9a893929cc2"
+PUBLIC_TOP_LEVEL_README = Path("README.md")
+PUBLIC_STASIS_BOUNDARY = Path("STASIS.md")
+PUBLIC_PROFILE_README = Path("profiles/README.md")
+PUBLIC_TYPESCRIPT_SDK_README = Path("sdk/typescript/README.md")
+PUBLIC_RELEASE_RUNBOOK = Path("docs/stasis/releases.md")
+PUBLIC_RELEASE_WORKFLOW = Path(".github/workflows/stasis-package.yml")
+MESSAGE_CHANNEL_LIMITS_SOURCE = Path("components/script/dom/globalscope/globalscope.rs")
 MESSAGE_CHANNEL_BASELINE_TEST_SOURCE = Path("ports/stasis/tests/baseline_protocol.rs")
-MESSAGE_CHANNEL_MULTI_PAIR_FIXTURE = Path(
-    "ports/stasis/tests/fixtures/message_channel_multi_pair.html"
-)
+MESSAGE_CHANNEL_MULTI_PAIR_FIXTURE = Path("ports/stasis/tests/fixtures/message_channel_multi_pair.html")
 MESSAGE_CHANNEL_SOURCE = Path("components/script/dom/globalscope/messagechannel.rs")
-STRUCTURED_CLONE_SOURCE = Path(
-    "components/script/dom/bindings/structuredclone.rs"
-)
+STRUCTURED_CLONE_SOURCE = Path("components/script/dom/bindings/structuredclone.rs")
 MESSAGE_PORT_SOURCE = Path("components/script/dom/globalscope/messageport.rs")
-INPUT_METHOD_CONTROL_SOURCE = Path(
-    "components/script/dom/document/document_embedder_controls.rs"
-)
-INPUT_METHOD_INPUT_SOURCE = Path(
-    "components/script/dom/html/form_controls/htmlinputelement.rs"
-)
-INPUT_METHOD_TEXTAREA_SOURCE = Path(
-    "components/script/dom/html/form_controls/htmltextareaelement.rs"
-)
+INPUT_METHOD_CONTROL_SOURCE = Path("components/script/dom/document/document_embedder_controls.rs")
+INPUT_METHOD_INPUT_SOURCE = Path("components/script/dom/html/form_controls/htmlinputelement.rs")
+INPUT_METHOD_TEXTAREA_SOURCE = Path("components/script/dom/html/form_controls/htmltextareaelement.rs")
 EVENT_SOURCE = Path("components/script/dom/event/event.rs")
 FOCUS_EVENT_SOURCE = Path("components/script/dom/event/focusevent.rs")
 CONTROLLED_AUTOMATION_SOURCE = Path("components/script/automation.rs")
-CONTROLLED_AUTOMATION_EVENT_TARGET_SOURCE = Path(
-    "components/script/dom/event/eventtarget.rs"
-)
-CONTROLLED_AUTOMATION_INPUT_EVENT_SOURCE = Path(
-    "components/script/dom/event/inputevent.rs"
-)
-CONTROLLED_AUTOMATION_POINTER_EVENT_SOURCE = Path(
-    "components/script/dom/event/pointerevent.rs"
-)
-CONTROLLED_AUTOMATION_SUBMIT_EVENT_SOURCE = Path(
-    "components/script/dom/event/submitevent.rs"
-)
-CONTROLLED_AUTOMATION_FORM_DATA_EVENT_SOURCE = Path(
-    "components/script/dom/event/formdataevent.rs"
-)
-CONTROLLED_AUTOMATION_EVENT_FIXTURE = Path(
-    "ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html"
-)
+CONTROLLED_AUTOMATION_EVENT_TARGET_SOURCE = Path("components/script/dom/event/eventtarget.rs")
+CONTROLLED_AUTOMATION_INPUT_EVENT_SOURCE = Path("components/script/dom/event/inputevent.rs")
+CONTROLLED_AUTOMATION_POINTER_EVENT_SOURCE = Path("components/script/dom/event/pointerevent.rs")
+CONTROLLED_AUTOMATION_SUBMIT_EVENT_SOURCE = Path("components/script/dom/event/submitevent.rs")
+CONTROLLED_AUTOMATION_FORM_DATA_EVENT_SOURCE = Path("components/script/dom/event/formdataevent.rs")
+CONTROLLED_AUTOMATION_EVENT_FIXTURE = Path("ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html")
 CONTROLLED_CSS_ANIMATION_SOURCE = Path("components/script/animations.rs")
-CONTROLLED_CSS_ANIMATION_EVENT_SOURCE = Path(
-    "components/script/dom/event/animationevent.rs"
-)
-CONTROLLED_CSS_TRANSITION_EVENT_SOURCE = Path(
-    "components/script/dom/event/transitionevent.rs"
-)
+CONTROLLED_CSS_ANIMATION_EVENT_SOURCE = Path("components/script/dom/event/animationevent.rs")
+CONTROLLED_CSS_TRANSITION_EVENT_SOURCE = Path("components/script/dom/event/transitionevent.rs")
 CONTROLLED_CSS_DOCUMENT_SOURCE = Path("components/script/dom/document/document.rs")
 CONTROLLED_CSS_ANIMATION_EVENT_FIXTURE = Path(
     "ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html"
 )
 CONTROLLED_RENDERING_SETTLEMENT_SOURCE = Path("ports/stasis/src/settle.rs")
-CONTROLLED_IMAGE_ELEMENT_SOURCE = Path(
-    "components/script/dom/html/embedded_content/htmlimageelement.rs"
-)
+CONTROLLED_IMAGE_ELEMENT_SOURCE = Path("components/script/dom/html/embedded_content/htmlimageelement.rs")
 CONTROLLED_IMAGE_WINDOW_SOURCE = Path("components/script/dom/window/window.rs")
-CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE = Path(
-    "components/script/event_loop/script_thread.rs"
-)
+CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE = Path("components/script/event_loop/script_thread.rs")
 CONTROLLED_IMAGE_MESSAGING_SOURCE = Path("components/script/messaging.rs")
 CONTROLLED_IMAGE_PRODUCER_FENCE_SOURCE = Path("components/script/producer_fence.rs")
-CONTROLLED_INLINE_SVG_SOURCE = Path(
-    "components/script/dom/svg/svgsvgelement.rs"
-)
-CONTROLLED_INLINE_SVG_FIXTURE = Path(
-    "ports/stasis/tests/fixtures/controlled_v2_inline_svg.html"
-)
-CONTROLLED_INLINE_SVG_ADVANCED_FIXTURE = Path(
-    "ports/stasis/tests/fixtures/controlled_v2_inline_svg_advanced.html"
-)
+CONTROLLED_IMAGE_CACHE_SOURCE = Path("components/net/image_cache.rs")
+CONTROLLED_PROFILE_WIRE_SOURCE = Path("ports/stasis/src/wire.rs")
+CONTROLLED_HTTP_IMAGE_FIXTURE = Path("ports/stasis/tests/fixtures/controlled_v2_image_http.html")
+CONTROLLED_HTTP_IMAGE_MULTIPART_FIXTURE = Path("ports/stasis/tests/fixtures/controlled_v2_image_http_multipart.html")
+CONTROLLED_INLINE_SVG_SOURCE = Path("components/script/dom/svg/svgsvgelement.rs")
+CONTROLLED_INLINE_SVG_FIXTURE = Path("ports/stasis/tests/fixtures/controlled_v2_inline_svg.html")
+CONTROLLED_INLINE_SVG_ADVANCED_FIXTURE = Path("ports/stasis/tests/fixtures/controlled_v2_inline_svg_advanced.html")
 EXECUTION_LIMITS_SOURCE = Path("components/timers/lib.rs")
 CONTROLLED_INPUT_METHOD_EMBEDDER_SUMMARY = (
     "controlledTopLevelSingleLineTextInputMethodPresentationWithoutVirtualKeyboard"
 )
 CONTROLLED_INPUT_METHOD_PRODUCT_SURFACE = (
-    "controlled_top_level_single_line_text_input_method_"
-    "presentation_suppression_without_virtual_keyboard"
+    "controlled_top_level_single_line_text_input_method_presentation_suppression_without_virtual_keyboard"
 )
 CONTROLLED_FOCUS_EVENT_TIMESTAMP_PRODUCT_SURFACE = (
     "controlled_top_level_engine_focus_event_timestamp_from_document_clock"
 )
 CONTROLLED_AUTOMATION_EVENT_TIMESTAMP_PRODUCT_SURFACE = (
-    "controlled_top_level_synchronous_public_automation_event_"
-    "timestamps_from_document_clock"
+    "controlled_top_level_synchronous_public_automation_event_timestamps_from_document_clock"
 )
 CONTROLLED_CSS_ANIMATION_EVENT_TIMESTAMP_PRODUCT_SURFACE = (
-    "controlled_public_non_auxiliary_top_level_internal_CSS_animation_event_"
-    "timestamps_from_document_clock"
+    "controlled_public_non_auxiliary_top_level_internal_CSS_animation_event_timestamps_from_document_clock"
 )
-CONTROLLED_IMAGE_ELEMENT_PRODUCT_SURFACE = (
-    "bounded_controlled_top_level_direct_data_svg_HTMLImageElement_completion"
+CONTROLLED_IMAGE_ELEMENT_PRODUCT_SURFACE = "bounded_controlled_top_level_direct_data_svg_HTMLImageElement_completion"
+CONTROLLED_HTTP_IMAGE_ELEMENT_PRODUCT_SURFACE = (
+    "initial_url_and_retained_ownership_bounded_controlled_top_level_direct_http_https_HTMLImageElement_completion"
 )
-CONTROLLED_INLINE_SVG_PRODUCT_SURFACE = (
-    "bounded_controlled_top_level_internal_serialized_data_svg_inline_rendering"
-)
+CONTROLLED_INLINE_SVG_PRODUCT_SURFACE = "bounded_controlled_top_level_internal_serialized_data_svg_inline_rendering"
 CONTROLLED_COOKIE_EXPIRY_PRODUCT_SURFACE = (
     "controlled_in_memory_persistent_cookie_expiry_with_explicit_v2_state_portability"
 )
-CONTROLLED_COOKIE_SAME_SITE_PRODUCT_SURFACE = (
-    "bounded_schemeful_SameSite_request_cookie_selection"
-)
-CONTROLLED_COOKIE_SAME_SITE_RESPONSE_PRODUCT_SURFACE = (
-    "bounded_schemeful_SameSite_response_cookie_storage"
-)
+CONTROLLED_COOKIE_SAME_SITE_PRODUCT_SURFACE = "bounded_schemeful_SameSite_request_cookie_selection"
+CONTROLLED_COOKIE_SAME_SITE_RESPONSE_PRODUCT_SURFACE = "bounded_schemeful_SameSite_response_cookie_storage"
 
 BINARY_NAME = "stasis"
 THIRD_PARTY_NAME = "THIRD_PARTY_LICENSES.html"
@@ -157,8 +113,7 @@ PLATFORM_CONTRACTS: dict[str, dict[str, str]] = {
         "architecture": "x86_64",
         "abi": "GNU/Linux with glibc 2.35 or newer",
         "install_note": (
-            "This executable targets x86_64 GNU/Linux with glibc 2.35 or newer "
-            "(the Ubuntu 22.04 compatibility floor)."
+            "This executable targets x86_64 GNU/Linux with glibc 2.35 or newer (the Ubuntu 22.04 compatibility floor)."
         ),
         "dependency_note": (
             "External runtime baseline: Ubuntu 22.04-compatible x86_64 userspace with "
@@ -171,13 +126,8 @@ PLATFORM_CONTRACTS: dict[str, dict[str, str]] = {
         "operating_system": "macOS",
         "architecture": "arm64",
         "abi": "macOS arm64",
-        "install_note": (
-            "This macOS arm64 executable is unsigned and is not Apple-notarized."
-        ),
-        "dependency_note": (
-            "External runtime dependencies: Apple system libraries and frameworks "
-            "supplied by macOS."
-        ),
+        "install_note": ("This macOS arm64 executable is unsigned and is not Apple-notarized."),
+        "dependency_note": ("External runtime dependencies: Apple system libraries and frameworks supplied by macOS."),
     },
 }
 SOURCE_ASSETS = {
@@ -253,9 +203,7 @@ def require_fullmatch(pattern: re.Pattern[str], value: str, field: str) -> str:
 def validate_identity(version: str, platform: str, revision: str, repository: str) -> None:
     require_fullmatch(VERSION_RE, version, "version")
     if platform not in PLATFORM_CONTRACTS:
-        raise ReleaseError(
-            f"unsupported platform {platform!r}; expected one of {sorted(PLATFORM_CONTRACTS)}"
-        )
+        raise ReleaseError(f"unsupported platform {platform!r}; expected one of {sorted(PLATFORM_CONTRACTS)}")
     require_fullmatch(REVISION_RE, revision, "revision")
     if not repository.startswith("https://") or repository.endswith("/"):
         raise ReleaseError(f"repository must be an https URL without a trailing slash: {repository!r}")
@@ -264,9 +212,7 @@ def validate_identity(version: str, platform: str, revision: str, repository: st
 def platform_contract(platform: str) -> dict[str, str]:
     contract = PLATFORM_CONTRACTS.get(platform)
     if contract is None:
-        raise ReleaseError(
-            f"unsupported platform {platform!r}; expected one of {sorted(PLATFORM_CONTRACTS)}"
-        )
+        raise ReleaseError(f"unsupported platform {platform!r}; expected one of {sorted(PLATFORM_CONTRACTS)}")
     return contract
 
 
@@ -304,11 +250,7 @@ def release_asset_names(version: str, platform: str) -> dict[str, str]:
 
 
 def source_text(repository: str, revision: str) -> str:
-    return (
-        f"Repository: {repository}\n"
-        f"Source: {repository}/commit/{revision}\n"
-        f"Revision: {revision}\n"
-    )
+    return f"Repository: {repository}\nSource: {repository}/commit/{revision}\nRevision: {revision}\n"
 
 
 def version_text(version: str, platform: str, revision: str) -> str:
@@ -342,7 +284,7 @@ def readme_text(version: str, platform: str, repository: str) -> str:
         "Start with INSTALL.txt. NATIVE-LIBRARIES.txt records the native runtime "
         "dependency boundary for this exact artifact. "
         "controlled-web-session-v2.json and session-v0.3-candidate.md record the "
-        "candidate execution-profile boundary shipped with these bytes.\n"
+        "stable execution-profile boundary shipped with these bytes.\n"
     )
 
 
@@ -391,9 +333,7 @@ def parse_sidecar(filename: Path, expected_label: str) -> str:
         raise ReleaseError(f"cannot read checksum sidecar {filename}: {error}") from error
     match = re.fullmatch(r"([0-9a-f]{64})  ([^\r\n]+)\n", content)
     if match is None or match.group(2) != expected_label:
-        raise ReleaseError(
-            f"checksum sidecar {filename.name} must contain one canonical entry for {expected_label}"
-        )
+        raise ReleaseError(f"checksum sidecar {filename.name} must contain one canonical entry for {expected_label}")
     return match.group(1)
 
 
@@ -408,8 +348,7 @@ def verify_frozen_v1_profile(source_root: Path) -> dict[str, str]:
     actual = sha256_file(filename)
     if actual != FROZEN_V1_PROFILE_SHA256:
         raise ReleaseError(
-            "frozen controlled-webapp-v1 profile SHA-256 differs: "
-            f"expected {FROZEN_V1_PROFILE_SHA256}, got {actual}"
+            f"frozen controlled-webapp-v1 profile SHA-256 differs: expected {FROZEN_V1_PROFILE_SHA256}, got {actual}"
         )
     return {"path": FROZEN_V1_PROFILE.as_posix(), "sha256": actual}
 
@@ -439,9 +378,7 @@ def require_expected_fields(
 ) -> None:
     for field, expected_value in expected.items():
         if document.get(field) != expected_value:
-            raise ReleaseError(
-                f"{description} {field} must be {expected_value!r}"
-            )
+            raise ReleaseError(f"{description} {field} must be {expected_value!r}")
 
 
 def require_exact_fields(
@@ -450,9 +387,7 @@ def require_exact_fields(
     description: str,
 ) -> None:
     if set(document) != set(expected):
-        raise ReleaseError(
-            f"{description} must contain exactly {sorted(expected)!r}"
-        )
+        raise ReleaseError(f"{description} must contain exactly {sorted(expected)!r}")
     require_expected_fields(document, expected, description)
 
 
@@ -465,17 +400,13 @@ def require_source_fragments_in_order(
     for fragment in fragments:
         position = source.find(fragment, cursor)
         if position < 0:
-            raise ReleaseError(
-                f"cannot locate ordered {description} source fragment {fragment!r}"
-            )
+            raise ReleaseError(f"cannot locate ordered {description} source fragment {fragment!r}")
         cursor = position + len(fragment)
 
 
 def verify_message_port_router_source(source: str) -> None:
     capacity_start = source.find("fn controlled_local_channel_capacity_admitted(")
-    retention_start = source.find(
-        "fn controlled_local_port_retains_native_capacity(", capacity_start
-    )
+    retention_start = source.find("fn controlled_local_port_retains_native_capacity(", capacity_start)
     retention_end = source.find("enum MessagePortRouteDisposition", retention_start)
     if min(capacity_start, retention_start, retention_end) < 0:
         raise ReleaseError("cannot locate controlled-local retained-entry capacity boundary")
@@ -504,9 +435,7 @@ def verify_message_port_router_source(source: str) -> None:
         ),
         "controlled-local router ownership",
     )
-    registration_start = source.find(
-        "if let MessagePortState::UnManaged = &*current_state"
-    )
+    registration_start = source.find("if let MessagePortState::UnManaged = &*current_state")
     registration_end = source.find(
         "if let MessagePortState::Managed(ownership, message_ports)",
         registration_start,
@@ -514,12 +443,8 @@ def verify_message_port_router_source(source: str) -> None:
     if registration_start < 0 or registration_end < 0:
         raise ReleaseError("cannot locate MessagePort registration ownership block")
     registration = source[registration_start:registration_end]
-    local_start = registration.find(
-        "MessagePortProvenance::ControlledLocal => {"
-    )
-    external_start = registration.find(
-        "MessagePortProvenance::ExternalCapable => {"
-    )
+    local_start = registration.find("MessagePortProvenance::ControlledLocal => {")
+    external_start = registration.find("MessagePortProvenance::ExternalCapable => {")
     if local_start < 0 or external_start < 0 or local_start >= external_start:
         raise ReleaseError("cannot separate controlled-local and external router registration")
     local_registration = registration[local_start:external_start]
@@ -543,9 +468,7 @@ def verify_message_port_router_source(source: str) -> None:
 def verify_controlled_local_pending_projection_source(source: str) -> None:
     facts_start = source.find("struct ControlledLocalPortPendingFacts")
     pair_helper_start = source.find("fn controlled_local_port_pending_source(")
-    pair_helper_end = source.find(
-        "fn add_controlled_local_queued_message(", pair_helper_start
-    )
+    pair_helper_end = source.find("fn add_controlled_local_queued_message(", pair_helper_start)
     if facts_start < 0 or pair_helper_start < 0 or pair_helper_end < 0:
         raise ReleaseError("cannot locate controlled-local pair projection helper")
     require_source_fragments_in_order(
@@ -609,9 +532,7 @@ def verify_controlled_local_pending_projection_source(source: str) -> None:
         "controlled-local exact destination association and reconciliation",
     )
 
-    unit_test_start = source.find(
-        "fn queued_message_associations_are_exact_and_reconcile_with_native_buffers()"
-    )
+    unit_test_start = source.find("fn queued_message_associations_are_exact_and_reconcile_with_native_buffers()")
     unit_test_end = source.find("\n}\n\nimpl Drop for AutoCloseWorker", unit_test_start)
     if unit_test_start < 0 or unit_test_end < 0:
         raise ReleaseError("cannot locate controlled-local accounting unit proof")
@@ -695,9 +616,7 @@ def verify_controlled_local_pending_projection_source(source: str) -> None:
         ),
         "controlled-local exact retained-message source inventory",
     )
-    gc_start = source.find(
-        "pub(crate) fn perform_a_message_port_garbage_collection_checkpoint(&self)"
-    )
+    gc_start = source.find("pub(crate) fn perform_a_message_port_garbage_collection_checkpoint(&self)")
     gc_end = source.find("/// Remove broadcast-channels that are closed.", gc_start)
     if gc_start < 0 or gc_end < 0:
         raise ReleaseError("cannot locate controlled-local MessagePort GC checkpoint")
@@ -745,9 +664,7 @@ def verify_controlled_local_fifo_source(source: str) -> None:
     start_end = source.find("pub(crate) fn close_message_port(", start_begin)
     if start_begin < 0 or start_end < 0:
         raise ReleaseError("cannot locate controlled-local MessagePort start routing")
-    controlled_start = source.find(
-        "MessagePortProvenance::ControlledLocal => {", start_begin, start_end
-    )
+    controlled_start = source.find("MessagePortProvenance::ControlledLocal => {", start_begin, start_end)
     if controlled_start < 0:
         raise ReleaseError("cannot locate controlled-local MessagePort start branch")
     require_source_fragments_in_order(
@@ -806,9 +723,7 @@ def verify_controlled_local_multi_pair_proof_source(
         ),
         "controlled-local queued-plus-buffered multi-pair fixture",
     )
-    test_start = baseline_source.find(
-        "fn controlled_multi_pair_pending_distinguishes_queued_and_buffered_owners()"
-    )
+    test_start = baseline_source.find("fn controlled_multi_pair_pending_distinguishes_queued_and_buffered_owners()")
     test_end = baseline_source.find(
         "fn controlled_local_message_channel_recursion_uses_the_shared_control_turn_budget()",
         test_start,
@@ -899,15 +814,9 @@ def verify_message_channel_incumbent_authority_source(
     message_channel_source: str,
 ) -> None:
     profile_start = global_scope_source.find("fn controlled_local_profile_enabled(&self)")
-    constructor_start = global_scope_source.find(
-        "pub(crate) fn admit_message_channel_constructor(", profile_start
-    )
-    post_start = global_scope_source.find(
-        "pub(crate) fn require_message_port_post(", constructor_start
-    )
-    payload_start = global_scope_source.find(
-        "pub(crate) fn require_message_port_payload(", post_start
-    )
+    constructor_start = global_scope_source.find("pub(crate) fn admit_message_channel_constructor(", profile_start)
+    post_start = global_scope_source.find("pub(crate) fn require_message_port_post(", constructor_start)
+    payload_start = global_scope_source.find("pub(crate) fn require_message_port_payload(", post_start)
     if min(profile_start, constructor_start, post_start, payload_start) < 0:
         raise ReleaseError("cannot locate controlled-local incumbent authority implementation")
     require_source_fragments_in_order(
@@ -998,9 +907,7 @@ def verify_controlled_animation_scheduler_liveness_source(source: str) -> None:
         ),
         "pending animation-event finite rendering demand",
     )
-    test_start = source.find(
-        "fn scheduled_pending_animation_events_advance_instead_of_spinning()"
-    )
+    test_start = source.find("fn scheduled_pending_animation_events_advance_instead_of_spinning()")
     test_end = source.find(
         "fn exact_now_rendering_opportunity_advances_instead_of_spinning()",
         test_start,
@@ -1076,9 +983,7 @@ def rust_braced_block_end(source: str, opening_brace: int, description: str) -> 
     raise ReleaseError(f"unterminated braced block for {description}")
 
 
-def input_method_initializer_spans(
-    source: str, description: str
-) -> list[tuple[int, int]]:
+def input_method_initializer_spans(source: str, description: str) -> list[tuple[int, int]]:
     spans = []
     for match in INPUT_METHOD_REQUEST_INITIALIZER_RE.finditer(source):
         opening_brace = source.find("{", match.start(), match.end())
@@ -1116,8 +1021,7 @@ def verify_input_method_request_inventory(source_root: Path) -> None:
     }
     if actual != expected:
         raise ReleaseError(
-            "components/script InputMethodRequest initializer inventory changed: "
-            f"expected {expected!r}, got {actual!r}"
+            f"components/script InputMethodRequest initializer inventory changed: expected {expected!r}, got {actual!r}"
         )
 
 
@@ -1129,9 +1033,7 @@ def verify_input_method_focus_producer(
 ) -> None:
     focus_functions = list(HANDLE_FOCUS_EVENT_RE.finditer(source))
     if len(focus_functions) != 1:
-        raise ReleaseError(
-            f"{source_name.as_posix()} must contain exactly one handle_focus_event producer"
-        )
+        raise ReleaseError(f"{source_name.as_posix()} must contain exactly one handle_focus_event producer")
     focus_match = focus_functions[0]
     opening_brace = source.find("{", focus_match.start(), focus_match.end())
     focus_end = rust_braced_block_end(
@@ -1139,19 +1041,13 @@ def verify_input_method_focus_producer(
         opening_brace,
         f"{source_name.as_posix()} handle_focus_event producer",
     )
-    initializer_spans = input_method_initializer_spans(
-        source, f"{source_name.as_posix()} InputMethodRequest producer"
-    )
+    initializer_spans = input_method_initializer_spans(source, f"{source_name.as_posix()} InputMethodRequest producer")
     if len(initializer_spans) != 1:
-        raise ReleaseError(
-            f"{source_name.as_posix()} must contain exactly one InputMethodRequest initializer"
-        )
+        raise ReleaseError(f"{source_name.as_posix()} must contain exactly one InputMethodRequest initializer")
     initializer_start, initializer_end = initializer_spans[0]
     if not (focus_match.start() <= initializer_start and initializer_end <= focus_end):
-        raise ReleaseError(
-            f"{source_name.as_posix()} InputMethodRequest must be owned by handle_focus_event"
-        )
-    focus_source = source[focus_match.start():focus_end]
+        raise ReleaseError(f"{source_name.as_posix()} InputMethodRequest must be owned by handle_focus_event")
+    focus_source = source[focus_match.start() : focus_end]
     initializer_source = source[initializer_start:initializer_end]
     require_source_fragments_in_order(
         focus_source,
@@ -1188,9 +1084,7 @@ def verify_controlled_input_method_source(
     control_initializers = input_method_initializer_spans(
         control_source, "controlled InputMethod test-helper initializer"
     )
-    test_module_start = control_source.find(
-        "#[cfg(test)]\nmod input_method_embedder_control_tests"
-    )
+    test_module_start = control_source.find("#[cfg(test)]\nmod input_method_embedder_control_tests")
     test_helper_start = control_source.find("fn input_method_request(", test_module_start)
     test_helper_opening_brace = control_source.find("{", test_helper_start)
     test_helper_end = (
@@ -1206,10 +1100,7 @@ def verify_controlled_input_method_source(
         len(control_initializers) != 1
         or test_module_start < 0
         or test_helper_start < 0
-        or not (
-            test_helper_start <= control_initializers[0][0]
-            and control_initializers[0][1] <= test_helper_end
-        )
+        or not (test_helper_start <= control_initializers[0][0] and control_initializers[0][1] <= test_helper_end)
     ):
         raise ReleaseError(
             "the sole document-control InputMethodRequest initializer must remain in "
@@ -1264,9 +1155,7 @@ def verify_controlled_input_method_source(
             "controlled InputMethod suppression helper must match the exact "
             "whitespace-normalized single-line Text/nonmultiline/no-virtual-keyboard body"
         )
-    show_start = control_source.find(
-        "pub(crate) fn show_embedder_control(", implementation_start
-    )
+    show_start = control_source.find("pub(crate) fn show_embedder_control(", implementation_start)
     send_start = control_source.find("fn send_embedder_control_request(", show_start)
     if show_start < 0 or send_start < 0:
         raise ReleaseError("cannot locate controlled InputMethod presentation boundary")
@@ -1290,9 +1179,7 @@ def verify_controlled_input_method_source(
     )
 
 
-def verify_controlled_focus_event_timestamp_source(
-    event_source: str, focus_event_source: str
-) -> None:
+def verify_controlled_focus_event_timestamp_source(event_source: str, focus_event_source: str) -> None:
     require_source_fragments_in_order(
         event_source,
         (
@@ -1304,17 +1191,13 @@ def verify_controlled_focus_event_timestamp_source(
         ),
         "provenance-aware Event timestamp storage",
     )
-    uninitialized_start = focus_event_source.find(
-        "pub(crate) fn new_uninitialized_with_proto("
-    )
+    uninitialized_start = focus_event_source.find("pub(crate) fn new_uninitialized_with_proto(")
     engine_new_start = focus_event_source.find("pub(crate) fn new(", uninitialized_start)
     new_with_proto_start = focus_event_source.find("fn new_with_proto(", engine_new_start)
     constructor_start = focus_event_source.find("fn Constructor(", new_with_proto_start)
     if min(uninitialized_start, engine_new_start, new_with_proto_start, constructor_start) < 0:
         raise ReleaseError("cannot locate FocusEvent construction boundaries")
-    if "set_creation_time_stamp" in focus_event_source[
-        uninitialized_start:engine_new_start
-    ]:
+    if "set_creation_time_stamp" in focus_event_source[uninitialized_start:engine_new_start]:
         raise ReleaseError("script-created FocusEvent unexpectedly receives controlled timestamp")
     engine_new_end = focus_event_source.rfind(
         "#[expect(clippy::too_many_arguments)]", engine_new_start, new_with_proto_start
@@ -1370,9 +1253,7 @@ def verify_controlled_focus_event_timestamp_source(
         )
     constructor = focus_event_source[constructor_start:]
     if "FocusEvent::new_with_proto(" not in constructor or "FocusEvent::new(" in constructor:
-        raise ReleaseError(
-            "FocusEvent WebIDL constructor must retain the host-timestamp construction path"
-        )
+        raise ReleaseError("FocusEvent WebIDL constructor must retain the host-timestamp construction path")
 
 
 def verify_controlled_automation_event_timestamp_source(
@@ -1388,12 +1269,8 @@ def verify_controlled_automation_event_timestamp_source(
     protocol_source: str,
     fixture_source: str,
 ) -> None:
-    sample_start = script_thread_source.find(
-        "let synchronous_automation_event_time = if operation.is_mutating()"
-    )
-    sample_end = script_thread_source.find(
-        "let capture_synchronous_navigation =", sample_start
-    )
+    sample_start = script_thread_source.find("let synchronous_automation_event_time = if operation.is_mutating()")
+    sample_end = script_thread_source.find("let capture_synchronous_navigation =", sample_start)
     if sample_start < 0 or sample_end < 0:
         raise ReleaseError("cannot locate synchronous automation timestamp admission")
     require_source_fragments_in_order(
@@ -1414,9 +1291,7 @@ def verify_controlled_automation_event_timestamp_source(
         "controlled synchronous automation timestamp admission before mutation",
     )
     scope_start = script_thread_source.find("let execution = {", sample_end)
-    scope_end = script_thread_source.find(
-        "let synchronous_navigation_emitted =", scope_start
-    )
+    scope_end = script_thread_source.find("let synchronous_navigation_emitted =", scope_start)
     if scope_start < 0 or scope_end < 0:
         raise ReleaseError("cannot locate synchronous automation timestamp RAII scope")
     require_source_fragments_in_order(
@@ -1432,12 +1307,8 @@ def verify_controlled_automation_event_timestamp_source(
         "controlled synchronous automation timestamp RAII scope",
     )
 
-    sampler_start = window_source.find(
-        "pub(crate) fn sample_controlled_v2_document_performance_time("
-    )
-    sampler_end = window_source.find(
-        "fn baseline_image_cache_transport(", sampler_start
-    )
+    sampler_start = window_source.find("pub(crate) fn sample_controlled_v2_document_performance_time(")
+    sampler_end = window_source.find("fn baseline_image_cache_transport(", sampler_start)
     if sampler_start < 0 or sampler_end < 0:
         raise ReleaseError("cannot locate controlled-v2 document Performance sampler")
     require_source_fragments_in_order(
@@ -1533,13 +1404,9 @@ def verify_controlled_automation_event_timestamp_source(
         )
         constructor = source[constructor_start:]
         if "synchronous_automation_event_time" in constructor:
-            raise ReleaseError(
-                f"script-created {description} unexpectedly consults the automation timestamp scope"
-            )
+            raise ReleaseError(f"script-created {description} unexpectedly consults the automation timestamp scope")
         if f"{description}::new_with_proto(" not in constructor:
-            raise ReleaseError(
-                f"script-created {description} must retain its WebIDL construction path"
-            )
+            raise ReleaseError(f"script-created {description} must retain its WebIDL construction path")
 
     input_constructor_start = input_event_source.find("fn Constructor(")
     if input_constructor_start < 0:
@@ -1549,9 +1416,7 @@ def verify_controlled_automation_event_timestamp_source(
         "let event = InputEvent::new(" not in input_constructor
         or "synchronous_automation_event_time" in input_constructor
     ):
-        raise ReleaseError(
-            "script-created InputEvent must retain its host-timestamp construction path"
-        )
+        raise ReleaseError("script-created InputEvent must retain its host-timestamp construction path")
     inherited_start = event_source.find("pub(crate) fn new_inherited() -> Event")
     inherited_end = event_source.find("pub(crate) fn new(", inherited_start)
     if inherited_start < 0 or inherited_end < 0:
@@ -1584,8 +1449,8 @@ def verify_controlled_automation_event_timestamp_source(
     require_source_fragments_in_order(
         fixture_source,
         (
-            'scheduledAt = String(performance.now())',
-            "setTimeout(() => document.body.dataset.advanced = \"yes\", 5)",
+            "scheduledAt = String(performance.now())",
+            'setTimeout(() => document.body.dataset.advanced = "yes", 5)',
             'addEventListener("input", record("fill"))',
             'addEventListener("click", record("activate"))',
             'addEventListener("reset", record("reset"))',
@@ -1613,18 +1478,12 @@ def verify_controlled_css_animation_event_timestamp_source(
     protocol_source: str,
     fixture_source: str,
 ) -> None:
-    dispatch_start = animations_source.find(
-        "pub(crate) fn send_pending_events(&self, window: &Window"
-    )
-    dispatch_end = animations_source.find(
-        "/// The type of transition event to trigger", dispatch_start
-    )
+    dispatch_start = animations_source.find("pub(crate) fn send_pending_events(&self, window: &Window")
+    dispatch_end = animations_source.find("/// The type of transition event to trigger", dispatch_start)
     if dispatch_start < 0 or dispatch_end < 0:
         raise ReleaseError("cannot isolate the CSS pending-event dispatch seam")
     dispatch = animations_source[dispatch_start:dispatch_end]
-    queue_take = dispatch.find(
-        "let events = std::mem::take(&mut *self.pending_events.safe_borrow_mut(cx.no_gc()))"
-    )
+    queue_take = dispatch.find("let events = std::mem::take(&mut *self.pending_events.safe_borrow_mut(cx.no_gc()))")
     if queue_take < 0:
         raise ReleaseError("cannot locate the CSS pending-event queue take")
     before_queue_take = dispatch[:queue_take]
@@ -1648,9 +1507,7 @@ def verify_controlled_css_animation_event_timestamp_source(
         "controlled CSS pending-event batch timestamp admission before queue take",
     )
     if dispatch.count("sample_controlled_v2_document_performance_time()") != 1:
-        raise ReleaseError(
-            "a nonempty CSS pending-event dispatch batch must sample document time exactly once"
-        )
+        raise ReleaseError("a nonempty CSS pending-event dispatch batch must sample document time exactly once")
     if dispatch.count("current_controlled_top_level_target_matches") != 2:
         raise ReleaseError(
             "CSS pending-event timestamps must check the exact public target before sampling "
@@ -1660,14 +1517,14 @@ def verify_controlled_css_animation_event_timestamp_source(
     require_source_fragments_in_order(
         dispatch[queue_take:],
         (
-            "TransitionOrAnimationEventType::AnimationEnd => atom!(\"animationend\")",
-            "TransitionOrAnimationEventType::AnimationStart => atom!(\"animationstart\")",
-            "TransitionOrAnimationEventType::AnimationCancel => atom!(\"animationcancel\")",
-            "TransitionOrAnimationEventType::AnimationIteration => atom!(\"animationiteration\")",
-            "TransitionOrAnimationEventType::TransitionCancel => atom!(\"transitioncancel\")",
-            "TransitionOrAnimationEventType::TransitionEnd => atom!(\"transitionend\")",
-            "TransitionOrAnimationEventType::TransitionRun => atom!(\"transitionrun\")",
-            "TransitionOrAnimationEventType::TransitionStart => atom!(\"transitionstart\")",
+            'TransitionOrAnimationEventType::AnimationEnd => atom!("animationend")',
+            'TransitionOrAnimationEventType::AnimationStart => atom!("animationstart")',
+            'TransitionOrAnimationEventType::AnimationCancel => atom!("animationcancel")',
+            'TransitionOrAnimationEventType::AnimationIteration => atom!("animationiteration")',
+            'TransitionOrAnimationEventType::TransitionCancel => atom!("transitioncancel")',
+            'TransitionOrAnimationEventType::TransitionEnd => atom!("transitionend")',
+            'TransitionOrAnimationEventType::TransitionRun => atom!("transitionrun")',
+            'TransitionOrAnimationEventType::TransitionStart => atom!("transitionstart")',
             "let owner_window = node.owner_window()",
             "let controlled_v2_event_time = controlled_v2_batch_time.filter(|_|",
             "let owner_document = node.owner_document()",
@@ -1691,9 +1548,7 @@ def verify_controlled_css_animation_event_timestamp_source(
         "exact-owner internal CSS animation and transition event timestamp dispatch",
     )
     if dispatch.count("set_creation_time_stamp(time_stamp)") != 2:
-        raise ReleaseError(
-            "CSS pending-event dispatch must stamp exactly the two internal event classes"
-        )
+        raise ReleaseError("CSS pending-event dispatch must stamp exactly the two internal event classes")
 
     for source, description in (
         (animation_event_source, "AnimationEvent"),
@@ -1704,22 +1559,16 @@ def verify_controlled_css_animation_event_timestamp_source(
         with_proto_start = source.find("fn new_with_proto(", engine_start)
         constructor_start = source.find("fn Constructor(", with_proto_start)
         if min(inherited_start, engine_start, with_proto_start, constructor_start) < 0:
-            raise ReleaseError(
-                f"cannot isolate internal and WebIDL {description} constructors"
-            )
+            raise ReleaseError(f"cannot isolate internal and WebIDL {description} constructors")
         if (
             "set_creation_time_stamp" in source
             or "sample_controlled_v2_document_performance_time" in source
             or "controlled_v2_batch_time" in source
         ):
-            raise ReleaseError(
-                f"{description} constructor source must not acquire controlled timestamp authority"
-            )
+            raise ReleaseError(f"{description} constructor source must not acquire controlled timestamp authority")
         constructor = source[constructor_start:]
         if f"{description}::new_with_proto(" not in constructor:
-            raise ReleaseError(
-                f"script-created {description} must retain its WebIDL host-timestamp path"
-            )
+            raise ReleaseError(f"script-created {description} must retain its WebIDL host-timestamp path")
 
     require_source_fragments_in_order(
         animations_source,
@@ -1834,6 +1683,44 @@ def verify_controlled_css_animation_event_timestamp_source(
 
 
 def verify_controlled_image_element_source(source: str) -> None:
+    require_source_fragments_in_order(
+        source,
+        (
+            "enum ImageRequestProvenance",
+            "ControlledV2DirectDataSvg",
+            "ControlledV2DirectHttpImage",
+            "fn is_controlled_v2(self) -> bool",
+            "Self::ControlledV2DirectDataSvg | Self::ControlledV2DirectHttpImage",
+        ),
+        "controlled direct image request provenance classes",
+    )
+    url_policy_start = source.find("fn controlled_v2_direct_image_url_provenance(")
+    url_policy_end = source.find("#[cfg(test)]", url_policy_start)
+    if url_policy_start < 0 or url_policy_end < 0:
+        raise ReleaseError("cannot locate controlled direct image URL policy")
+    require_source_fragments_in_order(
+        source[url_policy_start:url_policy_end],
+        (
+            'matches!(image_url.scheme(), "http" | "https")',
+            "serialized_url.len() <= CONTROLLED_V2_DIRECT_HTTP_IMAGE_URL_LIMIT",
+            "ImageRequestProvenance::ControlledV2DirectHttpImage",
+            "serialized_url.len() > CONTROLLED_V2_DIRECT_DATA_SVG_URL_LIMIT",
+            "DataUrl::process(serialized_url)",
+            'mime_type.type_ == "image"',
+            'mime_type.subtype == "svg+xml"',
+            "ImageRequestProvenance::ControlledV2DirectDataSvg",
+        ),
+        "controlled direct HTTP(S) and data-SVG URL selection policy",
+    )
+    require_source_fragments_in_order(
+        source,
+        (
+            "#[test]\n    fn bounded_http_and_https_urls_are_admitted_as_owned_image_streams()",
+            "#[test]\n    fn non_network_urls_do_not_gain_the_http_image_authority()",
+            "#[test]\n    fn oversized_http_url_remains_unowned()",
+        ),
+        "controlled direct HTTP(S) image URL policy unit proofs",
+    )
     selection_start = source.find("fn selected_request_provenance(")
     selection_end = source.find("fn active_request_provenance(", selection_start)
     if selection_start < 0 or selection_end < 0:
@@ -1847,13 +1734,10 @@ def verify_controlled_image_element_source(source: str) -> None:
             "return ImageRequestProvenance::Baseline",
             'get_string_attribute(&local_name!("src"))',
             "direct_src.str().as_ref() != selected_source.as_ref()",
-            "serialized_url.len() > CONTROLLED_V2_DIRECT_DATA_SVG_URL_LIMIT",
-            "DataUrl::process(serialized_url)",
-            'mime_type.type_ != "image"',
-            'mime_type.subtype != "svg+xml"',
-            "ImageRequestProvenance::ControlledV2DirectDataSvg",
+            "controlled_v2_direct_image_url_provenance(image_url)",
+            ".unwrap_or(ImageRequestProvenance::Baseline)",
         ),
-        "controlled direct data-SVG selection",
+        "controlled direct image DOM and exact-target selection",
     )
 
     prepare_start = source.find("fn prepare_image_request(")
@@ -1886,9 +1770,7 @@ def verify_controlled_image_element_source(source: str) -> None:
         "controlled image request authority fields",
     )
     if source.count("controlled_cache_id: None,") != 2:
-        raise ReleaseError(
-            "both HTMLImageElement request slots must begin without controlled cache authority"
-        )
+        raise ReleaseError("both HTMLImageElement request slots must begin without controlled cache authority")
 
     cached_identity_start = source.find("fn record_active_controlled_cache_id(")
     cached_identity_end = source.find("fn synchronous_image_delivery(", cached_identity_start)
@@ -1902,13 +1784,14 @@ def verify_controlled_image_element_source(source: str) -> None:
             "ImageRequestPhase::Pending => {",
             "self.pending_request.borrow_mut().controlled_cache_id = id",
             "fn owns_controlled_cache_id(",
-            "request.provenance == ImageRequestProvenance::ControlledV2DirectDataSvg",
+            "request.provenance.is_controlled_v2()",
             "request.controlled_cache_id == Some(id)",
             "fn prepare_cached_vector_identity(",
             "let Image::Vector(vector) = image",
             "ImageRequestProvenance::Baseline",
             "window.downgrade_cached_vector_identity_to_baseline(vector.id)",
             "ImageRequestProvenance::ControlledV2DirectDataSvg",
+            "ImageRequestProvenance::ControlledV2DirectHttpImage",
             ".retain_controlled_v2_cached_vector_identity(vector.id, self.upcast::<Node>())",
             "fn release_cached_vector_identity(",
             ".release_controlled_v2_cached_vector_identity(id, self.upcast::<Node>())",
@@ -1934,26 +1817,22 @@ def verify_controlled_image_element_source(source: str) -> None:
         (
             "self.synchronous_image_delivery(provenance)",
             ".prepare_cached_vector_identity(&image, provenance)",
-            "let controlled_cache_id = (provenance ==",
-            "ImageRequestProvenance::ControlledV2DirectDataSvg",
+            "let controlled_cache_id = provenance",
+            ".is_controlled_v2()",
             "Self::vector_image_id(Some(&image))",
             "self.record_active_controlled_cache_id(controlled_cache_id)",
             "ImageRequestProvenance::Baseline => {",
             "self.process_image_response(",
             "ImageResponse::Loaded(image, url)",
-            "ImageRequestProvenance::ControlledV2DirectDataSvg => {",
+            "ImageRequestProvenance::ControlledV2DirectDataSvg |",
+            "ImageRequestProvenance::ControlledV2DirectHttpImage => {",
             "self.install_loaded_image_response(image, url, cx)",
             "self.queue_controlled_v2_cache_hit_load(delivery)",
         ),
         "status-race cache-hit retained identity and controlled queued delivery",
     )
-    if (
-        "fire_image_event(" in fetch_cache_source
-        or "fire_image_completion_events(" in fetch_cache_source
-    ):
-        raise ReleaseError(
-            "HTMLImageElement cache-status dispatch must not fire completion events inline"
-        )
+    if "fire_image_event(" in fetch_cache_source or "fire_image_completion_events(" in fetch_cache_source:
+        raise ReleaseError("HTMLImageElement cache-status dispatch must not fire completion events inline")
 
     ready_start = source.find("ImageCacheResult::ReadyForRequest(id) => {")
     ready_end = source.find("ImageCacheResult::FailedToLoadOrDecode", ready_start)
@@ -1962,9 +1841,10 @@ def verify_controlled_image_element_source(source: str) -> None:
     require_source_fragments_in_order(
         source[ready_start:ready_end],
         (
-            "ImageRequestProvenance::ControlledV2DirectDataSvg => {",
+            "ImageRequestProvenance::ControlledV2DirectDataSvg |",
+            "ImageRequestProvenance::ControlledV2DirectHttpImage => {",
             "if self.register_image_cache_callback(id, ChangeType::Element, provenance) {",
-            "self.fetch_request(img_url, id);",
+            "self.fetch_request(img_url, id, provenance);",
         ),
         "controlled image registration before request start",
     )
@@ -1976,18 +1856,51 @@ def verify_controlled_image_element_source(source: str) -> None:
     require_source_fragments_in_order(
         source[callback_start:callback_end],
         (
-            "ImageRequestProvenance::ControlledV2DirectDataSvg => {",
+            "ImageRequestProvenance::ControlledV2DirectDataSvg |",
+            "ImageRequestProvenance::ControlledV2DirectHttpImage => {",
             "window.register_controlled_v2_image_cache_listener(",
             "self.upcast::<Node>()",
             "Self::queue_image_cache_response(",
             "delivery,",
             "return false;",
             "image_cache().add_listener(",
-            "if provenance == ImageRequestProvenance::ControlledV2DirectDataSvg",
+            "if provenance.is_controlled_v2()",
             "self.record_active_controlled_cache_id(Some(id))",
             "true",
         ),
         "controlled HTMLImageElement callback registration",
+    )
+    fetch_request_start = source.find("fn fetch_request(", callback_start)
+    fetch_request_end = source.find("fn process_image_response(", fetch_request_start)
+    if fetch_request_start < 0 or fetch_request_end < 0:
+        raise ReleaseError("cannot locate controlled image request provenance handoff")
+    require_source_fragments_in_order(
+        source[fetch_request_start:fetch_request_end],
+        (
+            "provenance: ImageRequestProvenance",
+            "let context = ImageContext",
+            "provenance,",
+        ),
+        "controlled image request provenance handoff into ImageContext",
+    )
+
+    multipart_start = source.find("if mime.type_() == mime::MULTIPART")
+    multipart_end = source.find("// The HTTP status code is ignored here", multipart_start)
+    if multipart_start < 0 or multipart_end < 0:
+        raise ReleaseError("cannot locate controlled multipart image retirement boundary")
+    require_source_fragments_in_order(
+        source[multipart_start:multipart_end],
+        (
+            'mime.subtype().as_str() == "x-mixed-replace"',
+            "self.aborted = true",
+            "self.provenance.is_controlled_v2()",
+            ".mark_controlled_v2_image_cache_id_unsupported(self.id)",
+            "FetchResponseMsg::ProcessResponseEOF(",
+            "Err(NetworkError::ResourceLoadError(",
+            "ResourceTimingType::Error",
+            "return;",
+        ),
+        "controlled HTTP multipart typed retirement",
     )
 
     queue_start = source.find("fn queue_image_cache_response(")
@@ -2005,7 +1918,7 @@ def verify_controlled_image_element_source(source: str) -> None:
             "element.release_cached_vector_identity(response_id)",
             "element.process_image_response(response.response, delivery, cx)",
         ),
-            "controlled image task and generation handoff",
+        "controlled image task and generation handoff",
     )
     cache_hit_start = source.find("// Step 7.4. If the list of available images")
     cache_hit_end = source.find("// Step 7.4.8.", cache_hit_start)
@@ -2116,9 +2029,7 @@ def verify_controlled_image_element_source(source: str) -> None:
         ),
         "shared loaded-image installation and pending authority promotion",
     )
-    response_end = source.find(
-        "fn process_image_response_for_environment_change(", response_start
-    )
+    response_end = source.find("fn process_image_response_for_environment_change(", response_start)
     if response_end < 0:
         raise ReleaseError("cannot locate shared loaded-image response consumer")
     require_source_fragments_in_order(
@@ -2136,17 +2047,18 @@ def verify_controlled_image_timestamp_source(source: str) -> None:
     synchronous_start = source.find("fn synchronous_image_delivery(")
     event_start = source.find("fn fire_image_event(", synchronous_start)
     completion_start = source.find("fn fire_image_completion_events(", event_start)
-    status_race_queue_start = source.find(
-        "fn queue_controlled_v2_cache_hit_load(", completion_start
-    )
+    status_race_queue_start = source.find("fn queue_controlled_v2_cache_hit_load(", completion_start)
     fetch_start = source.find("fn fetch_image(", status_race_queue_start)
-    if min(
-        synchronous_start,
-        event_start,
-        completion_start,
-        status_race_queue_start,
-        fetch_start,
-    ) < 0:
+    if (
+        min(
+            synchronous_start,
+            event_start,
+            completion_start,
+            status_race_queue_start,
+            fetch_start,
+        )
+        < 0
+    ):
         raise ReleaseError("cannot locate controlled image timestamp boundaries")
     require_source_fragments_in_order(
         source[synchronous_start:event_start],
@@ -2192,9 +2104,7 @@ def verify_controlled_image_timestamp_source(source: str) -> None:
         "controlled image status-race cache-hit queued timestamp handoff",
     )
     if 'atom!("loadend")' in status_race_queue_source:
-        raise ReleaseError(
-            "controlled image status-race cache hit must emit queued load only"
-        )
+        raise ReleaseError("controlled image status-race cache hit must emit queued load only")
 
     cache_hit_start = source.find("// Step 7.4. If the list of available images")
     cache_hit_end = source.find("// Step 7.4.8.", cache_hit_start)
@@ -2214,6 +2124,102 @@ def verify_controlled_image_timestamp_source(source: str) -> None:
     )
 
 
+def verify_controlled_http_image_protocol_proof_source(
+    baseline_source: str,
+    http_fixture_source: str,
+    multipart_fixture_source: str,
+) -> None:
+    require_source_fragments_in_order(
+        baseline_source,
+        (
+            "#[test]\nfn controlled_session_v2_http_image_success_and_failure_are_owned_without_v1_promotion()",
+            'exercise_controlled_http_image_profile("controlled-web-session-v2"',
+            'exercise_controlled_http_image_profile("controlled-web-session-v1"',
+            "#[test]\nfn controlled_session_v2_http_multipart_finite_response_retires_to_typed_image_load_unsupported()",
+            '"unsupported_rendering"',
+            '"image_load"',
+            "#[test]\nfn controlled_session_v2_http_same_id_aba_ignores_stale_generations()",
+            '"/probe"',
+            "b_flushed",
+            'format!("A>B>A|load:0>loadend:0|{a_url}|now:0")',
+            "#[test]\nfn controlled_session_v2_http_redirect_completion_is_owned()",
+            '"load:0>loadend:0|now:0"',
+            "#[test]\nfn controlled_session_v2_inflight_http_image_blocks_document_replacement()",
+            '"blocked_on_external_io"',
+            "Some(70)",
+        ),
+        "controlled HTTP image native protocol proofs",
+    )
+    require_source_fragments_in_order(
+        http_fixture_source,
+        (
+            'const assets = "https://controlled-image-assets.example.test"',
+            'for (const type of ["load", "error", "loadend"])',
+            "const cached = new Image()",
+            'record("cached", event)',
+            "cached.src = `${assets}/controlled-v2-http-image.svg`",
+            'document.querySelector("#loaded").src',
+            'document.querySelector("#failed").src',
+        ),
+        "controlled cross-origin HTTP success decode-error and cache-hit fixture",
+    )
+    require_source_fragments_in_order(
+        multipart_fixture_source,
+        (
+            "controlled v2 multipart HTTP image boundary",
+            'src="https://controlled-image-assets.example.test/controlled-v2-http-image.multipart"',
+        ),
+        "controlled cross-origin HTTP multipart fixture",
+    )
+
+
+def verify_controlled_image_per_pipeline_cache_source(source: str) -> None:
+    create_start = source.find("impl ImageCacheFactory for ImageCacheFactoryImpl")
+    create_end = source.find("pub struct ImageCacheImpl", create_start)
+    if create_start < 0 or create_end < 0:
+        raise ReleaseError("cannot locate per-pipeline ImageCache factory boundary")
+    require_source_fragments_in_order(
+        source[create_start:create_end],
+        (
+            "fn create(",
+            "webview_id: WebViewId",
+            "pipeline_id: PipelineId",
+            "Arc::new(ImageCacheImpl",
+            "store: Arc::new(Mutex::new(ImageCacheStore",
+            "pending_loads: AllPendingLoads::new()",
+            "completed_loads: HashMap::new()",
+            "vector_images: FxHashMap::default()",
+            "rasterized_vector_images: FxHashMap::default()",
+            "pipeline_id,",
+            "webview_id,",
+            "svg_id_image_id_map: Arc::new(Mutex::new(FxHashMap::default()))",
+            "thread_pool: self.thread_pool.clone()",
+        ),
+        "fresh per-pipeline ImageCache store with only decode infrastructure shared",
+    )
+
+
+def verify_controlled_profile_wire_source(source: str) -> None:
+    require_source_fragments_in_order(
+        source,
+        (
+            "    #[test]\n    fn controlled_web_session_v2_profile_is_an_explicit_bounded_surface_expansion()",
+            'include_bytes!("../../../profiles/controlled-web-session-v2.json")',
+            "Sha256::digest(profile_bytes)",
+            f'"{CANDIDATE_V2_PROFILE_SHA256}"',
+            'assert_eq!(profile["releaseStatus"], "stable_contract");',
+            'assert_eq!(profile["targetRelease"], "0.3.0");',
+            'profile["execution"]["controlledImageElement"]',
+            '"controlled_top_level_direct_data_svg_and_initial_url_retained_ownership_bounded_http_https"',
+            '"maximumInitialSelectedCanonicalUrlBytes": 65536',
+            '"multipartMixedReplace": "post_metadata_explicit_unsupported_provenance_retires_controlled_Image_producer_and_reports_unsupported_rendering_image_load_after_finite_resource_IO_drains_while_endless_resource_IO_remains_external"',
+            '"inflightHttpDocumentReplacement": "fatal_blocked_on_external_io_before_cross_document_successor_authority"',
+            '"unsupportedReservationReconciliation": "explicit_Unsupported_records_retain_exact_logical_ID_without_controlled_capacity_reservations"',
+        ),
+        "enabled exact controlled-web-session-v2 wire profile assertion",
+    )
+
+
 def verify_controlled_image_transport_source(
     messaging_source: str,
     producer_fence_source: str,
@@ -2221,6 +2227,66 @@ def verify_controlled_image_transport_source(
     script_thread_source: str,
     timers_source: str,
 ) -> None:
+    delivery_match_start = window_source.find("fn retained_image_provenance_accepts_delivery(")
+    delivery_match_end = window_source.find("struct PendingImageCallback", delivery_match_start)
+    if delivery_match_start < 0 or delivery_match_end < 0:
+        raise ReleaseError("cannot locate retained image provenance delivery matcher")
+    require_source_fragments_in_order(
+        window_source[delivery_match_start:delivery_match_end],
+        (
+            "retained != PendingImageProvenance::Unsupported",
+            "retained == delivery",
+        ),
+        "explicit Unsupported image provenance no-delivery boundary",
+    )
+    unsupported_retirement_start = window_source.find("pub(crate) fn mark_controlled_v2_image_cache_id_unsupported(")
+    unsupported_retirement_end = window_source.find(
+        "pub(crate) fn sample_controlled_v2_document_performance_time(",
+        unsupported_retirement_start,
+    )
+    if unsupported_retirement_start < 0 or unsupported_retirement_end < 0:
+        raise ReleaseError("cannot locate controlled image Unsupported retirement boundary")
+    raster_retirement_start = window_source.find(
+        "fn mark_unsupported(&mut self)",
+    )
+    raster_retirement_end = window_source.find("}\n}", raster_retirement_start)
+    if raster_retirement_start < 0 or raster_retirement_end < 0:
+        raise ReleaseError("cannot locate controlled raster Unsupported retirement boundary")
+    require_source_fragments_in_order(
+        window_source[raster_retirement_start:raster_retirement_end],
+        (
+            "self.provenance = PendingImageProvenance::Unsupported",
+            "self.reservation = None",
+        ),
+        "controlled raster Unsupported provenance and reservation retirement",
+    )
+    require_source_fragments_in_order(
+        window_source[unsupported_retirement_start:unsupported_retirement_end],
+        (
+            "self.controlled_image_identities.borrow_mut().remove(&id)",
+            "self.pending_image_callbacks.borrow_mut().get_mut(&id)",
+            "callback.provenance = PendingImageProvenance::Unsupported",
+            "callback._reservation = None",
+            "self.pending_layout_images.borrow_mut().get_mut(&id)",
+            "owner.provenance = PendingImageProvenance::Unsupported",
+            "if *candidate_id == id",
+            "entry.mark_unsupported()",
+        ),
+        "controlled multipart image Unsupported provenance and reservation retirement",
+    )
+    require_source_fragments_in_order(
+        window_source,
+        (
+            "#[test]\n    fn explicitly_unsupported_shared_id_is_exact_inventory_and_matches_no_delivery_set()",
+            "PendingImageProvenance::Unsupported",
+            "assert_eq!(observation.controlled_work_items, Some(0))",
+            "assert_eq!(observation.unsupported_work_items, Some(1))",
+            "retained_image_provenance_accepts_delivery(",
+            "PendingImageProvenance::Baseline",
+            "PendingImageProvenance::ControlledV2Fenced",
+        ),
+        "explicit Unsupported image inventory and no-delivery unit proof",
+    )
     require_source_fragments_in_order(
         messaging_source,
         (
@@ -2246,14 +2312,10 @@ def verify_controlled_image_transport_source(
         "producer-fenced image callback lifecycle",
     )
     owned_cancellation_start = producer_fence_source.find("impl Drop for ImageStreamProducer")
-    callback_state_start = producer_fence_source.find(
-        "struct ImageCallbackState", owned_cancellation_start
-    )
+    callback_state_start = producer_fence_source.find("struct ImageCallbackState", owned_cancellation_start)
     if owned_cancellation_start < 0 or callback_state_start < 0:
         raise ReleaseError("cannot locate image callback owned-cancellation boundary")
-    owned_cancellation = producer_fence_source[
-        owned_cancellation_start:callback_state_start
-    ]
+    owned_cancellation = producer_fence_source[owned_cancellation_start:callback_state_start]
     require_source_fragments_in_order(
         owned_cancellation,
         (
@@ -2267,9 +2329,7 @@ def verify_controlled_image_transport_source(
         "image callback owned cancellation",
     )
     if "self.abandon()" in owned_cancellation:
-        raise ReleaseError(
-            "cache-owned image callback retirement must not latch producer abandonment"
-        )
+        raise ReleaseError("cache-owned image callback retirement must not latch producer abandonment")
     owned_cancellation_test = producer_fence_source.find(
         "fn dropping_an_image_listener_before_terminal_is_owned_cancellation()"
     )
@@ -2322,24 +2382,21 @@ def verify_controlled_image_transport_source(
         "producer completion and abandonment exact fence-sequence-class match",
     )
 
-    registration_start = window_source.find(
-        "pub(crate) fn register_controlled_v2_image_cache_listener("
-    )
+    registration_start = window_source.find("pub(crate) fn register_controlled_v2_image_cache_listener(")
     sample_start = window_source.find(
         "pub(crate) fn sample_controlled_v2_document_performance_time(", registration_start
     )
-    baseline_transport_start = window_source.find(
-        "fn baseline_image_cache_transport(", sample_start
-    )
-    controlled_transport_end = window_source.find(
-        "fn retained_image_provenance(", baseline_transport_start
-    )
-    if min(
-        registration_start,
-        sample_start,
-        baseline_transport_start,
-        controlled_transport_end,
-    ) < 0:
+    baseline_transport_start = window_source.find("fn baseline_image_cache_transport(", sample_start)
+    controlled_transport_end = window_source.find("fn retained_image_provenance(", baseline_transport_start)
+    if (
+        min(
+            registration_start,
+            sample_start,
+            baseline_transport_start,
+            controlled_transport_end,
+        )
+        < 0
+    ):
         raise ReleaseError("cannot locate controlled Window image transport")
     require_source_fragments_in_order(
         window_source[registration_start:sample_start],
@@ -2361,9 +2418,7 @@ def verify_controlled_image_transport_source(
         ),
         "controlled Window image registration",
     )
-    if window_source[registration_start:sample_start].count(
-        "_reservation: identity_owner_reservation"
-    ) != 2:
+    if window_source[registration_start:sample_start].count("_reservation: identity_owner_reservation") != 2:
         raise ReleaseError(
             "controlled image callback registration must retain the exact identity-owner "
             "reservation on both occupied and vacant cache-ID paths"
@@ -2406,17 +2461,11 @@ def verify_controlled_image_transport_source(
         ),
         "controlled image live-retired-unknown target classification",
     )
-    message_completion_start = script_thread_source.find(
-        "struct ControlledImageMessageCompletion {"
-    )
-    message_completion_end = script_thread_source.find(
-        "struct InitialPipelineBootstrapFacts", message_completion_start
-    )
+    message_completion_start = script_thread_source.find("struct ControlledImageMessageCompletion {")
+    message_completion_end = script_thread_source.find("struct InitialPipelineBootstrapFacts", message_completion_start)
     if message_completion_start < 0 or message_completion_end < 0:
         raise ReleaseError("cannot locate controlled image message completion guard")
-    message_completion_source = script_thread_source[
-        message_completion_start:message_completion_end
-    ]
+    message_completion_source = script_thread_source[message_completion_start:message_completion_end]
     require_source_fragments_in_order(
         message_completion_source,
         (
@@ -2499,9 +2548,7 @@ def verify_controlled_image_transport_source(
         "guarded ScriptThread image delivery",
     )
     if image_handoff.count("drop(guard);") != 1:
-        raise ReleaseError(
-            "retired controlled image target must complete exactly one message guard"
-        )
+        raise ReleaseError("retired controlled image target must complete exactly one message guard")
     if image_handoff.count("let _ = guard.abandon();") != 3:
         raise ReleaseError(
             "controlled image delivery must abandon exactly the unknown-target, pre-handler "
@@ -2513,14 +2560,11 @@ def verify_controlled_image_transport_source(
         or "drop(message_guard)" in image_handoff
     ):
         raise ReleaseError(
-            "a retained image handler rejection must remain under scoped normal-return/unwind "
-            "completion"
+            "a retained image handler rejection must remain under scoped normal-return/unwind completion"
         )
 
 
-def verify_controlled_image_pending_and_teardown_source(
-    window_source: str, script_thread_source: str
-) -> None:
+def verify_controlled_image_pending_and_teardown_source(window_source: str, script_thread_source: str) -> None:
     require_source_fragments_in_order(
         window_source,
         (
@@ -2562,11 +2606,14 @@ def verify_controlled_image_pending_and_teardown_source(
     controlled_registration_start = window_source.find(
         "pub(crate) fn register_image_cache_listener(", layout_observation_start
     )
-    if min(
-        layout_owner_start,
-        layout_observation_start,
-        controlled_registration_start,
-    ) < 0:
+    if (
+        min(
+            layout_owner_start,
+            layout_observation_start,
+            controlled_registration_start,
+        )
+        < 0
+    ):
         raise ReleaseError("cannot locate retained layout-owner provenance boundary")
     require_source_fragments_in_order(
         window_source[layout_owner_start:layout_observation_start],
@@ -2598,11 +2645,14 @@ def verify_controlled_image_pending_and_teardown_source(
         "fn every_exact_cached_vector_owner_consumes_a_retained_record()",
         owner_without_callback_test_start,
     )
-    if min(
-        mixed_layout_test_start,
-        owner_without_callback_test_start,
-        owner_record_test_start,
-    ) < 0:
+    if (
+        min(
+            mixed_layout_test_start,
+            owner_without_callback_test_start,
+            owner_record_test_start,
+        )
+        < 0
+    ):
         raise ReleaseError("cannot locate retained layout-owner pending regression proofs")
     require_source_fragments_in_order(
         window_source[mixed_layout_test_start:owner_without_callback_test_start],
@@ -2666,9 +2716,7 @@ def verify_controlled_image_pending_and_teardown_source(
         "controlled image layout and raster provenance",
     )
     raster_start = window_source.find("fn new_image_rasterization_entry(")
-    raster_end = window_source.find(
-        "pub(crate) fn register_baseline_image_rasterization_listener(", raster_start
-    )
+    raster_end = window_source.find("pub(crate) fn register_baseline_image_rasterization_listener(", raster_start)
     if raster_start < 0 or raster_end < 0:
         raise ReleaseError("cannot locate controlled vector-raster retained record")
     require_source_fragments_in_order(
@@ -2683,12 +2731,8 @@ def verify_controlled_image_pending_and_teardown_source(
         ),
         "controlled vector-raster retained record",
     )
-    reflow_start = window_source.find(
-        "let Some(reflow_result) = self.layout.borrow_mut().reflow(reflow)"
-    )
-    post_reflow_handler_start = window_source.find(
-        "fn handle_pending_images_post_reflow(", reflow_start
-    )
+    reflow_start = window_source.find("let Some(reflow_result) = self.layout.borrow_mut().reflow(reflow)")
+    post_reflow_handler_start = window_source.find("fn handle_pending_images_post_reflow(", reflow_start)
     if reflow_start < 0 or post_reflow_handler_start < 0:
         raise ReleaseError("cannot locate post-reflow controlled raster admission boundary")
     require_source_fragments_in_order(
@@ -2701,12 +2745,8 @@ def verify_controlled_image_pending_and_teardown_source(
         ),
         "controlled reflow raster handoff",
     )
-    raster_handoff_start = window_source.find(
-        "for image in pending_rasterization_images", post_reflow_handler_start
-    )
-    raster_handoff_end = window_source.find(
-        "for node in pending_svg_element_for_serialization", raster_handoff_start
-    )
+    raster_handoff_start = window_source.find("for image in pending_rasterization_images", post_reflow_handler_start)
+    raster_handoff_end = window_source.find("for node in pending_svg_element_for_serialization", raster_handoff_start)
     if raster_handoff_start < 0 or raster_handoff_end < 0:
         raise ReleaseError("cannot locate exact post-reflow raster key handoff")
     require_source_fragments_in_order(
@@ -2725,12 +2765,8 @@ def verify_controlled_image_pending_and_teardown_source(
         ),
         "post-reflow exact raster reservation and fenced-listener installation",
     )
-    layout_handoff_start = window_source.find(
-        "for image in pending_images", post_reflow_handler_start
-    )
-    layout_handoff_end = window_source.find(
-        "for image in pending_rasterization_images", layout_handoff_start
-    )
+    layout_handoff_start = window_source.find("for image in pending_images", post_reflow_handler_start)
+    layout_handoff_end = window_source.find("for image in pending_rasterization_images", layout_handoff_start)
     if layout_handoff_start < 0 or layout_handoff_end < 0:
         raise ReleaseError("cannot locate post-reflow layout-owner provenance handoff")
     require_source_fragments_in_order(
@@ -2753,9 +2789,7 @@ def verify_controlled_image_pending_and_teardown_source(
     )
 
     delivery_start = window_source.find("pub(crate) fn pending_image_notification(")
-    delivery_end = window_source.find(
-        "pub(crate) fn handle_image_notification_pending", delivery_start
-    )
+    delivery_end = window_source.find("pub(crate) fn handle_image_notification_pending", delivery_start)
     if delivery_start < 0:
         raise ReleaseError("cannot locate retained layout-owner delivery rejection")
     if delivery_end < 0:
@@ -2769,31 +2803,31 @@ def verify_controlled_image_pending_and_teardown_source(
             "let delivery_provenance = delivery.provenance()",
             ".pending_layout_images",
             ".get(&response.id)",
-            "owner.provenance != delivery_provenance",
+            "!retained_image_provenance_accepts_delivery(",
+            "owner.provenance",
+            "delivery_provenance",
             "return Err(())",
             "std::mem::take(&mut *self.pending_image_callbacks.borrow_mut())",
-            "callback.provenance != delivery_provenance",
+            "!retained_image_provenance_accepts_delivery(",
+            "callback.provenance",
+            "delivery_provenance",
             "return Err(())",
             "for callback in callbacks.get()",
             "(callback.callback)(response.clone(), delivery, cx)",
         ),
         "mixed layout-owner delivery rejection before callbacks",
     )
-    retained_layout_rejection = (
-        "            .is_some_and(|owners| {\n"
-        "                owners\n"
-        "                    .iter()\n"
-        "                    .any(|owner| owner.provenance != delivery_provenance)\n"
-        "            })\n"
-        "        {\n"
-        "            return Err(());\n"
-        "        }\n\n"
-        "        // We take the images here"
-    )
-    if retained_layout_rejection not in delivery_source:
-        raise ReleaseError(
-            "mixed layout-owner rejection must leave Window pending collections retained"
-        )
+    retained_layout_start = delivery_source.find("        if self\n            .pending_layout_images")
+    retained_layout_end = delivery_source.find("        // We take the images here")
+    if retained_layout_start < 0 or retained_layout_end < 0:
+        raise ReleaseError("mixed layout-owner rejection must leave Window pending collections retained")
+    retained_layout_rejection = delivery_source[retained_layout_start:retained_layout_end]
+    if (
+        "return Err(());" not in retained_layout_rejection
+        or ".borrow_mut()" in retained_layout_rejection
+        or ".remove(" in retained_layout_rejection
+    ):
+        raise ReleaseError("mixed layout-owner rejection must fail before mutating retained Window state")
     retained_callback_rejection = (
         "        {\n"
         "            let _ = std::mem::replace(&mut *self.pending_image_callbacks.borrow_mut(), images);\n"
@@ -2802,13 +2836,9 @@ def verify_controlled_image_pending_and_teardown_source(
         "        for callback in callbacks.get()"
     )
     if retained_callback_rejection not in delivery_source:
-        raise ReleaseError(
-            "mixed callback rejection must restore Window pending callback state"
-        )
+        raise ReleaseError("mixed callback rejection must restore Window pending callback state")
 
-    raster_delivery_start = window_source.find(
-        "pub(crate) fn handle_image_rasterization_complete_notification("
-    )
+    raster_delivery_start = window_source.find("pub(crate) fn handle_image_rasterization_complete_notification(")
     if raster_delivery_start < 0 or raster_delivery_start >= delivery_start:
         raise ReleaseError("cannot locate retained raster delivery rejection")
     raster_delivery_source = window_source[raster_delivery_start:delivery_start]
@@ -2829,13 +2859,9 @@ def verify_controlled_image_pending_and_teardown_source(
         "        }"
     )
     if retained_raster_provenance_rejection not in raster_delivery_source:
-        raise ReleaseError(
-            "raster provenance rejection must restore the exact pending key"
-        )
+        raise ReleaseError("raster provenance rejection must restore the exact pending key")
     if retained_raster_callback_rejection not in raster_delivery_source:
-        raise ReleaseError(
-            "incomplete raster callback delivery must restore the exact pending key"
-        )
+        raise ReleaseError("incomplete raster callback delivery must restore the exact pending key")
     require_source_fragments_in_order(
         window_source,
         (
@@ -2855,9 +2881,7 @@ def verify_controlled_image_pending_and_teardown_source(
     )
 
     rendering_start = script_thread_source.find("fn capture_controlled_rendering(")
-    rendering_end = script_thread_source.find(
-        "fn capture_controlled_parsers(", rendering_start
-    )
+    rendering_end = script_thread_source.find("fn capture_controlled_parsers(", rendering_start)
     if rendering_start < 0 or rendering_end < 0:
         raise ReleaseError("cannot locate controlled rendering pending observation")
     rendering_capture = script_thread_source[rendering_start:rendering_end]
@@ -2879,9 +2903,7 @@ def verify_controlled_image_pending_and_teardown_source(
         "controlled image rendering-count capture",
     )
     if "fence.snapshot()" in rendering_capture:
-        raise ReleaseError(
-            "controlled rendering capture re-enters the producer fence"
-        )
+        raise ReleaseError("controlled rendering capture re-enters the producer fence")
 
     pending_start = script_thread_source.find("fn capture_controlled_pending(")
     pending_end = script_thread_source.find("fn handle_controlled_advance(", pending_start)
@@ -2912,20 +2934,14 @@ def verify_controlled_image_pending_and_teardown_source(
     if reconciliation_start < 0 or reconciliation_end < 0:
         raise ReleaseError("cannot bound controlled image producer reconciliation")
     if "fence.snapshot()" in pending_capture[reconciliation_start:reconciliation_end]:
-        raise ReleaseError(
-            "controlled image reconciliation ignored the qualified producer observation"
-        )
+        raise ReleaseError("controlled image reconciliation ignored the qualified producer observation")
 
     advance_start = pending_end
-    advance_end = script_thread_source.find(
-        "fn send_document_control_response(", advance_start
-    )
+    advance_end = script_thread_source.find("fn send_document_control_response(", advance_start)
     if advance_start < 0 or advance_end < 0:
         raise ReleaseError("cannot locate guarded controlled advance")
     advance_source = script_thread_source[advance_start:advance_end]
-    guarded_start = advance_source.find(
-        "let guarded = fence.with_matching_snapshot(token.producers().snapshot, || {"
-    )
+    guarded_start = advance_source.find("let guarded = fence.with_matching_snapshot(token.producers().snapshot, || {")
     guarded_end = advance_source.find("let detached: DetachedTimerEvent", guarded_start)
     if guarded_start < 0 or guarded_end < 0:
         raise ReleaseError("cannot locate exact producer-fenced advance capture")
@@ -2968,9 +2984,7 @@ def verify_controlled_inline_svg_rendering_source(
         "controlled inline SVG bounded canonical data-URL gate",
     )
 
-    cached_gate_start = svg_source.find(
-        "pub(crate) fn controlled_v2_cached_serialized_data_url("
-    )
+    cached_gate_start = svg_source.find("pub(crate) fn controlled_v2_cached_serialized_data_url(")
     process_use_start = svg_source.find("fn process_use_elements(", cached_gate_start)
     if cached_gate_start < 0 or process_use_start < 0:
         raise ReleaseError("cannot locate controlled inline SVG cached-URL admission")
@@ -3000,9 +3014,7 @@ def verify_controlled_inline_svg_rendering_source(
         ),
         "controlled inline SVG exact cached-URL and identity lifecycle",
     )
-    invalidate_start = svg_source.find(
-        "fn invalidate_cached_serialized_subtree_and_rasterization_result("
-    )
+    invalidate_start = svg_source.find("fn invalidate_cached_serialized_subtree_and_rasterization_result(")
     layout_impl_start = svg_source.find("impl<'dom> LayoutDom", invalidate_start)
     if invalidate_start < 0 or layout_impl_start < 0:
         raise ReleaseError("cannot locate controlled inline SVG invalidation release")
@@ -3021,20 +3033,55 @@ def verify_controlled_inline_svg_rendering_source(
         "controlled inline SVG generation invalidation",
     )
 
-    admission_start = window_source.find("fn image_id_has_baseline_retained_work(")
+    admission_start = window_source.find("fn image_id_has_explicitly_unsupported_retained_work(")
+    baseline_admission_start = window_source.find("fn image_id_has_baseline_retained_work(", admission_start)
+    inline_svg_decode_start = window_source.find("fn admits_controlled_v2_inline_svg_decode(", baseline_admission_start)
     raster_entry_start = window_source.find("fn new_image_rasterization_entry(", admission_start)
-    if admission_start < 0 or raster_entry_start < 0:
+    if (
+        min(
+            admission_start,
+            baseline_admission_start,
+            inline_svg_decode_start,
+            raster_entry_start,
+        )
+        < 0
+    ):
         raise ReleaseError("cannot locate controlled inline SVG Window admission helpers")
     require_source_fragments_in_order(
-        window_source[admission_start:raster_entry_start],
+        window_source[admission_start:baseline_admission_start],
+        (
+            "fn image_id_has_explicitly_unsupported_retained_work(",
+            "pending_image_callbacks",
+            ".get(&id)",
+            "callback.provenance == PendingImageProvenance::Unsupported",
+            "pending_layout_images",
+            ".get(&id)",
+            "owner.provenance == PendingImageProvenance::Unsupported",
+            "pending_images_for_rasterization",
+            "*candidate_id == id",
+            "entry.provenance == PendingImageProvenance::Unsupported",
+        ),
+        "explicit Unsupported exact cache-ID classifier",
+    )
+    require_source_fragments_in_order(
+        window_source[baseline_admission_start:inline_svg_decode_start],
         (
             "fn image_id_has_baseline_retained_work(",
             "pending_image_callbacks",
-            "callback.provenance == PendingImageProvenance::Baseline",
+            ".get(&id)",
+            "callback.provenance != PendingImageProvenance::ControlledV2Fenced",
             "pending_layout_images",
-            "owner.provenance == PendingImageProvenance::Baseline",
+            ".get(&id)",
+            "owner.provenance != PendingImageProvenance::ControlledV2Fenced",
             "pending_images_for_rasterization",
-            "entry.provenance == PendingImageProvenance::Baseline",
+            "*candidate_id == id",
+            "entry.provenance != PendingImageProvenance::ControlledV2Fenced",
+        ),
+        "unadmitted exact cache-ID classifier",
+    )
+    require_source_fragments_in_order(
+        window_source[inline_svg_decode_start:raster_entry_start],
+        (
             "fn admits_controlled_v2_inline_svg_decode(",
             "std::ptr::eq(self, node.owner_document().window())",
             "node.downcast::<SVGSVGElement>()",
@@ -3056,25 +3103,22 @@ def verify_controlled_inline_svg_rendering_source(
     if post_reflow_start < 0 or post_reflow_end < 0:
         raise ReleaseError("cannot locate controlled inline SVG post-reflow ownership")
     post_reflow = window_source[post_reflow_start:post_reflow_end]
-    controlled_decode_start = post_reflow.find(
-        "let mut controlled_inline_svg_fetches_started = HashSet::new()"
-    )
+    controlled_decode_start = post_reflow.find("let mut controlled_inline_svg_fetches_started = HashSet::new()")
     baseline_decode_start = post_reflow.find(
         "// Preserve the predecessor fetch-before-listener ordering",
         controlled_decode_start,
     )
-    raster_start = post_reflow.find(
-        "for image in pending_rasterization_images", baseline_decode_start
-    )
-    serialization_start = post_reflow.find(
-        "for node in pending_svg_element_for_serialization", raster_start
-    )
-    if min(
-        controlled_decode_start,
-        baseline_decode_start,
-        raster_start,
-        serialization_start,
-    ) < 0:
+    raster_start = post_reflow.find("for image in pending_rasterization_images", baseline_decode_start)
+    serialization_start = post_reflow.find("for node in pending_svg_element_for_serialization", raster_start)
+    if (
+        min(
+            controlled_decode_start,
+            baseline_decode_start,
+            raster_start,
+            serialization_start,
+        )
+        < 0
+    ):
         raise ReleaseError("cannot separate controlled inline SVG post-reflow phases")
     controlled_decode = post_reflow[controlled_decode_start:baseline_decode_start]
     require_source_fragments_in_order(
@@ -3101,12 +3145,9 @@ def verify_controlled_inline_svg_rendering_source(
         "controlled inline SVG identity/listener/fetch ordering",
     )
     if controlled_decode.count("fetch_image_for_layout(") != 1:
-        raise ReleaseError(
-            "controlled inline SVG decode must start exactly one fetch after fenced admission"
-        )
+        raise ReleaseError("controlled inline SVG decode must start exactly one fetch after fenced admission")
     if any(
-        event_fragment in controlled_decode
-        for event_fragment in ("Event::new(", "fire_image_event(", 'atom!("load")')
+        event_fragment in controlled_decode for event_fragment in ("Event::new(", "fire_image_event(", 'atom!("load")')
     ):
         raise ReleaseError("controlled inline SVG decode invents a DOM completion event")
 
@@ -3239,17 +3280,36 @@ def controlled_webapp_rendering_opportunity_limit(source: str) -> int:
     )
     if block is None:
         raise ReleaseError("cannot locate the native controlled execution-limit defaults")
-    rendering_opportunities = re.search(
-        r"rendering_opportunities:\s*([0-9_]+),", block.group("body")
-    )
+    rendering_opportunities = re.search(r"rendering_opportunities:\s*([0-9_]+),", block.group("body"))
     if rendering_opportunities is None:
         raise ReleaseError("cannot locate the native rendering-opportunity budget")
     return int(rendering_opportunities.group(1).replace("_", ""))
 
 
+def require_public_surface_markers(
+    source: str,
+    description: str,
+    markers: tuple[str, ...],
+    *,
+    forbidden: tuple[str, ...] = (),
+) -> None:
+    for marker in markers:
+        if marker not in source:
+            raise ReleaseError(f"{description} is missing the canonical public marker {marker!r}")
+    for marker in forbidden:
+        if marker in source:
+            raise ReleaseError(f"{description} retains the contradictory public marker {marker!r}")
+
+
 def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     profile_filename = source_root / CANDIDATE_V2_PROFILE
     contract_filename = source_root / CANDIDATE_V2_CONTRACT
+    public_top_level_readme_filename = source_root / PUBLIC_TOP_LEVEL_README
+    public_stasis_boundary_filename = source_root / PUBLIC_STASIS_BOUNDARY
+    public_profile_readme_filename = source_root / PUBLIC_PROFILE_README
+    public_typescript_sdk_readme_filename = source_root / PUBLIC_TYPESCRIPT_SDK_README
+    public_release_runbook_filename = source_root / PUBLIC_RELEASE_RUNBOOK
+    public_release_workflow_filename = source_root / PUBLIC_RELEASE_WORKFLOW
     message_limits_filename = source_root / MESSAGE_CHANNEL_LIMITS_SOURCE
     message_baseline_test_filename = source_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
     message_multi_pair_fixture_filename = source_root / MESSAGE_CHANNEL_MULTI_PAIR_FIXTURE
@@ -3262,75 +3322,51 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     event_filename = source_root / EVENT_SOURCE
     focus_event_filename = source_root / FOCUS_EVENT_SOURCE
     controlled_automation_filename = source_root / CONTROLLED_AUTOMATION_SOURCE
-    controlled_automation_event_target_filename = (
-        source_root / CONTROLLED_AUTOMATION_EVENT_TARGET_SOURCE
-    )
-    controlled_automation_input_event_filename = (
-        source_root / CONTROLLED_AUTOMATION_INPUT_EVENT_SOURCE
-    )
-    controlled_automation_pointer_event_filename = (
-        source_root / CONTROLLED_AUTOMATION_POINTER_EVENT_SOURCE
-    )
-    controlled_automation_submit_event_filename = (
-        source_root / CONTROLLED_AUTOMATION_SUBMIT_EVENT_SOURCE
-    )
-    controlled_automation_form_data_event_filename = (
-        source_root / CONTROLLED_AUTOMATION_FORM_DATA_EVENT_SOURCE
-    )
-    controlled_automation_event_fixture_filename = (
-        source_root / CONTROLLED_AUTOMATION_EVENT_FIXTURE
-    )
+    controlled_automation_event_target_filename = source_root / CONTROLLED_AUTOMATION_EVENT_TARGET_SOURCE
+    controlled_automation_input_event_filename = source_root / CONTROLLED_AUTOMATION_INPUT_EVENT_SOURCE
+    controlled_automation_pointer_event_filename = source_root / CONTROLLED_AUTOMATION_POINTER_EVENT_SOURCE
+    controlled_automation_submit_event_filename = source_root / CONTROLLED_AUTOMATION_SUBMIT_EVENT_SOURCE
+    controlled_automation_form_data_event_filename = source_root / CONTROLLED_AUTOMATION_FORM_DATA_EVENT_SOURCE
+    controlled_automation_event_fixture_filename = source_root / CONTROLLED_AUTOMATION_EVENT_FIXTURE
     controlled_css_animation_filename = source_root / CONTROLLED_CSS_ANIMATION_SOURCE
-    controlled_css_animation_event_filename = (
-        source_root / CONTROLLED_CSS_ANIMATION_EVENT_SOURCE
-    )
-    controlled_css_transition_event_filename = (
-        source_root / CONTROLLED_CSS_TRANSITION_EVENT_SOURCE
-    )
+    controlled_css_animation_event_filename = source_root / CONTROLLED_CSS_ANIMATION_EVENT_SOURCE
+    controlled_css_transition_event_filename = source_root / CONTROLLED_CSS_TRANSITION_EVENT_SOURCE
     controlled_css_document_filename = source_root / CONTROLLED_CSS_DOCUMENT_SOURCE
-    controlled_css_animation_event_fixture_filename = (
-        source_root / CONTROLLED_CSS_ANIMATION_EVENT_FIXTURE
-    )
-    controlled_rendering_settlement_filename = (
-        source_root / CONTROLLED_RENDERING_SETTLEMENT_SOURCE
-    )
+    controlled_css_animation_event_fixture_filename = source_root / CONTROLLED_CSS_ANIMATION_EVENT_FIXTURE
+    controlled_rendering_settlement_filename = source_root / CONTROLLED_RENDERING_SETTLEMENT_SOURCE
     controlled_image_element_filename = source_root / CONTROLLED_IMAGE_ELEMENT_SOURCE
     controlled_image_window_filename = source_root / CONTROLLED_IMAGE_WINDOW_SOURCE
-    controlled_image_script_thread_filename = (
-        source_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
-    )
+    controlled_image_script_thread_filename = source_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
     controlled_image_messaging_filename = source_root / CONTROLLED_IMAGE_MESSAGING_SOURCE
-    controlled_image_producer_fence_filename = (
-        source_root / CONTROLLED_IMAGE_PRODUCER_FENCE_SOURCE
-    )
+    controlled_image_producer_fence_filename = source_root / CONTROLLED_IMAGE_PRODUCER_FENCE_SOURCE
+    controlled_image_cache_filename = source_root / CONTROLLED_IMAGE_CACHE_SOURCE
+    controlled_profile_wire_filename = source_root / CONTROLLED_PROFILE_WIRE_SOURCE
+    controlled_http_image_fixture_filename = source_root / CONTROLLED_HTTP_IMAGE_FIXTURE
+    controlled_http_image_multipart_fixture_filename = source_root / CONTROLLED_HTTP_IMAGE_MULTIPART_FIXTURE
     controlled_inline_svg_filename = source_root / CONTROLLED_INLINE_SVG_SOURCE
     controlled_inline_svg_fixture_filename = source_root / CONTROLLED_INLINE_SVG_FIXTURE
-    controlled_inline_svg_advanced_fixture_filename = (
-        source_root / CONTROLLED_INLINE_SVG_ADVANCED_FIXTURE
-    )
+    controlled_inline_svg_advanced_fixture_filename = source_root / CONTROLLED_INLINE_SVG_ADVANCED_FIXTURE
     execution_limits_filename = source_root / EXECUTION_LIMITS_SOURCE
     require_regular_file(profile_filename, "controlled-web-session-v2 candidate profile")
     require_regular_file(contract_filename, "controlled-web-session-v2 candidate contract")
+    require_regular_file(public_top_level_readme_filename, "top-level public README")
+    require_regular_file(public_stasis_boundary_filename, "public Stasis product boundary")
+    require_regular_file(public_profile_readme_filename, "public profile README")
+    require_regular_file(public_typescript_sdk_readme_filename, "public TypeScript SDK README")
+    require_regular_file(public_release_runbook_filename, "public release runbook")
+    require_regular_file(public_release_workflow_filename, "public release-note workflow")
     require_regular_file(message_limits_filename, "MessageChannel native limit source")
-    require_regular_file(
-        message_baseline_test_filename, "MessageChannel native baseline proof source"
-    )
-    require_regular_file(
-        message_multi_pair_fixture_filename, "MessageChannel multi-pair fixture"
-    )
+    require_regular_file(message_baseline_test_filename, "MessageChannel native baseline proof source")
+    require_regular_file(message_multi_pair_fixture_filename, "MessageChannel multi-pair fixture")
     require_regular_file(message_channel_filename, "MessageChannel constructor source")
     require_regular_file(structured_clone_filename, "structured-clone transfer source")
     require_regular_file(message_port_filename, "MessagePort postMessage source")
     require_regular_file(input_method_control_filename, "controlled InputMethod source")
     require_regular_file(input_method_input_filename, "HTMLInput InputMethod producer")
-    require_regular_file(
-        input_method_textarea_filename, "HTMLTextArea InputMethod producer"
-    )
+    require_regular_file(input_method_textarea_filename, "HTMLTextArea InputMethod producer")
     require_regular_file(event_filename, "controlled Event timestamp source")
     require_regular_file(focus_event_filename, "controlled FocusEvent timestamp source")
-    require_regular_file(
-        controlled_automation_filename, "controlled automation event source"
-    )
+    require_regular_file(controlled_automation_filename, "controlled automation event source")
     require_regular_file(
         controlled_automation_event_target_filename,
         "controlled simple automation event source",
@@ -3355,9 +3391,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         controlled_automation_event_fixture_filename,
         "controlled automation event timestamp fixture",
     )
-    require_regular_file(
-        controlled_css_animation_filename, "controlled CSS animation dispatch source"
-    )
+    require_regular_file(controlled_css_animation_filename, "controlled CSS animation dispatch source")
     require_regular_file(
         controlled_css_animation_event_filename,
         "controlled internal AnimationEvent source",
@@ -3366,9 +3400,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         controlled_css_transition_event_filename,
         "controlled internal TransitionEvent source",
     )
-    require_regular_file(
-        controlled_css_document_filename, "controlled CSS rendering observation source"
-    )
+    require_regular_file(controlled_css_document_filename, "controlled CSS rendering observation source")
     require_regular_file(
         controlled_css_animation_event_fixture_filename,
         "controlled CSS animation event timestamp fixture",
@@ -3377,20 +3409,32 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         controlled_rendering_settlement_filename,
         "controlled rendering settlement source",
     )
-    require_regular_file(
-        controlled_image_element_filename, "controlled HTMLImageElement source"
-    )
+    require_regular_file(controlled_image_element_filename, "controlled HTMLImageElement source")
     require_regular_file(controlled_image_window_filename, "controlled image Window source")
     require_regular_file(
         controlled_image_script_thread_filename,
         "controlled image ScriptThread source",
     )
-    require_regular_file(
-        controlled_image_messaging_filename, "controlled image transport source"
-    )
+    require_regular_file(controlled_image_messaging_filename, "controlled image transport source")
     require_regular_file(
         controlled_image_producer_fence_filename,
         "controlled image producer-fence source",
+    )
+    require_regular_file(
+        controlled_image_cache_filename,
+        "controlled per-pipeline image-cache source",
+    )
+    require_regular_file(
+        controlled_profile_wire_filename,
+        "controlled exact profile wire assertion source",
+    )
+    require_regular_file(
+        controlled_http_image_fixture_filename,
+        "controlled HTTP image protocol fixture",
+    )
+    require_regular_file(
+        controlled_http_image_multipart_fixture_filename,
+        "controlled HTTP multipart image protocol fixture",
     )
     require_regular_file(controlled_inline_svg_filename, "controlled inline SVG source")
     require_regular_file(
@@ -3402,93 +3446,70 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "controlled inline SVG advanced protocol fixture",
     )
     require_regular_file(execution_limits_filename, "controlled execution-limit source")
-    if (
-        contract_filename.stat().st_size <= 0
-        or contract_filename.stat().st_size > MAX_TEXT_MEMBER_BYTES
-    ):
+    if contract_filename.stat().st_size <= 0 or contract_filename.stat().st_size > MAX_TEXT_MEMBER_BYTES:
         raise ReleaseError("controlled-web-session-v2 candidate contract has an invalid size")
     try:
         profile_text = profile_filename.read_text(encoding="utf-8")
         contract_text = contract_filename.read_text(encoding="utf-8")
+        public_top_level_readme = public_top_level_readme_filename.read_text(encoding="utf-8")
+        public_stasis_boundary = public_stasis_boundary_filename.read_text(encoding="utf-8")
+        public_profile_readme = public_profile_readme_filename.read_text(encoding="utf-8")
+        public_typescript_sdk_readme = public_typescript_sdk_readme_filename.read_text(encoding="utf-8")
+        public_release_runbook = public_release_runbook_filename.read_text(encoding="utf-8")
+        public_release_workflow = public_release_workflow_filename.read_text(encoding="utf-8")
         message_limits_source = message_limits_filename.read_text(encoding="utf-8")
-        message_baseline_test_source = message_baseline_test_filename.read_text(
-            encoding="utf-8"
-        )
-        message_multi_pair_fixture_source = message_multi_pair_fixture_filename.read_text(
-            encoding="utf-8"
-        )
+        message_baseline_test_source = message_baseline_test_filename.read_text(encoding="utf-8")
+        message_multi_pair_fixture_source = message_multi_pair_fixture_filename.read_text(encoding="utf-8")
         message_channel_source = message_channel_filename.read_text(encoding="utf-8")
         structured_clone_source = structured_clone_filename.read_text(encoding="utf-8")
         message_port_source = message_port_filename.read_text(encoding="utf-8")
         input_method_control_source = input_method_control_filename.read_text(encoding="utf-8")
         input_method_input_source = input_method_input_filename.read_text(encoding="utf-8")
-        input_method_textarea_source = input_method_textarea_filename.read_text(
-            encoding="utf-8"
-        )
+        input_method_textarea_source = input_method_textarea_filename.read_text(encoding="utf-8")
         event_source = event_filename.read_text(encoding="utf-8")
         focus_event_source = focus_event_filename.read_text(encoding="utf-8")
-        controlled_automation_source = controlled_automation_filename.read_text(
+        controlled_automation_source = controlled_automation_filename.read_text(encoding="utf-8")
+        controlled_automation_event_target_source = controlled_automation_event_target_filename.read_text(
             encoding="utf-8"
         )
-        controlled_automation_event_target_source = (
-            controlled_automation_event_target_filename.read_text(encoding="utf-8")
-        )
-        controlled_automation_input_event_source = (
-            controlled_automation_input_event_filename.read_text(encoding="utf-8")
-        )
-        controlled_automation_pointer_event_source = (
-            controlled_automation_pointer_event_filename.read_text(encoding="utf-8")
-        )
-        controlled_automation_submit_event_source = (
-            controlled_automation_submit_event_filename.read_text(encoding="utf-8")
-        )
-        controlled_automation_form_data_event_source = (
-            controlled_automation_form_data_event_filename.read_text(encoding="utf-8")
-        )
-        controlled_automation_event_fixture_source = (
-            controlled_automation_event_fixture_filename.read_text(encoding="utf-8")
-        )
-        controlled_css_animation_source = controlled_css_animation_filename.read_text(
+        controlled_automation_input_event_source = controlled_automation_input_event_filename.read_text(
             encoding="utf-8"
         )
-        controlled_css_animation_event_source = (
-            controlled_css_animation_event_filename.read_text(encoding="utf-8")
-        )
-        controlled_css_transition_event_source = (
-            controlled_css_transition_event_filename.read_text(encoding="utf-8")
-        )
-        controlled_css_document_source = controlled_css_document_filename.read_text(
+        controlled_automation_pointer_event_source = controlled_automation_pointer_event_filename.read_text(
             encoding="utf-8"
         )
-        controlled_css_animation_event_fixture_source = (
-            controlled_css_animation_event_fixture_filename.read_text(encoding="utf-8")
-        )
-        controlled_rendering_settlement_source = (
-            controlled_rendering_settlement_filename.read_text(encoding="utf-8")
-        )
-        controlled_image_element_source = controlled_image_element_filename.read_text(
+        controlled_automation_submit_event_source = controlled_automation_submit_event_filename.read_text(
             encoding="utf-8"
         )
-        controlled_image_window_source = controlled_image_window_filename.read_text(
+        controlled_automation_form_data_event_source = controlled_automation_form_data_event_filename.read_text(
             encoding="utf-8"
         )
-        controlled_image_script_thread_source = (
-            controlled_image_script_thread_filename.read_text(encoding="utf-8")
-        )
-        controlled_image_messaging_source = controlled_image_messaging_filename.read_text(
+        controlled_automation_event_fixture_source = controlled_automation_event_fixture_filename.read_text(
             encoding="utf-8"
         )
-        controlled_image_producer_fence_source = (
-            controlled_image_producer_fence_filename.read_text(encoding="utf-8")
-        )
-        controlled_inline_svg_source = controlled_inline_svg_filename.read_text(
+        controlled_css_animation_source = controlled_css_animation_filename.read_text(encoding="utf-8")
+        controlled_css_animation_event_source = controlled_css_animation_event_filename.read_text(encoding="utf-8")
+        controlled_css_transition_event_source = controlled_css_transition_event_filename.read_text(encoding="utf-8")
+        controlled_css_document_source = controlled_css_document_filename.read_text(encoding="utf-8")
+        controlled_css_animation_event_fixture_source = controlled_css_animation_event_fixture_filename.read_text(
             encoding="utf-8"
         )
-        controlled_inline_svg_fixture_source = (
-            controlled_inline_svg_fixture_filename.read_text(encoding="utf-8")
+        controlled_rendering_settlement_source = controlled_rendering_settlement_filename.read_text(encoding="utf-8")
+        controlled_image_element_source = controlled_image_element_filename.read_text(encoding="utf-8")
+        controlled_image_window_source = controlled_image_window_filename.read_text(encoding="utf-8")
+        controlled_image_script_thread_source = controlled_image_script_thread_filename.read_text(encoding="utf-8")
+        controlled_image_messaging_source = controlled_image_messaging_filename.read_text(encoding="utf-8")
+        controlled_image_producer_fence_source = controlled_image_producer_fence_filename.read_text(encoding="utf-8")
+        controlled_image_cache_source = controlled_image_cache_filename.read_text(encoding="utf-8")
+        controlled_profile_wire_source = controlled_profile_wire_filename.read_text(encoding="utf-8")
+        controlled_http_image_fixture_source = controlled_http_image_fixture_filename.read_text(encoding="utf-8")
+        controlled_http_image_multipart_fixture_source = controlled_http_image_multipart_fixture_filename.read_text(
+            encoding="utf-8"
         )
-        controlled_inline_svg_advanced_fixture_source = (
-            controlled_inline_svg_advanced_fixture_filename.read_text(encoding="utf-8")
+        controlled_inline_svg_source = controlled_inline_svg_filename.read_text(encoding="utf-8")
+        controlled_inline_svg_fixture_source = controlled_inline_svg_fixture_filename.read_text(encoding="utf-8")
+        controlled_inline_svg_advanced_fixture_source = controlled_inline_svg_advanced_fixture_filename.read_text(
+            encoding="utf-8"
         )
         execution_limits_source = execution_limits_filename.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
@@ -3509,15 +3530,9 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         strict_json_loads(profile_text, "controlled-web-session-v2 candidate profile"),
         "controlled-web-session-v2 candidate profile",
     )
-    compatibility = require_json_object(
-        profile.get("compatibility"), "controlled-web-session-v2 compatibility"
-    )
-    session_state = require_json_object(
-        profile.get("sessionState"), "controlled-web-session-v2 sessionState"
-    )
-    session_cookies = require_json_object(
-        session_state.get("cookies"), "controlled-web-session-v2 session cookies"
-    )
+    compatibility = require_json_object(profile.get("compatibility"), "controlled-web-session-v2 compatibility")
+    session_state = require_json_object(profile.get("sessionState"), "controlled-web-session-v2 sessionState")
+    session_cookies = require_json_object(session_state.get("cookies"), "controlled-web-session-v2 session cookies")
     cookie_persistence = require_json_object(
         session_cookies.get("persistence"),
         "controlled-web-session-v2 cookie persistence",
@@ -3558,9 +3573,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         cookie_page_api.get("cookieStore"),
         "controlled-web-session-v2 Cookie Store boundary",
     )
-    execution = require_json_object(
-        profile.get("execution"), "controlled-web-session-v2 execution"
-    )
+    execution = require_json_object(profile.get("execution"), "controlled-web-session-v2 execution")
     unsupported_classes = require_json_object(
         profile.get("unsupportedClasses"),
         "controlled-web-session-v2 unsupported classes",
@@ -3657,21 +3670,15 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     if type(supported_product_surface) is not list or any(
         type(entry) is not str for entry in supported_product_surface
     ):
-        raise ReleaseError(
-            "controlled-web-session-v2 supportedProductSurface must be an array of strings"
-        )
-    message_channel = require_json_object(
-        execution.get("messageChannel"), "controlled-web-session-v2 messageChannel"
-    )
+        raise ReleaseError("controlled-web-session-v2 supportedProductSurface must be an array of strings")
+    message_channel = require_json_object(execution.get("messageChannel"), "controlled-web-session-v2 messageChannel")
     construction = require_json_object(
         message_channel.get("construction"), "controlled-web-session-v2 MessageChannel construction"
     )
     post_message = require_json_object(
         message_channel.get("postMessage"), "controlled-web-session-v2 MessageChannel postMessage"
     )
-    delivery = require_json_object(
-        message_channel.get("delivery"), "controlled-web-session-v2 MessageChannel delivery"
-    )
+    delivery = require_json_object(message_channel.get("delivery"), "controlled-web-session-v2 MessageChannel delivery")
     retained_work_projection = require_json_object(
         delivery.get("retainedWorkProjection"),
         "controlled-web-session-v2 retained MessagePort work projection",
@@ -3680,60 +3687,41 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         message_channel.get("unsupported"),
         "controlled-web-session-v2 MessageChannel unsupported boundary",
     )
-    execution_limits = require_json_object(
-        profile.get("executionLimits"), "controlled-web-session-v2 executionLimits"
-    )
+    execution_limits = require_json_object(profile.get("executionLimits"), "controlled-web-session-v2 executionLimits")
     expected_identity = {
         "id": "controlled-web-session-v2",
-        "releaseStatus": "candidate_contract",
+        "releaseStatus": "stable_contract",
         "targetRelease": RELEASE_VERSION,
     }
     for field, expected in expected_identity.items():
         if profile.get(field) != expected:
-            raise ReleaseError(
-                f"controlled-web-session-v2 {field} must be {expected!r}"
-            )
+            raise ReleaseError(f"controlled-web-session-v2 {field} must be {expected!r}")
     if compatibility.get("predecessor") != "controlled-web-session-v1":
-        raise ReleaseError(
-            "controlled-web-session-v2 predecessor must be controlled-web-session-v1"
-        )
+        raise ReleaseError("controlled-web-session-v2 predecessor must be controlled-web-session-v1")
     if compatibility.get("predecessorProfileSha256") != FROZEN_V2_PROFILE_SHA256:
         raise ReleaseError(
-            "controlled-web-session-v2 predecessorProfileSha256 must pin the frozen "
-            "controlled-web-session-v1 profile"
+            "controlled-web-session-v2 predecessorProfileSha256 must pin the frozen controlled-web-session-v1 profile"
         )
     if compatibility.get("predecessorContractUnchanged") is not True:
-        raise ReleaseError(
-            "controlled-web-session-v2 predecessorContractUnchanged must remain true"
-        )
+        raise ReleaseError("controlled-web-session-v2 predecessorContractUnchanged must remain true")
     if compatibility.get("profileExpansion") != (
         "execution_headless_presentation_and_controlled_cookie_state_surfaces"
     ):
-        raise ReleaseError(
-            "controlled-web-session-v2 profile expansion identity changed"
-        )
-    if compatibility.get("stateArtifactProfile") != (
-        "selected_controlled_session_profile_exact"
-    ):
-        raise ReleaseError(
-            "controlled-web-session-v2 state artifact selection identity changed"
-        )
+        raise ReleaseError("controlled-web-session-v2 profile expansion identity changed")
+    if compatibility.get("stateArtifactProfile") != ("selected_controlled_session_profile_exact"):
+        raise ReleaseError("controlled-web-session-v2 state artifact selection identity changed")
     require_exact_fields(
         cookie_persistence,
         {
             "mode": "controlled_session_owned_expiry",
             "storage": "memory_only_for_session_lifetime",
             "diskOrHostPersistence": False,
-            "portablePersistence": (
-                "explicit_profile_v2_state_export_and_initial_import_only"
-            ),
+            "portablePersistence": ("explicit_profile_v2_state_export_and_initial_import_only"),
             "clock": "controlled_unix_time_ns_with_origin_zero",
             "maxAgePrecedence": "last_valid_Max-Age_over_Expires",
             "maximumLifetimeSeconds": 34_560_000,
             "clamp": "now_plus_400_days",
-            "purge": (
-                "lazily_before_cookie_observation_request_selection_and_state_export"
-            ),
+            "purge": ("lazily_before_cookie_observation_request_selection_and_state_export"),
             "expiresAtOrBeforeNow": "delete_instead_of_retain",
         },
         "controlled-web-session-v2 cookie persistence",
@@ -3754,9 +3742,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         {
             "maximumControlledUnixTimeNsInclusive": "18446744073709551615",
             "postOpenNetworkRequestAboveMaximum": cookie_post_open_time_range,
-            "controlledOpenFailurePrecedence": (
-                "same_code_hardened_to_fatal_fail_stop"
-            ),
+            "controlledOpenFailurePrecedence": ("same_code_hardened_to_fatal_fail_stop"),
             "persistentExpiryWithoutU64Headroom": "unsupported_cookie_time_range",
             "pageApiDomException": "NotSupportedError",
         },
@@ -3784,12 +3770,9 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     require_exact_fields(
         cookie_same_site_response_storage,
         {
-            "sameSiteOrTopLevelNavigation": (
-                "all_valid_unpartitioned_response_cookies_eligible"
-            ),
+            "sameSiteOrTopLevelNavigation": ("all_valid_unpartitioned_response_cookies_eligible"),
             "crossSiteSubresource": (
-                "only_secure_SameSite_None_eligible_Strict_Lax_and_"
-                "unspecified_ignored_without_terminal"
+                "only_secure_SameSite_None_eligible_Strict_Lax_and_unspecified_ignored_without_terminal"
             ),
             "requestMethod": "not_an_admission_input",
         },
@@ -3803,15 +3786,11 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "context": cookie_same_site_context,
             "none": "requires_secure",
             "strict": "included_only_for_schemeful_same_site_requests",
-            "lax": (
-                "included_for_schemeful_same_site_or_cross_site_top_level_safe_method"
-            ),
+            "lax": ("included_for_schemeful_same_site_or_cross_site_top_level_safe_method"),
             "unspecified": "same_request_filter_as_lax",
             "safeMethods": ["GET", "HEAD", "OPTIONS", "TRACE"],
             "noneSelection": "included_cross_site_when_secure",
-            "ineligibleCookie": (
-                "filtered_before_cookie_header_construction_without_terminal"
-            ),
+            "ineligibleCookie": ("filtered_before_cookie_header_construction_without_terminal"),
             "responseStorage": cookie_same_site_response_storage,
         },
         "controlled-web-session-v2 SameSite policy",
@@ -3875,19 +3854,10 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     require_exact_fields(
         controlled_input_method,
         {
-            "scope": (
-                "exact_public_controlled_non_auxiliary_top_level_WebView_document_global"
-            ),
-            "request": (
-                "page_driven_InputMethod_Text_nonmultiline_"
-                "allowVirtualKeyboard_false_only"
-            ),
-            "trigger": (
-                "page_driven_programmatic_DOM_focus_including_React_autoFocus"
-            ),
-            "semanticAutomation": (
-                "preexisting_profile_independent_suppression_unchanged"
-            ),
+            "scope": ("exact_public_controlled_non_auxiliary_top_level_WebView_document_global"),
+            "request": ("page_driven_InputMethod_Text_nonmultiline_allowVirtualKeyboard_false_only"),
+            "trigger": ("page_driven_programmatic_DOM_focus_including_React_autoFocus"),
+            "semanticAutomation": ("preexisting_profile_independent_suppression_unchanged"),
             "domSemantics": "focus_events_value_and_selection_preserved",
             "embedderPresentation": "suppressed_before_time_surface_admission",
             "visibleOwner": "not_published",
@@ -3902,18 +3872,12 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     require_exact_fields(
         controlled_focus_event_timestamp,
         {
-            "scope": (
-                "exact_public_controlled_non_auxiliary_top_level_WebView_document_global"
-            ),
+            "scope": ("exact_public_controlled_non_auxiliary_top_level_WebView_document_global"),
             "events": ["focus", "blur", "focusin", "focusout"],
             "creation": "engine_generated_document_focus_transition_only",
             "clock": "document_performance_clock_sampled_at_event_creation",
-            "observableValue": (
-                "Event_timeStamp_equals_document_relative_performance_time"
-            ),
-            "hostValue": (
-                "sampled_implementation_value_is_overwritten_and_not_observable"
-            ),
+            "observableValue": ("Event_timeStamp_equals_document_relative_performance_time"),
+            "hostValue": ("sampled_implementation_value_is_overwritten_and_not_observable"),
             "scriptCreatedFocusEvent": "host_timestamp",
             "otherEventsOutsideControlledAutomationScope": "host_timestamp",
             "predecessorBehavior": "controlled_web_session_v1_unchanged",
@@ -3928,25 +3892,18 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "automationScope": "synchronous_public_mutating_automation_action_only",
             "clock": "document_performance_clock_sampled_once_before_mutation",
             "lifetime": "RAII_scope_restored_before_action_response",
-            "coverage": (
-                "every_browser_created_event_constructed_synchronously_during_"
-                "the_admitted_action"
-            ),
+            "coverage": ("every_browser_created_event_constructed_synchronously_during_the_admitted_action"),
             "implementationSeams": controlled_automation_event_seams,
             "representativeProofEvents": (
-                "fill_input_activate_click_reset_check_click_input_change_select_"
-                "input_change_invalid_submit_formdata"
+                "fill_input_activate_click_reset_check_click_input_change_select_input_change_invalid_submit_formdata"
             ),
             "observableValue": (
                 "all_browser_created_events_synchronously_constructed_during_one_"
                 "admitted_action_share_its_document_relative_timestamp"
             ),
-            "samplingFailure": (
-                "reject_action_before_mutation_without_host_fallback"
-            ),
+            "samplingFailure": ("reject_action_before_mutation_without_host_fallback"),
             "scriptCreatedConstructors": (
-                "Event_InputEvent_PointerEvent_SubmitEvent_FormDataEvent_"
-                "remain_host_timestamp"
+                "Event_InputEvent_PointerEvent_SubmitEvent_FormDataEvent_remain_host_timestamp"
             ),
             "genericEventConstructor": "Event_new_inherited_unchanged",
             "predecessorBehavior": "controlled_web_session_v1_unchanged",
@@ -3968,12 +3925,9 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     require_exact_fields(
         controlled_css_animation_event_timestamps,
         {
-            "scope": (
-                "exact_public_controlled_non_auxiliary_top_level_WebView_document_global"
-            ),
+            "scope": ("exact_public_controlled_non_auxiliary_top_level_WebView_document_global"),
             "source": (
-                "nonempty_Animations_pending_event_dispatch_batch_already_retained_"
-                "by_document_rendering_authority"
+                "nonempty_Animations_pending_event_dispatch_batch_already_retained_by_document_rendering_authority"
             ),
             "eventKinds": [
                 "animationstart",
@@ -3985,9 +3939,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
                 "transitionend",
                 "transitioncancel",
             ],
-            "clock": (
-                "document_performance_clock_sampled_once_before_pending_queue_take"
-            ),
+            "clock": ("document_performance_clock_sampled_once_before_pending_queue_take"),
             "targetAdmission": (
                 "ScriptThread_current_controlled_top_level_target_matches_conservative_"
                 "singleton_reconstruction_with_undiscarded_non_auxiliary_WindowProxy"
@@ -3996,40 +3948,25 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
                 "queued_pipeline_and_rooted_node_owner_match_exact_public_controlled_"
                 "non_auxiliary_top_level_target_and_fully_active_Document"
             ),
-            "construction": (
-                "internal_AnimationEvent_and_TransitionEvent_timestamp_overwrite_"
-                "immediately_before_fire"
-            ),
+            "construction": ("internal_AnimationEvent_and_TransitionEvent_timestamp_overwrite_immediately_before_fire"),
             "observableValue": (
-                "every_admitted_internal_event_in_one_nonempty_dispatch_batch_"
-                "shares_its_document_relative_timestamp"
+                "every_admitted_internal_event_in_one_nonempty_dispatch_batch_shares_its_document_relative_timestamp"
             ),
-            "samplingFailure": (
-                "latch_controlled_clock_terminal_and_leave_batch_undispatched_"
-                "without_host_fallback"
-            ),
+            "samplingFailure": ("latch_controlled_clock_terminal_and_leave_batch_undispatched_without_host_fallback"),
             "pendingAuthority": (
-                "existing_pending_event_and_finite_infinite_unsupported_animation_"
-                "rendering_facts_unchanged"
+                "existing_pending_event_and_finite_infinite_unsupported_animation_rendering_facts_unchanged"
             ),
             "settlementScheduling": controlled_css_settlement_scheduling,
             "executionLimit": "existing_10000_rendering_opportunity_limit",
-            "representativeExecutableProof": (
-                "instant_finite_animationstart_and_animationend_only"
-            ),
+            "representativeExecutableProof": ("instant_finite_animationstart_and_animationend_only"),
             "transitionSettlementCompatibility": (
                 "not_claimed_timestamp_adapter_applies_only_if_an_existing_owned_"
                 "transition_record_reaches_pending_dispatch"
             ),
-            "scriptCreatedConstructors": (
-                "AnimationEvent_and_TransitionEvent_remain_host_timestamp"
-            ),
-            "auxiliaryStaleMismatchedNestedAndRealtime": (
-                "host_timestamp_predecessor_behavior"
-            ),
+            "scriptCreatedConstructors": ("AnimationEvent_and_TransitionEvent_remain_host_timestamp"),
+            "auxiliaryStaleMismatchedNestedAndRealtime": ("host_timestamp_predecessor_behavior"),
             "semanticBoundary": (
-                "timestamp_only_event_order_cardinality_elapsedTime_and_CSS_"
-                "animation_semantics_unchanged"
+                "timestamp_only_event_order_cardinality_elapsedTime_and_CSS_animation_semantics_unchanged"
             ),
             "predecessorBehavior": "controlled_web_session_v1_unchanged",
         },
@@ -4039,24 +3976,18 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         controlled_css_settlement_scheduling,
         {
             "scheduledPendingEventBatch": (
-                "finite_rendering_demand_advanced_to_exact_retained_scheduler_head_"
-                "including_deadline_equal_to_now"
+                "finite_rendering_demand_advanced_to_exact_retained_scheduler_head_including_deadline_equal_to_now"
             ),
-            "driveReadiness": (
-                "pending_animation_events_are_Drive_ready_only_without_a_live_"
-                "scheduled_opportunity"
-            ),
+            "driveReadiness": ("pending_animation_events_are_Drive_ready_only_without_a_live_scheduled_opportunity"),
             "reason": "Drive_cannot_detach_a_controlled_scheduler_entry",
-            "surfaceEffect": (
-                "liveness_correction_only_no_new_producer_task_source_or_execution_limit"
-            ),
+            "surfaceEffect": ("liveness_correction_only_no_new_producer_task_source_or_execution_limit"),
         },
         "controlled-web-session-v2 CSS pending-event settlement scheduling",
     )
     require_exact_fields(
         controlled_image_element,
         {
-            "mode": "controlled_top_level_direct_data_svg",
+            "mode": ("controlled_top_level_direct_data_svg_and_initial_url_retained_ownership_bounded_http_https"),
             "selection": controlled_image_selection,
             "retention": controlled_image_retention,
             "completion": controlled_image_completion,
@@ -4070,23 +4001,24 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         controlled_image_selection,
         {
             "interface": "HTMLImageElement",
-            "scope": (
-                "exact_public_controlled_non_auxiliary_top_level_WebView_document_global"
+            "scope": ("exact_public_controlled_non_auxiliary_top_level_WebView_document_global"),
+            "source": ("direct_src_selected_without_srcset_picture_or_environment_change"),
+            "urlSchemes": ["http", "https", "data"],
+            "httpHttps": ("content_format_agnostic_at_initial_selection_with_resource_IO_separately_owned"),
+            "httpHttpsOrigin": (
+                "same_and_cross_origin_source_ownership_response_determinism_governed_by_session_network_policy"
             ),
-            "source": (
-                "direct_src_selected_without_srcset_picture_or_environment_change"
-            ),
-            "parser": "canonical_DataUrl",
-            "mimeType": "image/svg+xml",
-            "maximumSerializedUrlBytes": 65536,
-            "requestProvenance": (
-                "captured_at_selection_and_carried_with_request_generation"
-            ),
+            "httpHttpsRedirects": ("resource_owned_final_URL_not_rechecked_against_initial_selected_URL_limit"),
+            "dataUrlParser": "canonical_DataUrl",
+            "dataUrlMimeType": "image/svg+xml",
+            "maximumInitialSelectedCanonicalUrlBytes": 65536,
+            "requestProvenance": ("captured_at_selection_and_carried_with_request_generation"),
             "retainedVectorAuthority": (
                 "controlled_cache_id_stored_on_request_only_after_successful_"
                 "registration_or_synchronous_exact_owner_retain"
             ),
-            "executionDomain": "same_ScriptThread_and_ImageCache",
+            "executionDomain": "same_ScriptThread_and_per_pipeline_ImageCacheStore",
+            "cacheReuseProofBoundary": ("same_pipeline_store_under_immutable_session_fixture_routes"),
         },
         "controlled-web-session-v2 HTMLImageElement selection",
     )
@@ -4103,26 +4035,18 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
                 "one_record_per_controlled_pending_callback_exact_cache_id_DOM_owner_"
                 "identity_or_vector_rasterization_key"
             ),
-            "overflow": (
-                "sticky_Image_producer_admission_limit_terminal_without_baseline_fallback"
-            ),
+            "overflow": ("sticky_Image_producer_admission_limit_terminal_without_baseline_fallback"),
             "decodeRequestAdmission": (
-                "ReadyForRequest_callback_and_identity_reservations_succeed_before_"
-                "cache_request_issue"
+                "ReadyForRequest_callback_and_identity_reservations_succeed_before_cache_request_issue"
             ),
-            "teardown": (
-                "callback_identity_layout_and_raster_collections_cleared_together_"
-                "releasing_all_records"
-            ),
+            "teardown": ("callback_identity_layout_and_raster_collections_cleared_together_releasing_all_records"),
         },
         "controlled-web-session-v2 HTMLImageElement retention",
     )
     require_exact_fields(
         controlled_image_completion,
         {
-            "synchronousCacheHit": (
-                "admitted_provenance_bound_current_turn_without_async_producer_lease"
-            ),
+            "synchronousCacheHit": ("admitted_provenance_bound_current_turn_without_async_producer_lease"),
             "asyncCacheDecode": "Image_producer_fenced_through_ScriptThread_handoff",
             "callbackRetirement": (
                 "cache_owned_callback_drop_before_protocol_terminal_is_owned_"
@@ -4139,8 +4063,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
                 "rendering_image_load"
             ),
             "handlerUnwind": (
-                "ControlledImageMessageCompletion_abandons_during_unwind_and_"
-                "completes_every_normal_handler_return"
+                "ControlledImageMessageCompletion_abandons_during_unwind_and_completes_every_normal_handler_return"
             ),
             "explicitAbandonment": (
                 "message_admission_failure_enqueue_rejection_producer_callback_panic_"
@@ -4153,43 +4076,36 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
                 "completion_and_abandonment_require_exact_fence_sequence_and_registered_"
                 "Image_kind_before_terminal_or_watermark_mutation"
             ),
-            "vectorRasterization": (
-                "fenced_only_when_joined_from_a_retained_exact_cache_id_DOM_owner_"
-                "identity"
-            ),
-            "vectorRasterizationStart": (
-                "may_begin_in_layout_before_post_reflow_exact_key_reservation"
-            ),
+            "vectorRasterization": ("fenced_only_when_joined_from_a_retained_exact_cache_id_DOM_owner_identity"),
+            "vectorRasterizationStart": ("may_begin_in_layout_before_post_reflow_exact_key_reservation"),
             "vectorRasterizationAdmission": (
                 "post_reflow_exact_key_reservation_and_fenced_listener_install_before_"
                 "next_ScriptThread_pending_snapshot_publish_or_observe"
             ),
             "vectorRasterizationCapacityFailure": (
-                "sticky_Image_producer_terminal_without_baseline_fallback_even_if_"
-                "task_already_started"
+                "sticky_Image_producer_terminal_without_baseline_fallback_even_if_task_already_started"
             ),
             "terminalResponses": [
                 "loaded",
                 "failed_to_load_or_decode",
                 "vector_rasterization_complete",
             ],
-            "queuedDomCallback": (
-                "ordinary_task_after_guarded_handoff_with_request_generation_check"
-            ),
-            "preHandlerMismatchOrAbandonment": (
-                "sticky_producer_terminal_without_baseline_fallback"
-            ),
+            "queuedDomCallback": ("ordinary_task_after_guarded_handoff_with_request_generation_check"),
+            "preHandlerMismatchOrAbandonment": ("sticky_producer_terminal_without_baseline_fallback"),
             "requestAuthorityLifecycle": (
                 "pending_to_current_move_preserves_exact_cache_id_and_abort_replace_"
                 "or_different_id_releases_exact_owner"
             ),
-            "sameIdAbaProtection": (
-                "stale_generation_releases_only_when_neither_request_slot_owns_"
-                "exact_cache_id"
+            "sameIdAbaProtection": ("stale_generation_releases_only_when_neither_request_slot_owns_exact_cache_id"),
+            "multipartMixedReplace": (
+                "post_metadata_explicit_unsupported_provenance_retires_controlled_"
+                "Image_producer_and_reports_unsupported_rendering_image_load_after_"
+                "finite_resource_IO_drains_while_endless_resource_IO_remains_external"
             ),
-            "decoderResourceBudget": (
-                "not_claimed_existing_wall_task_and_rendering_limits_only"
+            "inflightHttpDocumentReplacement": (
+                "fatal_blocked_on_external_io_before_cross_document_successor_authority"
             ),
+            "decoderResourceBudget": ("not_claimed_existing_wall_task_and_rendering_limits_only"),
         },
         "controlled-web-session-v2 HTMLImageElement completion",
     )
@@ -4197,32 +4113,31 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         controlled_image_pending,
         {
             "logicalIdentity": (
-                "union_of_callback_and_layout_PendingImageId_plus_exact_image_id_"
-                "size_rasterization_keys"
+                "union_of_callback_and_layout_PendingImageId_plus_exact_image_id_size_rasterization_keys"
             ),
-            "layoutOwnerProvenance": (
-                "captured_per_exact_cache_id_DOM_owner_at_first_post_reflow_retention"
-            ),
+            "layoutOwnerProvenance": ("captured_per_exact_cache_id_DOM_owner_at_first_post_reflow_retention"),
             "controlledClassification": (
                 "image_id_controlled_only_when_every_retained_callback_is_controlled_"
-                "and_no_retained_layout_owner_is_baseline"
+                "and_no_retained_owner_is_baseline_or_explicit_Unsupported"
             ),
             "mixedLayoutOwnership": (
                 "baseline_layout_owner_globally_downgrades_cache_id_and_live_raster_"
                 "keys_and_delivery_mismatch_rejects_before_any_callback_while_retained_"
                 "as_unsupported_rendering"
             ),
-            "mixedMissingOrBaseline": "unsupported_pending_rendering_image_load",
-            "controlledProjection": (
-                "Image_producer_fence_not_pending_rendering_image_load"
+            "mixedMissingOrBaseline": (
+                "missing_baseline_or_explicit_Unsupported_is_unsupported_pending_rendering_image_load"
             ),
+            "controlledProjection": ("Image_producer_fence_not_pending_rendering_image_load"),
             "reservationReconciliation": (
                 "live_controlled_records_equal_retained_controlled_callbacks_plus_"
                 "exact_cache_id_DOM_owner_identities_plus_controlled_rasterization_keys"
             ),
+            "unsupportedReservationReconciliation": (
+                "explicit_Unsupported_records_retain_exact_logical_ID_without_controlled_capacity_reservations"
+            ),
             "producerReconciliation": (
-                "pending_Image_producers_greater_than_or_equal_to_controlled_"
-                "logical_work_absent_terminal"
+                "pending_Image_producers_greater_than_or_equal_to_controlled_logical_work_absent_terminal"
             ),
         },
         "controlled-web-session-v2 HTMLImageElement pending authority",
@@ -4233,20 +4148,11 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "events": ["load", "error", "loadend"],
             "creation": "engine_generated_HTMLImageElement_completion_only",
             "clock": "document_performance_clock_sampled_once_per_completion",
-            "observableValue": (
-                "every_event_emitted_for_one_completion_shares_the_document_relative_"
-                "timestamp"
-            ),
+            "observableValue": ("every_event_emitted_for_one_completion_shares_the_document_relative_timestamp"),
             "ordinaryTerminalCardinality": "load_then_loadend_or_error_then_loadend",
             "existingCacheHitCardinality": "load_only",
-            "cacheHit": (
-                "sampled_before_queued_DOM_manipulation_task_and_carried_with_"
-                "request_generation"
-            ),
-            "async": (
-                "sampled_at_guarded_ScriptThread_delivery_and_carried_through_"
-                "queued_callback"
-            ),
+            "cacheHit": ("sampled_before_queued_DOM_manipulation_task_and_carried_with_request_generation"),
+            "async": ("sampled_at_guarded_ScriptThread_delivery_and_carried_through_queued_callback"),
             "hostFallback": "forbidden_for_admitted_work",
             "predecessorBehavior": "controlled_web_session_v1_unchanged",
         },
@@ -4255,36 +4161,24 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     require_exact_fields(
         controlled_image_unsupported,
         {
-            "httpHttpsBlobFileAndNonSvgDataUrls": (
-                "not_admitted_baseline_image_authorities_unchanged"
-            ),
+            "blobFileAndNonSvgDataUrls": "not_admitted_baseline_image_authorities_unchanged",
             "oversizeUrl": "not_admitted_baseline_image_authorities_unchanged",
-            "srcsetPictureAndEnvironmentChange": (
-                "not_admitted_baseline_image_authorities_unchanged"
-            ),
+            "srcsetPictureAndEnvironmentChange": ("not_admitted_baseline_image_authorities_unchanged"),
             "cssBackgroundListStyleAndContent": (
-                "not_admitted_unless_joining_a_retained_exact_cache_id_DOM_owner_"
-                "identity"
+                "not_admitted_unless_joining_a_retained_exact_cache_id_DOM_owner_identity"
             ),
-            "faviconAndVideoPoster": (
-                "not_admitted_baseline_image_authorities_unchanged"
+            "faviconAndVideoPoster": ("not_admitted_baseline_image_authorities_unchanged"),
+            "imageBitmapAndCanvasUpload": ("not_admitted_baseline_image_authorities_unchanged"),
+            "animatedImages": ("not_admitted_by_this_slice_existing_rendering_authority_unchanged"),
+            "multipartMixedReplace": (
+                "post_metadata_typed_unsupported_rendering_image_load_after_finite_"
+                "resource_IO_drains_without_streaming_semantics"
             ),
-            "imageBitmapAndCanvasUpload": (
-                "not_admitted_baseline_image_authorities_unchanged"
-            ),
-            "animatedImages": (
-                "not_admitted_by_this_slice_existing_rendering_authority_unchanged"
-            ),
-            "iframeWorkerWorkletAndCrossLoop": (
-                "not_admitted_existing_context_boundaries_unchanged"
-            ),
+            "iframeWorkerWorkletAndCrossLoop": ("not_admitted_existing_context_boundaries_unchanged"),
             "unadmittedSharedVectorCacheIdentity": (
-                "remove_all_controlled_owners_and_downgrade_live_raster_keys_to_"
-                "baseline"
+                "remove_all_controlled_owners_and_downgrade_live_raster_keys_to_baseline"
             ),
-            "nestedOrExternalSvgResources": (
-                "not_content_inspected_not_proven_by_this_slice"
-            ),
+            "nestedOrExternalSvgResources": ("not_content_inspected_not_proven_by_this_slice"),
         },
         "controlled-web-session-v2 HTMLImageElement unsupported boundary",
     )
@@ -4303,14 +4197,10 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         controlled_inline_svg_admission,
         {
             "interface": "SVGSVGElement",
-            "scope": (
-                "exact_public_controlled_non_auxiliary_top_level_WebView_document_global"
-            ),
+            "scope": ("exact_public_controlled_non_auxiliary_top_level_WebView_document_global"),
             "source": "internally_serialized_inline_svg_subtree_only",
             "requestKind": "InternalRequest_Yes",
-            "cachedUrlIdentity": (
-                "candidate_exactly_equals_element_cached_serialized_data_url"
-            ),
+            "cachedUrlIdentity": ("candidate_exactly_equals_element_cached_serialized_data_url"),
             "parser": "canonical_DataUrl",
             "mimeType": "image/svg+xml",
             "maximumSerializedUrlBytes": 65536,
@@ -4323,9 +4213,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         {
             "cacheIdJoin": "exact_PendingImageId_DOM_owner_identity_required",
             "retentionBudget": "shared_512_record_controlled_image_ownership_limit",
-            "mixedOwnership": (
-                "baseline_owner_globally_downgrades_shared_cache_id_and_live_raster_keys"
-            ),
+            "mixedOwnership": ("baseline_owner_globally_downgrades_shared_cache_id_and_live_raster_keys"),
             "hostFallback": "forbidden_for_admitted_work",
         },
         "controlled-web-session-v2 inline SVG ownership",
@@ -4334,13 +4222,9 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         controlled_inline_svg_completion,
         {
             "asyncCacheDecode": "Image_producer_fenced_through_ScriptThread_handoff",
-            "vectorRasterization": (
-                "fenced_only_from_exact_retained_inline_svg_cache_id_DOM_owner_identity"
-            ),
+            "vectorRasterization": ("fenced_only_from_exact_retained_inline_svg_cache_id_DOM_owner_identity"),
             "pendingProjection": "Image_producer_fence_not_pending_rendering_image_load",
-            "domLoadEvent": (
-                "not_emitted_by_internal_inline_svg_rendering_completion"
-            ),
+            "domLoadEvent": ("not_emitted_by_internal_inline_svg_rendering_completion"),
         },
         "controlled-web-session-v2 inline SVG completion",
     )
@@ -4349,35 +4233,24 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         {
             "baselineAndV1": "unchanged",
             "generalSvgRendering": "not_admitted_by_this_slice",
-            "nestedOrExternalResources": (
-                "not_admitted_or_proven_existing_resource_authority_unchanged"
-            ),
+            "nestedOrExternalResources": ("not_admitted_or_proven_existing_resource_authority_unchanged"),
             "nonInternalOrMismatchedUrl": "baseline_image_authorities_unchanged",
-            "iframeWorkerWorkletAndCrossLoop": (
-                "not_admitted_existing_context_boundaries_unchanged"
-            ),
+            "iframeWorkerWorkletAndCrossLoop": ("not_admitted_existing_context_boundaries_unchanged"),
         },
         "controlled-web-session-v2 inline SVG unsupported boundary",
     )
     require_exact_fields(
         host_timestamp_boundary,
         {
-            "controlledTopLevelEngineGeneratedFocusTransitionInV2": (
-                "document_clock_timestamp"
-            ),
-            "controlledTopLevelAdmittedImageCompletionEventsInV2": (
-                "shared_document_clock_timestamp"
-            ),
+            "controlledTopLevelEngineGeneratedFocusTransitionInV2": ("document_clock_timestamp"),
+            "controlledTopLevelAdmittedImageCompletionEventsInV2": ("shared_document_clock_timestamp"),
             "controlledTopLevelSynchronousPublicAutomationEventsInV2": (
                 "one_document_clock_timestamp_per_mutating_action"
             ),
             "controlledPublicNonAuxiliaryTopLevelInternalCssAnimationAndTransitionEventsInV2": (
-                "one_document_clock_timestamp_per_nonempty_pending_event_"
-                "dispatch_batch"
+                "one_document_clock_timestamp_per_nonempty_pending_event_dispatch_batch"
             ),
-            "scriptCreatedEventConstructorsAndAllUnlistedHostTimestampSurfaces": (
-                "host_timestamp"
-            ),
+            "scriptCreatedEventConstructorsAndAllUnlistedHostTimestampSurfaces": ("host_timestamp"),
         },
         "controlled-web-session-v2 host-timestamp boundary",
     )
@@ -4385,12 +4258,12 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         image_element_unsupported_class,
         {
             "admittedDirectDataSvg": "owned_bounded_Image_producer_work",
-            "baselineMixedOrUnownedRetainedWork": (
-                "unsupported_rendering_image_load"
+            "admittedDirectHttpHttps": (
+                "owned_Image_producer_work_with_initial_URL_and_retained_ownership_"
+                "bounds_and_resource_IO_separately_owned"
             ),
-            "excludedSynchronousCacheHit": (
-                "predecessor_behavior_no_universal_new_typed_rejection"
-            ),
+            "baselineMixedOrUnownedRetainedWork": ("unsupported_rendering_image_load"),
+            "excludedSynchronousCacheHit": ("predecessor_behavior_no_universal_new_typed_rejection"),
             "nestedOrExternalSvgResources": "not_proven",
         },
         "controlled-web-session-v2 image-element unsupported class",
@@ -4398,31 +4271,21 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     require_exact_fields(
         embedder_controls,
         {
-            CONTROLLED_INPUT_METHOD_EMBEDDER_SUMMARY: (
-                "suppressed_without_external_work"
-            ),
-            "selectElementColorPickerFilePickerContextMenuAndOtherControls": (
-                "embedder_control"
-            ),
+            CONTROLLED_INPUT_METHOD_EMBEDDER_SUMMARY: ("suppressed_without_external_work"),
+            "selectElementColorPickerFilePickerContextMenuAndOtherControls": ("embedder_control"),
         },
         "controlled-web-session-v2 embedder-control boundary",
     )
-    input_method_product_surfaces = [
-        entry for entry in supported_product_surface if "input_method" in entry.lower()
-    ]
+    input_method_product_surfaces = [entry for entry in supported_product_surface if "input_method" in entry.lower()]
     if input_method_product_surfaces != [CONTROLLED_INPUT_METHOD_PRODUCT_SURFACE]:
         raise ReleaseError(
             "controlled-web-session-v2 supportedProductSurface must contain exactly the "
             "single-line Text/nonmultiline/no-virtual-keyboard InputMethod summary"
         )
     focus_timestamp_product_surfaces = [
-        entry
-        for entry in supported_product_surface
-        if "focus_event_timestamp" in entry.lower()
+        entry for entry in supported_product_surface if "focus_event_timestamp" in entry.lower()
     ]
-    if focus_timestamp_product_surfaces != [
-        CONTROLLED_FOCUS_EVENT_TIMESTAMP_PRODUCT_SURFACE
-    ]:
+    if focus_timestamp_product_surfaces != [CONTROLLED_FOCUS_EVENT_TIMESTAMP_PRODUCT_SURFACE]:
         raise ReleaseError(
             "controlled-web-session-v2 supportedProductSurface must contain exactly the "
             "engine-generated top-level FocusEvent document-clock timestamp summary"
@@ -4432,39 +4295,33 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         for entry in supported_product_surface
         if "synchronous_public_automation_event_timestamps" in entry.lower()
     ]
-    if automation_timestamp_product_surfaces != [
-        CONTROLLED_AUTOMATION_EVENT_TIMESTAMP_PRODUCT_SURFACE
-    ]:
+    if automation_timestamp_product_surfaces != [CONTROLLED_AUTOMATION_EVENT_TIMESTAMP_PRODUCT_SURFACE]:
         raise ReleaseError(
             "controlled-web-session-v2 supportedProductSurface must contain exactly the "
             "synchronous public automation event document-clock timestamp summary"
         )
     css_animation_timestamp_product_surfaces = [
-        entry
-        for entry in supported_product_surface
-        if "internal_css_animation_event_timestamps" in entry.lower()
+        entry for entry in supported_product_surface if "internal_css_animation_event_timestamps" in entry.lower()
     ]
-    if css_animation_timestamp_product_surfaces != [
-        CONTROLLED_CSS_ANIMATION_EVENT_TIMESTAMP_PRODUCT_SURFACE
-    ]:
+    if css_animation_timestamp_product_surfaces != [CONTROLLED_CSS_ANIMATION_EVENT_TIMESTAMP_PRODUCT_SURFACE]:
         raise ReleaseError(
             "controlled-web-session-v2 supportedProductSurface must contain exactly the "
             "internal CSS animation event document-clock timestamp summary"
         )
     image_product_surfaces = [
-        entry
-        for entry in supported_product_surface
-        if "data_svg_htmlimageelement" in entry.lower()
+        entry for entry in supported_product_surface if "htmlimageelement_completion" in entry.lower()
     ]
-    if image_product_surfaces != [CONTROLLED_IMAGE_ELEMENT_PRODUCT_SURFACE]:
+    if image_product_surfaces != [
+        CONTROLLED_IMAGE_ELEMENT_PRODUCT_SURFACE,
+        CONTROLLED_HTTP_IMAGE_ELEMENT_PRODUCT_SURFACE,
+    ]:
         raise ReleaseError(
             "controlled-web-session-v2 supportedProductSurface must contain exactly the "
-            "bounded top-level direct data-SVG HTMLImageElement completion summary"
+            "bounded top-level direct data-SVG and initial-URL/retained-ownership-bounded "
+            "direct HTTP(S) HTMLImageElement completion summaries"
         )
     inline_svg_product_surfaces = [
-        entry
-        for entry in supported_product_surface
-        if "serialized_data_svg_inline_rendering" in entry.lower()
+        entry for entry in supported_product_surface if "serialized_data_svg_inline_rendering" in entry.lower()
     ]
     if inline_svg_product_surfaces != [CONTROLLED_INLINE_SVG_PRODUCT_SURFACE]:
         raise ReleaseError(
@@ -4472,9 +4329,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "bounded top-level internal serialized data-SVG inline-rendering summary"
         )
     cookie_expiry_product_surfaces = [
-        entry
-        for entry in supported_product_surface
-        if "persistent_cookie_expiry" in entry.lower()
+        entry for entry in supported_product_surface if "persistent_cookie_expiry" in entry.lower()
     ]
     if cookie_expiry_product_surfaces != [CONTROLLED_COOKIE_EXPIRY_PRODUCT_SURFACE]:
         raise ReleaseError(
@@ -4482,9 +4337,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "controlled in-memory persistent-cookie expiry summary"
         )
     cookie_same_site_product_surfaces = [
-        entry
-        for entry in supported_product_surface
-        if "samesite_request_cookie_selection" in entry.lower()
+        entry for entry in supported_product_surface if "samesite_request_cookie_selection" in entry.lower()
     ]
     if cookie_same_site_product_surfaces != [CONTROLLED_COOKIE_SAME_SITE_PRODUCT_SURFACE]:
         raise ReleaseError(
@@ -4492,13 +4345,9 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "bounded schemeful SameSite request-cookie selection summary"
         )
     cookie_same_site_response_product_surfaces = [
-        entry
-        for entry in supported_product_surface
-        if "samesite_response_cookie_storage" in entry.lower()
+        entry for entry in supported_product_surface if "samesite_response_cookie_storage" in entry.lower()
     ]
-    if cookie_same_site_response_product_surfaces != [
-        CONTROLLED_COOKIE_SAME_SITE_RESPONSE_PRODUCT_SURFACE
-    ]:
+    if cookie_same_site_response_product_surfaces != [CONTROLLED_COOKIE_SAME_SITE_RESPONSE_PRODUCT_SURFACE]:
         raise ReleaseError(
             "controlled-web-session-v2 supportedProductSurface must contain exactly the "
             "bounded schemeful SameSite response-cookie storage summary"
@@ -4514,43 +4363,27 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "interface": "MessageChannel",
             "scope": "active_controlled_top_level_document_global",
             "provenance": "constructor_created_controlled_local_pair",
-            "targetAdmission": (
-                "ScriptThread_current_controlled_top_level_target_matches_before_"
-                "pair_publication"
-            ),
+            "targetAdmission": ("ScriptThread_current_controlled_top_level_target_matches_before_pair_publication"),
             "incumbentAdmission": (
-                "incumbent_global_required_and_exact_owner_global_pipeline_WebView_"
-                "identity_before_pair_publication"
+                "incumbent_global_required_and_exact_owner_global_pipeline_WebView_identity_before_pair_publication"
             ),
             "borrowedOrMissingIncumbentFailure": (
-                "synchronous_NotSupportedError_and_sticky_external_subscription_"
-                "before_pair_publication"
+                "synchronous_NotSupportedError_and_sticky_external_subscription_before_pair_publication"
             ),
-            "routerOwnership": (
-                "controlled_local_only_no_router_id_or_constellation_registration"
-            ),
-            "mixedProvenance": (
-                "rejected_and_sticky_external_subscription_"
-                "never_cohabits_controlled_managed_map"
-            ),
+            "routerOwnership": ("controlled_local_only_no_router_id_or_constellation_registration"),
+            "mixedProvenance": ("rejected_and_sticky_external_subscription_never_cohabits_controlled_managed_map"),
             "maximumRetainedNativePortEntriesPerGlobal": 32,
             "capacityUnit": "retained_native_port_entry",
             "completePairCapacityFromEmptyGlobal": 16,
-            "completePairCapacityCondition": (
-                "no_one_ended_terminal_identities_retained"
-            ),
+            "completePairCapacityCondition": ("no_one_ended_terminal_identities_retained"),
             "oneEndedTerminalIdentityCapacity": (
-                "each_retained_identity_consumes_one_of_32_entries_and_reduces_"
-                "available_complete_pair_capacity"
+                "each_retained_identity_consumes_one_of_32_entries_and_reduces_available_complete_pair_capacity"
             ),
             "closedEntryCapacity": (
                 "retained_until_dom_garbage_collection_checkpoint_pruning_and_"
                 "while_any_controlled_local_message_reservation_remains"
             ),
-            "overflow": (
-                "synchronous_NotSupportedError_and_sticky_external_subscription_"
-                "before_pair_publication"
-            ),
+            "overflow": ("synchronous_NotSupportedError_and_sticky_external_subscription_before_pair_publication"),
         },
         "controlled-web-session-v2 MessageChannel construction",
     )
@@ -4559,16 +4392,14 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         {
             "transferList": "must_be_empty",
             "incumbentAdmission": (
-                "resolved_before_structured_clone_and_exact_owner_global_pipeline_"
-                "WebView_identity_required"
+                "resolved_before_structured_clone_and_exact_owner_global_pipeline_WebView_identity_required"
             ),
             "incumbentFailure": (
                 "synchronous_NotSupportedError_and_sticky_external_subscription_before_"
                 "serialization_detachment_reservation_or_dispatch"
             ),
             "nonemptyTransferListFailure": (
-                "synchronous_NotSupportedError_and_sticky_external_subscription_"
-                "before_serialization_detach_or_dispatch"
+                "synchronous_NotSupportedError_and_sticky_external_subscription_before_serialization_detach_or_dispatch"
             ),
         },
         "controlled-web-session-v2 MessageChannel postMessage",
@@ -4578,35 +4409,23 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         {
             "constellationOrExternallyRoutedPort": "external_subscription",
             "otherwiseValidPortTransferAttempt": "external_subscription",
-            "detachedPortTransferAttempt": (
-                "platform_DataCloneError_before_stasis_boundary"
-            ),
+            "detachedPortTransferAttempt": ("platform_DataCloneError_before_stasis_boundary"),
             "detachedPortPostMessage": "platform_noop_before_stasis_boundary",
-            "missingOrBorrowedIncumbentConstructor": (
-                "external_subscription_before_pair_publication"
-            ),
-            "missingOrBorrowedIncumbentPostMessage": (
-                "external_subscription_before_structured_clone_or_detachment"
-            ),
+            "missingOrBorrowedIncumbentConstructor": ("external_subscription_before_pair_publication"),
+            "missingOrBorrowedIncumbentPostMessage": ("external_subscription_before_structured_clone_or_detachment"),
             "replacedDiscardedOrAuxiliaryOwner": (
                 "external_subscription_before_controlled_local_authority_is_borrowed"
             ),
-            "otherwiseReachedCrossGlobalPortIncludingNestedWindow": (
-                "external_subscription"
-            ),
+            "otherwiseReachedCrossGlobalPortIncludingNestedWindow": ("external_subscription"),
             "nestedWindowCreation": "same_event_loop_iframe",
             "crossEventLoopIframeClassification": (
-                "conservative_alternate_ingress_fence_not_ordinary_child_"
-                "creation_outcome"
+                "conservative_alternate_ingress_fence_not_ordinary_child_creation_outcome"
             ),
             "otherwiseReachedCrossEventLoopPort": "external_subscription",
             "workerCreation": "worker_before_worker_global_or_port_exists",
-            "workerGlobalMessageChannel": (
-                "unreachable_not_independently_admitted_or_evidenced"
-            ),
+            "workerGlobalMessageChannel": ("unreachable_not_independently_admitted_or_evidenced"),
             "unexpectedAsyncIngress": (
-                "impossible_router_or_external_ingress_backstop_sticky_"
-                "external_subscription_drop_without_dispatch"
+                "impossible_router_or_external_ingress_backstop_sticky_external_subscription_drop_without_dispatch"
             ),
         },
         "controlled-web-session-v2 MessageChannel unsupported boundary",
@@ -4615,8 +4434,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         delivery,
         {
             "publicRetainedPresence": (
-                "queued_or_buffered_work_sources_kind_tracked_presence_"
-                "openEnded_reason_message_port"
+                "queued_or_buffered_work_sources_kind_tracked_presence_openEnded_reason_message_port"
             ),
         },
         "controlled-web-session-v2 MessageChannel delivery",
@@ -4625,29 +4443,18 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         retained_work_projection,
         {
             "reservationIdentity": (
-                "exact_destination_port_before_retention_in_ordinary_task_queue_or_"
-                "native_disabled_port_buffer"
+                "exact_destination_port_before_retention_in_ordinary_task_queue_or_native_disabled_port_buffer"
             ),
-            "accountingReconciliation": (
-                "global_retained_equals_sum_per_destination_queued_plus_sum_native_"
-                "buffered"
-            ),
-            "reciprocalPairWithOwnedWork": (
-                "one_deterministic_minimum_port_identity_per_pair"
-            ),
+            "accountingReconciliation": ("global_retained_equals_sum_per_destination_queued_plus_sum_native_buffered"),
+            "reciprocalPairWithOwnedWork": ("one_deterministic_minimum_port_identity_per_pair"),
             "zeroRetainedMessages": "does_not_make_idle_open_pair_pending",
-            "invalidMissingOrZeroDestinationAssociation": (
-                "pending_observation_failure"
-            ),
+            "invalidMissingOrZeroDestinationAssociation": ("pending_observation_failure"),
         },
         "controlled-web-session-v2 retained MessagePort work projection",
     )
     expected_transfer_preflight = {
         "scope": "complete_transfer_list_in_selected_controlled_global",
-        "ordering": (
-            "transfer_list_order_first_failure_stops_before_any_javascript_"
-            "transfer_step"
-        ),
+        "ordering": ("transfer_list_order_first_failure_stops_before_any_javascript_transfer_step"),
         "interfaces": [
             "MessagePort",
             "ReadableStream",
@@ -4655,12 +4462,10 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "TransformStream",
         ],
         "otherwiseValidEntryFailure": (
-            "synchronous_NotSupportedError_and_sticky_external_subscription_"
-            "before_any_javascript_transfer_step"
+            "synchronous_NotSupportedError_and_sticky_external_subscription_before_any_javascript_transfer_step"
         ),
         "platformValidationPrecedence": (
-            "per_checked_entry_detached_MessagePort_or_locked_stream_DataCloneError_"
-            "before_stasis_boundary"
+            "per_checked_entry_detached_MessagePort_or_locked_stream_DataCloneError_before_stasis_boundary"
         ),
         "earlierTransferEntriesOnBoundaryRejection": "remain_undetached",
         "notClaimed": [
@@ -4674,6 +4479,10 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "controlled-web-session-v2 port-backed transfer preflight",
     )
     contract_markers = (
+        "# Controlled session v2 contract",
+        "**Status:** Versioned contract for Stasis 0.3.0",
+        "Checked-in source is not a publication or",
+        "native-availability claim; verify the immutable tag, release, registry package, and provenance",
         "A non-empty `MessagePort.postMessage()` transfer list",
         "owns no MessagePort router identifier and never registers a",
         "`MessagePort`, `ReadableStream`, `WritableStream`, or",
@@ -4739,16 +4548,25 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "script-created `new AnimationEvent(...)` and\n`new TransitionEvent(...)` objects",
         "Auxiliary top-level WebViews are deliberately excluded",
         "does not expand CSS/Web Animations API\nsemantics",
-        "canonical `DataUrl` parser must accept it",
+        "canonical `DataUrl` parser accepts it",
+        "a direct `http:` or `https:` URL is admitted by scheme before response",
+        "A final redirect URL is not rechecked against the initial 65,536-byte",
+        "redirected fetch remains separately owned Resource I/O and the immutable",
+        "session network policy remains authoritative",
+        "active retains the existing fatal `blocked_on_external_io` boundary",
         "never reconstructed later from the element's current",
         "requires\nno invented asynchronous producer lease",
+        "`multipart/x-mixed-replace` is discovered only after HTTP response metadata",
+        "becomes observable after the separately owned\nResource I/O drains",
+        "an endless response remains blocked on that external I/O",
+        "Neither baseline nor\ncontrolled callback delivery can invoke the retained unsupported callback",
         "Message\nadmission failure, enqueue rejection, producer callback panic",
         "missing untombstoned target, a live tombstoned target, a live\nWindow",
         "exact public top-level target does not match",
         "Admitted work never retries via the baseline image sender",
         "image cache owns the callback's lifetime",
         "completes the stream lease as owned cancellation without a producer terminal",
-        "completes normally as retired only\nwhen pipeline teardown installed its permanent tombstone",
+        "completes normally as retired only\nwhen pipeline teardown independently installed its permanent tombstone",
         "Window, a handler `Err` likewise completes the scoped message guard normally",
         "stays in the Window's pending collections",
         "settlement reports it as typed\n`unsupported_rendering` / `image_load`",
@@ -4788,7 +4606,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "synchronous-cache-hit path emits only `load`",
         "this is not a universal eager-rejection promise",
         "Nested or external SVG resource\nsemantics are not proven",
-        "do not claim a separate deterministic CPU or allocation budget",
+        "they do not claim a separate deterministic CPU or allocation",
         "The second image slice is independent of `HTMLImageElement`",
         "request must be marked `InternalRequest::Yes`",
         "request URL must exactly equal the cached\nserialized URL for that same DOM owner",
@@ -4819,9 +4637,99 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     for marker in contract_markers:
         if marker not in contract_text:
             raise ReleaseError(
-                "controlled-web-session-v2 candidate contract is missing "
-                f"the canonical boundary marker {marker!r}"
+                f"controlled-web-session-v2 candidate contract is missing the canonical boundary marker {marker!r}"
             )
+    require_public_surface_markers(
+        public_top_level_readme,
+        "top-level public README",
+        (
+            "target the 0.3.0 train",
+            "`controlled-web-session-v1` still the default",
+            "[`controlled-web-session-v2` contract](docs/stasis/session-v0.3-candidate.md)",
+            "Source version and package CI are not publication proof",
+            "are the immutable predecessor; 0.3.0 is the stable successor only when its",
+            "Verify those public artifacts rather than inferring release status from this checkout.",
+        ),
+        forbidden=(
+            "The stable v0.2 release extends",
+            "current immutable public stable\nboundary remains",
+        ),
+    )
+    require_public_surface_markers(
+        public_stasis_boundary,
+        "public Stasis product boundary",
+        (
+            "Source version `0.3.0` is not a publication claim",
+            "canonical HTTP(S) URL no larger than 65,536 bytes",
+            "without inventing an asynchronous `Image` producer lease",
+            "Finite\n  asynchronous cache/decode completion is fenced by an `Image` producer",
+            "HTTP(S) Resource I/O remains separately owned",
+            "A final redirect URL is not rechecked",
+            "against the initial 65,536-byte selection bound",
+            "pipeline's image-cache store under immutable fixture routes",
+            "after its separately owned Resource I/O drains",
+            "an endless response remains blocked on external I/O",
+            "Public document replacement while HTTP image Resource I/O is active remains fatal",
+            "decoder-resource-budget",
+        ),
+    )
+    for public_readme, description in (
+        (public_profile_readme, "public profile README"),
+        (public_typescript_sdk_readme, "public TypeScript SDK README"),
+    ):
+        require_public_surface_markers(
+            public_readme,
+            description,
+            (
+                "An admitted synchronous cache hit is owned in",
+                "current Script turn and queues its existing ordinary DOM callback without inventing an",
+                "`Image` producer lease. Finite asynchronous cache/decode completion is producer-fenced",
+            ),
+            forbidden=(
+                "Cache hits and finite asynchronous completion\nremain producer-fenced",
+                "cache-hit or finite asynchronous completion is\nproducer-fenced",
+            ),
+        )
+    require_public_surface_markers(
+        public_profile_readme,
+        "public profile README HTTP image authority",
+        (
+            "with resource I/O separately owned and",
+            "Public document replacement while HTTP image resource I/O is active",
+            "retains fatal `blocked_on_external_io`",
+        ),
+    )
+    require_public_surface_markers(
+        public_typescript_sdk_readme,
+        "public TypeScript SDK publication and HTTP image authority",
+        (
+            "is not a publication claim: the native runtime must advertise v2",
+            "while HTTP image resource I/O remains active retains fatal `blocked_on_external_io`",
+        ),
+    )
+    require_public_surface_markers(
+        public_release_runbook,
+        "public release runbook",
+        (
+            "Source version is not\na publication claim",
+            "A final redirect URL is not rechecked against that initial limit",
+            "separately owned Resource I/O and the immutable session network policy remains authoritative",
+            "Cache\nreuse proof is limited to one pipeline's image-cache store under immutable fixture routes",
+        ),
+    )
+    require_public_surface_markers(
+        public_release_workflow,
+        "public GitHub release-note template",
+        (
+            "An admitted synchronous cache hit is owned in the current",
+            "without an invented asynchronous Image producer lease; finite asynchronous",
+            "A final\n          redirect URL is not rechecked against that initial selected-URL limit",
+            "Resource I/O and the\n          immutable session network policy remain authoritative",
+            "one pipeline's image-cache store under immutable fixture routes",
+            "Public document replacement while HTTP image resource I/O remains active keeps",
+            "the fatal blocked_on_external_io boundary",
+        ),
+    )
     verify_message_port_router_source(message_limits_source)
     verify_controlled_local_pending_projection_source(message_limits_source)
     verify_controlled_local_fifo_source(message_limits_source)
@@ -4864,11 +4772,16 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         message_baseline_test_source,
         controlled_css_animation_event_fixture_source,
     )
-    verify_controlled_animation_scheduler_liveness_source(
-        controlled_rendering_settlement_source
-    )
+    verify_controlled_animation_scheduler_liveness_source(controlled_rendering_settlement_source)
     verify_controlled_image_element_source(controlled_image_element_source)
     verify_controlled_image_timestamp_source(controlled_image_element_source)
+    verify_controlled_http_image_protocol_proof_source(
+        message_baseline_test_source,
+        controlled_http_image_fixture_source,
+        controlled_http_image_multipart_fixture_source,
+    )
+    verify_controlled_image_per_pipeline_cache_source(controlled_image_cache_source)
+    verify_controlled_profile_wire_source(controlled_profile_wire_source)
     verify_controlled_image_transport_source(
         controlled_image_messaging_source,
         controlled_image_producer_fence_source,
@@ -4904,13 +4817,16 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "MessageChannel serialized-payload",
         ),
         "ordinaryTasks": controlled_webapp_ordinary_task_limit(execution_limits_source),
-        "renderingOpportunities": controlled_webapp_rendering_opportunity_limit(
-            execution_limits_source
-        ),
-        "maximumControlledImageUrlBytes": rust_usize_constant(
+        "renderingOpportunities": controlled_webapp_rendering_opportunity_limit(execution_limits_source),
+        "maximumControlledDataSvgImageUrlBytes": rust_usize_constant(
             controlled_image_element_source,
             "CONTROLLED_V2_DIRECT_DATA_SVG_URL_LIMIT",
-            "controlled image serialized-URL",
+            "controlled data-SVG image serialized-URL",
+        ),
+        "maximumControlledHttpImageInitialUrlBytes": rust_usize_constant(
+            controlled_image_element_source,
+            "CONTROLLED_V2_DIRECT_HTTP_IMAGE_URL_LIMIT",
+            "controlled HTTP(S) image initial serialized-URL",
         ),
         "maximumControlledInlineSvgUrlBytes": rust_usize_constant(
             controlled_inline_svg_source,
@@ -4924,27 +4840,20 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         ),
     }
     profile_bounds = {
-        "maximumRetainedNativePortEntriesPerGlobal": construction.get(
-            "maximumRetainedNativePortEntriesPerGlobal"
-        ),
-        "maximumRetainedMessagesPerGlobal": post_message.get(
-            "maximumRetainedMessagesPerGlobal"
-        ),
-        "maximumSerializedPayloadBytes": post_message.get(
-            "maximumSerializedPayloadBytes"
-        ),
+        "maximumRetainedNativePortEntriesPerGlobal": construction.get("maximumRetainedNativePortEntriesPerGlobal"),
+        "maximumRetainedMessagesPerGlobal": post_message.get("maximumRetainedMessagesPerGlobal"),
+        "maximumSerializedPayloadBytes": post_message.get("maximumSerializedPayloadBytes"),
         "ordinaryTasks": execution_limits.get("ordinaryTasks"),
         "renderingOpportunities": execution_limits.get("renderingOpportunities"),
-        "maximumControlledImageUrlBytes": controlled_image_selection.get(
-            "maximumSerializedUrlBytes"
+        "maximumControlledDataSvgImageUrlBytes": controlled_image_selection.get(
+            "maximumInitialSelectedCanonicalUrlBytes"
         ),
-        "maximumControlledInlineSvgUrlBytes": controlled_inline_svg_admission.get(
-            "maximumSerializedUrlBytes"
+        "maximumControlledHttpImageInitialUrlBytes": controlled_image_selection.get(
+            "maximumInitialSelectedCanonicalUrlBytes"
         ),
+        "maximumControlledInlineSvgUrlBytes": controlled_inline_svg_admission.get("maximumSerializedUrlBytes"),
         "maximumRetainedControlledImageOwnershipRecordsPerWindow": (
-            controlled_image_retention.get(
-                "maximumRetainedControlledOwnershipRecordsPerWindow"
-            )
+            controlled_image_retention.get("maximumRetainedControlledOwnershipRecordsPerWindow")
         ),
     }
     if profile_bounds != native_bounds:
@@ -4955,9 +4864,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     if delivery.get("ordinaryTaskAccounting") != (
         "one_dispatched_message_event_consumes_one_executionLimits.ordinaryTasks"
     ):
-        raise ReleaseError(
-            "controlled-web-session-v2 must account each delivered message against ordinaryTasks"
-        )
+        raise ReleaseError("controlled-web-session-v2 must account each delivered message against ordinaryTasks")
     return {
         "path": CANDIDATE_V2_PROFILE.as_posix(),
         "sha256": profile_sha256,
@@ -5048,10 +4955,7 @@ def decompress_canonical_gzip(
                     )
                     output_bytes += len(decompressed)
                     if output_bytes > max_output_bytes:
-                        raise ReleaseError(
-                            "archive exceeds the maximum decompressed size "
-                            f"of {max_output_bytes} bytes"
-                        )
+                        raise ReleaseError(f"archive exceeds the maximum decompressed size of {max_output_bytes} bytes")
                     output.write(decompressed)
                     pending = decompressor.unconsumed_tail
                     if decompressor.eof:
@@ -5060,23 +4964,16 @@ def decompress_canonical_gzip(
                     if decompressor.unused_data or source.read(1):
                         raise ReleaseError("archive has data or another gzip member after canonical EOF")
                     break
-            flushed = decompressor.flush(
-                min(DECOMPRESSION_CHUNK_BYTES, max_output_bytes - output_bytes + 1)
-            )
+            flushed = decompressor.flush(min(DECOMPRESSION_CHUNK_BYTES, max_output_bytes - output_bytes + 1))
             output_bytes += len(flushed)
             if output_bytes > max_output_bytes:
-                raise ReleaseError(
-                    "archive exceeds the maximum decompressed size "
-                    f"of {max_output_bytes} bytes"
-                )
+                raise ReleaseError(f"archive exceeds the maximum decompressed size of {max_output_bytes} bytes")
             output.write(flushed)
         if not decompressor.eof:
             raise ReleaseError("archive gzip stream ended before its validated trailer")
 
 
-def expected_generated_assets(
-    version: str, platform: str, revision: str, repository: str
-) -> dict[str, bytes]:
+def expected_generated_assets(version: str, platform: str, revision: str, repository: str) -> dict[str, bytes]:
     return {
         "INSTALL.txt": install_text(version, platform).encode("utf-8"),
         "NATIVE-LIBRARIES.txt": native_libraries_text(version, platform).encode("utf-8"),
@@ -5095,9 +4992,7 @@ def require_bounded_nonempty_file(filename: Path, name: str) -> None:
     size = filename.stat().st_size
     limit = member_size_limit(name)
     if size <= 0 or size > limit:
-        raise ReleaseError(
-            f"bundle member {name} has invalid size {size}; allowed range is 1..{limit} bytes"
-        )
+        raise ReleaseError(f"bundle member {name} has invalid size {size}; allowed range is 1..{limit} bytes")
 
 
 def require_executable_mode(
@@ -5134,9 +5029,7 @@ def validate_bundle_directory(
     require_executable_mode(
         directory / BINARY_NAME,
         "packaged stasis executable",
-        self_test_allow_unrepresentable_windows_mode=(
-            _self_test_allow_unrepresentable_windows_mode
-        ),
+        self_test_allow_unrepresentable_windows_mode=(_self_test_allow_unrepresentable_windows_mode),
     )
     for packaged_name, source_name in SOURCE_ASSETS.items():
         source = source_root / source_name
@@ -5166,9 +5059,7 @@ def create_release(
     require_executable_mode(
         binary,
         "Stasis binary",
-        self_test_allow_unrepresentable_windows_mode=(
-            _self_test_allow_unrepresentable_windows_mode
-        ),
+        self_test_allow_unrepresentable_windows_mode=(_self_test_allow_unrepresentable_windows_mode),
     )
     for packaged_name, source_name in SOURCE_ASSETS.items():
         source = source_root / source_name
@@ -5176,8 +5067,7 @@ def create_release(
         size = source.stat().st_size
         if size <= 0 or size > MAX_TEXT_MEMBER_BYTES:
             raise ReleaseError(
-                f"source asset {source_name} has invalid size {size}; "
-                f"allowed range is 1..{MAX_TEXT_MEMBER_BYTES} bytes"
+                f"source asset {source_name} has invalid size {size}; allowed range is 1..{MAX_TEXT_MEMBER_BYTES} bytes"
             )
 
     dist.mkdir(parents=True, exist_ok=True)
@@ -5206,9 +5096,7 @@ def create_release(
             revision=revision,
             repository=repository,
             source_root=source_root,
-            _self_test_allow_unrepresentable_windows_mode=(
-                _self_test_allow_unrepresentable_windows_mode
-            ),
+            _self_test_allow_unrepresentable_windows_mode=(_self_test_allow_unrepresentable_windows_mode),
         )
         create_deterministic_archive(bundle, dist / names["archive"])
 
@@ -5235,8 +5123,7 @@ def verify_asset_directory(directory: Path, expected: Iterable[str]) -> None:
     actual = {entry.name for entry in entries}
     if any(entry.is_symlink() or not entry.is_file() for entry in entries) or actual != expected_set:
         raise ReleaseError(
-            f"release assets differ: missing={sorted(expected_set - actual)} "
-            f"extra={sorted(actual - expected_set)}"
+            f"release assets differ: missing={sorted(expected_set - actual)} extra={sorted(actual - expected_set)}"
         )
 
 
@@ -5245,9 +5132,7 @@ def verify_tar_metadata(package: tarfile.TarFile, bundle: str) -> dict[str, tarf
     members: list[tarfile.TarInfo] = []
     for member in package:
         if len(members) == expected_member_count:
-            raise ReleaseError(
-                f"archive contains more than the exact {expected_member_count}-member limit"
-            )
+            raise ReleaseError(f"archive contains more than the exact {expected_member_count}-member limit")
         members.append(member)
     names = [member.name for member in members]
     expected_names = {bundle, *(f"{bundle}/{name}" for name in EXPECTED_FILES)}
@@ -5272,14 +5157,12 @@ def verify_tar_metadata(package: tarfile.TarFile, bundle: str) -> dict[str, tarf
         member_limit = member_size_limit(relative)
         if member.size <= 0 or member.size > member_limit:
             raise ReleaseError(
-                f"archive member {member.name} has invalid size {member.size}; "
-                f"allowed range is 1..{member_limit} bytes"
+                f"archive member {member.name} has invalid size {member.size}; allowed range is 1..{member_limit} bytes"
             )
     total_member_bytes = sum(member.size for member in members if member.isfile())
     if total_member_bytes > MAX_UNCOMPRESSED_ARCHIVE_BYTES:
         raise ReleaseError(
-            "archive members exceed the maximum total uncompressed size "
-            f"of {MAX_UNCOMPRESSED_ARCHIVE_BYTES} bytes"
+            f"archive members exceed the maximum total uncompressed size of {MAX_UNCOMPRESSED_ARCHIVE_BYTES} bytes"
         )
     return by_name
 
@@ -5315,8 +5198,7 @@ def verify_release(
     archive_size = archive.stat().st_size
     if archive_size <= 0 or archive_size > MAX_COMPRESSED_ARCHIVE_BYTES:
         raise ReleaseError(
-            f"archive size {archive_size} is outside the allowed range "
-            f"1..{MAX_COMPRESSED_ARCHIVE_BYTES} bytes"
+            f"archive size {archive_size} is outside the allowed range 1..{MAX_COMPRESSED_ARCHIVE_BYTES} bytes"
         )
     archive_digest = sha256_file(archive)
     if parse_sidecar(asset_directory / names["archive_sha256"], names["archive"]) != archive_digest:
@@ -5374,9 +5256,7 @@ def verify_release(
         canonical_tar = stage / ".canonical.tar"
         create_deterministic_tar(stage / bundle, canonical_tar)
         if not files_equal(downloaded_tar, canonical_tar):
-            raise ReleaseError(
-                "archive tar bytes are not the canonical normalized Stasis serialization"
-            )
+            raise ReleaseError("archive tar bytes are not the canonical normalized Stasis serialization")
         canonical_tar.unlink()
         downloaded_tar.unlink()
         if extract_to is not None:
@@ -5418,11 +5298,7 @@ def parse_native_gate_identity(
         raise ReleaseError("gate log release-artifact record has an unexpected schema")
     if type(record["schema"]) is not int or record["schema"] != GATE_PROOF_SCHEMA:
         raise ReleaseError("gate log release-artifact record schema does not match")
-    if (
-        record["gate"] != GATE_NAME
-        or record["test"] != GATE_TEST
-        or record["version"] != version
-    ):
+    if record["gate"] != GATE_NAME or record["test"] != GATE_TEST or record["version"] != version:
         raise ReleaseError("gate log release-artifact gate or version does not match")
     if record["archive"] != {"name": archive_name, "sha256": archive_digest}:
         raise ReleaseError("gate log release-artifact archive does not match the selected archive")
@@ -5576,10 +5452,25 @@ def self_test() -> None:
         verify_frozen_v1_profile(repository_root)
         verify_frozen_v2_profile(repository_root)
         verify_candidate_v2_profile(repository_root)
+        generated_readme = readme_text(
+            RELEASE_VERSION,
+            "linux-x86_64",
+            "servo/stasis",
+        )
+        if "stable execution-profile boundary" not in generated_readme:
+            raise ReleaseError("self-test archive README omits the stable v2 profile boundary")
+        if "candidate execution-profile boundary" in generated_readme:
+            raise ReleaseError("self-test archive README regressed to candidate v2 wording")
         candidate_profile_root = root / "candidate-profile-source"
         candidate_authority_sources = (
             CANDIDATE_V2_PROFILE,
             CANDIDATE_V2_CONTRACT,
+            PUBLIC_TOP_LEVEL_README,
+            PUBLIC_STASIS_BOUNDARY,
+            PUBLIC_PROFILE_README,
+            PUBLIC_TYPESCRIPT_SDK_README,
+            PUBLIC_RELEASE_RUNBOOK,
+            PUBLIC_RELEASE_WORKFLOW,
             MESSAGE_CHANNEL_LIMITS_SOURCE,
             MESSAGE_CHANNEL_BASELINE_TEST_SOURCE,
             MESSAGE_CHANNEL_MULTI_PAIR_FIXTURE,
@@ -5609,6 +5500,10 @@ def self_test() -> None:
             CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE,
             CONTROLLED_IMAGE_MESSAGING_SOURCE,
             CONTROLLED_IMAGE_PRODUCER_FENCE_SOURCE,
+            CONTROLLED_IMAGE_CACHE_SOURCE,
+            CONTROLLED_PROFILE_WIRE_SOURCE,
+            CONTROLLED_HTTP_IMAGE_FIXTURE,
+            CONTROLLED_HTTP_IMAGE_MULTIPART_FIXTURE,
             CONTROLLED_INLINE_SVG_SOURCE,
             CONTROLLED_INLINE_SVG_FIXTURE,
             CONTROLLED_INLINE_SVG_ADVANCED_FIXTURE,
@@ -5627,12 +5522,263 @@ def self_test() -> None:
             except ReleaseError:
                 pass
             else:
-                raise ReleaseError(
-                    f"self-test accepted changed candidate {description}"
-                )
+                raise ReleaseError(f"self-test accepted changed candidate {description}")
+
+        def require_public_marker_mutation_rejected(
+            source_name: Path,
+            marker: str,
+            replacement: str,
+            description: str,
+        ) -> None:
+            reset_candidate_authority_sources()
+            filename = candidate_profile_root / source_name
+            source = filename.read_text(encoding="utf-8")
+            if source.count(marker) != 1:
+                raise ReleaseError(f"self-test cannot uniquely locate {description} public marker")
+            filename.write_text(source.replace(marker, replacement, 1), encoding="utf-8")
+            require_candidate_mutation_rejected(description)
 
         reset_candidate_authority_sources()
         verify_candidate_v2_profile(candidate_profile_root)
+
+        public_surface_mutations = (
+            (
+                PUBLIC_TOP_LEVEL_README,
+                "Source version and package CI are not publication proof.",
+                "Source version and package CI prove publication.",
+                "top-level source-versus-publication boundary",
+            ),
+            (
+                PUBLIC_TOP_LEVEL_README,
+                "0.3.0 is the stable successor only when its",
+                "0.3.0 is the stable successor even before its",
+                "top-level immutable public-successor evidence boundary",
+            ),
+            (
+                PUBLIC_TOP_LEVEL_README,
+                "`controlled-web-session-v1` still the default",
+                "`controlled-web-session-v2` is now the default",
+                "top-level frozen v1 default",
+            ),
+            (
+                PUBLIC_STASIS_BOUNDARY,
+                "Source version `0.3.0` is not a publication claim",
+                "Source version `0.3.0` is a publication claim",
+                "STASIS source-versus-publication boundary",
+            ),
+            (
+                PUBLIC_TYPESCRIPT_SDK_README,
+                "is not a publication claim: the native runtime must advertise v2",
+                "is a publication claim: the native runtime must advertise v2",
+                "SDK README source-versus-publication boundary",
+            ),
+            (
+                PUBLIC_RELEASE_RUNBOOK,
+                "Source version is not\na publication claim",
+                "Source version is\na publication claim",
+                "release-runbook source-versus-publication boundary",
+            ),
+            (
+                PUBLIC_PROFILE_README,
+                "without inventing an\nasynchronous `Image` producer lease",
+                "by inventing an\nasynchronous `Image` producer lease",
+                "profile README synchronous cache-hit no-lease boundary",
+            ),
+            (
+                PUBLIC_PROFILE_README,
+                "Finite asynchronous cache/decode completion is producer-fenced",
+                "Finite asynchronous cache/decode completion is not producer-fenced",
+                "profile README asynchronous image producer fence",
+            ),
+            (
+                PUBLIC_PROFILE_README,
+                "with resource I/O separately owned and",
+                "with resource I/O hidden inside image callback work and",
+                "profile README HTTP image Resource-I/O ownership",
+            ),
+            (
+                PUBLIC_TYPESCRIPT_SDK_README,
+                "without inventing an asynchronous\n`Image` producer lease",
+                "by inventing an asynchronous\n`Image` producer lease",
+                "SDK README synchronous cache-hit no-lease boundary",
+            ),
+            (
+                PUBLIC_TYPESCRIPT_SDK_README,
+                "Finite asynchronous cache/decode completion is producer-fenced",
+                "Finite asynchronous cache/decode completion is not producer-fenced",
+                "SDK README asynchronous image producer fence",
+            ),
+            (
+                PUBLIC_TYPESCRIPT_SDK_README,
+                "while HTTP image resource I/O remains active retains fatal `blocked_on_external_io`",
+                "while HTTP image resource I/O remains active succeeds without `blocked_on_external_io`",
+                "SDK README active-image replacement boundary",
+            ),
+            (
+                PUBLIC_STASIS_BOUNDARY,
+                "canonical HTTP(S) URL no larger than 65,536 bytes",
+                "canonical HTTP(S) URL no larger than 65,537 bytes",
+                "STASIS HTTP image initial-URL bound",
+            ),
+            (
+                CANDIDATE_V2_CONTRACT,
+                "A final redirect URL is not rechecked against the initial 65,536-byte",
+                "A final redirect URL is rechecked against the initial 65,536-byte",
+                "v2 contract HTTP image final-redirect boundary",
+            ),
+            (
+                PUBLIC_STASIS_BOUNDARY,
+                "HTTP(S) Resource I/O remains separately owned.",
+                "HTTP(S) Resource I/O is hidden in image callback work.",
+                "STASIS HTTP image Resource authority",
+            ),
+            (
+                PUBLIC_STASIS_BOUNDARY,
+                "A final redirect URL is not rechecked",
+                "A final redirect URL is rechecked",
+                "STASIS HTTP image final-redirect boundary",
+            ),
+            (
+                PUBLIC_STASIS_BOUNDARY,
+                "pipeline's image-cache store under immutable fixture routes",
+                "global image-cache store under live routes",
+                "STASIS HTTP image cache-provenance boundary",
+            ),
+            (
+                PUBLIC_STASIS_BOUNDARY,
+                "after its separately owned Resource I/O drains",
+                "before its separately owned Resource I/O drains",
+                "STASIS finite multipart retirement boundary",
+            ),
+            (
+                PUBLIC_STASIS_BOUNDARY,
+                "an endless response remains blocked on external I/O",
+                "an endless response becomes quiescent",
+                "STASIS endless multipart external-I/O boundary",
+            ),
+            (
+                PUBLIC_STASIS_BOUNDARY,
+                "Public document replacement while HTTP image Resource I/O is active remains fatal",
+                "Public document replacement while HTTP image Resource I/O is active succeeds",
+                "STASIS active-image replacement boundary",
+            ),
+            (
+                PUBLIC_RELEASE_RUNBOOK,
+                "A final redirect URL is not rechecked against that initial limit",
+                "A final redirect URL is rechecked against that initial limit",
+                "release-runbook HTTP image final-redirect boundary",
+            ),
+            (
+                PUBLIC_RELEASE_RUNBOOK,
+                "one pipeline's image-cache store under immutable fixture routes",
+                "a global image-cache store under live routes",
+                "release-runbook HTTP image cache-provenance boundary",
+            ),
+            (
+                PUBLIC_RELEASE_WORKFLOW,
+                "Public document replacement while HTTP image resource I/O remains active keeps",
+                "Public document replacement while HTTP image resource I/O remains active succeeds and removes",
+                "release-note active-image replacement boundary",
+            ),
+            (
+                PUBLIC_RELEASE_WORKFLOW,
+                "without an invented asynchronous Image producer lease",
+                "with an invented asynchronous Image producer lease",
+                "release-note synchronous cache-hit no-lease boundary",
+            ),
+            (
+                PUBLIC_RELEASE_WORKFLOW,
+                "redirect URL is not rechecked against that initial selected-URL limit",
+                "redirect URL is rechecked against that initial selected-URL limit",
+                "release-note HTTP image final-redirect boundary",
+            ),
+            (
+                PUBLIC_RELEASE_WORKFLOW,
+                "one pipeline's image-cache store under immutable fixture routes",
+                "a global image-cache store under live routes",
+                "release-note HTTP image cache-provenance boundary",
+            ),
+        )
+        for source_name, marker, replacement, description in public_surface_mutations:
+            require_public_marker_mutation_rejected(
+                source_name,
+                marker,
+                replacement,
+                description,
+            )
+
+        reset_candidate_authority_sources()
+        wire_filename = candidate_profile_root / CONTROLLED_PROFILE_WIRE_SOURCE
+        wire_source = wire_filename.read_text(encoding="utf-8")
+        enabled_wire_test = (
+            "    #[test]\n    fn controlled_web_session_v2_profile_is_an_explicit_bounded_surface_expansion()"
+        )
+        if wire_source.count(enabled_wire_test) != 1:
+            raise ReleaseError("self-test cannot uniquely locate enabled v2 wire profile proof")
+        wire_filename.write_text(
+            wire_source.replace(
+                enabled_wire_test,
+                "    #[allow(dead_code)]\n"
+                "    fn controlled_web_session_v2_profile_is_an_explicit_bounded_surface_expansion()",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("disabled v2 wire profile proof")
+
+        reset_candidate_authority_sources()
+        wire_source = wire_filename.read_text(encoding="utf-8")
+        pinned_wire_profile_sha = f'"{CANDIDATE_V2_PROFILE_SHA256}"'
+        if wire_source.count(pinned_wire_profile_sha) != 1:
+            raise ReleaseError("self-test cannot uniquely locate v2 wire profile hash")
+        wire_filename.write_text(
+            wire_source.replace(
+                pinned_wire_profile_sha,
+                '"0000000000000000000000000000000000000000000000000000000000000000"',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("stale v2 wire profile hash")
+
+        reset_candidate_authority_sources()
+        wire_source = wire_filename.read_text(encoding="utf-8")
+        stable_wire_status = (
+            'assert_eq!(profile["releaseStatus"], "stable_contract");\n'
+            '        assert_eq!(profile["targetRelease"], "0.3.0");'
+        )
+        if wire_source.count(stable_wire_status) != 1:
+            raise ReleaseError("self-test cannot uniquely locate v2 wire release status")
+        wire_filename.write_text(
+            wire_source.replace(
+                stable_wire_status,
+                'assert_eq!(profile["releaseStatus"], "candidate_contract");\n'
+                '        assert_eq!(profile["targetRelease"], "0.3.0");',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("stale v2 wire release status")
+
+        reset_candidate_authority_sources()
+        wire_source = wire_filename.read_text(encoding="utf-8")
+        wire_replacement_boundary = (
+            '"inflightHttpDocumentReplacement": '
+            '"fatal_blocked_on_external_io_before_cross_document_successor_authority"'
+        )
+        if wire_source.count(wire_replacement_boundary) != 1:
+            raise ReleaseError("self-test cannot uniquely locate v2 wire HTTP replacement assertion")
+        wire_filename.write_text(
+            wire_source.replace(
+                wire_replacement_boundary,
+                '"inflightHttpDocumentReplacement": "quiescent"',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("v2 wire HTTP replacement assertion")
+
+        reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test candidate profile",
@@ -5652,9 +5798,7 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test candidate cookie time-range boundary",
         )
-        candidate_profile["sessionState"]["cookies"]["timeRange"][
-            "postOpenNetworkRequestAboveMaximum"
-        ]["fatal"] = True
+        candidate_profile["sessionState"]["cookies"]["timeRange"]["postOpenNetworkRequestAboveMaximum"]["fatal"] = True
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -5665,9 +5809,9 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test candidate SameSite response storage",
         )
-        candidate_profile["sessionState"]["cookies"]["sameSite"][
-            "responseStorage"
-        ]["crossSiteSubresource"] = "all_valid_cookies_eligible"
+        candidate_profile["sessionState"]["cookies"]["sameSite"]["responseStorage"]["crossSiteSubresource"] = (
+            "all_valid_cookies_eligible"
+        )
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -5678,9 +5822,7 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test candidate profile router ownership",
         )
-        candidate_profile["execution"]["messageChannel"]["construction"][
-            "routerOwnership"
-        ] = "external_router"
+        candidate_profile["execution"]["messageChannel"]["construction"]["routerOwnership"] = "external_router"
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -5691,9 +5833,9 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test candidate profile transfer interfaces",
         )
-        candidate_profile["execution"][
-            "portBackedStructuredCloneTransferPreflight"
-        ]["interfaces"].remove("TransformStream")
+        candidate_profile["execution"]["portBackedStructuredCloneTransferPreflight"]["interfaces"].remove(
+            "TransformStream"
+        )
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -5704,9 +5846,7 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test closed candidate InputMethod focus boundary",
         )
-        candidate_profile["execution"]["controlledInputMethodFocus"][
-            "additionalInputMethodShape"
-        ] = "suppressed"
+        candidate_profile["execution"]["controlledInputMethodFocus"]["additionalInputMethodShape"] = "suppressed"
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -5717,9 +5857,9 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test closed candidate embedder-control boundary",
         )
-        candidate_profile["unsupportedClasses"]["embedderControls"][
-            "additionalInputMethodShape"
-        ] = "suppressed_without_external_work"
+        candidate_profile["unsupportedClasses"]["embedderControls"]["additionalInputMethodShape"] = (
+            "suppressed_without_external_work"
+        )
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -5754,9 +5894,7 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test controlled cookie lifetime",
         )
-        candidate_profile["sessionState"]["cookies"]["persistence"][
-            "maximumLifetimeSeconds"
-        ] = 34_560_001
+        candidate_profile["sessionState"]["cookies"]["persistence"]["maximumLifetimeSeconds"] = 34_560_001
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -5767,9 +5905,7 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test v2 state artifact compatibility",
         )
-        candidate_profile["sessionState"]["compatibleSelectedProfiles"].append(
-            "controlled-web-session-v1"
-        )
+        candidate_profile["sessionState"]["compatibleSelectedProfiles"].append("controlled-web-session-v1")
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -5791,9 +5927,7 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test exact MessageChannel candidate contract",
         )
-        candidate_profile["execution"]["messageChannel"]["construction"][
-            "completePairCapacityFromEmptyGlobal"
-        ] = 999
+        candidate_profile["execution"]["messageChannel"]["construction"]["completePairCapacityFromEmptyGlobal"] = 999
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -5804,9 +5938,7 @@ def self_test() -> None:
         message_channel_source = message_channel_filename.read_text(encoding="utf-8")
         incumbent_resolution = "let incumbent = GlobalScope::incumbent();"
         if message_channel_source.count(incumbent_resolution) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate MessageChannel incumbent resolution"
-            )
+            raise ReleaseError("self-test cannot uniquely locate MessageChannel incumbent resolution")
         message_channel_filename.write_text(
             message_channel_source.replace(
                 incumbent_resolution,
@@ -5815,20 +5947,14 @@ def self_test() -> None:
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "MessageChannel constructor incumbent resolution"
-        )
+        require_candidate_mutation_rejected("MessageChannel constructor incumbent resolution")
 
         reset_candidate_authority_sources()
         message_limits_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_limits_source = message_limits_filename.read_text(encoding="utf-8")
-        exact_target_gate = (
-            ".is_some_and(ScriptThread::current_controlled_top_level_target_matches)"
-        )
+        exact_target_gate = ".is_some_and(ScriptThread::current_controlled_top_level_target_matches)"
         if message_limits_source.count(exact_target_gate) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate MessageChannel exact target gate"
-            )
+            raise ReleaseError("self-test cannot uniquely locate MessageChannel exact target gate")
         message_limits_filename.write_text(
             message_limits_source.replace(exact_target_gate, ".is_some()", 1),
             encoding="utf-8",
@@ -5840,9 +5966,7 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test closed candidate supported product surface",
         )
-        candidate_profile["supportedProductSurface"].append(
-            "controlled_iframe_context_tree"
-        )
+        candidate_profile["supportedProductSurface"].append("controlled_iframe_context_tree")
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -5853,9 +5977,7 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test closed FocusEvent timestamp boundary",
         )
-        candidate_profile["execution"]["controlledFocusEventTimestamp"]["events"].append(
-            "click"
-        )
+        candidate_profile["execution"]["controlledFocusEventTimestamp"]["events"].append("click")
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -5866,125 +5988,103 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test generic automation event timestamp scope",
         )
-        candidate_profile["execution"]["controlledAutomationEventTimestamps"][
-            "coverage"
-        ] = "only_representative_proof_event_names"
+        candidate_profile["execution"]["controlledAutomationEventTimestamps"]["coverage"] = (
+            "only_representative_proof_event_names"
+        )
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
-        require_candidate_mutation_rejected(
-            "automation event-name allowlist substituted for causal scope"
-        )
+        require_candidate_mutation_rejected("automation event-name allowlist substituted for causal scope")
 
         reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test script-created automation event boundary",
         )
-        candidate_profile["execution"]["controlledAutomationEventTimestamps"][
-            "scriptCreatedConstructors"
-        ] = "document_clock_timestamp"
+        candidate_profile["execution"]["controlledAutomationEventTimestamps"]["scriptCreatedConstructors"] = (
+            "document_clock_timestamp"
+        )
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
-        require_candidate_mutation_rejected(
-            "script-created events admitted to automation timestamp scope"
-        )
+        require_candidate_mutation_rejected("script-created events admitted to automation timestamp scope")
 
         reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test automation event timestamp product surface",
         )
-        candidate_profile["supportedProductSurface"].append(
-            "controlled_script_created_automation_event_timestamp"
-        )
+        candidate_profile["supportedProductSurface"].append("controlled_script_created_automation_event_timestamp")
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
-        require_candidate_mutation_rejected(
-            "additional automation event timestamp product surface"
-        )
+        require_candidate_mutation_rejected("additional automation event timestamp product surface")
 
         reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test closed CSS animation event-kind boundary",
         )
-        candidate_profile["execution"]["controlledCssAnimationEventTimestamps"][
-            "eventKinds"
-        ].append("animationframe")
+        candidate_profile["execution"]["controlledCssAnimationEventTimestamps"]["eventKinds"].append("animationframe")
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
-        require_candidate_mutation_rejected(
-            "expanded CSS animation event timestamp kinds"
-        )
+        require_candidate_mutation_rejected("expanded CSS animation event timestamp kinds")
 
         reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test script-created CSS event boundary",
         )
-        candidate_profile["execution"]["controlledCssAnimationEventTimestamps"][
-            "scriptCreatedConstructors"
-        ] = "document_clock_timestamp"
+        candidate_profile["execution"]["controlledCssAnimationEventTimestamps"]["scriptCreatedConstructors"] = (
+            "document_clock_timestamp"
+        )
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
-        require_candidate_mutation_rejected(
-            "script-created CSS event constructors admitted"
-        )
+        require_candidate_mutation_rejected("script-created CSS event constructors admitted")
 
         reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test exact CSS pending-event record admission",
         )
-        candidate_profile["execution"]["controlledCssAnimationEventTimestamps"][
-            "recordAdmission"
-        ] = "every_AnimationEvent_and_TransitionEvent"
+        candidate_profile["execution"]["controlledCssAnimationEventTimestamps"]["recordAdmission"] = (
+            "every_AnimationEvent_and_TransitionEvent"
+        )
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
-        require_candidate_mutation_rejected(
-            "CSS event timestamp record provenance bypass"
-        )
+        require_candidate_mutation_rejected("CSS event timestamp record provenance bypass")
 
         reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test CSS public non-auxiliary target admission",
         )
-        candidate_profile["execution"]["controlledCssAnimationEventTimestamps"][
-            "targetAdmission"
-        ] = "any_top_level_Window"
+        candidate_profile["execution"]["controlledCssAnimationEventTimestamps"]["targetAdmission"] = (
+            "any_top_level_Window"
+        )
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
-        require_candidate_mutation_rejected(
-            "CSS auxiliary top-level target promotion"
-        )
+        require_candidate_mutation_rejected("CSS auxiliary top-level target promotion")
 
         reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test CSS transition settlement compatibility boundary",
         )
-        candidate_profile["execution"]["controlledCssAnimationEventTimestamps"][
-            "transitionSettlementCompatibility"
-        ] = "general_controlled_transition_settlement"
+        candidate_profile["execution"]["controlledCssAnimationEventTimestamps"]["transitionSettlementCompatibility"] = (
+            "general_controlled_transition_settlement"
+        )
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
-        require_candidate_mutation_rejected(
-            "general CSS transition settlement promotion"
-        )
+        require_candidate_mutation_rejected("general CSS transition settlement promotion")
 
         reset_candidate_authority_sources()
-        settlement_filename = (
-            candidate_profile_root / CONTROLLED_RENDERING_SETTLEMENT_SOURCE
-        )
+        settlement_filename = candidate_profile_root / CONTROLLED_RENDERING_SETTLEMENT_SOURCE
         settlement_source = settlement_filename.read_text(encoding="utf-8")
         pending_event_demand = (
             "            || rendering.document_update_required\n"
@@ -5992,30 +6092,23 @@ def self_test() -> None:
             "            || rendering.finite_animations != 0"
         )
         if settlement_source.count(pending_event_demand) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate pending animation-event finite demand"
-            )
+            raise ReleaseError("self-test cannot uniquely locate pending animation-event finite demand")
         settlement_filename.write_text(
             settlement_source.replace(
                 pending_event_demand,
-                "            || rendering.document_update_required\n"
-                "            || rendering.finite_animations != 0",
+                "            || rendering.document_update_required\n            || rendering.finite_animations != 0",
                 1,
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "scheduled pending animation-event finite demand"
-        )
+        require_candidate_mutation_rejected("scheduled pending animation-event finite demand")
 
         reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test closed host-timestamp boundary",
         )
-        candidate_profile["unsupportedClasses"]["hostTimestamp"][
-            "otherControlledEvents"
-        ] = "document_clock_timestamp"
+        candidate_profile["unsupportedClasses"]["hostTimestamp"]["otherControlledEvents"] = "document_clock_timestamp"
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -6026,9 +6119,7 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test FocusEvent timestamp product surface",
         )
-        candidate_profile["supportedProductSurface"].append(
-            "controlled_script_created_focus_event_timestamp"
-        )
+        candidate_profile["supportedProductSurface"].append("controlled_script_created_focus_event_timestamp")
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -6039,13 +6130,70 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test controlled image selection boundary",
         )
-        candidate_profile["execution"]["controlledImageElement"]["selection"][
-            "parser"
-        ] = "string_prefix"
+        candidate_profile["execution"]["controlledImageElement"]["selection"]["dataUrlParser"] = "string_prefix"
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
         require_candidate_mutation_rejected("noncanonical image URL parser")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test controlled HTTP image initial URL bound",
+        )
+        candidate_profile["execution"]["controlledImageElement"]["selection"][
+            "maximumInitialSelectedCanonicalUrlBytes"
+        ] = 65_537
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("controlled HTTP image initial URL bound")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test controlled HTTP image origin and redirect boundary",
+        )
+        candidate_profile["execution"]["controlledImageElement"]["selection"]["httpHttpsOrigin"] = "same_origin_only"
+        candidate_profile["execution"]["controlledImageElement"]["selection"]["httpHttpsRedirects"] = (
+            "final_URL_rejected"
+        )
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("controlled HTTP image origin or redirect boundary")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test controlled HTTP image cache and multipart boundary",
+        )
+        candidate_profile["execution"]["controlledImageElement"]["selection"]["cacheReuseProofBoundary"] = (
+            "cross_pipeline_global_cache"
+        )
+        candidate_profile["execution"]["controlledImageElement"]["completion"]["multipartMixedReplace"] = (
+            "owned_quiescent_decode_failure"
+        )
+        candidate_profile["execution"]["controlledImageElement"]["completion"]["inflightHttpDocumentReplacement"] = (
+            "controlled_ready"
+        )
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("controlled HTTP image cache, multipart, or replacement boundary")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test controlled image Unsupported provenance reconciliation",
+        )
+        candidate_profile["execution"]["controlledImageElement"]["pending"]["unsupportedReservationReconciliation"] = (
+            "unsupported_records_retain_controlled_reservations"
+        )
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("controlled image Unsupported provenance reconciliation")
 
         reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(
@@ -6065,9 +6213,7 @@ def self_test() -> None:
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test controlled image unsupported boundary",
         )
-        candidate_profile["execution"]["controlledImageElement"]["unsupported"][
-            "httpHttpsBlobFileAndNonSvgDataUrls"
-        ] = "owned"
+        candidate_profile["execution"]["controlledImageElement"]["unsupported"]["blobFileAndNonSvgDataUrls"] = "owned"
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -6086,9 +6232,7 @@ def self_test() -> None:
 
         reset_candidate_authority_sources()
         candidate_contract_filename = candidate_profile_root / CANDIDATE_V2_CONTRACT
-        candidate_contract_filename.write_bytes(
-            candidate_contract_filename.read_bytes() + b"\n"
-        )
+        candidate_contract_filename.write_bytes(candidate_contract_filename.read_bytes() + b"\n")
         require_candidate_mutation_rejected("candidate contract hash")
 
         reset_candidate_authority_sources()
@@ -6107,15 +6251,9 @@ def self_test() -> None:
         reset_candidate_authority_sources()
         input_method_source_filename = candidate_profile_root / INPUT_METHOD_CONTROL_SOURCE
         input_method_source = input_method_source_filename.read_text(encoding="utf-8")
-        semantic_guard = (
-            "if semantic_automation_focus_active {\n"
-            "        return true;\n"
-            "    }"
-        )
+        semantic_guard = "if semantic_automation_focus_active {\n        return true;\n    }"
         changed_semantic_guard = semantic_guard.replace("return true;", "return false;")
-        mutated_input_method_source = input_method_source.replace(
-            semantic_guard, changed_semantic_guard, 1
-        )
+        mutated_input_method_source = input_method_source.replace(semantic_guard, changed_semantic_guard, 1)
         if mutated_input_method_source == input_method_source:
             raise ReleaseError("self-test cannot mutate the semantic focus guard")
         input_method_source_filename.write_text(
@@ -6145,9 +6283,7 @@ def self_test() -> None:
         input_method_source = input_method_source_filename.read_text(encoding="utf-8")
         virtual_keyboard_predicate = "&& !input_method.allow_virtual_keyboard"
         if input_method_source.count(virtual_keyboard_predicate) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate the virtual-keyboard admission fence"
-            )
+            raise ReleaseError("self-test cannot uniquely locate the virtual-keyboard admission fence")
         input_method_source_filename.write_text(
             input_method_source.replace(
                 virtual_keyboard_predicate,
@@ -6163,9 +6299,7 @@ def self_test() -> None:
         textarea_source = textarea_source_filename.read_text(encoding="utf-8")
         textarea_multiline = "multiline: true,"
         if textarea_source.count(textarea_multiline) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate the textarea multiline provenance"
-            )
+            raise ReleaseError("self-test cannot uniquely locate the textarea multiline provenance")
         textarea_source_filename.write_text(
             textarea_source.replace(textarea_multiline, "multiline: false,", 1),
             encoding="utf-8",
@@ -6173,10 +6307,7 @@ def self_test() -> None:
         require_candidate_mutation_rejected("textarea multiline producer provenance")
 
         reset_candidate_authority_sources()
-        unreviewed_producer = (
-            candidate_profile_root
-            / "components/script/dom/unreviewed_input_method_producer.rs"
-        )
+        unreviewed_producer = candidate_profile_root / "components/script/dom/unreviewed_input_method_producer.rs"
         unreviewed_producer.parent.mkdir(parents=True, exist_ok=True)
         unreviewed_producer.write_text(
             """
@@ -6200,9 +6331,9 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test retained MessagePort work projection",
         )
-        candidate_profile["execution"]["messageChannel"]["delivery"][
-            "retainedWorkProjection"
-        ]["zeroRetainedMessages"] = "makes_idle_pair_pending"
+        candidate_profile["execution"]["messageChannel"]["delivery"]["retainedWorkProjection"][
+            "zeroRetainedMessages"
+        ] = "makes_idle_pair_pending"
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -6213,26 +6344,22 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test reciprocal MessagePort pair work projection",
         )
-        candidate_profile["execution"]["messageChannel"]["delivery"][
-            "retainedWorkProjection"
-        ]["reciprocalPairWithOwnedWork"] = (
-            "one_deterministic_maximum_port_identity_per_pair"
-        )
+        candidate_profile["execution"]["messageChannel"]["delivery"]["retainedWorkProjection"][
+            "reciprocalPairWithOwnedWork"
+        ] = "one_deterministic_maximum_port_identity_per_pair"
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
-        require_candidate_mutation_rejected(
-            "reciprocal MessagePort pair work projection contract"
-        )
+        require_candidate_mutation_rejected("reciprocal MessagePort pair work projection contract")
 
         reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test exact MessagePort reservation identity",
         )
-        candidate_profile["execution"]["messageChannel"]["delivery"][
-            "retainedWorkProjection"
-        ]["reservationIdentity"] = "global_unattributed_reservation"
+        candidate_profile["execution"]["messageChannel"]["delivery"]["retainedWorkProjection"][
+            "reservationIdentity"
+        ] = "global_unattributed_reservation"
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -6243,9 +6370,9 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test exact MessagePort accounting reconciliation",
         )
-        candidate_profile["execution"]["messageChannel"]["delivery"][
-            "retainedWorkProjection"
-        ]["accountingReconciliation"] = "global_retained_at_least_observed_work"
+        candidate_profile["execution"]["messageChannel"]["delivery"]["retainedWorkProjection"][
+            "accountingReconciliation"
+        ] = "global_retained_at_least_observed_work"
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -6256,9 +6383,9 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test fail-closed MessagePort association boundary",
         )
-        candidate_profile["execution"]["messageChannel"]["delivery"][
-            "retainedWorkProjection"
-        ]["invalidMissingOrZeroDestinationAssociation"] = "ignore"
+        candidate_profile["execution"]["messageChannel"]["delivery"]["retainedWorkProjection"][
+            "invalidMissingOrZeroDestinationAssociation"
+        ] = "ignore"
         (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
@@ -6374,12 +6501,8 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("top-level FocusEvent timestamp fence")
 
         reset_candidate_authority_sources()
-        automation_script_thread_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
-        )
-        automation_script_thread_source = automation_script_thread_filename.read_text(
-            encoding="utf-8"
-        )
+        automation_script_thread_filename = candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
+        automation_script_thread_source = automation_script_thread_filename.read_text(encoding="utf-8")
         automation_scope_start = automation_script_thread_source.find(
             "let synchronous_automation_event_time = if operation.is_mutating()"
         )
@@ -6388,29 +6511,21 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         )
         if automation_scope_start < 0 or automation_scope_end < 0:
             raise ReleaseError("self-test cannot isolate automation timestamp admission")
-        automation_scope = automation_script_thread_source[
-            automation_scope_start:automation_scope_end
-        ]
+        automation_scope = automation_script_thread_source[automation_scope_start:automation_scope_end]
         automation_script_thread_filename.write_text(
             automation_script_thread_source[:automation_scope_start]
             + automation_scope.replace("operation.is_mutating()", "true", 1)
             + automation_script_thread_source[automation_scope_end:],
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "non-mutating automation timestamp scope admission"
-        )
+        require_candidate_mutation_rejected("non-mutating automation timestamp scope admission")
 
         reset_candidate_authority_sources()
-        automation_control_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
-        )
+        automation_control_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
         automation_control_source = automation_control_filename.read_text(encoding="utf-8")
         automation_restore = "self.time.set(self.previous);"
         if automation_control_source.count(automation_restore) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate automation timestamp scope restoration"
-            )
+            raise ReleaseError("self-test cannot uniquely locate automation timestamp scope restoration")
         automation_control_filename.write_text(
             automation_control_source.replace(automation_restore, "let _ = self.previous;", 1),
             encoding="utf-8",
@@ -6418,39 +6533,23 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("automation timestamp RAII restoration")
 
         reset_candidate_authority_sources()
-        automation_event_target_filename = (
-            candidate_profile_root / CONTROLLED_AUTOMATION_EVENT_TARGET_SOURCE
-        )
-        automation_event_target_source = automation_event_target_filename.read_text(
-            encoding="utf-8"
-        )
+        automation_event_target_filename = candidate_profile_root / CONTROLLED_AUTOMATION_EVENT_TARGET_SOURCE
+        automation_event_target_source = automation_event_target_filename.read_text(encoding="utf-8")
         generic_event_stamp = "event.set_creation_time_stamp(time_stamp);"
         if automation_event_target_source.count(generic_event_stamp) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate generic automation event timestamp stamp"
-            )
+            raise ReleaseError("self-test cannot uniquely locate generic automation event timestamp stamp")
         automation_event_target_filename.write_text(
-            automation_event_target_source.replace(
-                generic_event_stamp, "let _ = time_stamp;", 1
-            ),
+            automation_event_target_source.replace(generic_event_stamp, "let _ = time_stamp;", 1),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "generic synchronous browser-event timestamp locality"
-        )
+        require_candidate_mutation_rejected("generic synchronous browser-event timestamp locality")
 
         reset_candidate_authority_sources()
-        automation_input_event_filename = (
-            candidate_profile_root / CONTROLLED_AUTOMATION_INPUT_EVENT_SOURCE
-        )
-        automation_input_event_source = automation_input_event_filename.read_text(
-            encoding="utf-8"
-        )
+        automation_input_event_filename = candidate_profile_root / CONTROLLED_AUTOMATION_INPUT_EVENT_SOURCE
+        automation_input_event_source = automation_input_event_filename.read_text(encoding="utf-8")
         input_constructor = "fn Constructor("
         if automation_input_event_source.count(input_constructor) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate script-created InputEvent constructor"
-            )
+            raise ReleaseError("self-test cannot uniquely locate script-created InputEvent constructor")
         automation_input_event_filename.write_text(
             automation_input_event_source.replace(
                 input_constructor,
@@ -6459,58 +6558,38 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "script-created InputEvent automation-scope bypass"
-        )
+        require_candidate_mutation_rejected("script-created InputEvent automation-scope bypass")
 
         reset_candidate_authority_sources()
-        automation_protocol_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
-        )
-        automation_protocol_source = automation_protocol_filename.read_text(
-            encoding="utf-8"
-        )
+        automation_protocol_filename = candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
+        automation_protocol_source = automation_protocol_filename.read_text(encoding="utf-8")
         representative_reset_stamp = "reset:reset:5"
         if automation_protocol_source.count(representative_reset_stamp) != 2:
-            raise ReleaseError(
-                "self-test cannot locate both representative reset timestamp traces"
-            )
+            raise ReleaseError("self-test cannot locate both representative reset timestamp traces")
         automation_protocol_filename.write_text(
-            automation_protocol_source.replace(
-                representative_reset_stamp, "reset:reset:0", 1
-            ),
+            automation_protocol_source.replace(representative_reset_stamp, "reset:reset:0", 1),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "representative derived reset-event timestamp proof"
-        )
+        require_candidate_mutation_rejected("representative derived reset-event timestamp proof")
 
         reset_candidate_authority_sources()
-        css_script_thread_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
-        )
+        css_script_thread_filename = candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
         css_script_thread_source = css_script_thread_filename.read_text(encoding="utf-8")
         auxiliary_gate = "if window_proxy.is_auxiliary()"
         if css_script_thread_source.count(auxiliary_gate) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate the CSS timestamp auxiliary gate"
-            )
+            raise ReleaseError("self-test cannot uniquely locate the CSS timestamp auxiliary gate")
         css_script_thread_filename.write_text(
             css_script_thread_source.replace(auxiliary_gate, "if false", 1),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "auxiliary top-level CSS timestamp target admission"
-        )
+        require_candidate_mutation_rejected("auxiliary top-level CSS timestamp target admission")
 
         reset_candidate_authority_sources()
         css_animations_filename = candidate_profile_root / CONTROLLED_CSS_ANIMATION_SOURCE
         css_animations_source = css_animations_filename.read_text(encoding="utf-8")
         css_sample = "window.sample_controlled_v2_document_performance_time()"
         if css_animations_source.count(css_sample) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate the CSS dispatch-batch time sample"
-            )
+            raise ReleaseError("self-test cannot uniquely locate the CSS dispatch-batch time sample")
         css_animations_filename.write_text(
             css_animations_source.replace(
                 css_sample,
@@ -6519,56 +6598,38 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "CSS dispatch batch document-time sample before queue take"
-        )
+        require_candidate_mutation_rejected("CSS dispatch batch document-time sample before queue take")
 
         reset_candidate_authority_sources()
         css_animations_filename = candidate_profile_root / CONTROLLED_CSS_ANIMATION_SOURCE
         css_animations_source = css_animations_filename.read_text(encoding="utf-8")
-        css_record_match = (
-            "ScriptThread::current_controlled_top_level_target_matches(&owner_window)"
-        )
+        css_record_match = "ScriptThread::current_controlled_top_level_target_matches(&owner_window)"
         if css_animations_source.count(css_record_match) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate CSS retained-record target matching"
-            )
+            raise ReleaseError("self-test cannot uniquely locate CSS retained-record target matching")
         css_animations_filename.write_text(
             css_animations_source.replace(css_record_match, "true", 1),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "CSS retained-record target membership bypass"
-        )
+        require_candidate_mutation_rejected("CSS retained-record target membership bypass")
 
         reset_candidate_authority_sources()
         css_animations_filename = candidate_profile_root / CONTROLLED_CSS_ANIMATION_SOURCE
         css_animations_source = css_animations_filename.read_text(encoding="utf-8")
         css_event_stamp = "event.upcast::<Event>().set_creation_time_stamp(time_stamp);"
         if css_animations_source.count(css_event_stamp) != 2:
-            raise ReleaseError(
-                "self-test cannot locate both internal CSS event timestamp stamps"
-            )
+            raise ReleaseError("self-test cannot locate both internal CSS event timestamp stamps")
         css_animations_filename.write_text(
             css_animations_source.replace(css_event_stamp, "let _ = time_stamp;", 1),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "internal TransitionEvent timestamp locality"
-        )
+        require_candidate_mutation_rejected("internal TransitionEvent timestamp locality")
 
         reset_candidate_authority_sources()
-        css_animation_event_filename = (
-            candidate_profile_root / CONTROLLED_CSS_ANIMATION_EVENT_SOURCE
-        )
-        css_animation_event_source = css_animation_event_filename.read_text(
-            encoding="utf-8"
-        )
+        css_animation_event_filename = candidate_profile_root / CONTROLLED_CSS_ANIMATION_EVENT_SOURCE
+        css_animation_event_source = css_animation_event_filename.read_text(encoding="utf-8")
         css_constructor = "fn Constructor("
         if css_animation_event_source.count(css_constructor) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate script-created AnimationEvent constructor"
-            )
+            raise ReleaseError("self-test cannot uniquely locate script-created AnimationEvent constructor")
         css_animation_event_filename.write_text(
             css_animation_event_source.replace(
                 css_constructor,
@@ -6577,20 +6638,14 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "script-created AnimationEvent controlled timestamp contamination"
-        )
+        require_candidate_mutation_rejected("script-created AnimationEvent controlled timestamp contamination")
 
         reset_candidate_authority_sources()
         css_animations_filename = candidate_profile_root / CONTROLLED_CSS_ANIMATION_SOURCE
         css_animations_source = css_animations_filename.read_text(encoding="utf-8")
-        pending_event_count = (
-            "observation.pending_event_count = self.pending_events.borrow().len()"
-        )
+        pending_event_count = "observation.pending_event_count = self.pending_events.borrow().len()"
         if css_animations_source.count(pending_event_count) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate retained CSS pending-event accounting"
-            )
+            raise ReleaseError("self-test cannot uniquely locate retained CSS pending-event accounting")
         css_animations_filename.write_text(
             css_animations_source.replace(
                 pending_event_count,
@@ -6599,18 +6654,14 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "retained CSS pending-event settlement accounting"
-        )
+        require_candidate_mutation_rejected("retained CSS pending-event settlement accounting")
 
         reset_candidate_authority_sources()
         css_protocol_filename = candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
         css_protocol_source = css_protocol_filename.read_text(encoding="utf-8")
         css_animation_start_proof = "animationstart:trusted:20:20:owned"
         if css_protocol_source.count(css_animation_start_proof) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate native CSS animation timestamp proof"
-            )
+            raise ReleaseError("self-test cannot uniquely locate native CSS animation timestamp proof")
         css_protocol_filename.write_text(
             css_protocol_source.replace(
                 css_animation_start_proof,
@@ -6619,20 +6670,14 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "native CSS animation timestamp proof"
-        )
+        require_candidate_mutation_rejected("native CSS animation timestamp proof")
 
         reset_candidate_authority_sources()
-        css_fixture_filename = (
-            candidate_profile_root / CONTROLLED_CSS_ANIMATION_EVENT_FIXTURE
-        )
+        css_fixture_filename = candidate_profile_root / CONTROLLED_CSS_ANIMATION_EVENT_FIXTURE
         css_fixture_source = css_fixture_filename.read_text(encoding="utf-8")
         script_animation_constructor = 'new AnimationEvent("animationstart"'
         if css_fixture_source.count(script_animation_constructor) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate script-created CSS event probe"
-            )
+            raise ReleaseError("self-test cannot uniquely locate script-created CSS event probe")
         css_fixture_filename.write_text(
             css_fixture_source.replace(
                 script_animation_constructor,
@@ -6641,9 +6686,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "script-created AnimationEvent host timestamp fixture"
-        )
+        require_candidate_mutation_rejected("script-created AnimationEvent host timestamp fixture")
 
         reset_candidate_authority_sources()
         event_source_filename = candidate_profile_root / EVENT_SOURCE
@@ -6661,9 +6704,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         reset_candidate_authority_sources()
         image_element_filename = candidate_profile_root / CONTROLLED_IMAGE_ELEMENT_SOURCE
         image_element_source = image_element_filename.read_text(encoding="utf-8")
-        image_top_level_gate = (
-            "!ScriptThread::current_controlled_top_level_target_matches(window)"
-        )
+        image_top_level_gate = "!ScriptThread::current_controlled_top_level_target_matches(window)"
         if image_element_source.count(image_top_level_gate) != 1:
             raise ReleaseError("self-test cannot uniquely locate exact image target gate")
         image_element_filename.write_text(
@@ -6671,6 +6712,56 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             encoding="utf-8",
         )
         require_candidate_mutation_rejected("controlled image exact public target gate")
+
+        reset_candidate_authority_sources()
+        image_protocol_filename = candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
+        image_protocol_source = image_protocol_filename.read_text(encoding="utf-8")
+        multipart_proof_name = (
+            "fn controlled_session_v2_http_multipart_finite_response_retires_to_typed_image_load_unsupported()"
+        )
+        if image_protocol_source.count(multipart_proof_name) != 1:
+            raise ReleaseError("self-test cannot uniquely locate controlled HTTP multipart protocol proof")
+        image_protocol_filename.write_text(
+            image_protocol_source.replace(
+                multipart_proof_name,
+                "fn deleted_controlled_http_multipart_proof()",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("controlled HTTP multipart native protocol proof")
+
+        reset_candidate_authority_sources()
+        http_image_fixture_filename = candidate_profile_root / CONTROLLED_HTTP_IMAGE_FIXTURE
+        http_image_fixture_source = http_image_fixture_filename.read_text(encoding="utf-8")
+        cross_origin_asset = 'const assets = "https://controlled-image-assets.example.test"'
+        if http_image_fixture_source.count(cross_origin_asset) != 1:
+            raise ReleaseError("self-test cannot uniquely locate controlled cross-origin HTTP image fixture")
+        http_image_fixture_filename.write_text(
+            http_image_fixture_source.replace(
+                cross_origin_asset,
+                "const assets = location.origin",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("controlled cross-origin HTTP image fixture boundary")
+
+        reset_candidate_authority_sources()
+        image_cache_filename = candidate_profile_root / CONTROLLED_IMAGE_CACHE_SOURCE
+        image_cache_source = image_cache_filename.read_text(encoding="utf-8")
+        fresh_completed_loads = "completed_loads: HashMap::new(),"
+        if image_cache_source.count(fresh_completed_loads) != 1:
+            raise ReleaseError("self-test cannot uniquely locate fresh per-pipeline completed image cache")
+        image_cache_filename.write_text(
+            image_cache_source.replace(
+                fresh_completed_loads,
+                "completed_loads: shared_completed_loads.clone(),",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("fresh per-pipeline completed image cache store")
 
         reset_candidate_authority_sources()
         image_element_filename = candidate_profile_root / CONTROLLED_IMAGE_ELEMENT_SOURCE
@@ -6717,11 +6808,68 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("controlled image native URL bound")
 
         reset_candidate_authority_sources()
+        image_element_filename = candidate_profile_root / CONTROLLED_IMAGE_ELEMENT_SOURCE
+        image_element_source = image_element_filename.read_text(encoding="utf-8")
+        http_image_url_limit = "const CONTROLLED_V2_DIRECT_HTTP_IMAGE_URL_LIMIT: usize = 65_536;"
+        if image_element_source.count(http_image_url_limit) != 1:
+            raise ReleaseError("self-test cannot uniquely locate controlled HTTP image URL bound")
+        image_element_filename.write_text(
+            image_element_source.replace(
+                http_image_url_limit,
+                "const CONTROLLED_V2_DIRECT_HTTP_IMAGE_URL_LIMIT: usize = 65_537;",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("controlled HTTP image native URL bound")
+
+        reset_candidate_authority_sources()
+        image_element_filename = candidate_profile_root / CONTROLLED_IMAGE_ELEMENT_SOURCE
+        image_element_source = image_element_filename.read_text(encoding="utf-8")
+        http_scheme_gate = 'matches!(image_url.scheme(), "http" | "https")'
+        if image_element_source.count(http_scheme_gate) != 1:
+            raise ReleaseError("self-test cannot uniquely locate controlled HTTP scheme gate")
+        image_element_filename.write_text(
+            image_element_source.replace(
+                http_scheme_gate,
+                'image_url.scheme() == "https"',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("controlled HTTP image scheme gate")
+
+        reset_candidate_authority_sources()
+        image_element_filename = candidate_profile_root / CONTROLLED_IMAGE_ELEMENT_SOURCE
+        image_element_source = image_element_filename.read_text(encoding="utf-8")
+        multipart_retirement = ".mark_controlled_v2_image_cache_id_unsupported(self.id);"
+        if image_element_source.count(multipart_retirement) != 1:
+            raise ReleaseError("self-test cannot uniquely locate controlled multipart image retirement")
+        image_element_filename.write_text(
+            image_element_source.replace(multipart_retirement, "", 1),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("controlled multipart image Unsupported retirement before terminal EOF")
+
+        reset_candidate_authority_sources()
+        image_element_source = image_element_filename.read_text(encoding="utf-8")
+        multipart_mime_gate = 'mime.type_() == mime::MULTIPART && mime.subtype().as_str() == "x-mixed-replace"'
+        if image_element_source.count(multipart_mime_gate) != 1:
+            raise ReleaseError("self-test cannot uniquely locate controlled multipart MIME subtype gate")
+        image_element_filename.write_text(
+            image_element_source.replace(
+                multipart_mime_gate,
+                "mime.type_() == mime::MULTIPART",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("controlled multipart x-mixed-replace subtype gate")
+
+        reset_candidate_authority_sources()
         image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
         image_window_source = image_window_filename.read_text(encoding="utf-8")
-        image_registration_limit = (
-            "const CONTROLLED_V2_IMAGE_RETAINED_RECORD_LIMIT: usize = 512;"
-        )
+        image_registration_limit = "const CONTROLLED_V2_IMAGE_RETAINED_RECORD_LIMIT: usize = 512;"
         if image_window_source.count(image_registration_limit) != 1:
             raise ReleaseError("self-test cannot uniquely locate controlled image capacity")
         image_window_filename.write_text(
@@ -6745,6 +6893,140 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             encoding="utf-8",
         )
         require_candidate_mutation_rejected("retained controlled image reservation")
+
+        reset_candidate_authority_sources()
+        image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        unsupported_reservation_release = "callback._reservation = None;"
+        if image_window_source.count(unsupported_reservation_release) != 1:
+            raise ReleaseError("self-test cannot uniquely locate Unsupported image reservation release")
+        image_window_filename.write_text(
+            image_window_source.replace(unsupported_reservation_release, "", 1),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("explicit Unsupported image controlled-reservation release")
+
+        reset_candidate_authority_sources()
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        unsupported_callback_exact_id = "self.pending_image_callbacks.borrow_mut().get_mut(&id)"
+        if image_window_source.count(unsupported_callback_exact_id) != 1:
+            raise ReleaseError("self-test cannot uniquely locate Unsupported callback exact-ID selection")
+        image_window_filename.write_text(
+            image_window_source.replace(
+                unsupported_callback_exact_id,
+                "self.pending_image_callbacks.borrow_mut().values_mut().next()",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("Unsupported callback exact cache-ID selection")
+
+        reset_candidate_authority_sources()
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        unsupported_layout_exact_id = "self.pending_layout_images.borrow_mut().get_mut(&id)"
+        if image_window_source.count(unsupported_layout_exact_id) != 1:
+            raise ReleaseError("self-test cannot uniquely locate Unsupported layout exact-ID selection")
+        image_window_filename.write_text(
+            image_window_source.replace(
+                unsupported_layout_exact_id,
+                "self.pending_layout_images.borrow_mut().values_mut().next()",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("Unsupported layout exact cache-ID selection")
+
+        reset_candidate_authority_sources()
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        unsupported_raster_exact_id = "if *candidate_id == id {\n                entry.mark_unsupported();"
+        if image_window_source.count(unsupported_raster_exact_id) != 1:
+            raise ReleaseError("self-test cannot uniquely locate Unsupported raster exact-ID selection")
+        image_window_filename.write_text(
+            image_window_source.replace(
+                unsupported_raster_exact_id,
+                "if true {\n                entry.mark_unsupported();",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("Unsupported raster exact cache-ID selection")
+
+        reset_candidate_authority_sources()
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        raster_unsupported_retirement = (
+            "fn mark_unsupported(&mut self) {\n"
+            "        self.provenance = PendingImageProvenance::Unsupported;\n"
+            "        self.reservation = None;\n"
+            "    }"
+        )
+        if image_window_source.count(raster_unsupported_retirement) != 1:
+            raise ReleaseError("self-test cannot uniquely locate raster Unsupported retirement")
+        image_window_filename.write_text(
+            image_window_source.replace(
+                raster_unsupported_retirement,
+                raster_unsupported_retirement.replace(
+                    "PendingImageProvenance::Unsupported",
+                    "PendingImageProvenance::Baseline",
+                    1,
+                ),
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("raster explicit Unsupported provenance retirement")
+
+        reset_candidate_authority_sources()
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        image_window_filename.write_text(
+            image_window_source.replace(
+                raster_unsupported_retirement,
+                raster_unsupported_retirement.replace(
+                    "        self.reservation = None;\n",
+                    "",
+                    1,
+                ),
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("raster Unsupported controlled-reservation release")
+
+        reset_candidate_authority_sources()
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        unsupported_classifier_start = image_window_source.find("fn image_id_has_explicitly_unsupported_retained_work(")
+        unsupported_classifier_end = image_window_source.find(
+            "fn image_id_has_baseline_retained_work(", unsupported_classifier_start
+        )
+        if unsupported_classifier_start < 0 or unsupported_classifier_end < 0:
+            raise ReleaseError("self-test cannot locate exact Unsupported cache-ID classifier")
+        unsupported_classifier = image_window_source[unsupported_classifier_start:unsupported_classifier_end]
+        if unsupported_classifier.count(".get(&id)") != 2:
+            raise ReleaseError("self-test cannot locate exact Unsupported callback/layout lookups")
+        image_window_filename.write_text(
+            image_window_source[:unsupported_classifier_start]
+            + unsupported_classifier.replace(".get(&id)", ".values().next()", 1)
+            + image_window_source[unsupported_classifier_end:],
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("Unsupported classifier callback exact cache-ID lookup")
+
+        reset_candidate_authority_sources()
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        unsupported_classifier = image_window_source[unsupported_classifier_start:unsupported_classifier_end]
+        unsupported_classifier_raster_id = "*candidate_id == id &&"
+        if unsupported_classifier.count(unsupported_classifier_raster_id) != 1:
+            raise ReleaseError("self-test cannot locate Unsupported classifier raster exact-ID predicate")
+        image_window_filename.write_text(
+            image_window_source[:unsupported_classifier_start]
+            + unsupported_classifier.replace(
+                unsupported_classifier_raster_id,
+                "true &&",
+                1,
+            )
+            + image_window_source[unsupported_classifier_end:],
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("Unsupported classifier raster exact cache-ID predicate")
 
         reset_candidate_authority_sources()
         image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
@@ -6775,9 +7057,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         image_window_source = image_window_filename.read_text(encoding="utf-8")
         raster_listener_install = "image_cache.add_rasterization_complete_listener("
         if image_window_source.count(raster_listener_install) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate post-reflow raster listener installation"
-            )
+            raise ReleaseError("self-test cannot uniquely locate post-reflow raster listener installation")
         image_window_filename.write_text(
             image_window_source.replace(
                 raster_listener_install,
@@ -6786,47 +7066,31 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "post-reflow exact-key fenced raster listener installation"
-        )
+        require_candidate_mutation_rejected("post-reflow exact-key fenced raster listener installation")
 
         reset_candidate_authority_sources()
         image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
         image_window_source = image_window_filename.read_text(encoding="utf-8")
-        mixed_layout_classification = (
-            "!matches!(layout_provenances.get(id), Some((baseline, _)) if *baseline != 0)"
-        )
+        mixed_layout_classification = "!matches!(layout_provenances.get(id), Some((baseline, _)) if *baseline != 0)"
         if image_window_source.count(mixed_layout_classification) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate mixed layout-owner classification"
-            )
+            raise ReleaseError("self-test cannot uniquely locate mixed layout-owner classification")
         image_window_filename.write_text(
             image_window_source.replace(mixed_layout_classification, "true", 1),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "baseline layout owner controlled-classification exclusion"
-        )
+        require_candidate_mutation_rejected("baseline layout owner controlled-classification exclusion")
 
         reset_candidate_authority_sources()
         image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
         image_window_source = image_window_filename.read_text(encoding="utf-8")
         layout_handoff_start = image_window_source.find("for image in pending_images")
-        layout_handoff_end = image_window_source.find(
-            "for image in pending_rasterization_images", layout_handoff_start
-        )
+        layout_handoff_end = image_window_source.find("for image in pending_rasterization_images", layout_handoff_start)
         if layout_handoff_start < 0 or layout_handoff_end < 0:
             raise ReleaseError("self-test cannot locate layout-owner post-reflow handoff")
-        layout_handoff_source = image_window_source[
-            layout_handoff_start:layout_handoff_end
-        ]
-        baseline_layout_downgrade = (
-            "self.downgrade_cached_vector_identity_to_baseline(id);"
-        )
+        layout_handoff_source = image_window_source[layout_handoff_start:layout_handoff_end]
+        baseline_layout_downgrade = "self.downgrade_cached_vector_identity_to_baseline(id);"
         if layout_handoff_source.count(baseline_layout_downgrade) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate baseline layout-owner global downgrade"
-            )
+            raise ReleaseError("self-test cannot uniquely locate baseline layout-owner global downgrade")
         image_window_filename.write_text(
             image_window_source[:layout_handoff_start]
             + layout_handoff_source.replace(baseline_layout_downgrade, "", 1)
@@ -6838,33 +7102,27 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         reset_candidate_authority_sources()
         image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
         image_window_source = image_window_filename.read_text(encoding="utf-8")
-        layout_delivery_mismatch = "owner.provenance != delivery_provenance"
-        if image_window_source.count(layout_delivery_mismatch) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate layout-owner delivery mismatch"
-            )
+        unsupported_delivery_guard = "retained != PendingImageProvenance::Unsupported && retained == delivery"
+        if image_window_source.count(unsupported_delivery_guard) != 1:
+            raise ReleaseError("self-test cannot uniquely locate explicit Unsupported delivery guard")
         image_window_filename.write_text(
-            image_window_source.replace(layout_delivery_mismatch, "false", 1),
+            image_window_source.replace(
+                unsupported_delivery_guard,
+                "retained == delivery",
+                1,
+            ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "mixed layout-owner delivery rejection before callbacks"
-        )
+        require_candidate_mutation_rejected("explicit Unsupported delivery rejection before callbacks")
 
         reset_candidate_authority_sources()
         image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
         image_window_source = image_window_filename.read_text(encoding="utf-8")
         retained_mixed_layout_state = (
-            "            })\n"
-            "        {\n"
-            "            return Err(());\n"
-            "        }\n\n"
-            "        // We take the images here"
+            "        {\n            return Err(());\n        }\n\n        // We take the images here"
         )
         if image_window_source.count(retained_mixed_layout_state) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate retained mixed layout-owner state"
-            )
+            raise ReleaseError("self-test cannot uniquely locate retained mixed layout-owner state")
         image_window_filename.write_text(
             image_window_source.replace(
                 retained_mixed_layout_state,
@@ -6894,9 +7152,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         reset_candidate_authority_sources()
         image_messaging_filename = candidate_profile_root / CONTROLLED_IMAGE_MESSAGING_SOURCE
         image_messaging_source = image_messaging_filename.read_text(encoding="utf-8")
-        guarded_transport = (
-            "ControlledV2(DocumentProducerEnvelope<ImageCacheResponseMessage>)"
-        )
+        guarded_transport = "ControlledV2(DocumentProducerEnvelope<ImageCacheResponseMessage>)"
         if image_messaging_source.count(guarded_transport) != 1:
             raise ReleaseError("self-test cannot uniquely locate guarded image transport")
         image_messaging_filename.write_text(
@@ -6910,13 +7166,9 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("guard-bearing image transport")
 
         reset_candidate_authority_sources()
-        producer_fence_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_PRODUCER_FENCE_SOURCE
-        )
+        producer_fence_filename = candidate_profile_root / CONTROLLED_IMAGE_PRODUCER_FENCE_SOURCE
         producer_fence_source = producer_fence_filename.read_text(encoding="utf-8")
-        vector_terminal = (
-            "ImageCacheResponseMessage::VectorImageRasterizationComplete(..) => true"
-        )
+        vector_terminal = "ImageCacheResponseMessage::VectorImageRasterizationComplete(..) => true"
         if producer_fence_source.count(vector_terminal) != 1:
             raise ReleaseError("self-test cannot uniquely locate vector image terminal")
         producer_fence_filename.write_text(
@@ -6926,27 +7178,15 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("vector image producer terminal")
 
         reset_candidate_authority_sources()
-        producer_fence_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_PRODUCER_FENCE_SOURCE
-        )
+        producer_fence_filename = candidate_profile_root / CONTROLLED_IMAGE_PRODUCER_FENCE_SOURCE
         producer_fence_source = producer_fence_filename.read_text(encoding="utf-8")
-        owned_cancellation_completion = (
-            "        self.complete();\n"
-            "    }\n"
-            "}\n\n"
-            "struct ImageCallbackState"
-        )
+        owned_cancellation_completion = "        self.complete();\n    }\n}\n\nstruct ImageCallbackState"
         if producer_fence_source.count(owned_cancellation_completion) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate image callback owned cancellation"
-            )
+            raise ReleaseError("self-test cannot uniquely locate image callback owned cancellation")
         producer_fence_filename.write_text(
             producer_fence_source.replace(
                 owned_cancellation_completion,
-                "        self.abandon();\n"
-                "    }\n"
-                "}\n\n"
-                "struct ImageCallbackState",
+                "        self.abandon();\n    }\n}\n\nstruct ImageCallbackState",
                 1,
             ),
             encoding="utf-8",
@@ -6956,13 +7196,9 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         reset_candidate_authority_sources()
         producer_ledger_filename = candidate_profile_root / EXECUTION_LIMITS_SOURCE
         producer_ledger_source = producer_ledger_filename.read_text(encoding="utf-8")
-        class_match = (
-            "if state.active_leases.get(&lease_id.sequence) != Some(&lease_id.kind) {"
-        )
+        class_match = "if state.active_leases.get(&lease_id.sequence) != Some(&lease_id.kind) {"
         if producer_ledger_source.count(class_match) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate producer lease class match"
-            )
+            raise ReleaseError("self-test cannot uniquely locate producer lease class match")
         producer_ledger_filename.write_text(
             producer_ledger_source.replace(
                 class_match,
@@ -6971,14 +7207,10 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "producer completion and abandonment class match"
-        )
+        require_candidate_mutation_rejected("producer completion and abandonment class match")
 
         reset_candidate_authority_sources()
-        image_script_thread_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
-        )
+        image_script_thread_filename = candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
         image_script_thread_source = image_script_thread_filename.read_text(encoding="utf-8")
         image_execution_profile_gate = (
             "                if self.document_control_profile != DocumentControlProfile::TopLevelSession ||\n"
@@ -7003,9 +7235,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("controlled image delivery profile gate")
 
         reset_candidate_authority_sources()
-        image_script_thread_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
-        )
+        image_script_thread_filename = candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
         image_script_thread_source = image_script_thread_filename.read_text(encoding="utf-8")
         retired_target_completion = (
             "                        ControlledImageDeliveryTarget::Retired => {\n"
@@ -7016,15 +7246,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             "                        },"
         )
         if image_script_thread_source.count(retired_target_completion) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate retired image-target completion"
-            )
+            raise ReleaseError("self-test cannot uniquely locate retired image-target completion")
         image_script_thread_filename.write_text(
             image_script_thread_source.replace(
                 retired_target_completion,
-                retired_target_completion.replace(
-                    "drop(guard);", "let _ = guard.abandon();"
-                ),
+                retired_target_completion.replace("drop(guard);", "let _ = guard.abandon();"),
                 1,
             ),
             encoding="utf-8",
@@ -7032,9 +7258,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("retired image target owned cancellation")
 
         reset_candidate_authority_sources()
-        image_script_thread_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
-        )
+        image_script_thread_filename = candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
         image_script_thread_source = image_script_thread_filename.read_text(encoding="utf-8")
         unknown_target_abandonment = (
             "                        ControlledImageDeliveryTarget::Unknown => {\n"
@@ -7045,15 +7269,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             "                        },"
         )
         if image_script_thread_source.count(unknown_target_abandonment) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate unknown image-target abandonment"
-            )
+            raise ReleaseError("self-test cannot uniquely locate unknown image-target abandonment")
         image_script_thread_filename.write_text(
             image_script_thread_source.replace(
                 unknown_target_abandonment,
-                unknown_target_abandonment.replace(
-                    "let _ = guard.abandon();", "drop(guard);"
-                ),
+                unknown_target_abandonment.replace("let _ = guard.abandon();", "drop(guard);"),
                 1,
             ),
             encoding="utf-8",
@@ -7061,9 +7281,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("unknown image target abandonment")
 
         reset_candidate_authority_sources()
-        image_script_thread_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
-        )
+        image_script_thread_filename = candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
         image_script_thread_source = image_script_thread_filename.read_text(encoding="utf-8")
         prehandler_authority_abandonment = (
             "                    !Self::current_controlled_top_level_target_matches(&window)\n"
@@ -7073,27 +7291,19 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             "                }"
         )
         if image_script_thread_source.count(prehandler_authority_abandonment) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate pre-handler image authority abandonment"
-            )
+            raise ReleaseError("self-test cannot uniquely locate pre-handler image authority abandonment")
         image_script_thread_filename.write_text(
             image_script_thread_source.replace(
                 prehandler_authority_abandonment,
-                prehandler_authority_abandonment.replace(
-                    "let _ = guard.abandon();", "drop(guard);"
-                ),
+                prehandler_authority_abandonment.replace("let _ = guard.abandon();", "drop(guard);"),
                 1,
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "pre-handler image authority abandonment"
-        )
+        require_candidate_mutation_rejected("pre-handler image authority abandonment")
 
         reset_candidate_authority_sources()
-        image_script_thread_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
-        )
+        image_script_thread_filename = candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
         image_script_thread_source = image_script_thread_filename.read_text(encoding="utf-8")
         prehandler_clock_abandonment = (
             "                let Ok(completion_time) = window.sample_controlled_v2_document_performance_time()\n"
@@ -7103,15 +7313,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             "                };"
         )
         if image_script_thread_source.count(prehandler_clock_abandonment) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate pre-handler image clock abandonment"
-            )
+            raise ReleaseError("self-test cannot uniquely locate pre-handler image clock abandonment")
         image_script_thread_filename.write_text(
             image_script_thread_source.replace(
                 prehandler_clock_abandonment,
-                prehandler_clock_abandonment.replace(
-                    "let _ = guard.abandon();", "drop(guard);"
-                ),
+                prehandler_clock_abandonment.replace("let _ = guard.abandon();", "drop(guard);"),
                 1,
             ),
             encoding="utf-8",
@@ -7119,18 +7325,13 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("pre-handler image clock abandonment")
 
         reset_candidate_authority_sources()
-        image_script_thread_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
-        )
+        image_script_thread_filename = candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
         image_script_thread_source = image_script_thread_filename.read_text(encoding="utf-8")
         retained_handler_completion = (
-            "        let _message_completion = "
-            "ControlledImageMessageCompletion::new(message_guard);"
+            "        let _message_completion = ControlledImageMessageCompletion::new(message_guard);"
         )
         if image_script_thread_source.count(retained_handler_completion) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate retained image-handler completion"
-            )
+            raise ReleaseError("self-test cannot uniquely locate retained image-handler completion")
         image_script_thread_filename.write_text(
             image_script_thread_source.replace(
                 retained_handler_completion,
@@ -7142,15 +7343,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("scoped retained image-handler completion")
 
         reset_candidate_authority_sources()
-        image_script_thread_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
-        )
+        image_script_thread_filename = candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
         image_script_thread_source = image_script_thread_filename.read_text(encoding="utf-8")
         handler_unwind_abandonment = "        if std::thread::panicking() {"
         if image_script_thread_source.count(handler_unwind_abandonment) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate image-handler unwind abandonment"
-            )
+            raise ReleaseError("self-test cannot uniquely locate image-handler unwind abandonment")
         image_script_thread_filename.write_text(
             image_script_thread_source.replace(
                 handler_unwind_abandonment,
@@ -7162,9 +7359,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("image-handler unwind abandonment")
 
         reset_candidate_authority_sources()
-        image_script_thread_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
-        )
+        image_script_thread_filename = candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
         image_script_thread_source = image_script_thread_filename.read_text(encoding="utf-8")
         controlled_pending_projection = (
             "let pending_images = if self.document_execution_profile ==\n"
@@ -7177,9 +7372,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         image_script_thread_filename.write_text(
             image_script_thread_source.replace(
                 controlled_pending_projection,
-                controlled_pending_projection.replace(
-                    "unsupported_image_work", "retained_image_work"
-                ),
+                controlled_pending_projection.replace("unsupported_image_work", "retained_image_work"),
                 1,
             ),
             encoding="utf-8",
@@ -7187,17 +7380,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("controlled image pending projection")
 
         reset_candidate_authority_sources()
-        image_script_thread_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
-        )
+        image_script_thread_filename = candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
         image_script_thread_source = image_script_thread_filename.read_text(encoding="utf-8")
-        guarded_advance_capture = (
-            "let guarded = fence.with_matching_snapshot(token.producers().snapshot, || {\n"
-        )
+        guarded_advance_capture = "let guarded = fence.with_matching_snapshot(token.producers().snapshot, || {\n"
         if image_script_thread_source.count(guarded_advance_capture) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate exact producer-fenced advance capture"
-            )
+            raise ReleaseError("self-test cannot uniquely locate exact producer-fenced advance capture")
         image_script_thread_filename.write_text(
             image_script_thread_source.replace(
                 guarded_advance_capture,
@@ -7206,24 +7393,16 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "reentrant producer-fence read during controlled advance"
-        )
+        require_candidate_mutation_rejected("reentrant producer-fence read during controlled advance")
 
         reset_candidate_authority_sources()
-        image_script_thread_filename = (
-            candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
-        )
+        image_script_thread_filename = candidate_profile_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
         image_script_thread_source = image_script_thread_filename.read_text(encoding="utf-8")
         qualified_image_producer_observation = (
-            "            producers\n"
-            "                .snapshot\n"
-            "                .for_kind(DocumentProducerKind::Image)"
+            "            producers\n                .snapshot\n                .for_kind(DocumentProducerKind::Image)"
         )
         if image_script_thread_source.count(qualified_image_producer_observation) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate qualified image producer comparison"
-            )
+            raise ReleaseError("self-test cannot uniquely locate qualified image producer comparison")
         image_script_thread_filename.write_text(
             image_script_thread_source.replace(
                 qualified_image_producer_observation,
@@ -7235,9 +7414,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "controlled image comparison bypasses qualified producer observation"
-        )
+        require_candidate_mutation_rejected("controlled image comparison bypasses qualified producer observation")
 
         reset_candidate_authority_sources()
         image_element_filename = candidate_profile_root / CONTROLLED_IMAGE_ELEMENT_SOURCE
@@ -7254,13 +7431,9 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         reset_candidate_authority_sources()
         image_element_filename = candidate_profile_root / CONTROLLED_IMAGE_ELEMENT_SOURCE
         image_element_source = image_element_filename.read_text(encoding="utf-8")
-        status_race_queue_handoff = (
-            "self.queue_controlled_v2_cache_hit_load(delivery);"
-        )
+        status_race_queue_handoff = "self.queue_controlled_v2_cache_hit_load(delivery);"
         if image_element_source.count(status_race_queue_handoff) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate controlled image status-race queue handoff"
-            )
+            raise ReleaseError("self-test cannot uniquely locate controlled image status-race queue handoff")
         image_element_filename.write_text(
             image_element_source.replace(
                 status_race_queue_handoff,
@@ -7269,9 +7442,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "controlled image status-race synchronous event bypass"
-        )
+        require_candidate_mutation_rejected("controlled image status-race synchronous event bypass")
 
         reset_candidate_authority_sources()
         image_element_filename = candidate_profile_root / CONTROLLED_IMAGE_ELEMENT_SOURCE
@@ -7304,13 +7475,9 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         reset_candidate_authority_sources()
         image_element_filename = candidate_profile_root / CONTROLLED_IMAGE_ELEMENT_SOURCE
         image_element_source = image_element_filename.read_text(encoding="utf-8")
-        successful_registration_authority = (
-            "self.record_active_controlled_cache_id(Some(id));"
-        )
+        successful_registration_authority = "self.record_active_controlled_cache_id(Some(id));"
         if image_element_source.count(successful_registration_authority) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate successful image registration authority"
-            )
+            raise ReleaseError("self-test cannot uniquely locate successful image registration authority")
         image_element_filename.write_text(
             image_element_source.replace(
                 successful_registration_authority,
@@ -7364,13 +7531,9 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         reset_candidate_authority_sources()
         image_element_filename = candidate_profile_root / CONTROLLED_IMAGE_ELEMENT_SOURCE
         image_element_source = image_element_filename.read_text(encoding="utf-8")
-        baseline_identity_downgrade = (
-            "window.downgrade_cached_vector_identity_to_baseline(vector.id);"
-        )
+        baseline_identity_downgrade = "window.downgrade_cached_vector_identity_to_baseline(vector.id);"
         if image_element_source.count(baseline_identity_downgrade) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate baseline shared-vector identity downgrade"
-            )
+            raise ReleaseError("self-test cannot uniquely locate baseline shared-vector identity downgrade")
         image_element_filename.write_text(
             image_element_source.replace(
                 baseline_identity_downgrade,
@@ -7415,13 +7578,9 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         reset_candidate_authority_sources()
         inline_svg_filename = candidate_profile_root / CONTROLLED_INLINE_SVG_SOURCE
         inline_svg_source = inline_svg_filename.read_text(encoding="utf-8")
-        inline_internal_request_gate = (
-            "is_internal_request == InternalRequest::Yes"
-        )
+        inline_internal_request_gate = "is_internal_request == InternalRequest::Yes"
         if inline_svg_source.count(inline_internal_request_gate) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate inline SVG internal-request gate"
-            )
+            raise ReleaseError("self-test cannot uniquely locate inline SVG internal-request gate")
         inline_svg_filename.write_text(
             inline_svg_source.replace(inline_internal_request_gate, "true", 1),
             encoding="utf-8",
@@ -7431,13 +7590,9 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         reset_candidate_authority_sources()
         inline_svg_filename = candidate_profile_root / CONTROLLED_INLINE_SVG_SOURCE
         inline_svg_source = inline_svg_filename.read_text(encoding="utf-8")
-        inline_exact_cached_url = (
-            ".is_some_and(|cached| cached == *candidate)"
-        )
+        inline_exact_cached_url = ".is_some_and(|cached| cached == *candidate)"
         if inline_svg_source.count(inline_exact_cached_url) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate inline SVG exact cached-URL gate"
-            )
+            raise ReleaseError("self-test cannot uniquely locate inline SVG exact cached-URL gate")
         inline_svg_filename.write_text(
             inline_svg_source.replace(
                 inline_exact_cached_url,
@@ -7453,9 +7608,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         image_window_source = image_window_filename.read_text(encoding="utf-8")
         inline_controlled_branch = "if controlled_inline_svg {\n"
         if image_window_source.count(inline_controlled_branch) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate controlled inline SVG decode branch"
-            )
+            raise ReleaseError("self-test cannot uniquely locate controlled inline SVG decode branch")
         image_window_filename.write_text(
             image_window_source.replace(
                 inline_controlled_branch,
@@ -7464,20 +7617,14 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "inline SVG fetch before exact owner/listener admission"
-        )
+        require_candidate_mutation_rejected("inline SVG fetch before exact owner/listener admission")
 
         reset_candidate_authority_sources()
         image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
         image_window_source = image_window_filename.read_text(encoding="utf-8")
-        inline_raster_id_gate = (
-            "Some(Image::Vector(vector)) if vector.id == id"
-        )
+        inline_raster_id_gate = "Some(Image::Vector(vector)) if vector.id == id"
         if image_window_source.count(inline_raster_id_gate) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate inline SVG raster cache-ID gate"
-            )
+            raise ReleaseError("self-test cannot uniquely locate inline SVG raster cache-ID gate")
         image_window_filename.write_text(
             image_window_source.replace(
                 inline_raster_id_gate,
@@ -7493,9 +7640,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         inline_fixture_source = inline_fixture_filename.read_text(encoding="utf-8")
         inline_event_observer = "svg.addEventListener(type"
         if inline_fixture_source.count(inline_event_observer) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate inline SVG no-event observer"
-            )
+            raise ReleaseError("self-test cannot uniquely locate inline SVG no-event observer")
         inline_fixture_filename.write_text(
             inline_fixture_source.replace(inline_event_observer, "void(type", 1),
             encoding="utf-8",
@@ -7503,15 +7648,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("inline SVG zero-event native proof")
 
         reset_candidate_authority_sources()
-        inline_protocol_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
-        )
+        inline_protocol_filename = candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
         inline_protocol_source = inline_protocol_filename.read_text(encoding="utf-8")
         advanced_inline_no_event_trace = '"inline-svg:5|load-events:0"'
         if inline_protocol_source.count(advanced_inline_no_event_trace) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate advanced inline SVG no-event trace"
-            )
+            raise ReleaseError("self-test cannot uniquely locate advanced inline SVG no-event trace")
         inline_protocol_filename.write_text(
             inline_protocol_source.replace(
                 advanced_inline_no_event_trace,
@@ -7520,21 +7661,13 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             ),
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "advanced inline SVG controlled-clock raster completion proof"
-        )
+        require_candidate_mutation_rejected("advanced inline SVG controlled-clock raster completion proof")
 
         reset_candidate_authority_sources()
-        message_port_source_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
-        )
+        message_port_source_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_port_source = message_port_source_filename.read_text(encoding="utf-8")
-        capacity_start = message_port_source.find(
-            "fn controlled_local_channel_capacity_admitted("
-        )
-        capacity_end = message_port_source.find(
-            "fn next_controlled_local_retained_message_count(", capacity_start
-        )
+        capacity_start = message_port_source.find("fn controlled_local_channel_capacity_admitted(")
+        capacity_end = message_port_source.find("fn next_controlled_local_retained_message_count(", capacity_start)
         if capacity_start < 0 or capacity_end < 0:
             raise ReleaseError("self-test cannot locate retained-port entry admission")
         capacity_source = message_port_source[capacity_start:capacity_end]
@@ -7550,9 +7683,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("two-entry MessageChannel pair admission")
 
         reset_candidate_authority_sources()
-        message_port_source_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
-        )
+        message_port_source_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_port_source = message_port_source_filename.read_text(encoding="utf-8")
         message_port_source_filename.write_text(
             message_port_source.replace(
@@ -7565,15 +7696,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("controlled-local router source")
 
         reset_candidate_authority_sources()
-        message_port_source_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
-        )
+        message_port_source_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_port_source = message_port_source_filename.read_text(encoding="utf-8")
         reciprocal_projection = "(id == pair_identity).then_some(pair_identity)"
         if message_port_source.count(reciprocal_projection) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate reciprocal MessagePort pair projection"
-            )
+            raise ReleaseError("self-test cannot uniquely locate reciprocal MessagePort pair projection")
         mutated_message_port_source = message_port_source.replace(
             reciprocal_projection,
             "Some(id)",
@@ -7583,20 +7710,14 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             mutated_message_port_source,
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "reciprocal MessagePort pair source coalescing"
-        )
+        require_candidate_mutation_rejected("reciprocal MessagePort pair source coalescing")
 
         reset_candidate_authority_sources()
-        message_port_source_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
-        )
+        message_port_source_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_port_source = message_port_source_filename.read_text(encoding="utf-8")
         minimum_pair_identity = "let pair_identity = std::cmp::min(id, peer_id);"
         if message_port_source.count(minimum_pair_identity) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate minimum MessagePort pair identity"
-            )
+            raise ReleaseError("self-test cannot uniquely locate minimum MessagePort pair identity")
         mutated_message_port_source = message_port_source.replace(
             minimum_pair_identity,
             "let pair_identity = std::cmp::max(id, peer_id);",
@@ -7606,19 +7727,12 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             mutated_message_port_source,
             encoding="utf-8",
         )
-        require_candidate_mutation_rejected(
-            "minimum reciprocal MessagePort pair source identity"
-        )
+        require_candidate_mutation_rejected("minimum reciprocal MessagePort pair source identity")
 
         reset_candidate_authority_sources()
-        message_port_source_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
-        )
+        message_port_source_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_port_source = message_port_source_filename.read_text(encoding="utf-8")
-        queued_map_field = (
-            "controlled_local_queued_message_counts: "
-            "RefCell<FxHashMap<MessagePortId, usize>>"
-        )
+        queued_map_field = "controlled_local_queued_message_counts: RefCell<FxHashMap<MessagePortId, usize>>"
         if message_port_source.count(queued_map_field) != 1:
             raise ReleaseError("self-test cannot uniquely locate queued MessagePort map")
         message_port_source_filename.write_text(
@@ -7632,15 +7746,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("per-destination queued MessagePort map")
 
         reset_candidate_authority_sources()
-        message_port_source_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
-        )
+        message_port_source_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_port_source = message_port_source_filename.read_text(encoding="utf-8")
         reconciliation_equality = "== Some(retained_messages)"
         if message_port_source.count(reconciliation_equality) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate exact MessagePort reconciliation"
-            )
+            raise ReleaseError("self-test cannot uniquely locate exact MessagePort reconciliation")
         message_port_source_filename.write_text(
             message_port_source.replace(
                 reconciliation_equality,
@@ -7652,25 +7762,15 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("inexact native MessagePort reconciliation")
 
         reset_candidate_authority_sources()
-        message_port_source_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
-        )
+        message_port_source_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_port_source = message_port_source_filename.read_text(encoding="utf-8")
-        zero_association_guard = (
-            ".any(|(id, count)| {\n"
-            "                *count == 0"
-        )
+        zero_association_guard = ".any(|(id, count)| {\n                *count == 0"
         if message_port_source.count(zero_association_guard) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate zero MessagePort association rejection"
-            )
+            raise ReleaseError("self-test cannot uniquely locate zero MessagePort association rejection")
         message_port_source_filename.write_text(
             message_port_source.replace(
                 zero_association_guard,
-                (
-                    ".any(|(id, count)| {\n"
-                    "                *count == usize::MAX"
-                ),
+                (".any(|(id, count)| {\n                *count == usize::MAX"),
                 1,
             ),
             encoding="utf-8",
@@ -7678,17 +7778,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("zero MessagePort association rejection")
 
         reset_candidate_authority_sources()
-        message_port_source_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
-        )
+        message_port_source_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_port_source = message_port_source_filename.read_text(encoding="utf-8")
-        queued_reconciliation_input = (
-            "queued_controlled_local_messages.values().copied()"
-        )
+        queued_reconciliation_input = "queued_controlled_local_messages.values().copied()"
         if message_port_source.count(queued_reconciliation_input) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate queued MessagePort reconciliation input"
-            )
+            raise ReleaseError("self-test cannot uniquely locate queued MessagePort reconciliation input")
         message_port_source_filename.write_text(
             message_port_source.replace(
                 queued_reconciliation_input,
@@ -7700,9 +7794,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("missing queued MessagePort reconciliation")
 
         reset_candidate_authority_sources()
-        message_port_source_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
-        )
+        message_port_source_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_port_source = message_port_source_filename.read_text(encoding="utf-8")
         mutated_message_port_source = message_port_source.replace(
             ".handle_controlled_local_incoming(task)",
@@ -7718,17 +7810,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("controlled-local pre-start FIFO admission")
 
         reset_candidate_authority_sources()
-        message_port_source_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
-        )
+        message_port_source_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_port_source = message_port_source_filename.read_text(encoding="utf-8")
-        queued_association = (
-            "if !self.associate_controlled_local_queued_message(entangled_id)"
-        )
+        queued_association = "if !self.associate_controlled_local_queued_message(entangled_id)"
         if message_port_source.count(queued_association) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate pre-queue MessagePort association"
-            )
+            raise ReleaseError("self-test cannot uniquely locate pre-queue MessagePort association")
         message_port_source_filename.write_text(
             message_port_source.replace(queued_association, "if false", 1),
             encoding="utf-8",
@@ -7736,15 +7822,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("MessagePort destination association before queue")
 
         reset_candidate_authority_sources()
-        message_port_source_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
-        )
+        message_port_source_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_port_source = message_port_source_filename.read_text(encoding="utf-8")
         first_terminal_finish = "self.finish_controlled_local_queued_message(port_id);"
         if message_port_source.count(first_terminal_finish) < 3:
-            raise ReleaseError(
-                "self-test cannot locate controlled-local terminal accounting transitions"
-            )
+            raise ReleaseError("self-test cannot locate controlled-local terminal accounting transitions")
         message_port_source_filename.write_text(
             message_port_source.replace(first_terminal_finish, "false;", 1),
             encoding="utf-8",
@@ -7752,18 +7834,14 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("MessagePort terminal accounting transition")
 
         reset_candidate_authority_sources()
-        message_port_source_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
-        )
+        message_port_source_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_port_source = message_port_source_filename.read_text(encoding="utf-8")
         move_transition = (
             "if retains_controlled_reservation {\n"
             "                self.move_controlled_local_queued_message_to_buffer(port_id)"
         )
         if message_port_source.count(move_transition) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate MessagePort move-to-buffer transition"
-            )
+            raise ReleaseError("self-test cannot uniquely locate MessagePort move-to-buffer transition")
         message_port_source_filename.write_text(
             message_port_source.replace(
                 move_transition,
@@ -7778,9 +7856,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("MessagePort move-to-buffer accounting transition")
 
         reset_candidate_authority_sources()
-        message_port_source_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
-        )
+        message_port_source_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_port_source = message_port_source_filename.read_text(encoding="utf-8")
         mutated_message_port_source = message_port_source.replace(
             "retained_controlled_local_messages > 0",
@@ -7796,15 +7872,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("closed-port tombstone retention")
 
         reset_candidate_authority_sources()
-        message_port_source_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
-        )
+        message_port_source_filename = candidate_profile_root / MESSAGE_CHANNEL_LIMITS_SOURCE
         message_port_source = message_port_source_filename.read_text(encoding="utf-8")
         unmanaged_empty_guard = "queued_controlled_local_messages.is_empty()"
         if message_port_source.count(unmanaged_empty_guard) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate UnManaged queued-work rejection"
-            )
+            raise ReleaseError("self-test cannot uniquely locate UnManaged queued-work rejection")
         mutated_message_port_source = message_port_source.replace(
             unmanaged_empty_guard,
             "true",
@@ -7819,15 +7891,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("UnManaged retained-work rejection")
 
         reset_candidate_authority_sources()
-        multi_pair_test_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
-        )
+        multi_pair_test_filename = candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
         multi_pair_test_source = multi_pair_test_filename.read_text(encoding="utf-8")
         two_owner_assertion = "message_port_sources, 2,"
         if multi_pair_test_source.count(two_owner_assertion) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate the two-owner MessagePort assertion"
-            )
+            raise ReleaseError("self-test cannot uniquely locate the two-owner MessagePort assertion")
         multi_pair_test_filename.write_text(
             multi_pair_test_source.replace(two_owner_assertion, "message_port_sources, 1,", 1),
             encoding="utf-8",
@@ -7835,15 +7903,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("multi-pair two-owner native proof")
 
         reset_candidate_authority_sources()
-        multi_pair_fixture_filename = (
-            candidate_profile_root / MESSAGE_CHANNEL_MULTI_PAIR_FIXTURE
-        )
+        multi_pair_fixture_filename = candidate_profile_root / MESSAGE_CHANNEL_MULTI_PAIR_FIXTURE
         multi_pair_fixture_source = multi_pair_fixture_filename.read_text(encoding="utf-8")
         buffered_listener = 'buffered.port1.addEventListener("message"'
         if multi_pair_fixture_source.count(buffered_listener) != 1:
-            raise ReleaseError(
-                "self-test cannot uniquely locate the disabled-port multi-pair fixture"
-            )
+            raise ReleaseError("self-test cannot uniquely locate the disabled-port multi-pair fixture")
         multi_pair_fixture_filename.write_text(
             multi_pair_fixture_source.replace(
                 buffered_listener,
@@ -7893,10 +7957,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(repository_root / source_name, destination)
         (source_root / SOURCE_ASSETS["STASIS_UPSTREAM.toml"]).write_text(
-            "".join(
-                f'{key} = {json.dumps(value, allow_nan=False)}\n'
-                for key, value in UPSTREAM_IDENTITIES.items()
-            ),
+            "".join(f"{key} = {json.dumps(value, allow_nan=False)}\n" for key, value in UPSTREAM_IDENTITIES.items()),
             encoding="utf-8",
         )
         binary = root / BINARY_NAME
@@ -7930,9 +7991,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
                 extract_to=extracted,
             )
             if result["archiveSha256"] != verified["archiveSha256"]:
-                raise ReleaseError(
-                    f"self-test {platform} archive digest changed during verification"
-                )
+                raise ReleaseError(f"self-test {platform} archive digest changed during verification")
 
             names = release_asset_names(version, platform)
             archive = dist / names["archive"]
@@ -7948,12 +8007,8 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             contract = platform_contract(platform)
             if contract["display_name"] not in generated["README.md"].decode("utf-8"):
                 raise ReleaseError(f"self-test {platform} README lost its platform identity")
-            if contract["dependency_note"] not in generated["NATIVE-LIBRARIES.txt"].decode(
-                "utf-8"
-            ):
-                raise ReleaseError(
-                    f"self-test {platform} native dependency metadata changed"
-                )
+            if contract["dependency_note"] not in generated["NATIVE-LIBRARIES.txt"].decode("utf-8"):
+                raise ReleaseError(f"self-test {platform} native dependency metadata changed")
             if contract["install_note"] not in generated["INSTALL.txt"].decode("utf-8"):
                 raise ReleaseError(f"self-test {platform} install metadata changed")
 
@@ -7992,10 +8047,7 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
                 run_id=run_id,
                 run_attempt="1",
             )
-            if (
-                created_proof["schema"] != GATE_PROOF_SCHEMA
-                or created_proof["platform"] != platform
-            ):
+            if created_proof["schema"] != GATE_PROOF_SCHEMA or created_proof["platform"] != platform:
                 raise ReleaseError(f"self-test {platform} gate proof identity changed")
             verify_gate_proof(
                 proof_directory=proof_dir,
@@ -8015,12 +8067,8 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
                 binary_digest,
             )
 
-        mac_generated = expected_generated_assets(
-            version, "macos-aarch64", revision, repository
-        )
-        linux_generated = expected_generated_assets(
-            version, "linux-x86_64", revision, repository
-        )
+        mac_generated = expected_generated_assets(version, "macos-aarch64", revision, repository)
+        linux_generated = expected_generated_assets(version, "linux-x86_64", revision, repository)
         for name in ("INSTALL.txt", "NATIVE-LIBRARIES.txt", "README.md", "VERSION.txt"):
             if mac_generated[name] == linux_generated[name]:
                 raise ReleaseError(f"self-test generated platform-neutral {name}")

@@ -4,7 +4,7 @@ Support profiles name the exact browser subset for which Stasis can make control
 claims. A profile is a versioned product contract, not a request to emulate every browser feature.
 
 `controlled-webapp-v1.json` is the profile shipped by Stasis 0.1. It is frozen byte-for-byte and
-remains the default selected by the legacy `Runtime.open()` API. Every later candidate must prove
+remains the default selected by the legacy `Runtime.open()` API. Every later profile must prove
 that this profile's request shapes, result shapes, close behavior, and typed unsupported outcomes
 have not changed.
 
@@ -16,19 +16,22 @@ request/evidence streams, a fresh-process pool, and a reference crawler. Its
 `stable_contract` status and frozen release digest prohibit silent changes; incompatible changes
 require a newly named profile.
 
-`controlled-web-session-v2.json` is a complete candidate contract targeting Stasis 0.3.0. It keeps
+`controlled-web-session-v2.json` is the complete versioned contract for Stasis 0.3.0. It keeps
 v1 as the `openSession()` default and adds bounded, same-global, untransferred `MessageChannel`
-delivery; one narrow direct `HTMLImageElement.src` `data:image/svg+xml` cache/decode path; one
+delivery; one bounded direct `HTMLImageElement.src` cache/decode path for canonical data SVG and
+initial HTTP(S) selection; one
 distinct inline `<svg>` path whose internally serialized data-SVG URL is the exact cached URL for
 that SVG owner in the exact public non-auxiliary controlled top-level document; and suppression of page-driven, single-line
 text InputMethod
 presentation when no virtual keyboard is requested there. It also adds an exact v2 cookie-state
-artifact with controlled in-memory expiry and bounded schemeful SameSite request selection. Image admission requires the canonical
-data-URL parser, exact `image/svg+xml`, no `srcset`/`picture`/environment-change selection, a
+artifact with controlled in-memory expiry and bounded schemeful SameSite request selection. Image
+admission requires no `srcset`/`picture`/environment-change selection, an initially selected
 serialized URL of at most 65,536 bytes, the same ScriptThread/ImageCache, and capacity within 512
-total retained controlled image ownership records. Cache hits and finite asynchronous completion
-remain producer-fenced, and one document-clock sample is shared by the engine-generated
-`load`/`error`/`loadend` completion set. Cache-owned callback retirement is an owned cancellation
+total retained controlled image ownership records. An admitted synchronous cache hit is owned in
+the current Script turn and queues its existing ordinary DOM callback without inventing an
+asynchronous `Image` producer lease. Finite asynchronous cache/decode completion is producer-fenced,
+and one document-clock sample is shared by the engine-generated `load`/`error`/`loadend` completion
+set. Cache-owned callback retirement is an owned cancellation
 that completes its Image stream normally, as does a dequeued response whose closed-pipeline
 tombstone proves that navigation retired its Window. A normal live handler rejection preserves the
 pending owner or key, completes the scoped message guard, and settles as typed
@@ -40,7 +43,14 @@ registered Image producer class. The inline path additionally requires an intern
 the same canonical MIME/URL bound, an exact cache-ID owner join, and fenced decode/raster
 completion; it creates no DOM load event. Excluded URLs and image consumers receive no new owned
 authority; retained baseline work and observed host timestamps keep their existing typed rejection
-paths.
+paths. Data URLs require the canonical parser and exact `image/svg+xml`; HTTP(S) is admitted by the
+initially selected scheme before response format is known, with resource I/O separately owned and
+finite decode failure retained as an owned error completion. Post-metadata
+`multipart/x-mixed-replace` remains typed `unsupported_rendering` / `image_load` after separately
+owned finite Resource I/O drains, without baseline callback fallback; an endless response remains
+blocked on that external I/O. Public document replacement while HTTP image resource I/O is active
+retains fatal `blocked_on_external_io`; v2 does not claim cross-document replacement through that
+state.
 
 Programmatic focus, including React `autoFocus`, is covered only in that exact public target; literal
 HTML `autofocus` processing is not. Engine-generated focus transitions there expose document-clock `Event.timeStamp`. In addition, one
@@ -63,8 +73,8 @@ borrowed, missing, replaced, discarded, or auxiliary caller is rejected before s
 transfer detachment. Idle reciprocal local ports are inert;
 queued deliveries consume the ordinary-task budget. Other InputMethod shapes and embedder controls
 remain unsupported. Transferred, cross-global, cross-event-loop, worker, BroadcastChannel, and
-externally routed ports remain typed `external_subscription` or worker boundaries. HTTP/HTTPS,
-blob/file, non-SVG data, CSS/background/generated-content, favicon, video-poster, animated,
+externally routed ports remain typed `external_subscription` or worker boundaries. Blob/file,
+non-SVG data, CSS/background/generated-content, favicon, video-poster, animated,
 general or nested/external SVG resources, iframe/worker/worklet, and transferred image paths are
 not promoted by the image slice. Web Animations API semantics, event ordering/cardinality,
 `elapsedTime`, and CSS animation limits are unchanged. Scheduled pending animation-event batches

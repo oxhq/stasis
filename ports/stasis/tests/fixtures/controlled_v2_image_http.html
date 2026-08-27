@@ -1,15 +1,35 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>controlled v2 HTTP image remains outside owned slice</title>
-<img id="image" alt="HTTP SVG">
+<title>controlled v2 cross-origin HTTP image completion</title>
+<img id="loaded" alt="HTTP SVG">
+<img id="failed" alt="invalid HTTP image">
 <output id="result">waiting</output>
 <script>
-  const image = document.querySelector("#image");
+  const assets = "https://controlled-image-assets.example.test";
   const result = document.querySelector("#result");
-  for (const type of ["load", "error", "loadend"]) {
-    image.addEventListener(type, (event) => {
-      result.textContent = `${event.type}:${event.timeStamp}`;
-    });
+  const traces = { loaded: [], failed: [], cached: [] };
+  const expected = { loaded: 2, failed: 2, cached: 1 };
+  const record = (name, event) => {
+    traces[name].push(`${event.type}:${event.timeStamp}`);
+    if (Object.entries(expected).every(([key, count]) => traces[key].length === count)) {
+      result.textContent = `loaded:${traces.loaded.join(">")}|failed:${traces.failed.join(">")}|cached:${traces.cached.join(">")}|now:${performance.now()}`;
+    }
+  };
+  for (const name of ["loaded", "failed"]) {
+    const image = document.querySelector(`#${name}`);
+    for (const type of ["load", "error", "loadend"]) {
+      image.addEventListener(type, (event) => record(name, event));
+    }
   }
-  image.src = "/controlled-v2-http-image.svg";
+  document.querySelector("#loaded").addEventListener("load", () => {
+    const cached = new Image();
+    for (const type of ["load", "error", "loadend"]) {
+      cached.addEventListener(type, (event) => record("cached", event));
+    }
+    document.body.append(cached);
+    cached.src = `${assets}/controlled-v2-http-image.svg`;
+  });
+
+  document.querySelector("#loaded").src = `${assets}/controlled-v2-http-image.svg`;
+  document.querySelector("#failed").src = `${assets}/controlled-v2-http-image.invalid`;
 </script>

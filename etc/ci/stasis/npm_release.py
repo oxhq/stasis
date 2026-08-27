@@ -594,6 +594,16 @@ def require_v2_direct_data_svg_proof(
         "externalIo",
         "completionTrace",
         "evidenceProfile",
+        "httpNavigationBoundary",
+        "httpOutcome",
+        "httpProducerPending",
+        "httpProducerTerminal",
+        "httpPendingImages",
+        "httpRuntimeFailures",
+        "httpUnsupportedWork",
+        "httpExternalIo",
+        "httpCompletionTrace",
+        "httpEvidenceProfile",
         "sameControlledSession",
         "exactBinaryLaunch",
         "closeResponseAndEof",
@@ -611,12 +621,26 @@ def require_v2_direct_data_svg_proof(
         "externalIo": "0",
         "completionTrace": "load:0>loadend:0|now:0",
         "evidenceProfile": "controlled-web-session-v2",
+        "httpNavigationBoundary": "controlled_ready",
+        "httpOutcome": "quiescent",
+        "httpProducerPending": "0",
+        "httpPendingImages": "0",
+        "httpRuntimeFailures": "0",
+        "httpUnsupportedWork": "0",
+        "httpExternalIo": "0",
+        "httpCompletionTrace": (
+            "loaded:load:0>loadend:0|failed:error:0>loadend:0|"
+            "cached:load:0|now:0"
+        ),
+        "httpEvidenceProfile": "controlled-web-session-v2",
     }
     for field, expected in expected_values.items():
         if require_json_string(value.get(field), f"{description} {field}") != expected:
             raise NpmReleaseError(f"{description} field does not match: {field}")
     if value.get("producerTerminal") is not False:
         raise NpmReleaseError(f"{description} field is not false: producerTerminal")
+    if value.get("httpProducerTerminal") is not False:
+        raise NpmReleaseError(f"{description} field is not false: httpProducerTerminal")
     for field in (
         "sameControlledSession",
         "exactBinaryLaunch",
@@ -1370,6 +1394,19 @@ def self_test() -> None:
                 "externalIo": "0",
                 "completionTrace": "load:0>loadend:0|now:0",
                 "evidenceProfile": "controlled-web-session-v2",
+                "httpNavigationBoundary": "controlled_ready",
+                "httpOutcome": "quiescent",
+                "httpProducerPending": "0",
+                "httpProducerTerminal": False,
+                "httpPendingImages": "0",
+                "httpRuntimeFailures": "0",
+                "httpUnsupportedWork": "0",
+                "httpExternalIo": "0",
+                "httpCompletionTrace": (
+                    "loaded:load:0>loadend:0|failed:error:0>loadend:0|"
+                    "cached:load:0|now:0"
+                ),
+                "httpEvidenceProfile": "controlled-web-session-v2",
                 "sameControlledSession": True,
                 "exactBinaryLaunch": True,
                 "closeResponseAndEof": True,
@@ -1766,6 +1803,28 @@ def self_test() -> None:
                     if key != "pendingImages"
                 },
             ),
+            *[
+                (
+                    f"missing direct HTTP image lifecycle field {field}",
+                    {
+                        key: value
+                        for key, value in base_v2_direct_data_svg.items()
+                        if key != field
+                    },
+                )
+                for field in (
+                    "httpNavigationBoundary",
+                    "httpOutcome",
+                    "httpProducerPending",
+                    "httpProducerTerminal",
+                    "httpPendingImages",
+                    "httpRuntimeFailures",
+                    "httpUnsupportedWork",
+                    "httpExternalIo",
+                    "httpCompletionTrace",
+                    "httpEvidenceProfile",
+                )
+            ],
             (
                 "extra direct data-SVG lifecycle field",
                 {**base_v2_direct_data_svg, "hostFallback": True},
@@ -1790,6 +1849,42 @@ def self_test() -> None:
                         "evidenceProfile",
                         "controlled-webapp-v1",
                     ),
+                    (
+                        "wrong HTTP image navigation boundary",
+                        "httpNavigationBoundary",
+                        "unsupported",
+                    ),
+                    (
+                        "numeric HTTP image navigation boundary",
+                        "httpNavigationBoundary",
+                        0,
+                    ),
+                    ("nonquiescent HTTP image outcome", "httpOutcome", "unsupported_work"),
+                    ("numeric HTTP image outcome", "httpOutcome", 0),
+                    ("pending HTTP image producer", "httpProducerPending", "1"),
+                    ("numeric HTTP image producer count", "httpProducerPending", 0),
+                    ("terminal HTTP image producer", "httpProducerTerminal", True),
+                    ("numeric HTTP image producer terminal", "httpProducerTerminal", 0),
+                    ("pending HTTP rendering image", "httpPendingImages", "1"),
+                    ("numeric HTTP rendering image count", "httpPendingImages", 0),
+                    ("HTTP image runtime failure", "httpRuntimeFailures", "1"),
+                    ("numeric HTTP image runtime failures", "httpRuntimeFailures", 0),
+                    ("HTTP image unsupported work", "httpUnsupportedWork", "1"),
+                    ("numeric HTTP image unsupported work", "httpUnsupportedWork", 0),
+                    ("HTTP image external I/O", "httpExternalIo", "1"),
+                    ("numeric HTTP image external I/O", "httpExternalIo", 0),
+                    (
+                        "wrong HTTP image completion trace",
+                        "httpCompletionTrace",
+                        "loaded:load:1",
+                    ),
+                    ("numeric HTTP image completion trace", "httpCompletionTrace", 0),
+                    (
+                        "wrong HTTP image evidence profile",
+                        "httpEvidenceProfile",
+                        "controlled-web-session-v1",
+                    ),
+                    ("numeric HTTP image evidence profile", "httpEvidenceProfile", 0),
                     ("image not in same session", "sameControlledSession", False),
                     ("image not exact binary", "exactBinaryLaunch", False),
                     ("image missing close proof", "closeResponseAndEof", False),

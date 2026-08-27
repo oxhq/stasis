@@ -21,6 +21,7 @@ use net_traits::image_cache::{
 use net_traits::request::{CorsSettings, Destination, Initiator, RequestId};
 use net_traits::{
     FetchMetadata, FetchResponseMsg, NetworkError, ReferrerPolicy, ResourceFetchTiming,
+    ResourceTimingType,
 };
 use num_traits::ToPrimitive;
 use pixels::{CorsStatus, ImageMetadata, Snapshot};
@@ -95,13 +96,100 @@ enum ImageRequestPhase {
 /// This deliberately records the admission decision at selection time. Image-cache callbacks
 /// must not reconstruct ownership later from the then-current DOM, because an element can be
 /// mutated or moved while a response is in flight.
-#[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
+#[derive(Clone, Copy, Debug, JSTraceable, MallocSizeOf, PartialEq)]
 enum ImageRequestProvenance {
     Baseline,
     ControlledV2DirectDataSvg,
+    ControlledV2DirectHttpImage,
 }
 
 const CONTROLLED_V2_DIRECT_DATA_SVG_URL_LIMIT: usize = 65_536;
+const CONTROLLED_V2_DIRECT_HTTP_IMAGE_URL_LIMIT: usize = 65_536;
+
+impl ImageRequestProvenance {
+    fn is_controlled_v2(self) -> bool {
+        matches!(
+            self,
+            Self::ControlledV2DirectDataSvg | Self::ControlledV2DirectHttpImage
+        )
+    }
+}
+
+/// Classify only the URL-shaped part of a direct image request.
+///
+/// DOM ownership, exact-target membership, and direct-`src` selection are checked separately by
+/// `selected_request_provenance`. Keeping this helper policy-only makes the HTTP(S) admission
+/// boundary independently testable without constructing a DOM.
+fn controlled_v2_direct_image_url_provenance(
+    image_url: &ServoUrl,
+) -> Option<ImageRequestProvenance> {
+    let serialized_url = image_url.as_str();
+    if matches!(image_url.scheme(), "http" | "https") {
+        return (serialized_url.len() <= CONTROLLED_V2_DIRECT_HTTP_IMAGE_URL_LIMIT)
+            .then_some(ImageRequestProvenance::ControlledV2DirectHttpImage);
+    }
+
+    if serialized_url.len() > CONTROLLED_V2_DIRECT_DATA_SVG_URL_LIMIT {
+        return None;
+    }
+    let Ok(data_url) = DataUrl::process(serialized_url) else {
+        return None;
+    };
+    let mime_type = data_url.mime_type();
+    (mime_type.type_ == "image" && mime_type.subtype == "svg+xml")
+        .then_some(ImageRequestProvenance::ControlledV2DirectDataSvg)
+}
+
+#[cfg(test)]
+mod controlled_v2_direct_image_url_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_http_and_https_urls_are_admitted_as_owned_image_streams() {
+        for url in [
+            "http://images.example.test/avatar.png",
+            "https://images.example.test/avatar.svg",
+        ] {
+            assert_eq!(
+                controlled_v2_direct_image_url_provenance(&ServoUrl::parse(url).unwrap()),
+                Some(ImageRequestProvenance::ControlledV2DirectHttpImage),
+            );
+        }
+    }
+
+    #[test]
+    fn non_network_urls_do_not_gain_the_http_image_authority() {
+        for url in [
+            "data:image/png;base64,iVBORw0KGgo=",
+            "file:///tmp/avatar.png",
+            "blob:https://images.example.test/00000000-0000-0000-0000-000000000000",
+        ] {
+            assert_eq!(
+                controlled_v2_direct_image_url_provenance(&ServoUrl::parse(url).unwrap()),
+                None,
+            );
+        }
+        assert_eq!(
+            controlled_v2_direct_image_url_provenance(
+                &ServoUrl::parse("data:image/svg+xml,%3Csvg/%3E").unwrap(),
+            ),
+            Some(ImageRequestProvenance::ControlledV2DirectDataSvg),
+        );
+    }
+
+    #[test]
+    fn oversized_http_url_remains_unowned() {
+        let prefix = "https://images.example.test/";
+        let url = format!(
+            "{prefix}{}",
+            "a".repeat(CONTROLLED_V2_DIRECT_HTTP_IMAGE_URL_LIMIT + 1 - prefix.len()),
+        );
+        assert_eq!(
+            controlled_v2_direct_image_url_provenance(&ServoUrl::parse(&url).unwrap()),
+            None,
+        );
+    }
+}
 
 /// <https://html.spec.whatwg.org/multipage/#image-request>
 #[derive(JSTraceable, MallocSizeOf)]
@@ -194,6 +282,7 @@ struct ImageContext {
     doc: Trusted<Document>,
     url: ServoUrl,
     element: Trusted<HTMLImageElement>,
+    provenance: ImageRequestProvenance,
 }
 
 impl FetchResponseListener for ImageContext {
@@ -227,6 +316,31 @@ impl FetchResponseListener for ImageContext {
             let mime: Mime = content_type.clone().into_inner().into();
             if mime.type_() == mime::MULTIPART && mime.subtype().as_str() == "x-mixed-replace" {
                 self.aborted = true;
+                if self.provenance.is_controlled_v2() {
+                    // Multipart images are an open-ended stream, not the finite decode authority
+                    // admitted by controlled-web-session-v2. Preserve the controlled callback
+                    // transport long enough to retire its producer lease, but deliberately mark
+                    // its retained cache ID Unsupported before committing a terminal response.
+                    // Neither baseline nor controlled delivery can match that provenance, which
+                    // retains typed image_load evidence instead of timing out or pretending the
+                    // stream completed.
+                    self.element
+                        .root()
+                        .owner_window()
+                        .mark_controlled_v2_image_cache_id_unsupported(self.id);
+                    self.image_cache.notify_pending_response(
+                        self.id,
+                        FetchResponseMsg::ProcessResponseEOF(
+                            request_id,
+                            Err(NetworkError::ResourceLoadError(
+                                "multipart/x-mixed-replace image streams are outside controlled-web-session-v2"
+                                    .to_owned(),
+                            )),
+                            ResourceFetchTiming::new(ResourceTimingType::Error),
+                        ),
+                    );
+                    return;
+                }
             }
         }
 
@@ -330,20 +444,8 @@ impl HTMLImageElement {
             return ImageRequestProvenance::Baseline;
         }
 
-        let serialized_url = image_url.as_str();
-        if serialized_url.len() > CONTROLLED_V2_DIRECT_DATA_SVG_URL_LIMIT {
-            return ImageRequestProvenance::Baseline;
-        }
-
-        let Ok(data_url) = DataUrl::process(serialized_url) else {
-            return ImageRequestProvenance::Baseline;
-        };
-        let mime_type = data_url.mime_type();
-        if mime_type.type_ != "image" || mime_type.subtype != "svg+xml" {
-            return ImageRequestProvenance::Baseline;
-        }
-
-        ImageRequestProvenance::ControlledV2DirectDataSvg
+        controlled_v2_direct_image_url_provenance(image_url)
+            .unwrap_or(ImageRequestProvenance::Baseline)
     }
 
     fn active_request_provenance(&self) -> ImageRequestProvenance {
@@ -369,8 +471,7 @@ impl HTMLImageElement {
             .into_iter()
             .any(|request| {
                 let request = request.borrow();
-                request.provenance == ImageRequestProvenance::ControlledV2DirectDataSvg &&
-                    request.controlled_cache_id == Some(id)
+                request.provenance.is_controlled_v2() && request.controlled_cache_id == Some(id)
             })
     }
 
@@ -390,7 +491,8 @@ impl HTMLImageElement {
                 window.downgrade_cached_vector_identity_to_baseline(vector.id);
                 Ok(())
             },
-            ImageRequestProvenance::ControlledV2DirectDataSvg => window
+            ImageRequestProvenance::ControlledV2DirectDataSvg |
+            ImageRequestProvenance::ControlledV2DirectHttpImage => window
                 .retain_controlled_v2_cached_vector_identity(vector.id, self.upcast::<Node>())
                 .map_err(|_| ()),
         }
@@ -420,7 +522,8 @@ impl HTMLImageElement {
     ) -> Result<ImageCallbackDelivery, ()> {
         match provenance {
             ImageRequestProvenance::Baseline => Ok(ImageCallbackDelivery::Baseline),
-            ImageRequestProvenance::ControlledV2DirectDataSvg => self
+            ImageRequestProvenance::ControlledV2DirectDataSvg |
+            ImageRequestProvenance::ControlledV2DirectHttpImage => self
                 .owner_window()
                 .sample_controlled_v2_document_performance_time()
                 .map(
@@ -520,8 +623,8 @@ impl HTMLImageElement {
                     // or announce a vector cache hit that later layout cannot join safely.
                     return;
                 }
-                let controlled_cache_id = (provenance ==
-                    ImageRequestProvenance::ControlledV2DirectDataSvg)
+                let controlled_cache_id = provenance
+                    .is_controlled_v2()
                     .then(|| Self::vector_image_id(Some(&image)))
                     .flatten();
                 self.record_active_controlled_cache_id(controlled_cache_id);
@@ -529,7 +632,8 @@ impl HTMLImageElement {
                     ImageRequestProvenance::Baseline => {
                         self.process_image_response(ImageResponse::Loaded(image, url), delivery, cx)
                     },
-                    ImageRequestProvenance::ControlledV2DirectDataSvg => {
+                    ImageRequestProvenance::ControlledV2DirectDataSvg |
+                    ImageRequestProvenance::ControlledV2DirectHttpImage => {
                         // `get_image()` can miss before the stable-state microtask while this
                         // status check observes the completed entry. Normalize that race to the
                         // same queued, load-only event shape as the step-7.4 cache-hit path.
@@ -556,16 +660,17 @@ impl HTMLImageElement {
                 match provenance {
                     ImageRequestProvenance::Baseline => {
                         // Preserve the predecessor ordering for every unowned image path.
-                        self.fetch_request(img_url, id);
+                        self.fetch_request(img_url, id, provenance);
                         let _ =
                             self.register_image_cache_callback(id, ChangeType::Element, provenance);
                     },
-                    ImageRequestProvenance::ControlledV2DirectDataSvg => {
+                    ImageRequestProvenance::ControlledV2DirectDataSvg |
+                    ImageRequestProvenance::ControlledV2DirectHttpImage => {
                         // Controlled work must have a retained owner before it starts. If
                         // capacity or producer-fence admission fails, Window latches the typed
                         // terminal and this request is never issued.
                         if self.register_image_cache_callback(id, ChangeType::Element, provenance) {
-                            self.fetch_request(img_url, id);
+                            self.fetch_request(img_url, id, provenance);
                         }
                     },
                 }
@@ -645,7 +750,8 @@ impl HTMLImageElement {
                     );
                 })
             },
-            ImageRequestProvenance::ControlledV2DirectDataSvg => {
+            ImageRequestProvenance::ControlledV2DirectDataSvg |
+            ImageRequestProvenance::ControlledV2DirectHttpImage => {
                 let Ok(callback) = window.register_controlled_v2_image_cache_listener(
                     id,
                     self.upcast::<Node>(),
@@ -672,7 +778,7 @@ impl HTMLImageElement {
             window.pipeline_id(),
             id,
         ));
-        if provenance == ImageRequestProvenance::ControlledV2DirectDataSvg {
+        if provenance.is_controlled_v2() {
             // Record authority only after both retained-record admission and listener install
             // succeed. A failed controlled registration must leave no request-owned cache ID.
             self.record_active_controlled_cache_id(Some(id));
@@ -680,7 +786,12 @@ impl HTMLImageElement {
         true
     }
 
-    fn fetch_request(&self, img_url: &ServoUrl, id: PendingImageId) {
+    fn fetch_request(
+        &self,
+        img_url: &ServoUrl,
+        id: PendingImageId,
+        provenance: ImageRequestProvenance,
+    ) {
         let document = self.owner_document();
         let window = self.owner_window();
 
@@ -692,6 +803,7 @@ impl HTMLImageElement {
             doc: Trusted::new(&document),
             element: Trusted::new(self),
             url: img_url.clone(),
+            provenance,
         };
 
         // https://html.spec.whatwg.org/multipage/#update-the-image-data steps 17-20
@@ -723,8 +835,7 @@ impl HTMLImageElement {
         let released_vector_id = {
             let mut current_request = self.current_request.borrow_mut();
             let old_controlled_id = current_request.controlled_cache_id;
-            let retained_new_id = (current_request.provenance ==
-                ImageRequestProvenance::ControlledV2DirectDataSvg &&
+            let retained_new_id = (current_request.provenance.is_controlled_v2() &&
                 current_request.controlled_cache_id == new_vector_id)
                 .then_some(new_vector_id)
                 .flatten();
@@ -1253,8 +1364,8 @@ impl HTMLImageElement {
                         // cached vector without an exact owner for later raster work.
                         return;
                     }
-                    let controlled_cache_id = (provenance ==
-                        ImageRequestProvenance::ControlledV2DirectDataSvg)
+                    let controlled_cache_id = provenance
+                        .is_controlled_v2()
                         .then(|| Self::vector_image_id(Some(&image)))
                         .flatten();
 
@@ -1459,7 +1570,7 @@ impl HTMLImageElement {
                 );
             },
             ImageCacheResult::ReadyForRequest(id) => {
-                self.fetch_request(&image_url, id);
+                self.fetch_request(&image_url, id, ImageRequestProvenance::Baseline);
                 self.register_image_cache_callback(
                     id,
                     change_type,

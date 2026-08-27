@@ -337,6 +337,7 @@ const { values } = parseArgs({
     revision: { type: "string" },
     "session-v2-fixture": { type: "string" },
     "session-v2-image-fixture": { type: "string" },
+    "session-v2-http-image-fixture": { type: "string" },
     "session-v2-inline-svg-fixture": { type: "string" },
     "session-v2-focus-fixture": { type: "string" },
     "session-v2-automation-event-fixture": { type: "string" },
@@ -355,6 +356,7 @@ for (const field of [
   "revision",
   "session-v2-fixture",
   "session-v2-image-fixture",
+  "session-v2-http-image-fixture",
   "session-v2-inline-svg-fixture",
   "session-v2-focus-fixture",
   "session-v2-automation-event-fixture",
@@ -371,6 +373,7 @@ const binary = resolve(values.binary);
 const fixture = resolve(values.fixture);
 const sessionV2Fixture = resolve(values["session-v2-fixture"]);
 const sessionV2ImageFixture = resolve(values["session-v2-image-fixture"]);
+const sessionV2HttpImageFixture = resolve(values["session-v2-http-image-fixture"]);
 const sessionV2InlineSvgFixture = resolve(values["session-v2-inline-svg-fixture"]);
 const sessionV2FocusFixture = resolve(values["session-v2-focus-fixture"]);
 const sessionV2AutomationEventFixture = resolve(values["session-v2-automation-event-fixture"]);
@@ -388,6 +391,10 @@ assert.ok(
 assert.ok(
   isAbsolute(sessionV2ImageFixture),
   "--session-v2-image-fixture must resolve to an absolute path before launch",
+);
+assert.ok(
+  isAbsolute(sessionV2HttpImageFixture),
+  "--session-v2-http-image-fixture must resolve to an absolute path before launch",
 );
 assert.ok(
   isAbsolute(sessionV2InlineSvgFixture),
@@ -502,6 +509,13 @@ assert.ok(
   "--session-v2-image-fixture must be a regular file",
 );
 const sessionV2ImageFixtureBody = await readFile(sessionV2ImageFixture, "utf8");
+const sessionV2HttpImageFixtureStatus = await lstat(sessionV2HttpImageFixture);
+assert.ok(
+  sessionV2HttpImageFixtureStatus.isFile() &&
+    !sessionV2HttpImageFixtureStatus.isSymbolicLink(),
+  "--session-v2-http-image-fixture must be a regular file",
+);
+const sessionV2HttpImageFixtureBody = await readFile(sessionV2HttpImageFixture, "utf8");
 const sessionV2InlineSvgFixtureStatus = await lstat(sessionV2InlineSvgFixture);
 assert.ok(
   sessionV2InlineSvgFixtureStatus.isFile() &&
@@ -974,6 +988,13 @@ try {
 
   const v2FixtureUrl = "https://packed-sdk-message-channel-v2.example.test/";
   const v2ImageFixtureUrl = "https://packed-sdk-direct-data-svg-v2.example.test/";
+  const v2HttpImageFixtureUrl = "https://packed-sdk-direct-http-image-v2.example.test/";
+  const v2HttpImageAssetUrl =
+    "https://controlled-image-assets.example.test/controlled-v2-http-image.svg";
+  const v2HttpInvalidImageAssetUrl =
+    "https://controlled-image-assets.example.test/controlled-v2-http-image.invalid";
+  const v2HttpImageSvgBody =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="green"/></svg>';
   const v2InlineSvgFixtureUrl = "https://packed-sdk-inline-svg-v2.example.test/";
   const v2FocusFixtureUrl = "https://packed-sdk-input-method-focus-v2.example.test/";
   const v2AutomationEventFixtureUrl =
@@ -1002,6 +1023,30 @@ try {
             status: 200,
             headers: [["content-type", "text/html; charset=utf-8"]],
             body: { utf8: sessionV2ImageFixtureBody },
+          },
+        },
+        {
+          match: { method: "GET", url: { exact: v2HttpImageFixtureUrl } },
+          fulfill: {
+            status: 200,
+            headers: [["content-type", "text/html; charset=utf-8"]],
+            body: { utf8: sessionV2HttpImageFixtureBody },
+          },
+        },
+        {
+          match: { method: "GET", url: { exact: v2HttpImageAssetUrl } },
+          fulfill: {
+            status: 200,
+            headers: [["content-type", "image/svg+xml"]],
+            body: { utf8: v2HttpImageSvgBody },
+          },
+        },
+        {
+          match: { method: "GET", url: { exact: v2HttpInvalidImageAssetUrl } },
+          fulfill: {
+            status: 200,
+            headers: [["content-type", "image/png"]],
+            body: { utf8: "not an image" },
           },
         },
         {
@@ -1112,9 +1157,39 @@ try {
   const v2ImageEvidence = v2Session.settlementEvidence(v2ImageSettled);
   assert.equal(v2ImageEvidence.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
 
+  const v2HttpImageNavigation = await v2Session.navigate(
+    v2HttpImageFixtureUrl,
+    v2ImageTraceResult.stateToken,
+    commandDeadline(),
+  );
+  assert.equal(v2HttpImageNavigation.boundary, "controlled_ready");
+  const v2HttpImageSettled = await v2Session.settle(
+    v2HttpImageNavigation.stateToken,
+    {},
+    commandDeadline(),
+  );
+  assert.equal(v2HttpImageSettled.outcome, "quiescent");
+  assert.deepEqual(v2HttpImageSettled.unsupportedWork, []);
+  assert.deepEqual(v2HttpImageSettled.externalIo, []);
+  assert.equal(v2HttpImageSettled.snapshot.producers.pending, 0n);
+  assert.equal(v2HttpImageSettled.snapshot.producers.terminal, false);
+  assert.equal(v2HttpImageSettled.snapshot.rendering.pendingImages, 0n);
+  assert.deepEqual(v2HttpImageSettled.snapshot.runtimeFailures, []);
+  const v2HttpImageTraceResult = await v2Session.text(
+    "#result",
+    v2HttpImageSettled.stateToken,
+    commandDeadline(),
+  );
+  assert.equal(
+    v2HttpImageTraceResult.value,
+    "loaded:load:0>loadend:0|failed:error:0>loadend:0|cached:load:0|now:0",
+  );
+  const v2HttpImageEvidence = v2Session.settlementEvidence(v2HttpImageSettled);
+  assert.equal(v2HttpImageEvidence.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
+
   const v2InlineSvgNavigation = await v2Session.navigate(
     v2InlineSvgFixtureUrl,
-    v2ImageTraceResult.stateToken,
+    v2HttpImageTraceResult.stateToken,
     commandDeadline(),
   );
   assert.equal(v2InlineSvgNavigation.boundary, "controlled_ready");
@@ -1395,6 +1470,16 @@ try {
     externalIo: String(v2ImageSettled.externalIo.length),
     completionTrace: v2ImageTraceResult.value,
     evidenceProfile: v2ImageEvidence.profile,
+    httpNavigationBoundary: v2HttpImageNavigation.boundary,
+    httpOutcome: v2HttpImageSettled.outcome,
+    httpProducerPending: String(v2HttpImageSettled.snapshot.producers.pending),
+    httpProducerTerminal: v2HttpImageSettled.snapshot.producers.terminal,
+    httpPendingImages: String(v2HttpImageSettled.snapshot.rendering.pendingImages),
+    httpRuntimeFailures: String(v2HttpImageSettled.snapshot.runtimeFailures.length),
+    httpUnsupportedWork: String(v2HttpImageSettled.unsupportedWork.length),
+    httpExternalIo: String(v2HttpImageSettled.externalIo.length),
+    httpCompletionTrace: v2HttpImageTraceResult.value,
+    httpEvidenceProfile: v2HttpImageEvidence.profile,
     sameControlledSession: true,
     exactBinaryLaunch: true,
     closeResponseAndEof: true,

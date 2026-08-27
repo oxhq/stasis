@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       release_tag:
-        description: Exact Stasis release-candidate tag; v0.3.0 is the only accepted value
+        description: Exact Stasis release tag; v0.3.0 is the only accepted value
         required: false
         type: string
   push:
@@ -1127,7 +1127,7 @@ jobs:
 
           Proof boundary: exact-SHA Windows build, explicit-executable TypeScript session
           North Star, complete baseline_protocol plus native fixture and redirect-order tests,
-          canonical controlled-web-session-v2 profile and candidate contract, ANGLE rendering backend,
+          canonical controlled-web-session-v2 profile and versioned contract, ANGLE rendering backend,
           app-local MSVC runtime closure, fresh ZIP extraction, and extracted-binary
           act-settle-inspect. This artifact is outside the stable macOS/Linux release,
           promotion, provenance, runtime-manifest, and npm managed-runtime inventories.
@@ -1895,6 +1895,7 @@ jobs:
             --fixture ports/stasis/tests/fixtures/timer_10s.html \
             --session-v2-fixture ports/stasis/tests/fixtures/message_channel_buffered.html \
             --session-v2-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_data_svg.html \
+            --session-v2-http-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_http.html \
             --session-v2-inline-svg-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg.html \
             --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
             --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
@@ -2164,6 +2165,19 @@ jobs:
                       "externalIo": "0",
                       "completionTrace": "load:0>loadend:0|now:0",
                       "evidenceProfile": "controlled-web-session-v2",
+                      "httpNavigationBoundary": "controlled_ready",
+                      "httpOutcome": "quiescent",
+                      "httpProducerPending": "0",
+                      "httpProducerTerminal": False,
+                      "httpPendingImages": "0",
+                      "httpRuntimeFailures": "0",
+                      "httpUnsupportedWork": "0",
+                      "httpExternalIo": "0",
+                      "httpCompletionTrace": (
+                          "loaded:load:0>loadend:0|failed:error:0>loadend:0|"
+                          "cached:load:0|now:0"
+                      ),
+                      "httpEvidenceProfile": "controlled-web-session-v2",
                       "sameControlledSession": True,
                       "exactBinaryLaunch": True,
                       "closeResponseAndEof": True,
@@ -3748,7 +3762,7 @@ jobs:
           name: ${{ needs.verify-promotion.outputs.staged_gate_artifact_name }}
           path: gate-proof
 
-      - name: Recheck staged identities and provenance without candidate code
+      - name: Recheck staged identities and provenance without source code
         shell: bash
         run: |
           set -euo pipefail
@@ -4139,9 +4153,10 @@ jobs:
 
           Stasis 0.3 preserves the frozen controlled-webapp-v1 and
           controlled-web-session-v1 contracts. The explicitly selected
-          controlled-web-session-v2 candidate adds bounded, same-global, untransferred
+          controlled-web-session-v2 profile adds bounded, same-global, untransferred
           MessageChannel/MessagePort delivery; a bounded direct top-level HTMLImageElement.src
-          data:image/svg+xml cache/decode completion path; a distinct bounded top-level inline SVG
+          cache/decode completion path for canonical data SVG and direct HTTP(S) selection; a
+          distinct bounded top-level inline SVG
           path for its exact cached internally serialized data-SVG request and cache-ID owner on the
           same ScriptThread/ImageCache; and
           an explicit headless InputMethod boundary for controlled top-level, single-line text focus
@@ -4163,8 +4178,21 @@ jobs:
           memory-only and become portable only through explicit controlled-web-session-v2 state
           export/import. A v1 artifact is never migrated implicitly, opaque or unknown SameSite
           context is typed unsupported, and partitioned cookies remain outside the profile.
-          The HTML image path requires canonical exact-MIME
-          direct-src selection within its URL and retained-ownership limits. The inline path also
+          The HTML image path requires direct-src selection within its initial 65,536-byte selected-URL
+          and retained-ownership limits. An admitted synchronous cache hit is owned in the current
+          Script turn without an invented asynchronous Image producer lease; finite asynchronous
+          cache/decode completion is Image-producer fenced. Canonical data URLs require exact
+          image/svg+xml; direct HTTP(S) is admitted before response format is known, with Resource I/O
+          separately owned and finite decode failure retained as an owned error completion. A final
+          redirect URL is not rechecked against that initial selected-URL limit; Resource I/O and the
+          immutable session network policy remain authoritative. Deterministic cache reuse is proven
+          only within one pipeline's image-cache store under immutable fixture routes, not across
+          pipelines or for live or mutable HTTP content. Post-metadata
+          multipart/x-mixed-replace remains typed unsupported after separately owned finite Resource
+          I/O drains, without baseline callback fallback; an endless response remains blocked on
+          that external I/O. Public document replacement while HTTP image resource I/O remains active keeps
+          the fatal blocked_on_external_io boundary; v2 does not claim replacement through that
+          state. The inline path also
           requires an internal request and exact cached-URL/cache-ID join; it is fenced through
           decode/raster completion and creates no DOM load event. Script-created events, including
           AnimationEvent/TransitionEvent constructors, port

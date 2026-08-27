@@ -57,9 +57,10 @@ Release identity and immutable boundaries:
   a redirect-evidence ordering race in which a successor request could begin
   before its predecessor's terminal callback and omit that predecessor's
   response evidence.
-- `profiles/controlled-web-session-v2.json` and the TypeScript selector define the 0.3.0
-  candidate's bounded same-global, untransferred `MessageChannel` delivery; direct top-level
-  `HTMLImageElement.src` `data:image/svg+xml` cache/decode completion; a distinct bounded inline
+- `profiles/controlled-web-session-v2.json` and the TypeScript selector define the versioned 0.3.0
+  contract's bounded same-global, untransferred `MessageChannel` delivery; direct top-level
+  `HTMLImageElement.src` completion for canonical `data:image/svg+xml` or an initially selected
+  canonical HTTP(S) URL no larger than 65,536 bytes; a distinct bounded inline
   `<svg>` path whose internal serialized data-SVG request must exactly match that element's cached
   URL and join its exact cache-ID owner; and narrow exact public non-auxiliary controlled top-level, single-line
   `InputMethodType::Text` presentation suppression only when `multiline = false` and no virtual
@@ -74,6 +75,18 @@ Release identity and immutable boundaries:
   pre-handler authority, target-invariant or clock failure, and guarded transport loss remain sticky
   abandonment terminals.
   Completion and abandonment must match the exact live lease and registered Image producer class.
+  An admitted synchronous image-cache hit is owned in the current Script turn and queues its
+  existing ordinary DOM callback without inventing an asynchronous `Image` producer lease. Finite
+  asynchronous cache/decode completion is fenced by an `Image` producer through ScriptThread
+  handoff. HTTP(S) Resource I/O remains separately owned. A final redirect URL is not rechecked
+  against the initial 65,536-byte selection bound; the redirected fetch and immutable session
+  network policy remain authoritative. Deterministic cache reuse is proven only within one
+  pipeline's image-cache store under immutable fixture routes, not across pipelines or for live or
+  mutable HTTP content. A finite `multipart/x-mixed-replace` response becomes typed
+  `unsupported_rendering` / `image_load` after its separately owned Resource I/O drains, without a
+  baseline callback or fake quiescence; an endless response remains blocked on external I/O.
+  Public document replacement while HTTP image Resource I/O is active remains fatal
+  `blocked_on_external_io` before successor-document authority.
   Local-channel construction and posting require the exact active public top-level target plus an
   incumbent matching the owner global, pipeline, and WebView, before pair publication or structured
   cloning respectively. Each nonempty owned CSS animation pending-event dispatch batch also receives one document-clock
@@ -84,7 +97,8 @@ Release identity and immutable boundaries:
   the exact retained scheduler head, while only an unscheduled batch is `Drive`-ready; this closes a
   checkpoint-spin liveness bug without adding a task source or limit. Auxiliary WebViews remain host-stamped. Inline SVG gains no DOM completion-event claim,
   and script-created animation/transition constructors, excluded
-  image, general SVG/resource, and other unlisted host-stamped paths remain unsupported or retain
+  image, animated/decode-timeline, decoder-resource-budget, general SVG/resource, and other
+  unlisted host-stamped paths remain unsupported or retain
   their frozen predecessor authority. V2 also owns persistent cookies in memory against controlled
   Unix time, with Max-Age precedence, a 400-day clamp, lazy expiry purge, and exact v2
   export/import identity. SameSite request selection uses captured schemeful site-for-cookies, the

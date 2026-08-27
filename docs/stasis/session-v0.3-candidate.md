@@ -1,19 +1,20 @@
-# Controlled session v2 candidate
+# Controlled session v2 contract
 
-> **Status:** Candidate contract targeting Stasis 0.3.0. The canonical profile is
-> `profiles/controlled-web-session-v2.json`. It is not a stable-release or native-availability
-> claim. `Runtime.openSession()` continues to default to `controlled-web-session-v1`; v2 must be
-> selected explicitly and the native runtime must advertise it.
+> **Status:** Versioned contract for Stasis 0.3.0. The canonical profile is
+> `profiles/controlled-web-session-v2.json`. Checked-in source is not a publication or
+> native-availability claim; verify the immutable tag, release, registry package, and provenance.
+> `Runtime.openSession()` continues to default to `controlled-web-session-v1`; v2 must be selected
+> explicitly and the native runtime must advertise it.
 
 `controlled-web-session-v2` preserves the complete v1 session contract and adds seven
-benchmark-driven compatibility slices: controlled-local messaging, direct data-SVG image
+benchmark-driven compatibility slices: controlled-local messaging, bounded direct image
 completion, inline-SVG rendering completion, single-line text-focus presentation and focus-event
 time, synchronous public-automation event time, internal CSS animation-event time, and controlled
 persistent-cookie expiry plus SameSite request selection. The owned
-source added by this candidate is a constructor-created
+source added by this profile is a constructor-created
 `MessageChannel` whose two ports remain in the active controlled top-level document global, and a
-bounded direct `HTMLImageElement.src` `data:image/svg+xml` completion path in the same controlled
-ScriptThread and ImageCache. The focus boundary suppresses only native InputMethod UI for
+bounded direct `HTMLImageElement.src` completion path for canonical data SVG and direct HTTP(S)
+selection in the same controlled ScriptThread and ImageCache. The focus boundary suppresses only native InputMethod UI for
 controlled top-level, single-line `InputMethodType::Text` focus with `multiline = false` and no
 virtual keyboard requested. Engine-generated focus transitions and admitted image completion
 events receive document-clock event timestamps. A separate synchronous automation scope gives the
@@ -123,19 +124,25 @@ The WebIDL `new_with_proto` paths remain unchanged, so script-created `new Anima
 even if they inherit the selected profile. V1, auxiliary, nested, realtime, stale, and owner- or
 pipeline-mismatched records retain predecessor behavior.
 
-## Controlled direct data-SVG image boundary
+## Controlled direct image boundary
 
 The image slice is deliberately an ownership contract, not a declaration that every Servo image
 path is deterministic. It applies only to an active top-level document selected with
 `controlled-web-session-v2` that is the exact public non-auxiliary target, and only when an
-`HTMLImageElement` selects its direct `src` without
-`srcset`, `picture`, or environment-change selection. The serialized `ServoUrl` must be at most
-65,536 bytes; the canonical `DataUrl` parser must accept it; and its parsed MIME type must be
-exactly `image/svg+xml`. This decision is captured on the image request at selection time and
-carried with that request's generation. It is never reconstructed later from the element's current
-URL or DOM position. A request stores a controlled cache ID only after its asynchronous callback
-registration or synchronous exact-owner retain succeeds; URL equality alone never creates that
-authority.
+`HTMLImageElement` selects its direct `src` without `srcset`, `picture`, or environment-change
+selection. The initially selected serialized `ServoUrl` must be at most 65,536 bytes. A `data:`
+URL is admitted only when the canonical `DataUrl` parser accepts it and its parsed MIME type is
+exactly `image/svg+xml`; a direct `http:` or `https:` URL is admitted by scheme before response
+metadata or decoded format is known. Resource I/O remains independently owned by the existing
+network authority. A public document replacement attempted while HTTP image resource I/O remains
+active retains the existing fatal `blocked_on_external_io` boundary; v2 does not claim successful
+cross-document replacement through that state. The selection decision is captured on the image request and carried with that
+request's generation. It is never reconstructed later from the element's current URL, response
+content type, or DOM position. A final redirect URL is not rechecked against the initial 65,536-byte
+selection bound; the redirected fetch remains separately owned Resource I/O and the immutable
+session network policy remains authoritative. A request stores a
+controlled cache ID only after its asynchronous callback registration or synchronous exact-owner
+retain succeeds; URL equality alone never creates that authority.
 
 A synchronous admitted cache hit is already executing in an owned controlled turn, so it requires
 no invented asynchronous producer lease. Its request provenance and completion time are still
@@ -143,7 +150,8 @@ captured before the existing DOM-manipulation task is queued and remain bound to
 generation. A finite asynchronous cache decode owns an Image producer stream from callback
 registration through terminal enqueue. Every cache message has its own producer guard, the guarded
 envelope survives the ScriptThread handoff, and only then may the HTML element queue its ordinary
-DOM callback. Loaded and failed-to-load-or-decode responses terminate that stream. Message
+DOM callback. Loaded and failed-to-load-or-decode responses terminate that stream, so an HTTP
+response that is not a decodable image remains an owned finite error completion. Message
 admission failure, enqueue rejection, producer callback panic, or guarded transport loss becomes a sticky
 producer terminal. After dequeue, a missing untombstoned target, a live tombstoned target, a live
 Window whose profile, execution mode, or exact public top-level target does not match, or a Window
@@ -154,7 +162,8 @@ The image cache owns the callback's lifetime. If it authoritatively retires that
 protocol terminal, dropping the callback proves that this stream can no longer enqueue document
 work and completes the stream lease as owned cancellation without a producer terminal. This is
 distinct from losing an expected handoff. A dequeued response completes normally as retired only
-when pipeline teardown installed its permanent tombstone before removing the Window: the owning
+when pipeline teardown independently installed its permanent tombstone before removing the Window:
+the owning
 event loop received it, but no mutation target remains. Once a response reaches its live owning
 Window, a handler `Err` likewise completes the scoped message guard normally. The rejected key or
 owner stays in the Window's pending collections and settlement reports it as typed
@@ -203,6 +212,15 @@ image callbacks or layout invalidation run. The owner or raster key remains reta
 message guard completes normally, and pending observation classifies that work as
 `unsupported_rendering` / `image_load`.
 
+`multipart/x-mixed-replace` is discovered only after HTTP response metadata, when the request has
+already been admitted. V2 therefore does not silently relabel that callback as baseline. It marks
+the exact retained image provenance unsupported, releases its controlled ownership reservations,
+and retires the finite Image producer while retaining an explicit unsupported image fact. The typed
+`unsupported_rendering` / `image_load` terminal becomes observable after the separately owned
+Resource I/O drains; an endless response remains blocked on that external I/O. Neither baseline nor
+controlled callback delivery can invoke the retained unsupported callback. This exception is
+limited to an admitted v2 direct HTTP(S) request. Baseline and v1 multipart behavior is unchanged.
+
 At most 512 controlled image ownership records may be retained by one Window. Each pending
 controlled callback, each exact `(cache ID, DOM owner)` identity, and each controlled
 vector-rasterization key owns one non-cloneable capacity reservation. Multiple DOM owners sharing a
@@ -219,7 +237,8 @@ ImageCache teardown drops the corresponding producer callbacks.
 Pending observation treats the union of callback and per-owner layout `PendingImageId` values as
 logical image identities and treats each `(PendingImageId, requested size)` raster key as separate
 work. An image ID is controlled only when every retained callback for that ID is controlled and no
-retained layout owner is baseline. Live record count must equal retained controlled callbacks plus
+retained callback or layout owner is baseline or explicitly unsupported. Live record count must
+equal retained controlled callbacks plus
 exact `(cache ID, DOM owner)` identities plus controlled raster keys, and, absent a producer
 terminal, the Image producer's pending count must be at least the number of controlled logical work
 items. Controlled items are represented by the producer fence and are removed from the generic
@@ -235,18 +254,22 @@ synchronous-cache-hit path emits only `load`; v2 preserves that cardinality whil
 event from the same controlled boundary. A host-domain value is never substituted for an admitted
 image completion. Script-created events and unadmitted image paths retain predecessor behavior.
 
-HTTP, HTTPS, blob, file, non-SVG data URLs, over-size URLs, over-cap registrations, `srcset`,
-`picture`, environment changes, favicon, video poster, `ImageBitmap`, canvas upload, animated image
-semantics, iframe, worker, worklet, and cross-event-loop paths receive no new authority from the
-direct HTML image slice.
+Blob, file, non-SVG data URLs, over-size initial URLs, over-cap registrations, `srcset`, `picture`,
+environment changes, favicon, video poster, `ImageBitmap`, canvas upload, animated image semantics,
+iframe, worker, worklet, and cross-event-loop paths receive no new authority from the direct HTML
+image slice. HTTP(S) response formats are not pre-admission allowlisted; finite cache/decode success
+or failure is owned, while the post-metadata multipart case above remains explicitly unsupported.
 Except for the explicit over-cap terminal, this is not a universal eager-rejection promise:
 unadmitted paths retain baseline behavior, retained asynchronous work remains rejected by existing
 pending-rendering authority, and an observed host timestamp remains rejected by existing clock
 authority. The gate does not inspect SVG payload contents. Nested or external SVG resource
 semantics are not proven or admitted by this slice; separately surfaced external work remains under
-the existing resource-I/O authority. The URL and retained-owner limits bound admission and callback
-scheduling; they do not claim a separate deterministic CPU or allocation budget for SVG parsing,
-decoding, or rasterization. Existing wall, ordinary-task, and rendering limits remain authoritative.
+the existing resource-I/O authority. The initial selected-URL and retained-owner limits bound
+admission and callback scheduling; they do not claim a separate deterministic CPU or allocation
+budget for image parsing, decoding, or rasterization. Cache reuse is proven only within one
+pipeline's image-cache store and the immutable fixture-route model; live or mutable HTTP content is
+not deterministic proof. Existing wall, ordinary-task, rendering, and resource-I/O limits remain
+authoritative.
 
 ## Controlled inline SVG rendering boundary
 
@@ -320,7 +343,7 @@ identity, a zero queued association, or a missing association exposed by that re
 pending observation closed; there is no global nonzero fallback identity. A well-formed reciprocal
 pair with owned work projects exactly one deterministic minimum port identity, so independent pairs
 with work remain independently visible; malformed or nonreciprocal identities remain individually
-pending. A zero retained count does not make an otherwise-idle open pair pending. This candidate
+pending. A zero retained count does not make an otherwise-idle open pair pending. V2
 does not claim a public per-source dispatch counter, and the frozen/common wire schema is not
 expanded for one.
 
@@ -345,7 +368,7 @@ Constellation MessagePort router. In the normal production `GlobalScope` path, a
 mixed-provenance registration or router/external callback latches `external_subscription`, grants
 no ingress authority, and installs or dispatches nothing. This is a product execution boundary,
 not a hostile or forged renderer-IPC security claim. BroadcastChannel is prevented at construction;
-the candidate does not claim a separate impossible-callback backstop for it.
+v2 does not claim a separate impossible-callback backstop for it.
 
 For an arbitrary structured-clone transfer list in the selected controlled global, Stasis scans in
 list order for an otherwise-valid `MessagePort`, `ReadableStream`, `WritableStream`, or
@@ -405,7 +428,7 @@ settle results are privately bound to that selected profile, so both `settlement
 and `session.settlementEvidence(result)` preserve it; a contradictory explicit profile is rejected.
 Unbound manually constructed results retain the legacy v1 default.
 
-The candidate pins its predecessor profile by SHA-256
+V2 pins its predecessor profile by SHA-256
 `9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a`. Candidate validation
 re-hashes that frozen `controlled-web-session-v1` file independently; naming the predecessor is not
 accepted as evidence that its bytes stayed unchanged.

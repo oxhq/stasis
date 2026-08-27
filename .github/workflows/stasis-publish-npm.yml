@@ -713,6 +713,7 @@ jobs:
             --fixture ports/stasis/tests/fixtures/timer_10s.html \
             --session-v2-fixture ports/stasis/tests/fixtures/message_channel_buffered.html \
             --session-v2-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_data_svg.html \
+            --session-v2-http-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_http.html \
             --session-v2-inline-svg-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg.html \
             --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
             --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
@@ -952,6 +953,19 @@ jobs:
                       "externalIo": "0",
                       "completionTrace": "load:0>loadend:0|now:0",
                       "evidenceProfile": "controlled-web-session-v2",
+                      "httpNavigationBoundary": "controlled_ready",
+                      "httpOutcome": "quiescent",
+                      "httpProducerPending": "0",
+                      "httpProducerTerminal": False,
+                      "httpPendingImages": "0",
+                      "httpRuntimeFailures": "0",
+                      "httpUnsupportedWork": "0",
+                      "httpExternalIo": "0",
+                      "httpCompletionTrace": (
+                          "loaded:load:0>loadend:0|failed:error:0>loadend:0|"
+                          "cached:load:0|now:0"
+                      ),
+                      "httpEvidenceProfile": "controlled-web-session-v2",
                       "sameControlledSession": True,
                       "exactBinaryLaunch": True,
                       "closeResponseAndEof": True,
@@ -3090,6 +3104,7 @@ jobs:
             --fixture ports/stasis/tests/fixtures/timer_10s.html \
             --session-v2-fixture ports/stasis/tests/fixtures/message_channel_buffered.html \
             --session-v2-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_data_svg.html \
+            --session-v2-http-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_http.html \
             --session-v2-inline-svg-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg.html \
             --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
             --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
