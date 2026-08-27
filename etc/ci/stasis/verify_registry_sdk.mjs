@@ -142,6 +142,17 @@ function countMessagePortSources(snapshot) {
   ).length;
 }
 
+function cookieStateWithoutLastAccessSequence(cookie) {
+  assert.ok(cookie && typeof cookie === "object", "cookie state record must be an object");
+  const { lastAccessSequence: _lastAccessSequence, ...stableState } = cookie;
+  return stableState;
+}
+
+function cookieStatesWithoutLastAccessSequence(cookies) {
+  assert.ok(Array.isArray(cookies), "cookie state must be an array");
+  return cookies.map(cookieStateWithoutLastAccessSequence);
+}
+
 function parseStrictJson(source, label) {
   let cursor = 0;
   const fail = (message) => {
@@ -1805,11 +1816,11 @@ try {
   const portableV2State = await v2CookieSessionHandle.exportState(commandDeadline());
   assert.equal(portableV2State.state.schemaVersion, 1);
   assert.equal(portableV2State.state.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
-  assert.equal(
-    portableV2State.state.cookies.find((cookie) => cookie.name === "remember_me")
-      ?.expiresUnixTimeNs,
-    expectedRememberedExpiryNs,
+  const portableRememberedCookie = portableV2State.state.cookies.find(
+    (cookie) => cookie.name === "remember_me",
   );
+  assert.ok(portableRememberedCookie, "portable v2 state omitted the response cookie");
+  assert.equal(portableRememberedCookie.expiresUnixTimeNs, expectedRememberedExpiryNs);
   const portableCrossSiteCookie = portableV2State.state.cookies.find(
     (cookie) => cookie.name === "cross_lax",
   );
@@ -1820,6 +1831,16 @@ try {
     "portable v2 state must retain the canonical localhost cookie domain",
   );
   assert.equal(portableCrossSiteCookie.expiresUnixTimeNs, crossSiteCookieExpiryNs);
+  assert.equal(
+    portableRememberedCookie.lastAccessSequence,
+    0n,
+    "portable response cookie must precede the newly inserted cross-site control",
+  );
+  assert.equal(
+    portableCrossSiteCookie.lastAccessSequence,
+    1n,
+    "portable cross-site control must begin as the most recently accessed cookie",
+  );
 
   await v2CookieSessionHandle.close(commandDeadline());
   await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
@@ -1915,23 +1936,39 @@ try {
   });
   const restoredCookieState = await v2CookieRestoreSession.exportState(commandDeadline());
   assert.equal(restoredCookieState.state.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
-  assert.equal(
-    restoredCookieState.state.cookies.find((cookie) => cookie.name === "remember_me")
-      ?.expiresUnixTimeNs,
-    expectedRememberedExpiryNs,
+  const restoredRememberedCookie = restoredCookieState.state.cookies.find(
+    (cookie) => cookie.name === "remember_me",
   );
+  assert.ok(restoredRememberedCookie, "restored v2 state omitted the response cookie");
+  assert.equal(restoredRememberedCookie.expiresUnixTimeNs, expectedRememberedExpiryNs);
   const restoredCrossSiteCookie = restoredCookieState.state.cookies.find(
     (cookie) => cookie.name === "cross_lax",
   );
-  assert.equal(restoredCrossSiteCookie?.domain, "localhost");
-  assert.deepEqual(
-    restoredCrossSiteCookie,
-    portableCrossSiteCookie,
-    "cross-site Lax filtering must retain the imported cookie identity in v2 state",
+  assert.ok(restoredCrossSiteCookie, "restored v2 state omitted the cross-site Lax control");
+  assert.equal(restoredCrossSiteCookie.domain, "localhost");
+  const stableCookieStateRetained = isDeepStrictEqual(
+    cookieStatesWithoutLastAccessSequence(restoredCookieState.state.cookies),
+    cookieStatesWithoutLastAccessSequence(portableV2State.state.cookies),
+  );
+  assert.equal(
+    stableCookieStateRetained,
+    true,
+    "request selection must retain every imported cookie field except operational access order",
+  );
+  assert.equal(
+    restoredCrossSiteCookie.lastAccessSequence,
+    0n,
+    "the filtered cross-site control must remain older after dense access-order export",
+  );
+  assert.equal(
+    restoredRememberedCookie.lastAccessSequence,
+    1n,
+    "the same-site response cookie must become newest after request selection",
   );
   const crossSiteLaxCookieFiltered =
     cookieCrossRequests[0].cookie === "" &&
-    isDeepStrictEqual(restoredCrossSiteCookie, portableCrossSiteCookie);
+    stableCookieStateRetained &&
+    restoredCrossSiteCookie.lastAccessSequence < restoredRememberedCookie.lastAccessSequence;
   assert.equal(crossSiteLaxCookieFiltered, true);
   const v2CookieEvidence = v2CookieRestoreSession.settlementEvidence(
     restoredCookieSettled,
