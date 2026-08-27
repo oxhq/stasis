@@ -317,6 +317,15 @@ fn controlled_fill_profile_admits_every_declared_text_control() {
 
 #[test]
 fn ten_second_timeout_advances_without_ten_seconds_of_wall_time() {
+    exercise_ten_second_timeout(true);
+}
+
+#[test]
+fn ten_second_timeout_session_closes_cleanly_after_virtual_advance() {
+    exercise_ten_second_timeout(false);
+}
+
+fn exercise_ten_second_timeout(enforce_wall_budget: bool) {
     let _serial = process_test_guard();
     let server = FixtureServer::start(TIMER_10S_FIXTURE, false);
     let mut shell = TestShell::spawn();
@@ -351,10 +360,12 @@ fn ten_second_timeout_advances_without_ten_seconds_of_wall_time() {
     let after = shell.settle_default();
     let wall_elapsed = wall_started.elapsed();
     assert_outcome(&after, "quiescent");
-    assert!(
-        wall_elapsed < Duration::from_secs(8),
-        "a 10s virtual timer slept for {wall_elapsed:?} of wall time"
-    );
+    if enforce_wall_budget {
+        assert!(
+            wall_elapsed < Duration::from_secs(8),
+            "a 10s virtual timer slept for {wall_elapsed:?} of wall time"
+        );
+    }
     assert_eq!(
         exact_decimal(&after, "virtualTimeNs") - before_virtual_time,
         VIRTUAL_TEN_SECONDS_NS,

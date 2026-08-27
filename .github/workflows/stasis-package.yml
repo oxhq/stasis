@@ -229,14 +229,14 @@ jobs:
           sudo apt-get install --yes xvfb
           ./mach bootstrap --yes --skip-lints --skip-nextest
 
-      - name: Prepare Linux teardown diagnostics
+      - name: Prepare Linux native-test diagnostics
         if: matrix.release_platform == 'linux-x86_64'
         shell: bash
         run: |
           set -euo pipefail
           diagnostics="$RUNNER_TEMP/stasis-linux-crash-attempt-$GITHUB_RUN_ATTEMPT"
           test ! -e "$diagnostics"
-          mkdir -p "$diagnostics/logs"
+          mkdir -p "$diagnostics/logs" "$diagnostics/binaries"
           echo "STASIS_LINUX_CRASH_DIR=$diagnostics" >> "$GITHUB_ENV"
 
       - name: Build the exact-SHA Stasis executable
@@ -324,17 +324,37 @@ jobs:
             "$session_gate_log"
 
       - name: Gate the automation and bounded-settlement fixture matrix
+        id: controlled_mvp_gate
         shell: bash
         run: |
           set -euo pipefail
           test_runner=(env)
           if [[ "$STASIS_PLATFORM" == 'linux-x86_64' ]]; then
             test_runner=(xvfb-run -a env)
+            "${test_runner[@]}" \
+              cargo test --locked --profile production-stripped \
+                -p stasis-shell --test controlled_mvp \
+                -- --test-threads=1 --show-output \
+              2>&1 | tee "$STASIS_LINUX_CRASH_DIR/logs/controlled-mvp.raw.log"
+            # Each invocation must pass. This samples 50 independent process lifecycles and is
+            # deliberately not a retry of a failed assertion or crashed executable.
+            for lifecycle_attempt in {1..50}; do
+              printf 'lifecycle_fresh_process_sample=%02d/50 test=ten_second_timeout_session_closes_cleanly_after_virtual_advance\n' \
+                "$lifecycle_attempt" \
+                | tee -a "$STASIS_LINUX_CRASH_DIR/logs/controlled-mvp.raw.log"
+              "${test_runner[@]}" \
+                cargo test --locked --profile production-stripped \
+                  -p stasis-shell --test controlled_mvp \
+                  ten_second_timeout_session_closes_cleanly_after_virtual_advance \
+                  -- --exact --test-threads=1 --show-output \
+                2>&1 | tee -a "$STASIS_LINUX_CRASH_DIR/logs/controlled-mvp.raw.log"
+            done
+          else
+            "${test_runner[@]}" \
+              cargo test --locked --profile production-stripped \
+                -p stasis-shell --test controlled_mvp \
+                -- --test-threads=1 --show-output
           fi
-          "${test_runner[@]}" \
-            cargo test --locked --profile production-stripped \
-              -p stasis-shell --test controlled_mvp \
-              -- --test-threads=1 --show-output
 
       - name: Gate the full baseline protocol matrix
         id: baseline_protocol_gate
@@ -356,50 +376,332 @@ jobs:
                 -- --test-threads=1 --show-output
           fi
 
-      - name: Collect Linux baseline crash diagnostics
+      - name: Collect Linux native-test crash diagnostics
         if: >-
           failure()
-          && steps.baseline_protocol_gate.outcome == 'failure'
           && matrix.release_platform == 'linux-x86_64'
           && env.STASIS_LINUX_CRASH_DIR != ''
+          && (
+            steps.controlled_mvp_gate.outcome == 'failure'
+            || steps.baseline_protocol_gate.outcome == 'failure'
+          )
         shell: bash
+        env:
+          CONTROLLED_MVP_OUTCOME: ${{ steps.controlled_mvp_gate.outcome }}
+          BASELINE_PROTOCOL_OUTCOME: ${{ steps.baseline_protocol_gate.outcome }}
         run: |
           set +e
           diagnostics="$STASIS_LINUX_CRASH_DIR"
-          binary='target/production-stripped/stasis'
           status_file="$diagnostics/collection-status.txt"
           if [[ ! -d "$diagnostics" ]]; then
             echo 'the Linux crash diagnostics directory was not prepared' >&2
             exit 0
           fi
           : > "$status_file"
-          if [[ -f "$diagnostics/logs/baseline.raw.log" ]]; then
-            if tail -c 1048576 "$diagnostics/logs/baseline.raw.log" \
-                > "$diagnostics/logs/baseline.tail.log"; then
-              echo 'baseline_tail=ok' >> "$status_file"
+          echo 'schema=1' >> "$status_file"
+          if [[ "$CONTROLLED_MVP_OUTCOME" == 'failure' ]]; then
+            failed_gate='controlled_mvp'
+            failed_log="$diagnostics/logs/controlled-mvp.raw.log"
+          elif [[ "$BASELINE_PROTOCOL_OUTCOME" == 'failure' ]]; then
+            failed_gate='baseline_protocol'
+            failed_log="$diagnostics/logs/baseline.raw.log"
+          else
+            failed_gate='unknown'
+            failed_log=''
+          fi
+          echo "failed_gate=$failed_gate" >> "$status_file"
+          if [[ -s "$diagnostics/logs/controlled-mvp.raw.log" ]]; then
+            echo 'controlled_mvp_raw_log=available_for_sanitization' >> "$status_file"
+          else
+            echo 'controlled_mvp_raw_log=missing_or_empty' >> "$status_file"
+          fi
+          if [[ -s "$diagnostics/logs/baseline.raw.log" ]]; then
+            echo 'baseline_protocol_raw_log=available_for_sanitization' >> "$status_file"
+          else
+            echo 'baseline_protocol_raw_log=missing_or_empty' >> "$status_file"
+          fi
+
+          binary_source="$GITHUB_WORKSPACE/target/production-stripped/stasis"
+          if [[ -f "$binary_source" && ! -L "$binary_source" ]]; then
+            if cp --preserve=mode,timestamps -- "$binary_source" "$diagnostics/binaries/stasis"; then
+              echo 'stasis_binary_copy=ok' >> "$status_file"
             else
-              echo 'baseline_tail=failed' >> "$status_file"
+              echo 'stasis_binary_copy=failed' >> "$status_file"
             fi
           else
-            echo 'baseline_tail=source_missing' >> "$status_file"
+            echo 'stasis_binary_copy=source_missing_or_symlink' >> "$status_file"
           fi
-          if [[ -f "$binary" ]]; then
-            if cp "$binary" "$diagnostics/stasis-exact"; then
-              echo 'binary_copy=ok' >> "$status_file"
+
+          harness_relative=''
+          if [[ -n "$failed_log" && -s "$failed_log" && "$failed_gate" != 'unknown' ]]; then
+            harness_relative=$(LC_ALL=C sed -nE \
+              "s|^[[:space:]]*Running tests/${failed_gate}\\.rs \\((target/production-stripped/deps/${failed_gate}-[0-9a-f]+)\\)[[:space:]]*$|\\1|p" \
+              "$failed_log" | tail -n 1)
+          fi
+          if [[ "$harness_relative" =~ ^target/production-stripped/deps/${failed_gate}-[0-9a-f]+$ ]]; then
+            harness_source="$GITHUB_WORKSPACE/$harness_relative"
+            if [[ -f "$harness_source" && ! -L "$harness_source" && -x "$harness_source" ]]; then
+              if cp --preserve=mode,timestamps -- \
+                  "$harness_source" "$diagnostics/binaries/failed-test-harness"; then
+                echo 'failed_harness_copy=ok' >> "$status_file"
+              else
+                echo 'failed_harness_copy=failed' >> "$status_file"
+              fi
             else
-              echo 'binary_copy=failed' >> "$status_file"
+              echo 'failed_harness_copy=source_missing_symlink_or_not_executable' >> "$status_file"
             fi
           else
-            echo 'binary_copy=source_missing' >> "$status_file"
+            echo 'failed_harness_copy=path_unavailable_or_invalid' >> "$status_file"
           fi
+
+          summary="$diagnostics/logs/failure-summary.log"
+          if python3 - "$GITHUB_WORKSPACE" "$failed_gate" "$failed_log" "$summary" <<'PY'
+          import os
+          import re
+          import sys
+
+          workspace, failed_gate, raw_path, summary_path = sys.argv[1:]
+          max_input_bytes = 32 * 1024 * 1024
+          max_input_lines = 100_000
+          max_line_bytes = 4096
+          max_output_lines = 4096
+          max_output_bytes = 256 * 1024
+          retained = []
+          retained_bytes = 0
+          source_lines = 0
+          omitted_lines = 0
+          input_truncated = False
+          failure_list_mode = False
+
+          def append_structural(value):
+              global retained_bytes
+              encoded = value.encode("ascii", "strict")
+              if len(retained) >= max_output_lines or retained_bytes + len(encoded) + 1 > max_output_bytes:
+                  return False
+              retained.append(value)
+              retained_bytes += len(encoded) + 1
+              return True
+
+          def sanitize_line(line):
+              global failure_list_mode
+              line = line.replace(workspace, "<workspace>")
+              match = re.fullmatch(
+                  r"lifecycle_fresh_process_sample=(0[1-9]|[1-4][0-9]|50)/50 "
+                  r"test=ten_second_timeout_session_closes_cleanly_after_virtual_advance",
+                  line,
+              )
+              if match:
+                  return f"lifecycle_sample={match.group(1)}/50 test=ten_second_timeout_session_closes_cleanly_after_virtual_advance"
+
+              match = re.fullmatch(
+                  r"\s*Compiling ([A-Za-z0-9_.+-]+) v([0-9A-Za-z.+-]+)"
+                  r"(?: \(<workspace>(?:/[A-Za-z0-9_.+-]+)+\))?",
+                  line,
+              )
+              if match:
+                  source = "workspace" if "<workspace>" in line else "registry"
+                  return f"cargo_compile package={match.group(1)} version={match.group(2)} source={source}"
+
+              match = re.fullmatch(
+                  r"\s*Finished `production-stripped` profile "
+                  r"\[(optimized|unoptimized)(?: \+ debuginfo)?\] target\(s\) in ([0-9]+(?:\.[0-9]+)?)s",
+                  line,
+              )
+              if match:
+                  return f"cargo_finished profile=production-stripped mode={match.group(1)} seconds={match.group(2)}"
+
+              match = re.fullmatch(
+                  r"\s*Running tests/(controlled_mvp|baseline_protocol)\.rs "
+                  r"\(target/production-stripped/deps/(controlled_mvp|baseline_protocol)-([0-9a-f]+)\)",
+                  line,
+              )
+              if match and match.group(1) == match.group(2):
+                  return f"cargo_running target={match.group(1)} harness={match.group(2)}-{match.group(3)}"
+
+              match = re.fullmatch(r"running ([0-9]+) tests?", line)
+              if match:
+                  return f"libtest_running count={match.group(1)}"
+
+              match = re.fullmatch(
+                  r"test ([A-Za-z0-9_:]+) \.\.\. (ok|FAILED|ignored)"
+                  r"(?:, release gate: set STASIS_RELEASE_BINARY, STASIS_RELEASE_ARCHIVE, "
+                  r"and STASIS_RELEASE_REVISION)?",
+                  line,
+              )
+              if match:
+                  return f"test name={match.group(1)} status={match.group(2)}"
+
+              if line == "failures:":
+                  failure_list_mode = True
+                  return "section=failures"
+              if line == "successes:":
+                  failure_list_mode = False
+                  return "section=successes"
+              if failure_list_mode:
+                  match = re.fullmatch(r"    ([A-Za-z0-9_:]+)", line)
+                  if match:
+                      return f"failure_name={match.group(1)}"
+                  if line:
+                      failure_list_mode = False
+
+              match = re.fullmatch(r"---- ([A-Za-z0-9_:]+) stdout ----", line)
+              if match:
+                  return f"failure_output test={match.group(1)}"
+
+              match = re.fullmatch(
+                  r"thread '([A-Za-z0-9_:]+)'(?: \([1-9][0-9]*\))? panicked at "
+                  r"(?:<workspace>/)?(ports/stasis/tests/(controlled_mvp|baseline_protocol)\.rs):"
+                  r"([1-9][0-9]*):([1-9][0-9]*):",
+                  line,
+              )
+              if match:
+                  return f"panic test={match.group(1)} location={match.group(2)}:{match.group(4)}:{match.group(5)}"
+
+              match = re.fullmatch(
+                  r"stasis exited unsuccessfully with signal: ([1-9][0-9]*) "
+                  r"\((SIG[A-Z0-9]+)\)( \(core dumped\))?; stderr tail: "
+                  r"Redirecting call to abort\(\) to mozalloc_abort",
+                  line,
+              )
+              if match:
+                  dumped = "true" if match.group(3) else "false"
+                  return f"stasis_exit signal={match.group(1)} name={match.group(2)} core_dumped={dumped} stderr_marker=mozalloc_abort"
+
+              match = re.fullmatch(
+                  r"stasis exited unsuccessfully with exit (?:code|status): ([1-9][0-9]*); "
+                  r"stderr tail: (Redirecting call to abort\(\) to mozalloc_abort|<stderr unavailable>)",
+                  line,
+              )
+              if match:
+                  marker = "mozalloc_abort" if "mozalloc_abort" in match.group(2) else "unavailable"
+                  return f"stasis_exit code={match.group(1)} stderr_marker={marker}"
+
+              if line == "Redirecting call to abort() to mozalloc_abort":
+                  return "stderr_marker=mozalloc_abort"
+
+              match = re.fullmatch(
+                  r"test result: (ok|FAILED)\. ([0-9]+) passed; ([0-9]+) failed; "
+                  r"([0-9]+) ignored; ([0-9]+) measured; ([0-9]+) filtered out; "
+                  r"finished in ([0-9]+(?:\.[0-9]+)?)s",
+                  line,
+              )
+              if match:
+                  return (
+                      f"test_result status={match.group(1)} passed={match.group(2)} "
+                      f"failed={match.group(3)} ignored={match.group(4)} "
+                      f"measured={match.group(5)} filtered={match.group(6)} seconds={match.group(7)}"
+                  )
+
+              match = re.fullmatch(
+                  r"error: test failed, to rerun pass `-p stasis-shell --test "
+                  r"(controlled_mvp|baseline_protocol)`",
+                  line,
+              )
+              if match:
+                  return f"cargo_rerun package=stasis-shell test={match.group(1)}"
+              return None
+
+          append_structural("schema=1")
+          append_structural(f"failed_gate={failed_gate if failed_gate in {'controlled_mvp', 'baseline_protocol'} else 'unknown'}")
+          append_structural("raw_log_uploaded=false")
+          source_status = "missing"
+          try:
+              size = os.path.getsize(raw_path)
+              source_status = "available"
+              start = max(0, size - max_input_bytes)
+              input_truncated = start > 0
+              with open(raw_path, "rb") as source:
+                  source.seek(start)
+                  if start:
+                      source.readline()
+                  for raw_line in source:
+                      if source_lines >= max_input_lines:
+                          input_truncated = True
+                          break
+                      source_lines += 1
+                      if len(raw_line) > max_line_bytes:
+                          omitted_lines += 1
+                          continue
+                      line = raw_line.rstrip(b"\r\n").decode("utf-8", "replace")
+                      if any(ord(character) < 32 and character != "\t" for character in line):
+                          omitted_lines += 1
+                          continue
+                      structural = sanitize_line(line)
+                      if structural is None or not append_structural(structural):
+                          omitted_lines += 1
+          except (OSError, ValueError):
+              source_status = "missing"
+
+          append_structural(f"source_status={source_status}")
+          append_structural(f"source_lines={source_lines}")
+          append_structural(f"omitted_lines={omitted_lines}")
+          append_structural(f"input_truncated={'true' if input_truncated else 'false'}")
+          with open(summary_path, "w", encoding="ascii", newline="\n") as summary:
+              for retained_line in retained:
+                  summary.write(retained_line + "\n")
+          sys.exit(0 if source_status == "available" else 2)
+          PY
+          then
+            echo 'failure_summary=ok' >> "$status_file"
+          else
+            echo 'failure_summary=source_missing_or_sanitizer_failed' >> "$status_file"
+          fi
+
+          rm -f -- \
+            "$diagnostics/logs/controlled-mvp.raw.log" \
+            "$diagnostics/logs/baseline.raw.log"
+          if [[ ! -e "$diagnostics/logs/controlled-mvp.raw.log" \
+              && ! -e "$diagnostics/logs/baseline.raw.log" ]]; then
+            echo 'raw_logs_deleted=ok' >> "$status_file"
+          else
+            echo 'raw_logs_deleted=failed' >> "$status_file"
+          fi
+
           if {
+            echo 'schema=1'
+            echo 'boundary=failure_only_sanitized_lifecycle_diagnostics'
             echo "revision=$GITHUB_SHA"
+            echo "run_id=$GITHUB_RUN_ID"
             echo "run_attempt=$GITHUB_RUN_ATTEMPT"
-            uname -a
-            LC_ALL=C getconf GNU_LIBC_VERSION
-            if [[ -f "$diagnostics/stasis-exact" ]]; then
-              sha256sum "$diagnostics/stasis-exact"
+            echo "failed_gate=$failed_gate"
+            echo "controlled_mvp_outcome=$CONTROLLED_MVP_OUTCOME"
+            echo "baseline_protocol_outcome=$BASELINE_PROTOCOL_OUTCOME"
+            echo 'raw_logs_uploaded=false'
+            echo 'raw_core_memory_uploaded=false'
+            echo 'process_environment_values_captured=false'
+            printf 'kernel='; uname -srm
+            printf 'libc='; LC_ALL=C getconf GNU_LIBC_VERSION
+            if [[ -f "$summary" && ! -L "$summary" ]]; then
+              stat --printf='failure_summary_size=%s\n' "$summary"
+              printf 'failure_summary_sha256='
+              sha256sum "$summary" | awk '{print $1}'
+            else
+              echo 'failure_summary=missing_or_symlink'
             fi
+            for binary_spec in \
+              "stasis:$diagnostics/binaries/stasis" \
+              "failed_test_harness:$diagnostics/binaries/failed-test-harness"; do
+              binary_label=${binary_spec%%:*}
+              copied_binary=${binary_spec#*:}
+              if [[ -f "$copied_binary" && ! -L "$copied_binary" ]]; then
+                stat --printf="${binary_label}_size=%s\n${binary_label}_mode=%a\n" "$copied_binary"
+                printf '%s_sha256=' "$binary_label"
+                sha256sum "$copied_binary" | awk '{print $1}'
+                build_id=$(readelf --notes "$copied_binary" \
+                  | LC_ALL=C sed -nE 's/^[[:space:]]*Build ID: ([0-9a-f]+)$/\1/p' \
+                  | head -n 1)
+                if [[ "$build_id" =~ ^[0-9a-f]+$ ]]; then
+                  echo "${binary_label}_build_id=$build_id"
+                else
+                  echo "${binary_label}_build_id=unavailable"
+                fi
+                echo "${binary_label}_ldd_begin"
+                ldd "$copied_binary" | LC_ALL=C sort
+                echo "${binary_label}_ldd_end"
+              else
+                echo "${binary_label}=missing_or_symlink"
+              fi
+            done
           } > "$diagnostics/metadata.txt" 2>&1; then
             echo 'metadata=ok' >> "$status_file"
           else
@@ -407,20 +709,24 @@ jobs:
           fi
           exit 0
 
-      - name: Upload Linux baseline crash diagnostics
+      - name: Upload Linux native-test crash diagnostics
         if: >-
           failure()
-          && steps.baseline_protocol_gate.outcome == 'failure'
           && matrix.release_platform == 'linux-x86_64'
           && env.STASIS_LINUX_CRASH_DIR != ''
+          && (
+            steps.controlled_mvp_gate.outcome == 'failure'
+            || steps.baseline_protocol_gate.outcome == 'failure'
+          )
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: stasis-linux-crash-diagnostics-attempt-${{ github.run_attempt }}
           path: |
-            ${{ env.STASIS_LINUX_CRASH_DIR }}/logs/baseline.tail.log
+            ${{ env.STASIS_LINUX_CRASH_DIR }}/logs/failure-summary.log
+            ${{ env.STASIS_LINUX_CRASH_DIR }}/binaries/stasis
+            ${{ env.STASIS_LINUX_CRASH_DIR }}/binaries/failed-test-harness
             ${{ env.STASIS_LINUX_CRASH_DIR }}/collection-status.txt
             ${{ env.STASIS_LINUX_CRASH_DIR }}/metadata.txt
-            ${{ env.STASIS_LINUX_CRASH_DIR }}/stasis-exact
           if-no-files-found: error
           retention-days: 7
 
