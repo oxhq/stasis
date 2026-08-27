@@ -644,10 +644,13 @@ const cookieMainServer = createServer((request, response) => {
       "text/html; charset=utf-8",
       `<!doctype html><html><body>
         <output id="time-range-arm">pending</output>
+        <button id="time-range-advance" type="button">advance</button>
         <script>
-          setTimeout(() => {
-            document.querySelector("#time-range-arm").textContent = "advanced";
-          }, 1);
+          document.querySelector("#time-range-advance").addEventListener("click", () => {
+            setTimeout(() => {
+              document.querySelector("#time-range-arm").textContent = "advanced";
+            }, 1);
+          });
         </script>
       </body></html>`,
     );
@@ -2143,7 +2146,7 @@ try {
       profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
       clock: {
         mode: "controlled",
-        initialVirtualTimeNs: MAX_U64_VIRTUAL_TIME_NS,
+        initialVirtualTimeNs: MAX_U64_VIRTUAL_TIME_NS - 1n,
         unixTimeOriginNs: 0n,
       },
       network: { mode: "live", routes: [] },
@@ -2156,8 +2159,13 @@ try {
     url: "/time-range-arm",
     cookie: "",
   });
-  const timeRangeArmed = await v2CookieTimeRangeSession.settle(
+  const timeRangeScheduled = await v2CookieTimeRangeSession.activate(
+    "#time-range-advance",
     v2CookieTimeRangeSession.stateToken,
+    commandDeadline(),
+  );
+  const timeRangeArmed = await v2CookieTimeRangeSession.settle(
+    timeRangeScheduled.stateToken,
     {},
     commandDeadline(),
   );
