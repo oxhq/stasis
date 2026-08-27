@@ -1177,6 +1177,26 @@ jobs:
             throw "the Windows baseline_protocol gate failed with exit code $exitCode"
           }
 
+      - name: Gate repeated Windows rejected-transfer shutdown lifecycles
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $testName = 'predecessor_profile_keeps_pre_v2_stream_transfer_side_effect_order'
+          $testCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell ' +
+            "--test baseline_protocol $testName -- --exact --test-threads=1 --show-output; " +
+            'exit $LASTEXITCODE'
+          # Every invocation must pass. These are independent lifecycle samples, not retries of a
+          # failed assertion or process.
+          foreach ($sample in 1..50) {
+            Write-Output ("windows_lifecycle_fresh_process_sample={0:D2}/50 test={1}" -f `
+              $sample, $testName)
+            & .\mach.ps1 exec -- pwsh -NoProfile -Command $testCommand
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -ne 0) {
+              throw "Windows lifecycle sample $sample/50 failed with exit code $exitCode"
+            }
+          }
+
       - name: Gate controlled-network redirect ordering invariants
         run: |
           $ErrorActionPreference = 'Stop'

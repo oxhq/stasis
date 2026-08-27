@@ -6,6 +6,7 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::cmp::max;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -26,7 +27,7 @@ use gaol::sandbox::{ChildSandbox, ChildSandboxMethods};
 use ipc_channel::ipc::{self, IpcSender};
 use layout::LayoutFactoryImpl;
 use layout_api::ScriptThreadFactory;
-use log::{Log, Metadata, Record, debug, warn};
+use log::{Log, Metadata, Record, debug, error, warn};
 use media::{GlApi, NativeDisplay, WindowGLContext};
 use net::embedder::NetToEmbedderMsg;
 use net::image_cache::ImageCacheFactoryImpl;
@@ -236,6 +237,9 @@ struct ServoInner {
     /// Tracks whether we are in the process of shutting down, or have shut down.
     /// This is shared with `WebView`s and the `ServoRenderer`.
     shutdown_state: Rc<Cell<ShutdownState>>,
+    /// Retained until shutdown so JavaScript-engine teardown cannot race the final Constellation
+    /// thread unwind after `ShutdownComplete` crosses the embedder channel.
+    constellation_thread: Option<JoinHandle<()>>,
     /// A map  [`WebView`]s that are managed by this [`Servo`] instance. These are stored
     /// as `Weak` references so that the embedding application can control their lifetime.
     /// When accessed, `Servo` will be reponsible for cleaning up the invalid `Weak`
@@ -984,6 +988,11 @@ impl Drop for ServoInner {
         while self.spin_event_loop() {
             std::thread::sleep(Duration::from_micros(500));
         }
+        if let Some(constellation_thread) = self.constellation_thread.take()
+            && constellation_thread.join().is_err()
+        {
+            error!("Failed to join the Constellation thread during Servo shutdown.");
+        }
     }
 }
 
@@ -1102,7 +1111,7 @@ impl Servo {
             opts.temporary_storage,
         );
 
-        create_constellation(
+        let constellation_thread = create_constellation(
             embedder_to_constellation_receiver,
             &paint.borrow(),
             embedder_proxy,
@@ -1146,6 +1155,7 @@ impl Servo {
             net_embedder_receiver,
             constellation_embedder_receiver,
             shutdown_state,
+            constellation_thread: Some(constellation_thread),
             webviews: Default::default(),
             servo_errors: ServoErrorChannel::default(),
             _js_engine_setup: js_engine_setup,
@@ -1324,7 +1334,7 @@ fn create_constellation(
     async_runtime: Box<dyn net_traits::AsyncRuntime>,
     public_storage_threads: StorageThreads,
     private_storage_threads: StorageThreads,
-) {
+) -> JoinHandle<()> {
     // Global configuration options, parsed from the command line.
     let opts = opts::get();
 
@@ -1372,14 +1382,14 @@ fn create_constellation(
 
     let layout_factory = Arc::new(LayoutFactoryImpl());
 
-    Constellation::<script::ScriptThread, script::ServiceWorkerManager>::start(
+    Constellation::<script::ScriptThread, script::ServiceWorkerManager>::start_joinable(
         embedder_to_constellation_receiver,
         initial_state,
         layout_factory,
         opts.random_pipeline_closure_probability,
         opts.random_pipeline_closure_seed,
         opts.hard_fail,
-    );
+    )
 }
 
 // A logger that logs to two downstream loggers.

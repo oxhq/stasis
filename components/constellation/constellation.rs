@@ -813,6 +813,17 @@ enum ExitPipelineMode {
 /// The number of warnings to include in each crash report.
 const WARNINGS_BUFFER_SIZE: usize = 32;
 
+#[derive(Clone, Copy)]
+enum ShutdownCompleteDelivery {
+    WakeEmbedder,
+    PollingOwner,
+}
+
+enum ShutdownCompleteTarget {
+    Waking(GenericEmbedderProxy<ConstellationToEmbedderMsg>),
+    Polling(Sender<ConstellationToEmbedderMsg>),
+}
+
 impl<STF, SWF> Constellation<STF, SWF>
 where
     STF: ScriptThreadFactory,
@@ -828,6 +839,46 @@ where
         random_pipeline_closure_seed: Option<usize>,
         hard_fail: bool,
     ) {
+        drop(Self::start_with_shutdown_delivery(
+            embedder_to_constellation_receiver,
+            state,
+            layout_factory,
+            random_pipeline_closure_probability,
+            random_pipeline_closure_seed,
+            hard_fail,
+            ShutdownCompleteDelivery::WakeEmbedder,
+        ));
+    }
+
+    /// Create a new constellation thread and retain authority to join its physical termination.
+    pub fn start_joinable(
+        embedder_to_constellation_receiver: Receiver<EmbedderToConstellationMessage>,
+        state: InitialConstellationState,
+        layout_factory: Arc<dyn LayoutFactory>,
+        random_pipeline_closure_probability: Option<f32>,
+        random_pipeline_closure_seed: Option<usize>,
+        hard_fail: bool,
+    ) -> JoinHandle<()> {
+        Self::start_with_shutdown_delivery(
+            embedder_to_constellation_receiver,
+            state,
+            layout_factory,
+            random_pipeline_closure_probability,
+            random_pipeline_closure_seed,
+            hard_fail,
+            ShutdownCompleteDelivery::PollingOwner,
+        )
+    }
+
+    fn start_with_shutdown_delivery(
+        embedder_to_constellation_receiver: Receiver<EmbedderToConstellationMessage>,
+        state: InitialConstellationState,
+        layout_factory: Arc<dyn LayoutFactory>,
+        random_pipeline_closure_probability: Option<f32>,
+        random_pipeline_closure_seed: Option<usize>,
+        hard_fail: bool,
+        shutdown_complete_delivery: ShutdownCompleteDelivery,
+    ) -> JoinHandle<()> {
         thread::Builder::new()
             .name("Constellation".to_owned())
             .spawn(move || {
@@ -959,17 +1010,42 @@ where
                     user_contents_for_manager_id: Default::default(),
                 };
 
-                let shutdown_complete_proxy =
-                    constellation.constellation_to_embedder_proxy.clone();
+                let shutdown_complete_target = match shutdown_complete_delivery {
+                    ShutdownCompleteDelivery::WakeEmbedder => ShutdownCompleteTarget::Waking(
+                        constellation.constellation_to_embedder_proxy.clone(),
+                    ),
+                    ShutdownCompleteDelivery::PollingOwner => ShutdownCompleteTarget::Polling(
+                        constellation
+                        .constellation_to_embedder_proxy
+                        .sender
+                        .clone(),
+                    ),
+                };
                 constellation.run();
 
                 // Drop all Constellation-owned state before telling the embedder that shutdown is
                 // complete. The embedder uses this signal as its boundary for de-initializing Servo.
                 drop(constellation);
                 debug!("Asking embedding layer to complete shutdown.");
-                shutdown_complete_proxy.send(ConstellationToEmbedderMsg::ShutdownComplete);
+                match shutdown_complete_target {
+                    ShutdownCompleteTarget::Waking(proxy) => {
+                        proxy.send(ConstellationToEmbedderMsg::ShutdownComplete)
+                    },
+                    ShutdownCompleteTarget::Polling(sender) => {
+                        // `ServoInner::drop` polls this receiver while shutting down, so this
+                        // terminal message does not need an event-loop wake. Avoiding the callback
+                        // also means the embedder can safely join this thread after consuming the
+                        // message: no arbitrary `EventLoopWaker` implementation can still be
+                        // waiting on that same embedder.
+                        if let Err(error) =
+                            sender.send(ConstellationToEmbedderMsg::ShutdownComplete)
+                        {
+                            warn!("Failed to send Constellation shutdown completion: {error:?}.");
+                        }
+                    },
+                }
             })
-            .expect("Thread spawning failed");
+            .expect("Thread spawning failed")
     }
 
     fn event_loops(&self) -> Vec<Rc<EventLoop>> {
