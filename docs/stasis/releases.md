@@ -53,6 +53,19 @@ macOS/Linux candidate archive has twelve files: the historical ten-file
 runtime/source inventory plus `controlled-web-session-v2.json` and
 `session-v0.3-candidate.md`, both byte-bound to the candidate source revision.
 
+The seventh slice owns persistent cookies in memory for the exact v2 session. Expiry uses
+controlled Unix nanoseconds with origin zero, valid `Max-Age` takes precedence over `Expires`,
+lifetime is clamped to 400 days, and lazy purge precedes observation, request selection, and
+export. SameSite selection uses captured schemeful site-for-cookies, the current redirect-hop
+method, and the top-level-navigation bit; ineligible cookies are filtered, while unknown or opaque
+context remains typed unsupported before network start. V2 state retains schema 1 but carries the
+literal v2 profile and is portable only through explicit v2 export and initial import. V1 state is
+not migrated. Cross-site subresource responses retain only valid Secure SameSite=None cookies;
+top-level-navigation responses admit all otherwise valid unpartitioned cookies. A post-open
+request above u64 is nonfatal `unsupported_cookie_time_range` before network start; initial open
+hardens the same code to fatal fail-stop. Partitioned cookies and
+CookieStore read/getAll/delete remain unsupported.
+
 The checked-out release and npm workflows accept only exact `v0.3.0` for new
 promotion/publication work. They do not authorize rebuilding or replacing any
 published `0.2.x` bytes. Do not describe `0.3.0` as released until its hosted
@@ -185,8 +198,16 @@ script-created event interfaces remain host-stamped and settle as `unsupported_c
 A second fresh exact-binary process proves controlled internal `animationstart` and `animationend`
 dispatch reaches quiescence through finite rendering demand, then proves script-created
 `AnimationEvent` and `TransitionEvent` values remain host-stamped and typed unsupported. The durable
-SDK proof binds all six candidate slices to the same package, native digest, source revision, both
-close responses, and both protocol EOFs.
+SDK gate additionally proves one same-site login response can retain and export a controlled
+persistent cookie and that cross-site subresource selection filters an imported Lax
+cookie while retaining its exact state identity. A third same-host exact-binary process opens
+without an import and proves neither an ambient request cookie nor cookie state appears; a fourth
+process opens at u64 max, advances beyond it, and proves a post-open request fails as
+`unsupported_cookie_time_range` before reaching the server. Every exact-binary child receives an
+explicit runtime-only environment
+allowlist rather than workflow or registry credentials. Its schema-7 proof binds all seven
+candidate slices to the same package, native
+digest, source revision, clean close responses, and protocol EOFs.
 
 The frozen v0.2 story and complete native `baseline_protocol` target also run
 against each exact production-stripped native

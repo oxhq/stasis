@@ -11,7 +11,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use embedder_traits::{SessionNavigationId, WebResourceLoadId};
+use embedder_traits::{
+    ControlledCookiePolicy, DocumentExecutionProfile, SessionNavigationId, WebResourceLoadId,
+};
 use parking_lot::Mutex;
 use serde::Serialize;
 use url::Url;
@@ -48,6 +50,7 @@ pub enum ControlledNetworkFailure {
     CookieSameSiteContextUnsupported,
     PersistentCookieUnsupported,
     PartitionedCookieUnsupported,
+    CookieTimeRangeUnsupported,
     InvalidCookie,
 }
 
@@ -129,6 +132,7 @@ pub enum ControlledNetworkCookieFailure {
     SameSiteContextUnsupported,
     PersistentCookieUnsupported,
     PartitionedCookieUnsupported,
+    TimeRangeUnsupported,
     InvalidCookie,
 }
 
@@ -146,6 +150,7 @@ struct ControlledNetworkInner {
     retired_redirect_predecessors: BTreeMap<WebResourceLoadId, NetworkRequestId>,
     retired_redirect_order: VecDeque<WebResourceLoadId>,
     virtual_time_ns: u128,
+    controlled_cookie_v2: bool,
     sticky_failure: Option<ControlledNetworkFailure>,
 }
 
@@ -159,13 +164,38 @@ impl ControlledNetworkSession {
         fixture_value: serde_json::Value,
         initial_virtual_time_ns: u128,
     ) -> Result<Self, NetworkFixtureError> {
-        Ok(Self::new(
+        Self::from_json_with_execution_profile(
+            fixture_value,
+            initial_virtual_time_ns,
+            DocumentExecutionProfile::Baseline,
+        )
+    }
+
+    pub fn from_json_with_execution_profile(
+        fixture_value: serde_json::Value,
+        initial_virtual_time_ns: u128,
+        execution_profile: DocumentExecutionProfile,
+    ) -> Result<Self, NetworkFixtureError> {
+        Ok(Self::new_with_execution_profile(
             NetworkFixtureTable::from_json(fixture_value)?,
             initial_virtual_time_ns,
+            execution_profile,
         ))
     }
 
     pub fn new(fixtures: NetworkFixtureTable, initial_virtual_time_ns: u128) -> Self {
+        Self::new_with_execution_profile(
+            fixtures,
+            initial_virtual_time_ns,
+            DocumentExecutionProfile::Baseline,
+        )
+    }
+
+    pub fn new_with_execution_profile(
+        fixtures: NetworkFixtureTable,
+        initial_virtual_time_ns: u128,
+        execution_profile: DocumentExecutionProfile,
+    ) -> Self {
         Self(Arc::new(Mutex::new(ControlledNetworkInner {
             fixtures,
             evidence: NetworkEvidenceLedger::new(EvidenceLedgerBounds::default()),
@@ -173,6 +203,8 @@ impl ControlledNetworkSession {
             retired_redirect_predecessors: BTreeMap::new(),
             retired_redirect_order: VecDeque::new(),
             virtual_time_ns: initial_virtual_time_ns,
+            controlled_cookie_v2: execution_profile
+                == DocumentExecutionProfile::ControlledWebSessionV2,
             sticky_failure: None,
         })))
     }
@@ -191,6 +223,22 @@ impl ControlledNetworkSession {
     pub fn begin(&self, request: ControlledNetworkRequest<'_>) -> ControlledNetworkAction {
         let mut inner = self.0.lock();
         inner.begin(request)
+    }
+
+    /// Admit one request and capture the exact cookie clock from the same owner serialization
+    /// point. The returned policy is safe to carry through Net without consulting later time.
+    pub fn begin_with_cookie_policy(
+        &self,
+        request: ControlledNetworkRequest<'_>,
+    ) -> (ControlledNetworkAction, ControlledCookiePolicy) {
+        let mut inner = self.0.lock();
+        let policy = inner.cookie_policy();
+        (inner.begin(request), policy)
+    }
+
+    /// Return the current policy for a synchronous privileged state boundary.
+    pub fn cookie_policy(&self) -> ControlledCookiePolicy {
+        self.0.lock().cookie_policy()
     }
 
     /// Report a Net-owned terminal. A redirect successor and its predecessor terminal may arrive
@@ -244,6 +292,9 @@ impl ControlledNetworkSession {
                     },
                     ControlledNetworkCookieFailure::PartitionedCookieUnsupported => {
                         ControlledNetworkFailure::PartitionedCookieUnsupported
+                    },
+                    ControlledNetworkCookieFailure::TimeRangeUnsupported => {
+                        ControlledNetworkFailure::CookieTimeRangeUnsupported
                     },
                     ControlledNetworkCookieFailure::InvalidCookie => {
                         ControlledNetworkFailure::InvalidCookie
@@ -328,6 +379,16 @@ impl ControlledNetworkSession {
 }
 
 impl ControlledNetworkInner {
+    fn cookie_policy(&self) -> ControlledCookiePolicy {
+        if self.controlled_cookie_v2 {
+            ControlledCookiePolicy::SessionV2 {
+                unix_time_ns: self.virtual_time_ns,
+            }
+        } else {
+            ControlledCookiePolicy::SessionV1
+        }
+    }
+
     fn begin(&mut self, request: ControlledNetworkRequest<'_>) -> ControlledNetworkAction {
         if self.sticky_failure.is_some() {
             return ControlledNetworkAction::Abort {
@@ -974,6 +1035,46 @@ mod tests {
             time_session.snapshot().sticky_failure,
             Some(ControlledNetworkFailure::VirtualTimeRegressed)
         );
+    }
+
+    #[test]
+    fn cookie_policy_captures_v2_time_at_request_admission_and_preserves_v1() {
+        let url = Url::parse("https://example.test/data").unwrap();
+
+        let v1 = fixture_session("live", json!([]));
+        let (v1_action, v1_policy) = v1.begin_with_cookie_policy(request(31, 0, &url, Some(0)));
+        assert_eq!(v1_policy, ControlledCookiePolicy::SessionV1);
+        let v1_handle = match v1_action {
+            ControlledNetworkAction::Passthrough { handle } => handle,
+            _ => panic!("expected v1 passthrough"),
+        };
+        v1.live_terminal(v1_handle.load_id(), ControlledNetworkTerminal::Failed);
+
+        let v2 = ControlledNetworkSession::from_json_with_execution_profile(
+            json!({"mode": "live", "routes": []}),
+            7,
+            DocumentExecutionProfile::ControlledWebSessionV2,
+        )
+        .unwrap();
+        assert_eq!(
+            v2.cookie_policy(),
+            ControlledCookiePolicy::SessionV2 { unix_time_ns: 7 },
+        );
+        let (v2_action, captured) = v2.begin_with_cookie_policy(request(32, 0, &url, Some(0)));
+        let v2_handle = match v2_action {
+            ControlledNetworkAction::Passthrough { handle } => handle,
+            _ => panic!("expected v2 passthrough"),
+        };
+        v2.set_virtual_time_ns(11).unwrap();
+        assert_eq!(
+            captured,
+            ControlledCookiePolicy::SessionV2 { unix_time_ns: 7 },
+        );
+        assert_eq!(
+            v2.cookie_policy(),
+            ControlledCookiePolicy::SessionV2 { unix_time_ns: 11 },
+        );
+        v2.live_terminal(v2_handle.load_id(), ControlledNetworkTerminal::Failed);
     }
 
     #[test]

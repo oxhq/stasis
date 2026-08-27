@@ -88,7 +88,7 @@ import type {
   SessionAdvanceToNextResult,
   SessionAuditOptions,
   SessionAutomationMutationResult,
-  SessionCookie,
+  SessionCookieFor,
   SessionCookiesResult,
   SessionEvidenceResult,
   SessionFocusResult,
@@ -103,7 +103,7 @@ import type {
   SessionRequestsResult,
   SessionSelectResult,
   SessionSettleResult,
-  SessionState,
+  SessionStateFor,
   SessionStateExportResult,
   SessionStateMutationResult,
   SessionStateToken,
@@ -832,20 +832,20 @@ export class Session<Profile extends SelectableSessionProfile = SessionSupportPr
     return result;
   }
 
-  async getCookies(options: CommandOptions = {}): Promise<SessionCookiesResult> {
+  async getCookies(options: CommandOptions = {}): Promise<SessionCookiesResult<Profile>> {
     this.#assertOpen();
     this.#assertMethod(METHOD.getCookies);
     const { result } = await this.#client.request(
       METHOD.getCookies,
       {},
       this.#requestOptions(options, "none"),
-      decodeSessionCookies,
+      (value) => decodeSessionCookies(value, this.profile),
     );
     return result;
   }
 
   async setCookies(
-    cookies: readonly SessionCookie[],
+    cookies: readonly SessionCookieFor<Profile>[],
     expectedSessionStateToken: SessionStateToken,
     options: CommandOptions = {},
   ): Promise<SessionStateMutationResult> {
@@ -853,7 +853,7 @@ export class Session<Profile extends SelectableSessionProfile = SessionSupportPr
     this.#assertMethod(METHOD.setCookies);
     const { result } = await this.#client.request(
       METHOD.setCookies,
-      encodeSessionCookiesSetParams(cookies, expectedSessionStateToken),
+      encodeSessionCookiesSetParams(cookies, expectedSessionStateToken, this.profile),
       this.#requestOptions(options, "indeterminate"),
       (value) => decodeSessionStateMutation(value, "session.cookies.set result"),
     );
@@ -888,14 +888,14 @@ export class Session<Profile extends SelectableSessionProfile = SessionSupportPr
     return result;
   }
 
-  async exportState(options: CommandOptions = {}): Promise<SessionStateExportResult> {
+  async exportState(options: CommandOptions = {}): Promise<SessionStateExportResult<Profile>> {
     this.#assertOpen();
     this.#assertMethod(METHOD.exportState);
     const { result } = await this.#client.request(
       METHOD.exportState,
       {},
       this.#requestOptions(options, "none"),
-      decodeSessionStateExport,
+      (value) => decodeSessionStateExport(value, this.profile),
     );
     return result;
   }
@@ -908,7 +908,7 @@ export class Session<Profile extends SelectableSessionProfile = SessionSupportPr
    * unconditional and session state is sensitive.
    */
   async importState(
-    state: SessionState,
+    state: SessionStateFor<Profile>,
     expectedSessionStateToken: SessionStateToken,
     options: CommandOptions = {},
   ): Promise<never> {

@@ -15,6 +15,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::net::IpAddr;
 
+use embedder_traits::ControlledCookiePolicy;
 use net_traits::pub_domains::{is_pub_domain, reg_suffix};
 use net_traits::{
     COOKIE_STATE_MAX_COOKIES_PER_REGISTRABLE_HOST_V1,
@@ -38,9 +39,11 @@ use crate::token_namespace::{
 
 pub const SESSION_STATE_SCHEMA_VERSION_V1: u16 = 1;
 pub const CONTROLLED_WEB_SESSION_V1_PROFILE: &str = "controlled-web-session-v1";
+pub const CONTROLLED_WEB_SESSION_V2_PROFILE: &str = "controlled-web-session-v2";
 pub const TOP_LEVEL_SESSION_STORAGE_SCOPE: &str = "top_level_browsing_context";
 pub const MAX_SESSION_STATE_BYTES: usize = 512 * 1024;
 pub const MAX_SESSION_COOKIES: usize = 512;
+const MAX_CONTROLLED_COOKIE_LIFETIME_NS: u64 = 34_560_000 * 1_000_000_000;
 pub const MAX_SESSION_COOKIES_PER_REGISTRABLE_HOST: usize =
     COOKIE_STATE_MAX_COOKIES_PER_REGISTRABLE_HOST_V1;
 pub const MAX_SESSION_COOKIE_BYTES: usize = 4096;
@@ -442,6 +445,7 @@ pub enum SessionStateError {
     DuplicateCookieIdentity,
     DuplicateCreationSequence,
     DuplicateLastAccessSequence,
+    CookieTimeRangeUnsupported,
     PersistentCookieUnsupported,
     PartitionedCookieUnsupported,
     TooManyOrigins,
@@ -479,6 +483,7 @@ impl SessionStateError {
             Self::DuplicateCookieIdentity => "duplicate_session_cookie",
             Self::DuplicateCreationSequence => "duplicate_cookie_creation_sequence",
             Self::DuplicateLastAccessSequence => "duplicate_cookie_access_sequence",
+            Self::CookieTimeRangeUnsupported => "unsupported_cookie_time_range",
             Self::PersistentCookieUnsupported => "unsupported_persistent_cookie",
             Self::PartitionedCookieUnsupported => "unsupported_partitioned_cookie",
             Self::TooManyOrigins => "too_many_session_storage_origins",
@@ -598,6 +603,9 @@ pub trait UnpublishedSessionStateBackend: Sized {
 pub trait LiveSessionStateBackend {
     type Error;
 
+    fn controlled_cookie_policy(&self) -> ControlledCookiePolicy {
+        ControlledCookiePolicy::SessionV1
+    }
     fn revisions(&self) -> Result<SessionStateRevisions, Self::Error>;
     fn cookie_state(&self) -> Result<CookieStateSnapshotV1, Self::Error>;
     fn web_storage_state(&self) -> Result<WebStorageStateSnapshotV1, Self::Error>;
@@ -617,13 +625,19 @@ pub trait LiveSessionStateBackend {
 pub struct ServoSessionStateBackend<'a> {
     site_data: &'a SiteDataManager,
     webview_id: WebViewId,
+    controlled_cookie_policy: ControlledCookiePolicy,
 }
 
 impl<'a> ServoSessionStateBackend<'a> {
-    pub const fn new(site_data: &'a SiteDataManager, webview_id: WebViewId) -> Self {
+    pub const fn new(
+        site_data: &'a SiteDataManager,
+        webview_id: WebViewId,
+        controlled_cookie_policy: ControlledCookiePolicy,
+    ) -> Self {
         Self {
             site_data,
             webview_id,
+            controlled_cookie_policy,
         }
     }
 }
@@ -639,7 +653,7 @@ impl ServoSessionStateBackend<'_> {
     fn observed_revisions(&self) -> Result<SessionStateRevisions, ServoSessionStateBackendError> {
         let cookie = self
             .site_data
-            .cookie_state()
+            .controlled_cookie_state(self.controlled_cookie_policy)
             .map_err(|_| ServoSessionStateBackendError::Cookie)?;
         let web_storage = self
             .site_data
@@ -655,13 +669,17 @@ impl ServoSessionStateBackend<'_> {
 impl LiveSessionStateBackend for ServoSessionStateBackend<'_> {
     type Error = ServoSessionStateBackendError;
 
+    fn controlled_cookie_policy(&self) -> ControlledCookiePolicy {
+        self.controlled_cookie_policy
+    }
+
     fn revisions(&self) -> Result<SessionStateRevisions, Self::Error> {
         self.observed_revisions()
     }
 
     fn cookie_state(&self) -> Result<CookieStateSnapshotV1, Self::Error> {
         self.site_data
-            .cookie_state()
+            .controlled_cookie_state(self.controlled_cookie_policy)
             .map_err(|_| ServoSessionStateBackendError::Cookie)
     }
 
@@ -677,7 +695,11 @@ impl LiveSessionStateBackend for ServoSessionStateBackend<'_> {
         snapshot: CookieStateSnapshotV1,
     ) -> Result<u64, Self::Error> {
         self.site_data
-            .replace_cookie_state(expected_revision, snapshot)
+            .replace_controlled_cookie_state(
+                self.controlled_cookie_policy,
+                expected_revision,
+                snapshot,
+            )
             .map_err(|_| ServoSessionStateBackendError::Cookie)
     }
 
@@ -705,7 +727,11 @@ impl UnpublishedSessionStateBackend for ServoSessionStateBackend<'_> {
         snapshot: CookieStateSnapshotV1,
     ) -> Result<u64, Self::Error> {
         self.site_data
-            .replace_cookie_state(expected_revision, snapshot)
+            .replace_controlled_cookie_state(
+                self.controlled_cookie_policy,
+                expected_revision,
+                snapshot,
+            )
             .map_err(|_| ServoSessionStateBackendError::Cookie)
     }
 
@@ -732,15 +758,22 @@ pub fn initialize_servo_session_state_before_publication(
     site_data: &SiteDataManager,
     webview_id: WebViewId,
     authority: &mut SessionStateAuthority,
+    controlled_cookie_policy: ControlledCookiePolicy,
     state: Option<SessionStateV1>,
 ) -> Result<SessionStateToken, SessionStateError> {
-    let backend = ServoSessionStateBackend::new(site_data, webview_id);
+    validate_controlled_cookie_policy_time(controlled_cookie_policy)?;
+    let backend = ServoSessionStateBackend::new(site_data, webview_id, controlled_cookie_policy);
     let observed = UnpublishedSessionStateBackend::revisions(&backend)
         .map_err(|_| SessionStateError::BackendRejected(SessionStateBackendStage::Observe))?;
     let Some(state) = state else {
         return authority.observe(observed);
     };
-    let prepared = prepare_open_state_import(authority, observed, state)?;
+    let prepared = prepare_open_state_import_with_policy(
+        authority,
+        observed,
+        controlled_cookie_policy,
+        state,
+    )?;
     let initialized = apply_prepared_session_state_import(backend, authority, prepared)?;
     Ok(initialized.session_state_token().clone())
 }
@@ -772,8 +805,23 @@ pub fn prepare_session_state_import(
     observed_revisions: SessionStateRevisions,
     params: SessionStateImportParamsV1,
 ) -> Result<PreparedSessionStateImport, SessionStateError> {
+    prepare_session_state_import_with_policy(
+        authority,
+        observed_revisions,
+        ControlledCookiePolicy::SessionV1,
+        params,
+    )
+}
+
+/// Validate and authorize an initialization-phase import under the selected session profile.
+pub fn prepare_session_state_import_with_policy(
+    authority: &mut SessionStateAuthority,
+    observed_revisions: SessionStateRevisions,
+    controlled_cookie_policy: ControlledCookiePolicy,
+    params: SessionStateImportParamsV1,
+) -> Result<PreparedSessionStateImport, SessionStateError> {
     authority.authorize(&params.expected_session_state_token, observed_revisions)?;
-    prepare_state(observed_revisions, params.state)
+    prepare_state(observed_revisions, controlled_cookie_policy, params.state)
 }
 
 /// Validate the `session.open({ state })` sugar using the builder's current hidden token.
@@ -782,8 +830,23 @@ pub fn prepare_open_state_import(
     observed_revisions: SessionStateRevisions,
     state: SessionStateV1,
 ) -> Result<PreparedSessionStateImport, SessionStateError> {
+    prepare_open_state_import_with_policy(
+        authority,
+        observed_revisions,
+        ControlledCookiePolicy::SessionV1,
+        state,
+    )
+}
+
+/// Validate `session.open({ state })` under its immutable controlled-session profile.
+pub fn prepare_open_state_import_with_policy(
+    authority: &mut SessionStateAuthority,
+    observed_revisions: SessionStateRevisions,
+    controlled_cookie_policy: ControlledCookiePolicy,
+    state: SessionStateV1,
+) -> Result<PreparedSessionStateImport, SessionStateError> {
     authority.observe(observed_revisions)?;
-    prepare_state(observed_revisions, state)
+    prepare_state(observed_revisions, controlled_cookie_policy, state)
 }
 
 /// Apply both backend replacements before publication or consume and abandon the target on error.
@@ -848,6 +911,8 @@ pub fn session_cookies_get<B: LiveSessionStateBackend>(
     backend: &B,
     authority: &mut SessionStateAuthority,
 ) -> Result<SessionCookiesResultV1, SessionStateError> {
+    let controlled_cookie_policy = backend.controlled_cookie_policy();
+    validate_controlled_cookie_policy_time(controlled_cookie_policy)?;
     let snapshot = backend
         .cookie_state()
         .map_err(|_| SessionStateError::BackendRejected(SessionStateBackendStage::CookieRead))?;
@@ -856,7 +921,7 @@ pub fn session_cookies_get<B: LiveSessionStateBackend>(
         return Err(SessionStateError::BackendRevisionChanged);
     }
     let cookies = wire_cookies(snapshot.cookies);
-    validate_cookie_slice(&cookies)?;
+    validate_cookie_slice(&cookies, controlled_cookie_policy)?;
     Ok(SessionCookiesResultV1 {
         cookies,
         session_state_token: authority.observe(revisions)?,
@@ -867,6 +932,7 @@ pub fn session_storage_get<B: LiveSessionStateBackend>(
     backend: &B,
     authority: &mut SessionStateAuthority,
 ) -> Result<SessionStorageResultV1, SessionStateError> {
+    validate_controlled_cookie_policy_time(backend.controlled_cookie_policy())?;
     let snapshot = backend.web_storage_state().map_err(|_| {
         SessionStateError::BackendRejected(SessionStateBackendStage::WebStorageRead)
     })?;
@@ -886,6 +952,8 @@ pub fn session_state_export<B: LiveSessionStateBackend>(
     backend: &B,
     authority: &mut SessionStateAuthority,
 ) -> Result<SessionStateExportResultV1, SessionStateError> {
+    let controlled_cookie_policy = backend.controlled_cookie_policy();
+    validate_controlled_cookie_policy_time(controlled_cookie_policy)?;
     let cookies = backend
         .cookie_state()
         .map_err(|_| SessionStateError::BackendRejected(SessionStateBackendStage::Export))?;
@@ -896,8 +964,8 @@ pub fn session_state_export<B: LiveSessionStateBackend>(
     if cookies.revision != revisions.cookie || storage.revision != revisions.web_storage {
         return Err(SessionStateError::BackendRevisionChanged);
     }
-    let state = wire_state(cookies.cookies, storage.origins);
-    validate_state(&state)?;
+    let state = wire_state(controlled_cookie_policy, cookies.cookies, storage.origins);
+    validate_state_for_policy(&state, controlled_cookie_policy)?;
     Ok(SessionStateExportResultV1 {
         state,
         session_state_token: authority.observe(revisions)?,
@@ -909,18 +977,20 @@ pub fn session_cookies_set<B: LiveSessionStateBackend>(
     authority: &mut SessionStateAuthority,
     params: SessionCookiesSetParamsV1,
 ) -> Result<SessionStateMutationResultV1, SessionStateError> {
+    let controlled_cookie_policy = backend.controlled_cookie_policy();
+    validate_controlled_cookie_policy_time(controlled_cookie_policy)?;
     let storage = backend.web_storage_state().map_err(|_| {
         SessionStateError::BackendRejected(SessionStateBackendStage::WebStorageRead)
     })?;
     let candidate = SessionStateV1 {
         schema_version: SESSION_STATE_SCHEMA_VERSION_V1,
-        profile: CONTROLLED_WEB_SESSION_V1_PROFILE.into(),
+        profile: controlled_cookie_policy_profile(controlled_cookie_policy).into(),
         sensitive: true,
         session_storage_scope: TOP_LEVEL_SESSION_STORAGE_SCOPE.into(),
         cookies: params.cookies,
         origins: wire_origins(storage.origins),
     };
-    validate_state(&candidate)?;
+    validate_state_for_policy(&candidate, controlled_cookie_policy)?;
 
     // This is the authorization linearization point immediately before compare-replace.
     let observed = observe_live_revisions(backend)?;
@@ -944,18 +1014,20 @@ pub fn session_storage_set<B: LiveSessionStateBackend>(
     authority: &mut SessionStateAuthority,
     params: SessionStorageSetParamsV1,
 ) -> Result<SessionStateMutationResultV1, SessionStateError> {
+    let controlled_cookie_policy = backend.controlled_cookie_policy();
+    validate_controlled_cookie_policy_time(controlled_cookie_policy)?;
     let cookies = backend
         .cookie_state()
         .map_err(|_| SessionStateError::BackendRejected(SessionStateBackendStage::CookieRead))?;
     let candidate = SessionStateV1 {
         schema_version: SESSION_STATE_SCHEMA_VERSION_V1,
-        profile: CONTROLLED_WEB_SESSION_V1_PROFILE.into(),
+        profile: controlled_cookie_policy_profile(controlled_cookie_policy).into(),
         sensitive: true,
         session_storage_scope: TOP_LEVEL_SESSION_STORAGE_SCOPE.into(),
         cookies: wire_cookies(cookies.cookies),
         origins: params.origins,
     };
-    validate_state(&candidate)?;
+    validate_state_for_policy(&candidate, controlled_cookie_policy)?;
 
     // This is the authorization linearization point immediately before compare-replace.
     let observed = observe_live_revisions(backend)?;
@@ -1002,12 +1074,13 @@ fn finish_live_mutation<B: LiveSessionStateBackend>(
 }
 
 fn wire_state(
+    controlled_cookie_policy: ControlledCookiePolicy,
     cookies: Vec<CookieStateRecordV1>,
     origins: Vec<WebStorageOriginStateV1>,
 ) -> SessionStateV1 {
     SessionStateV1 {
         schema_version: SESSION_STATE_SCHEMA_VERSION_V1,
-        profile: CONTROLLED_WEB_SESSION_V1_PROFILE.into(),
+        profile: controlled_cookie_policy_profile(controlled_cookie_policy).into(),
         sensitive: true,
         session_storage_scope: TOP_LEVEL_SESSION_STORAGE_SCOPE.into(),
         cookies: wire_cookies(cookies),
@@ -1117,9 +1190,10 @@ fn backend_origins(origins: Vec<SessionOriginStateV1>) -> Vec<WebStorageOriginSt
 
 fn prepare_state(
     revisions: SessionStateRevisions,
+    controlled_cookie_policy: ControlledCookiePolicy,
     state: SessionStateV1,
 ) -> Result<PreparedSessionStateImport, SessionStateError> {
-    validate_state(&state)?;
+    validate_state_for_policy(&state, controlled_cookie_policy)?;
     let cookies = CookieStateSnapshotV1 {
         schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
         revision: revisions.cookie,
@@ -1140,8 +1214,8 @@ fn prepare_state(
                     SessionCookieSameSite::Lax => CookieStateSameSite::Lax,
                     SessionCookieSameSite::None => CookieStateSameSite::None,
                 },
-                expires_unix_time_ns: None,
-                partitioned: false,
+                expires_unix_time_ns: cookie.expires_unix_time_ns.map(WireU64::get),
+                partitioned: cookie.partitioned,
                 creation_sequence: cookie.creation_sequence.get(),
                 last_access_sequence: cookie.last_access_sequence.get(),
             })
@@ -1181,11 +1255,29 @@ fn prepare_state(
     })
 }
 
+pub const fn controlled_cookie_policy_profile(
+    controlled_cookie_policy: ControlledCookiePolicy,
+) -> &'static str {
+    match controlled_cookie_policy {
+        ControlledCookiePolicy::SessionV1 => CONTROLLED_WEB_SESSION_V1_PROFILE,
+        ControlledCookiePolicy::SessionV2 { .. } => CONTROLLED_WEB_SESSION_V2_PROFILE,
+    }
+}
+
+/// Preserve the frozen v1 validator for existing callers and tests.
 pub fn validate_state(state: &SessionStateV1) -> Result<(), SessionStateError> {
+    validate_state_for_policy(state, ControlledCookiePolicy::SessionV1)
+}
+
+/// Validate one schema-v1 state document under its immutable controlled-session profile.
+pub fn validate_state_for_policy(
+    state: &SessionStateV1,
+    controlled_cookie_policy: ControlledCookiePolicy,
+) -> Result<(), SessionStateError> {
     if state.schema_version != SESSION_STATE_SCHEMA_VERSION_V1 {
         return Err(SessionStateError::InvalidSchemaVersion);
     }
-    if state.profile != CONTROLLED_WEB_SESSION_V1_PROFILE {
+    if state.profile != controlled_cookie_policy_profile(controlled_cookie_policy) {
         return Err(SessionStateError::InvalidProfile);
     }
     if !state.sensitive {
@@ -1194,7 +1286,7 @@ pub fn validate_state(state: &SessionStateV1) -> Result<(), SessionStateError> {
     if state.session_storage_scope != TOP_LEVEL_SESSION_STORAGE_SCOPE {
         return Err(SessionStateError::InvalidSessionStorageScope);
     }
-    validate_cookie_slice(&state.cookies)?;
+    validate_cookie_slice(&state.cookies, controlled_cookie_policy)?;
     validate_origin_slice(&state.origins)?;
 
     let mut counter = SizeCounter::new(MAX_SESSION_STATE_BYTES);
@@ -1202,7 +1294,11 @@ pub fn validate_state(state: &SessionStateV1) -> Result<(), SessionStateError> {
     Ok(())
 }
 
-fn validate_cookie_slice(cookies: &[SessionCookieV1]) -> Result<(), SessionStateError> {
+fn validate_cookie_slice(
+    cookies: &[SessionCookieV1],
+    controlled_cookie_policy: ControlledCookiePolicy,
+) -> Result<(), SessionStateError> {
+    let controlled_now = validate_controlled_cookie_policy_time(controlled_cookie_policy)?;
     if cookies.len() > MAX_SESSION_COOKIES {
         return Err(SessionStateError::TooManyCookies);
     }
@@ -1212,11 +1308,26 @@ fn validate_cookie_slice(cookies: &[SessionCookieV1]) -> Result<(), SessionState
     let mut access_sequences = HashSet::new();
     let mut cookies_per_registrable_host = HashMap::new();
     for cookie in cookies {
-        if cookie.expires_unix_time_ns.is_some() {
+        if matches!(controlled_cookie_policy, ControlledCookiePolicy::SessionV1)
+            && cookie.expires_unix_time_ns.is_some()
+        {
             return Err(SessionStateError::PersistentCookieUnsupported);
         }
         if cookie.partitioned {
             return Err(SessionStateError::PartitionedCookieUnsupported);
+        }
+        if let (Some(now), Some(expires_unix_time_ns)) =
+            (controlled_now, cookie.expires_unix_time_ns)
+        {
+            let expiry = expires_unix_time_ns.get();
+            if expiry > now {
+                let maximum = now
+                    .checked_add(MAX_CONTROLLED_COOKIE_LIFETIME_NS)
+                    .ok_or(SessionStateError::CookieTimeRangeUnsupported)?;
+                if expiry > maximum {
+                    return Err(SessionStateError::InvalidCookie);
+                }
+            }
         }
         if !is_valid_cookie_state_name_and_value(&cookie.name, &cookie.value)
             || !is_canonical_cookie_state_domain(&cookie.domain)
@@ -1259,6 +1370,21 @@ fn validate_cookie_slice(cookies: &[SessionCookieV1]) -> Result<(), SessionState
     serde_json::to_writer(&mut counter, cookies)
         .map_err(|_| SessionStateError::CookieArrayTooLarge)?;
     Ok(())
+}
+
+/// Validate the controller-owned cookie clock before any backend observation or mutation.
+///
+/// The general document clock is u128, while the portable cookie artifact is deliberately bounded
+/// to Unix nanoseconds representable by u64. V1 carries no cookie-clock authority.
+pub fn validate_controlled_cookie_policy_time(
+    controlled_cookie_policy: ControlledCookiePolicy,
+) -> Result<Option<u64>, SessionStateError> {
+    match controlled_cookie_policy {
+        ControlledCookiePolicy::SessionV1 => Ok(None),
+        ControlledCookiePolicy::SessionV2 { unix_time_ns } => u64::try_from(unix_time_ns)
+            .map(Some)
+            .map_err(|_| SessionStateError::CookieTimeRangeUnsupported),
+    }
 }
 
 /// Return exactly the bucket key used by Servo's `CookieStorage` capacity check.
@@ -1435,6 +1561,13 @@ mod tests {
         }
     }
 
+    fn v2_state(expires_unix_time_ns: u64) -> SessionStateV1 {
+        let mut state = state();
+        state.profile = CONTROLLED_WEB_SESSION_V2_PROFILE.into();
+        state.cookies[0].expires_unix_time_ns = Some(WireU64::new(expires_unix_time_ns));
+        state
+    }
+
     #[test]
     fn strict_wire_shape_matches_typescript_and_redacts_debug() {
         let state = state();
@@ -1544,6 +1677,58 @@ mod tests {
                 | SessionStateError::OriginStorageTooLarge
                 | SessionStateError::StateTooLarge)
         ));
+    }
+
+    #[test]
+    fn v1_is_frozen_while_v2_accepts_bounded_persistent_cookie_state() {
+        let maximum_v2_expiry = 42 + MAX_CONTROLLED_COOKIE_LIFETIME_NS;
+        let v2 = v2_state(maximum_v2_expiry);
+        assert_eq!(validate_state(&v2), Err(SessionStateError::InvalidProfile),);
+
+        let mut v1_with_expiry = v2.clone();
+        v1_with_expiry.profile = CONTROLLED_WEB_SESSION_V1_PROFILE.into();
+        assert_eq!(
+            validate_state(&v1_with_expiry),
+            Err(SessionStateError::PersistentCookieUnsupported),
+        );
+
+        let policy = ControlledCookiePolicy::SessionV2 { unix_time_ns: 42 };
+        assert_eq!(validate_state_for_policy(&v2, policy), Ok(()));
+        assert_eq!(
+            validate_state_for_policy(&v2_state(maximum_v2_expiry + 1), policy),
+            Err(SessionStateError::InvalidCookie),
+        );
+        assert_eq!(
+            validate_state_for_policy(&state(), policy),
+            Err(SessionStateError::InvalidProfile),
+        );
+
+        let above_u64 = ControlledCookiePolicy::SessionV2 {
+            unix_time_ns: u128::from(u64::MAX) + 1,
+        };
+        let mut empty_v2 = v2_state(0);
+        empty_v2.cookies.clear();
+        assert_eq!(
+            validate_state_for_policy(&empty_v2, above_u64),
+            Err(SessionStateError::CookieTimeRangeUnsupported),
+            "v2 time is bounded even when the state carries no persistent cookies",
+        );
+
+        let without_persistence_headroom = ControlledCookiePolicy::SessionV2 {
+            unix_time_ns: u128::from(u64::MAX - 1),
+        };
+        assert_eq!(
+            validate_state_for_policy(&v2_state(u64::MAX), without_persistence_headroom),
+            Err(SessionStateError::CookieTimeRangeUnsupported),
+        );
+        assert_eq!(
+            validate_state_for_policy(&v2_state(u64::MAX), ControlledCookiePolicy::SessionV2 {
+                unix_time_ns: u128::from(u64::MAX),
+            }),
+            Ok(()),
+            "expiry at controlled now remains a valid lazy-deletion record",
+        );
+        assert_eq!(v2.schema_version, SESSION_STATE_SCHEMA_VERSION_V1);
     }
 
     #[test]
@@ -1919,6 +2104,7 @@ mod tests {
     }
 
     struct LiveFakeBackend {
+        controlled_cookie_policy: ControlledCookiePolicy,
         cookie_revision: Cell<u64>,
         web_storage_revision: Cell<u64>,
         cookies: Vec<CookieStateRecordV1>,
@@ -1936,6 +2122,7 @@ mod tests {
     impl LiveFakeBackend {
         fn empty() -> Self {
             Self {
+                controlled_cookie_policy: ControlledCookiePolicy::SessionV1,
                 cookie_revision: Cell::new(0),
                 web_storage_revision: Cell::new(0),
                 cookies: Vec::new(),
@@ -1951,6 +2138,13 @@ mod tests {
             }
         }
 
+        fn v2(unix_time_ns: u128) -> Self {
+            Self {
+                controlled_cookie_policy: ControlledCookiePolicy::SessionV2 { unix_time_ns },
+                ..Self::empty()
+            }
+        }
+
         fn revisions_value(&self) -> SessionStateRevisions {
             SessionStateRevisions {
                 cookie: self.cookie_revision.get(),
@@ -1961,6 +2155,10 @@ mod tests {
 
     impl LiveSessionStateBackend for LiveFakeBackend {
         type Error = &'static str;
+
+        fn controlled_cookie_policy(&self) -> ControlledCookiePolicy {
+            self.controlled_cookie_policy
+        }
 
         fn revisions(&self) -> Result<SessionStateRevisions, Self::Error> {
             if self.fail_next_revision_observation.replace(false) {
@@ -2134,6 +2332,226 @@ mod tests {
         assert_eq!(
             format!("{:?}", initialized.session_state_token()),
             "SessionStateToken(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn v2_import_preserves_expiry_and_rotates_before_publication() {
+        let initial = SessionStateRevisions {
+            cookie: 0,
+            web_storage: 0,
+        };
+        let policy = ControlledCookiePolicy::SessionV2 { unix_time_ns: 42 };
+        let mut authority = test_authority();
+        let initial_token = authority.observe(initial).unwrap();
+        let prepared = prepare_open_state_import_with_policy(
+            &mut authority,
+            initial,
+            policy,
+            v2_state(42 + MAX_CONTROLLED_COOKIE_LIFETIME_NS),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.cookies.cookies[0].expires_unix_time_ns,
+            Some(42 + MAX_CONTROLLED_COOKIE_LIFETIME_NS),
+        );
+
+        let initialized = apply_prepared_session_state_import(
+            FakeBackend {
+                revisions: initial,
+                fail_storage: false,
+                abandoned: Arc::new(AtomicBool::new(false)),
+            },
+            &mut authority,
+            prepared,
+        )
+        .unwrap();
+        assert_ne!(initialized.session_state_token(), &initial_token);
+    }
+
+    #[test]
+    fn v2_live_state_round_trips_expiry_while_v1_export_stays_frozen() {
+        let persistent_cookie = backend_cookies(v2_state(1_000).cookies)
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut v1_backend = LiveFakeBackend::empty();
+        v1_backend.cookies.push(persistent_cookie.clone());
+        assert_eq!(
+            session_state_export(&v1_backend, &mut test_authority()),
+            Err(SessionStateError::PersistentCookieUnsupported),
+        );
+
+        let mut v2_backend = LiveFakeBackend::v2(42);
+        v2_backend.cookies.push(persistent_cookie);
+        let mut authority = test_authority();
+        let exported = session_state_export(&v2_backend, &mut authority).unwrap();
+        assert_eq!(
+            exported.state.schema_version,
+            SESSION_STATE_SCHEMA_VERSION_V1
+        );
+        assert_eq!(exported.state.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
+        assert_eq!(
+            exported.state.cookies[0].expires_unix_time_ns,
+            Some(WireU64::new(1_000)),
+        );
+
+        let mut replacement = cookie();
+        replacement.expires_unix_time_ns = Some(WireU64::new(2_000));
+        session_cookies_set(
+            &mut v2_backend,
+            &mut authority,
+            SessionCookiesSetParamsV1 {
+                cookies: vec![replacement],
+                expected_session_state_token: exported.session_state_token,
+            },
+        )
+        .unwrap();
+        assert_eq!(v2_backend.cookies[0].expires_unix_time_ns, Some(2_000),);
+    }
+
+    #[test]
+    fn v2_live_state_mutations_reject_cookie_time_range_before_backend_replace() {
+        let policy_time = u128::from(u64::MAX) + 1;
+
+        let mut cookie_backend = LiveFakeBackend::v2(policy_time);
+        let mut cookie_authority = test_authority();
+        let cookie_token = cookie_authority
+            .observe(cookie_backend.revisions_value())
+            .unwrap();
+        assert_eq!(
+            session_cookies_set(
+                &mut cookie_backend,
+                &mut cookie_authority,
+                SessionCookiesSetParamsV1 {
+                    cookies: Vec::new(),
+                    expected_session_state_token: cookie_token,
+                },
+            ),
+            Err(SessionStateError::CookieTimeRangeUnsupported),
+        );
+        assert_eq!(cookie_backend.cookie_replace_count, 0);
+        assert_eq!(cookie_backend.web_storage_replace_count, 0);
+
+        let mut storage_backend = LiveFakeBackend::v2(policy_time);
+        let mut storage_authority = test_authority();
+        let storage_token = storage_authority
+            .observe(storage_backend.revisions_value())
+            .unwrap();
+        assert_eq!(
+            session_storage_set(
+                &mut storage_backend,
+                &mut storage_authority,
+                SessionStorageSetParamsV1 {
+                    origins: Vec::new(),
+                    expected_session_state_token: storage_token,
+                },
+            ),
+            Err(SessionStateError::CookieTimeRangeUnsupported),
+        );
+        assert_eq!(storage_backend.cookie_replace_count, 0);
+        assert_eq!(storage_backend.web_storage_replace_count, 0);
+    }
+
+    #[test]
+    fn v2_lazy_expiry_revision_invalidates_the_pre_expiry_token() {
+        struct ExpiringBackend {
+            unix_time_ns: Cell<u128>,
+            cookie_revision: Cell<u64>,
+            expired: Cell<bool>,
+            cookie: CookieStateRecordV1,
+        }
+
+        impl ExpiringBackend {
+            fn purge_if_expired(&self) {
+                if !self.expired.get()
+                    && self
+                        .cookie
+                        .expires_unix_time_ns
+                        .is_some_and(|expires| u128::from(expires) <= self.unix_time_ns.get())
+                {
+                    self.expired.set(true);
+                    self.cookie_revision
+                        .set(self.cookie_revision.get().checked_add(1).unwrap());
+                }
+            }
+        }
+
+        impl LiveSessionStateBackend for ExpiringBackend {
+            type Error = ();
+
+            fn controlled_cookie_policy(&self) -> ControlledCookiePolicy {
+                ControlledCookiePolicy::SessionV2 {
+                    unix_time_ns: self.unix_time_ns.get(),
+                }
+            }
+
+            fn revisions(&self) -> Result<SessionStateRevisions, Self::Error> {
+                self.purge_if_expired();
+                Ok(SessionStateRevisions {
+                    cookie: self.cookie_revision.get(),
+                    web_storage: 0,
+                })
+            }
+
+            fn cookie_state(&self) -> Result<CookieStateSnapshotV1, Self::Error> {
+                self.purge_if_expired();
+                Ok(CookieStateSnapshotV1 {
+                    schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+                    revision: self.cookie_revision.get(),
+                    cookies: (!self.expired.get())
+                        .then(|| self.cookie.clone())
+                        .into_iter()
+                        .collect(),
+                })
+            }
+
+            fn web_storage_state(&self) -> Result<WebStorageStateSnapshotV1, Self::Error> {
+                Ok(WebStorageStateSnapshotV1 {
+                    schema_version: WEB_STORAGE_STATE_SCHEMA_VERSION_V1,
+                    revision: 0,
+                    origins: Vec::new(),
+                })
+            }
+
+            fn replace_cookie_state(
+                &mut self,
+                _: u64,
+                _: CookieStateSnapshotV1,
+            ) -> Result<u64, Self::Error> {
+                Err(())
+            }
+
+            fn replace_web_storage_state(
+                &mut self,
+                _: u64,
+                _: WebStorageStateSnapshotV1,
+            ) -> Result<u64, Self::Error> {
+                Err(())
+            }
+        }
+
+        let cookie = backend_cookies(v2_state(10).cookies)
+            .into_iter()
+            .next()
+            .unwrap();
+        let backend = ExpiringBackend {
+            unix_time_ns: Cell::new(9),
+            cookie_revision: Cell::new(0),
+            expired: Cell::new(false),
+            cookie,
+        };
+        let mut authority = test_authority();
+        let before_expiry = authority.observe(backend.revisions().unwrap()).unwrap();
+
+        backend.unix_time_ns.set(10);
+        let after_expiry = session_cookies_get(&backend, &mut authority).unwrap();
+        assert!(after_expiry.cookies.is_empty());
+        assert_ne!(after_expiry.session_state_token, before_expiry);
+        assert_eq!(
+            authority.authorize(&before_expiry, backend.revisions().unwrap()),
+            Err(SessionStateError::StaleSessionStateToken),
         );
     }
 

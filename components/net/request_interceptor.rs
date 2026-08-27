@@ -4,15 +4,14 @@
 
 use content_security_policy::Destination;
 use embedder_traits::{
-    GenericEmbedderProxy, WebResourceCookiePolicyFailure, WebResourceKind, WebResourceLoadId,
-    WebResourceLoadTerminal, WebResourceRequest, WebResourceResponseMsg,
+    ControlledCookieContext, GenericEmbedderProxy, WebResourceCookiePolicyFailure, WebResourceKind,
+    WebResourceLoadId, WebResourceLoadTerminal, WebResourceRequest, WebResourceResponseMsg,
 };
 use log::error;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::{Request, RequestMode, RequestOriginatingApi};
 use net_traits::response::{Response, ResponseBody};
 use net_traits::{ControlledCookiePolicyError, NetworkError};
-use servo_url::ServoUrl;
 
 use crate::embedder::NetToEmbedderMsg;
 use crate::fetch::methods::FetchContext;
@@ -24,7 +23,7 @@ pub struct RequestInterceptor {
 
 pub struct InterceptedRequest {
     pub load_id: WebResourceLoadId,
-    pub controlled_cookie_site: Option<ServoUrl>,
+    pub controlled_cookie_context: Option<ControlledCookieContext>,
     pub fixture_response: bool,
 }
 
@@ -72,12 +71,12 @@ impl RequestInterceptor {
 
         // TODO: use done_chan and run in CoreResourceThreadPool.
         let mut accumulated_body = Vec::new();
-        let mut controlled_cookie_site = None;
+        let mut controlled_cookie_context = None;
         let mut fixture_response = false;
         while let Some(message) = receiver.recv().await {
             match message {
-                WebResourceResponseMsg::ControlledSession { top_level_url } => {
-                    controlled_cookie_site = Some(ServoUrl::from_url(top_level_url));
+                WebResourceResponseMsg::ControlledSession { cookie_context } => {
+                    controlled_cookie_context = Some(cookie_context);
                 },
                 WebResourceResponseMsg::Start(webresource_response) => {
                     fixture_response = true;
@@ -115,7 +114,7 @@ impl RequestInterceptor {
         }
         InterceptedRequest {
             load_id: controlled_load_id,
-            controlled_cookie_site,
+            controlled_cookie_context,
             fixture_response,
         }
     }
@@ -138,6 +137,9 @@ impl RequestInterceptor {
                 },
                 ControlledCookiePolicyError::PartitionedCookieUnsupported => {
                     WebResourceCookiePolicyFailure::PartitionedCookieUnsupported
+                },
+                ControlledCookiePolicyError::TimeRangeUnsupported => {
+                    WebResourceCookiePolicyFailure::TimeRangeUnsupported
                 },
                 ControlledCookiePolicyError::InvalidCookie => {
                     WebResourceCookiePolicyFailure::InvalidCookie

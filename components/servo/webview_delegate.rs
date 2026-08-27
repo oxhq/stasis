@@ -267,10 +267,13 @@ impl WebResourceLoad {
 
     /// Install the controlled-session cookie context before choosing fixture or live handling.
     #[doc(hidden)]
-    pub(crate) fn mark_controlled_session(&mut self, top_level_url: Url) {
+    pub(crate) fn mark_controlled_session(
+        &mut self,
+        cookie_context: embedder_traits::ControlledCookieContext,
+    ) {
         if let Err(error) = self
             .responder
-            .send(WebResourceResponseMsg::ControlledSession { top_level_url })
+            .send(WebResourceResponseMsg::ControlledSession { cookie_context })
         {
             self.error_sender.raise_response_send_error(error);
         }

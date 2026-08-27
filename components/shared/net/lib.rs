@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 use content_security_policy::{self as csp};
 use cookie::Cookie;
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use embedder_traits::{ControlledCookieContext, ControlledCookiePolicy};
 use headers::{ContentType, HeaderMapExt, ReferrerPolicy as ReferrerPolicyHeader};
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use hyper_serde::Serde;
@@ -590,10 +591,18 @@ impl ResourceThreads {
 
     /// Return a bounded canonical snapshot of the public cookie jar.
     pub fn cookie_state(&self) -> Result<CookieStateSnapshotV1, CookieStateError> {
+        self.controlled_cookie_state(ControlledCookiePolicy::SessionV1)
+    }
+
+    /// Return a bounded canonical snapshot under an explicit controlled-session policy.
+    pub fn controlled_cookie_state(
+        &self,
+        policy: ControlledCookiePolicy,
+    ) -> Result<CookieStateSnapshotV1, CookieStateError> {
         let (sender, receiver) = generic_channel::channel().unwrap();
         let _ = self
             .core_thread
-            .send(CoreResourceMsg::ExportCookieState(sender));
+            .send(CoreResourceMsg::ExportCookieState(policy, sender));
         receiver.recv().unwrap()
     }
 
@@ -603,8 +612,23 @@ impl ResourceThreads {
         expected_revision: u64,
         snapshot: CookieStateSnapshotV1,
     ) -> Result<u64, CookieStateError> {
+        self.replace_controlled_cookie_state(
+            ControlledCookiePolicy::SessionV1,
+            expected_revision,
+            snapshot,
+        )
+    }
+
+    /// Replace the public cookie jar under an explicit controlled-session policy.
+    pub fn replace_controlled_cookie_state(
+        &self,
+        policy: ControlledCookiePolicy,
+        expected_revision: u64,
+        snapshot: CookieStateSnapshotV1,
+    ) -> Result<u64, CookieStateError> {
         let (sender, receiver) = generic_channel::channel().unwrap();
         let _ = self.core_thread.send(CoreResourceMsg::ReplaceCookieState(
+            policy,
             expected_revision,
             snapshot,
             sender,
@@ -764,7 +788,7 @@ pub enum CoreResourceMsg {
     /// resumes, so an unsupported attribute can never be committed speculatively.
     SetControlledCookieForUrl(
         ServoUrl,
-        ServoUrl,
+        ControlledCookieContext,
         String,
         GenericSender<Result<(), ControlledCookiePolicyError>>,
     ),
@@ -780,7 +804,7 @@ pub enum CoreResourceMsg {
     /// controller-owned access order.
     GetControlledCookieStringForUrl(
         ServoUrl,
-        ServoUrl,
+        ControlledCookieContext,
         GenericSender<Result<Option<String>, ControlledCookiePolicyError>>,
     ),
     /// Retrieve the stored cookies as a vector for the given URL.
@@ -791,10 +815,14 @@ pub enum CoreResourceMsg {
         CookieSource,
     ),
     /// Return a bounded, canonical, versioned snapshot of the complete public cookie jar.
-    ExportCookieState(GenericSender<Result<CookieStateSnapshotV1, CookieStateError>>),
+    ExportCookieState(
+        ControlledCookiePolicy,
+        GenericSender<Result<CookieStateSnapshotV1, CookieStateError>>,
+    ),
     /// Atomically replace the public cookie jar when its revision still matches the caller's
     /// observation. This privileged path is intended for controlled session restoration.
     ReplaceCookieState(
+        ControlledCookiePolicy,
         u64,
         CookieStateSnapshotV1,
         GenericSender<Result<u64, CookieStateError>>,
@@ -1417,6 +1445,7 @@ pub enum CookieStateError {
     InvalidCookie,
     PartitionedCookieUnsupported,
     PersistentCookieUnsupported,
+    TimeRangeUnsupported,
 }
 
 /// Secret-safe rejection reasons for the deterministic controlled-session cookie boundary.
@@ -1430,6 +1459,7 @@ pub enum ControlledCookiePolicyError {
     SameSiteContextUnsupported,
     PersistentCookieUnsupported,
     PartitionedCookieUnsupported,
+    TimeRangeUnsupported,
     InvalidCookie,
 }
 

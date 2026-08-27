@@ -38,7 +38,8 @@ Release identity and immutable boundaries:
   `controlled-webapp-v1` profile owns one top-level document;
   `controlled-web-session-v1` already admits checked replacement documents on
   that same event loop. `controlled-web-session-v2` preserves that session and
-  navigation authority and expands only declared execution and headless-presentation surfaces. Unsupported or
+  navigation authority and expands only declared execution, headless-presentation, and controlled
+  cookie-state surfaces. Unsupported or
   open-ended work is reported as a typed outcome instead of silently falling
   back to uncontrolled progress.
 - The published `@oxhq/stasis@0.2.1` remains immutable release history. The
@@ -84,9 +85,18 @@ Release identity and immutable boundaries:
   checkpoint-spin liveness bug without adding a task source or limit. Auxiliary WebViews remain host-stamped. Inline SVG gains no DOM completion-event claim,
   and script-created animation/transition constructors, excluded
   image, general SVG/resource, and other unlisted host-stamped paths remain unsupported or retain
-  their frozen predecessor authority.
+  their frozen predecessor authority. V2 also owns persistent cookies in memory against controlled
+  Unix time, with Max-Age precedence, a 400-day clamp, lazy expiry purge, and exact v2
+  export/import identity. SameSite request selection uses captured schemeful site-for-cookies, the
+  current redirect-hop method, and the top-level-navigation bit; ineligible cookies are filtered,
+  while unknown or opaque context stays typed unsupported before network start. Cross-site
+  subresource responses retain only valid Secure SameSite=None cookies; top-level responses admit
+  every otherwise valid unpartitioned cookie. Controlled Unix time above u64 is a nonfatal
+  `unsupported_cookie_time_range` boundary for a post-open request before network start, never a
+  truncation; initial controlled open hardens the same code to fatal fail-stop. Partitioned
+  cookies and the deferred CookieStore read/getAll/delete methods receive no new authority.
   It is explicit-only,
-  leaves the v1 session default and state artifact unchanged, and is not a public release claim
+  leaves the v1 session default and v1 behavior unchanged, and is not a public release claim
   until exact v0.3 artifacts pass the hosted promotion and public-consumer gates.
 - The owner-loop progress path contains no polling sleeps; this is not a claim
   about every shutdown path inherited from upstream Servo. The frozen v1 wire

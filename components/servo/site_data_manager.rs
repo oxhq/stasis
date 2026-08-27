@@ -6,6 +6,7 @@ use std::cell::{Cell, RefCell};
 
 use bitflags::bitflags;
 use cookie::Cookie;
+use embedder_traits::ControlledCookiePolicy;
 use log::warn;
 use net_traits::pub_domains::registered_domain_name;
 use net_traits::{
@@ -131,6 +132,14 @@ impl SiteDataManager {
         self.public_resource_threads.cookie_state()
     }
 
+    /// Return cookie state under an explicit controlled-session policy and clock.
+    pub fn controlled_cookie_state(
+        &self,
+        policy: ControlledCookiePolicy,
+    ) -> Result<CookieStateSnapshotV1, CookieStateError> {
+        self.public_resource_threads.controlled_cookie_state(policy)
+    }
+
     /// Atomically replace public cookie state if its observed revision is still current.
     pub fn replace_cookie_state(
         &self,
@@ -139,6 +148,17 @@ impl SiteDataManager {
     ) -> Result<u64, CookieStateError> {
         self.public_resource_threads
             .replace_cookie_state(expected_revision, snapshot)
+    }
+
+    /// Replace cookie state under an explicit controlled-session policy and clock.
+    pub fn replace_controlled_cookie_state(
+        &self,
+        policy: ControlledCookiePolicy,
+        expected_revision: u64,
+        snapshot: CookieStateSnapshotV1,
+    ) -> Result<u64, CookieStateError> {
+        self.public_resource_threads
+            .replace_controlled_cookie_state(policy, expected_revision, snapshot)
     }
 
     /// Return all public local storage plus one WebView's scoped session storage.

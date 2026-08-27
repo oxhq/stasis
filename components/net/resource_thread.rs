@@ -526,16 +526,18 @@ impl ResourceChannelManager {
             },
             CoreResourceMsg::SetControlledCookieForUrl(
                 request,
-                top_level_url,
+                cookie_context,
                 cookie_value,
                 consumer,
             ) => {
                 let mut cookie_jar = http_state.cookie_jar.write();
-                consumer.send_or_ignore(cookie_jar.set_controlled_session_cookie_from_non_http(
-                    &request,
-                    &top_level_url,
-                    &cookie_value,
-                ));
+                consumer.send_or_ignore(
+                    cookie_jar.set_controlled_session_cookie_from_non_http_with_context(
+                        &request,
+                        &cookie_context,
+                        &cookie_value,
+                    ),
+                );
             },
             CoreResourceMsg::SetCookieForUrlAsync(cookie_store_id, url, cookie, source) => {
                 self.resource_manager.set_cookie_for_url(
@@ -551,13 +553,16 @@ impl ResourceChannelManager {
                 cookie_jar.remove_expired_cookies_for_url(&url);
                 consumer.send_or_ignore(cookie_jar.cookies_for_url(&url, source));
             },
-            CoreResourceMsg::GetControlledCookieStringForUrl(url, top_level_url, consumer) => {
+            CoreResourceMsg::GetControlledCookieStringForUrl(url, cookie_context, consumer) => {
                 let mut cookie_jar = http_state.cookie_jar.write();
-                consumer.send_or_ignore(cookie_jar.controlled_session_cookies_for_url(
-                    &url,
-                    &top_level_url,
-                    CookieSource::NonHTTP,
-                ));
+                consumer.send_or_ignore(
+                    cookie_jar.controlled_session_cookies_for_url_with_context(
+                        &url,
+                        &http::Method::GET,
+                        &cookie_context,
+                        CookieSource::NonHTTP,
+                    ),
+                );
             },
             CoreResourceMsg::GetCookiesForUrl(url, consumer, source) => {
                 let mut cookie_jar = http_state.cookie_jar.write();
@@ -568,13 +573,17 @@ impl ResourceChannelManager {
                     .collect();
                 consumer.send_or_ignore(cookies);
             },
-            CoreResourceMsg::ExportCookieState(consumer) => {
+            CoreResourceMsg::ExportCookieState(policy, consumer) => {
                 let mut cookie_jar = http_state.cookie_jar.write();
-                consumer.send_or_ignore(cookie_jar.export_state());
+                consumer.send_or_ignore(cookie_jar.export_state_with_policy(policy));
             },
-            CoreResourceMsg::ReplaceCookieState(expected_revision, snapshot, consumer) => {
+            CoreResourceMsg::ReplaceCookieState(policy, expected_revision, snapshot, consumer) => {
                 let mut cookie_jar = http_state.cookie_jar.write();
-                consumer.send_or_ignore(cookie_jar.replace_state(expected_revision, snapshot));
+                consumer.send_or_ignore(cookie_jar.replace_state_with_policy(
+                    policy,
+                    expected_revision,
+                    snapshot,
+                ));
             },
             CoreResourceMsg::GetCookieDataForUrlAsync(cookie_store_id, url, name) => {
                 let mut cookie_jar = http_state.cookie_jar.write();

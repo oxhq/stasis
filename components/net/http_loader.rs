@@ -359,15 +359,19 @@ fn set_request_cookies(
 
 fn set_controlled_request_cookies(
     url: &ServoUrl,
-    top_level_url: &ServoUrl,
+    method: &Method,
+    context: &embedder_traits::ControlledCookieContext,
     headers: &mut HeaderMap,
     cookie_jar: &RwLock<CookieStorage>,
 ) -> Result<(), ControlledCookiePolicyError> {
-    let cookie_list = cookie_jar.write().controlled_session_cookies_for_url(
-        url,
-        top_level_url,
-        CookieSource::HTTP,
-    )?;
+    let cookie_list = cookie_jar
+        .write()
+        .controlled_session_cookies_for_url_with_context(
+            url,
+            method,
+            context,
+            CookieSource::HTTP,
+        )?;
     if let Some(cookie_list) = cookie_list {
         let cookie_list_header_value = HeaderValue::from_bytes(cookie_list.as_bytes())
             .map_err(|_| ControlledCookiePolicyError::InvalidCookie)?;
@@ -405,7 +409,8 @@ fn set_cookies_from_headers(
 /// mutated. Callers must convert any rejection into a terminal network error.
 pub(crate) fn set_controlled_cookies_from_headers(
     url: &ServoUrl,
-    top_level_url: &ServoUrl,
+    method: &Method,
+    context: &embedder_traits::ControlledCookieContext,
     headers: &HeaderMap,
     cookie_jar: &RwLock<CookieStorage>,
 ) -> Result<(), ControlledCookiePolicyError> {
@@ -422,7 +427,7 @@ pub(crate) fn set_controlled_cookies_from_headers(
     }
     cookie_jar
         .write()
-        .set_controlled_session_cookies_from_headers(url, top_level_url, &values)
+        .set_controlled_session_cookies_from_headers_with_context(url, method, context, &values)
 }
 
 fn build_tls_security_info(handshake: &TlsHandshakeInfo, hsts_enabled: bool) -> TlsSecurityInfo {
@@ -1392,7 +1397,7 @@ async fn http_network_or_cache_fetch(
     done_chan: &mut DoneChannel,
     context: &FetchContext,
 ) -> Response {
-    let controlled_cookie_site = fetch_params.controlled_cookie_site.clone();
+    let controlled_cookie_context = fetch_params.controlled_cookie_context.clone();
     let controlled_fixture_response = fetch_params.controlled_fixture_response;
     let controlled_cookie_failure = fetch_params.controlled_cookie_failure.clone();
     // Step 2. Let httpFetchParams be null.
@@ -1423,7 +1428,7 @@ async fn http_network_or_cache_fetch(
         // and Set httpFetchParams to a copy of fetchParams.
         fetch_params_copy =
             std::mem::replace(fetch_params, FetchParams::new(fetch_params.request.clone()));
-        fetch_params.controlled_cookie_site = controlled_cookie_site.clone();
+        fetch_params.controlled_cookie_context = controlled_cookie_context.clone();
         fetch_params.controlled_fixture_response = controlled_fixture_response;
         fetch_params.controlled_cookie_failure = controlled_cookie_failure;
         http_fetch_params = &mut fetch_params_copy;
@@ -1586,10 +1591,11 @@ async fn http_network_or_cache_fetch(
         // Substep 1
         // TODO http://mxr.mozilla.org/servo/source/components/net/http_loader.rs#504
         // XXXManishearth http_loader has block_cookies: support content blocking here too
-        let controlled_cookie_result = match &controlled_cookie_site {
-            Some(top_level_url) => set_controlled_request_cookies(
+        let controlled_cookie_result = match &controlled_cookie_context {
+            Some(cookie_context) => set_controlled_request_cookies(
                 &current_url,
-                top_level_url,
+                &http_request.method,
+                cookie_context,
                 &mut http_request.headers,
                 &context.state.cookie_jar,
             ),
@@ -2202,7 +2208,7 @@ async fn http_network_fetch(
     context: &FetchContext,
 ) -> Response {
     let mut response_end_timer = ResponseEndTimer(Some(context.timing.clone()));
-    let controlled_cookie_site = fetch_params.controlled_cookie_site.clone();
+    let controlled_cookie_context = fetch_params.controlled_cookie_context.clone();
 
     // Step 1: Let request be fetchParams’s request.
     let request = &mut fetch_params.request;
@@ -2219,7 +2225,7 @@ async fn http_network_fetch(
     let url = request.current_url();
     let request_id = request.id.0.to_string();
     if log_enabled!(log::Level::Info) {
-        if controlled_cookie_site.is_some() {
+        if controlled_cookie_context.is_some() {
             info!(
                 "{:?} controlled request for {}{}",
                 request.method,
@@ -2341,7 +2347,7 @@ async fn http_network_fetch(
     };
 
     if log_enabled!(log::Level::Info) {
-        if controlled_cookie_site.is_some() {
+        if controlled_cookie_context.is_some() {
             debug!(
                 "{:?} controlled response for {}{}",
                 res.version(),
@@ -2518,10 +2524,11 @@ async fn http_network_fetch(
     // TODO this step isn't possible yet
     // Step 15
     if credentials_flag {
-        let cookie_result = match &controlled_cookie_site {
-            Some(top_level_url) => set_controlled_cookies_from_headers(
+        let cookie_result = match &controlled_cookie_context {
+            Some(cookie_context) => set_controlled_cookies_from_headers(
                 &url,
-                top_level_url,
+                &request.method,
+                cookie_context,
                 &response.headers,
                 &context.state.cookie_jar,
             ),

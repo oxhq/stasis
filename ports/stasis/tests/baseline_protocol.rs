@@ -140,6 +140,15 @@ Promise.all([
   document.cookie = `controlled-cookie-contract=${exactContract ? "exact" : "wrong"}; Path=/`;
 });
 </script>"#;
+const CONTROLLED_V2_COOKIE_EXPIRY_FIXTURE: &[u8] = br##"<!doctype html>
+<meta charset="utf-8">
+<button id="start">start</button>
+<output id="result">idle</output>
+<script>
+document.querySelector("#start").addEventListener("click", () => {
+  setTimeout(() => { document.querySelector("#result").textContent = "fired"; }, 5);
+});
+</script>"##;
 
 #[test]
 fn embedded_baseline_survives_a_bad_close_and_reports_the_final_url() {
@@ -376,6 +385,245 @@ fn controlled_page_cookie_mutations_remain_atomic_and_exportable() {
         }),
     );
     assert_eq!(receive(&responses)["id"], "close-cookie");
+    drop(input);
+
+    let (status_sender, status_receiver) = sync_channel(1);
+    thread::spawn(move || {
+        status_sender.send(child.wait()).ok();
+    });
+    let status = status_receiver
+        .recv_timeout(RESPONSE_TIMEOUT)
+        .expect("stasis did not exit after session.close")
+        .expect("failed to wait for stasis");
+    assert!(status.success());
+}
+
+#[test]
+fn controlled_session_v2_expiry_rotates_session_state_authority() {
+    let url = "https://cookie-expiry.example.test/".to_owned();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_stasis"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn stasis");
+    let mut input = child.stdin.take().expect("missing child stdin");
+    let responses = spawn_response_reader(child.stdout.take().expect("missing child stdout"));
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "init-cookie-expiry",
+            "method": "protocol.initialize",
+            "params": {"client": {"name": "integration-test", "version": "0.0.0"}},
+        }),
+    );
+    assert_eq!(receive(&responses)["id"], "init-cookie-expiry");
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "open-cookie-expiry",
+            "method": "session.open",
+            "params": {
+                "url": url,
+                "clockMode": "controlled",
+                "profile": "controlled-web-session-v2",
+                "initialVirtualTimeNs": "0",
+                "state": {
+                    "schemaVersion": 1,
+                    "profile": "controlled-web-session-v2",
+                    "sensitive": true,
+                    "sessionStorageScope": "top_level_browsing_context",
+                    "cookies": [{
+                        "name": "persistent",
+                        "value": "alive",
+                        "domain": "cookie-expiry.example.test",
+                        "path": "/",
+                        "hostOnly": true,
+                        "secure": true,
+                        "httpOnly": false,
+                        "sameSite": "lax",
+                        "expiresUnixTimeNs": "1000000",
+                        "partitioned": false,
+                        "creationSequence": "0",
+                        "lastAccessSequence": "0"
+                    }],
+                    "origins": []
+                },
+                "network": {
+                    "mode": "fixtures_only",
+                    "routes": [{
+                        "match": {"method": "GET", "url": {"exact": url}},
+                        "fulfill": {
+                            "status": 200,
+                            "headers": [["content-type", "text/html; charset=utf-8"]],
+                            "body": {
+                                "utf8": std::str::from_utf8(
+                                    CONTROLLED_V2_COOKIE_EXPIRY_FIXTURE,
+                                )
+                                .unwrap(),
+                            },
+                        },
+                    }],
+                },
+            },
+        }),
+    );
+    let opened = receive(&responses);
+    assert_eq!(opened["id"], "open-cookie-expiry", "{opened:#}");
+    let open_state_token = opened["result"]["stateToken"]
+        .as_str()
+        .expect("v2 expiry open must carry stateToken")
+        .to_owned();
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "export-cookie-before-expiry",
+            "sessionId": "s-1",
+            "method": "session.state.export",
+            "params": {},
+        }),
+    );
+    let before_expiry = receive(&responses);
+    assert_eq!(
+        before_expiry["result"]["state"]["profile"], "controlled-web-session-v2",
+        "{before_expiry:#}",
+    );
+    assert_eq!(
+        before_expiry["result"]["state"]["cookies"][0]["expiresUnixTimeNs"], "1000000",
+        "{before_expiry:#}",
+    );
+    let pre_expiry_session_token = before_expiry["result"]["sessionStateToken"]
+        .as_str()
+        .expect("pre-expiry export must carry sessionStateToken")
+        .to_owned();
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "schedule-cookie-expiry",
+            "sessionId": "s-1",
+            "method": "action.activate",
+            "params": {"selector": "#start", "expectedStateToken": open_state_token},
+        }),
+    );
+    let scheduled = receive(&responses);
+    assert_eq!(scheduled["id"], "schedule-cookie-expiry", "{scheduled:#}");
+    let scheduled_token = scheduled["result"]["stateToken"]
+        .as_str()
+        .expect("scheduled expiry timer must carry stateToken")
+        .to_owned();
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "qualify-cookie-expiry",
+            "sessionId": "s-1",
+            "method": "runtime.settle",
+            "params": {"expectedStateToken": scheduled_token, "maxVirtualTimeNs": "0"},
+        }),
+    );
+    let qualified = receive(&responses);
+    assert_eq!(qualified["id"], "qualify-cookie-expiry", "{qualified:#}");
+    assert_eq!(
+        qualified["result"]["outcome"], "virtual_time_limit_exceeded",
+        "{qualified:#}",
+    );
+    let qualified_token = qualified["result"]["stateToken"]
+        .as_str()
+        .expect("qualified expiry timer must carry stateToken")
+        .to_owned();
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "advance-cookie-expiry",
+            "sessionId": "s-1",
+            "method": "runtime.advance_to_next",
+            "params": {"expectedStateToken": qualified_token},
+        }),
+    );
+    let advanced = receive(&responses);
+    assert_eq!(advanced["id"], "advance-cookie-expiry", "{advanced:#}");
+    assert_eq!(advanced["result"]["outcome"], "advanced", "{advanced:#}");
+    assert_eq!(
+        advanced["result"]["virtualTimeNs"], "5000000",
+        "{advanced:#}"
+    );
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "get-cookie-after-expiry",
+            "sessionId": "s-1",
+            "method": "session.cookies.get",
+            "params": {},
+        }),
+    );
+    let after_expiry = receive(&responses);
+    assert_eq!(
+        after_expiry["id"], "get-cookie-after-expiry",
+        "{after_expiry:#}"
+    );
+    assert_eq!(
+        after_expiry["result"]["cookies"],
+        json!([]),
+        "{after_expiry:#}"
+    );
+    assert_ne!(
+        after_expiry["result"]["sessionStateToken"], pre_expiry_session_token,
+        "expiry must rotate the session-state authority: {after_expiry:#}",
+    );
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "stale-cookie-after-expiry",
+            "sessionId": "s-1",
+            "method": "session.cookies.set",
+            "params": {
+                "cookies": [],
+                "expectedSessionStateToken": pre_expiry_session_token,
+            },
+        }),
+    );
+    let stale = receive(&responses);
+    assert_eq!(
+        stale["error"]["code"], "stale_session_state_token",
+        "{stale:#}",
+    );
+    assert_eq!(stale["error"]["stateEffect"], "none", "{stale:#}");
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "close-cookie-expiry",
+            "sessionId": "s-1",
+            "method": "session.close",
+            "params": {},
+        }),
+    );
+    assert_eq!(receive(&responses)["id"], "close-cookie-expiry");
     drop(input);
 
     let (status_sender, status_receiver) = sync_channel(1);

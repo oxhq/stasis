@@ -13,8 +13,8 @@
     "maximumOpaqueTokenBytes": 256,
     "selection": "explicit",
     "sessionOpenDefault": "controlled-web-session-v1",
-    "stateArtifactProfile": "controlled-web-session-v1",
-    "profileExpansion": "execution_and_headless_presentation_surfaces_only"
+    "stateArtifactProfile": "selected_controlled_session_profile_exact",
+    "profileExpansion": "execution_headless_presentation_and_controlled_cookie_state_surfaces"
   },
   "sessionScope": {
     "processesPerSession": 1,
@@ -178,7 +178,7 @@
       "fatal": false,
       "stateEffect": "none"
     },
-    "artifactProfile": "controlled-web-session-v1"
+    "artifactProfile": "selected_controlled_session_profile_exact_no_implicit_migration"
   },
   "navigation": {
     "initial": {
@@ -1173,7 +1173,31 @@
   "sessionState": {
     "cookies": {
       "supported": true,
-      "persistence": "session_only",
+      "persistence": {
+        "mode": "controlled_session_owned_expiry",
+        "storage": "memory_only_for_session_lifetime",
+        "diskOrHostPersistence": false,
+        "portablePersistence": "explicit_profile_v2_state_export_and_initial_import_only",
+        "clock": "controlled_unix_time_ns_with_origin_zero",
+        "maxAgePrecedence": "last_valid_Max-Age_over_Expires",
+        "maximumLifetimeSeconds": 34560000,
+        "clamp": "now_plus_400_days",
+        "purge": "lazily_before_cookie_observation_request_selection_and_state_export",
+        "expiresAtOrBeforeNow": "delete_instead_of_retain"
+      },
+      "timeRange": {
+        "maximumControlledUnixTimeNsInclusive": "18446744073709551615",
+        "postOpenNetworkRequestAboveMaximum": {
+          "code": "unsupported_cookie_time_range",
+          "boundary": "before_network_start_and_cookie_header_construction",
+          "fatal": false,
+          "stateEffect": "partial",
+          "processEffect": "continue"
+        },
+        "controlledOpenFailurePrecedence": "same_code_hardened_to_fatal_fail_stop",
+        "persistentExpiryWithoutU64Headroom": "unsupported_cookie_time_range",
+        "pageApiDomException": "NotSupportedError"
+      },
       "partitioning": "unpartitioned_only",
       "domain": {
         "form": "canonical_host",
@@ -1193,17 +1217,37 @@
       "secure": true,
       "sameSite": {
         "metadataRoundTrip": true,
-        "topLevelNavigationContext": "target_url",
+        "siteModel": "schemeful_site",
+        "context": {
+          "requestClient": "captured_at_request_creation",
+          "siteForCookies": "captured_from_request_client",
+          "requestMethod": "current_redirect_hop_method",
+          "topLevelNavigation": "captured_request_boolean",
+          "unknownOrOpaque": {
+            "code": "unsupported_cookie_same_site_context",
+            "boundary": "before_network_start_and_cookie_header_construction"
+          }
+        },
         "none": "requires_secure",
-        "strict": "schemeful_same_site_requests_only",
-        "lax": "schemeful_same_site_requests_only",
-        "crossSiteOrIndeterminate": {
-          "code": "unsupported_cookie_same_site_context",
-          "boundary": "before_network_start_and_state_mutation"
+        "strict": "included_only_for_schemeful_same_site_requests",
+        "lax": "included_for_schemeful_same_site_or_cross_site_top_level_safe_method",
+        "unspecified": "same_request_filter_as_lax",
+        "safeMethods": [
+          "GET",
+          "HEAD",
+          "OPTIONS",
+          "TRACE"
+        ],
+        "noneSelection": "included_cross_site_when_secure",
+        "ineligibleCookie": "filtered_before_cookie_header_construction_without_terminal",
+        "responseStorage": {
+          "sameSiteOrTopLevelNavigation": "all_valid_unpartitioned_response_cookies_eligible",
+          "crossSiteSubresource": "only_secure_SameSite_None_eligible_Strict_Lax_and_unspecified_ignored_without_terminal",
+          "requestMethod": "not_an_admission_input"
         }
       },
-      "unsupportedSetCookie": {
-        "expiresOrMaxAge": "unsupported_persistent_cookie",
+      "setCookie": {
+        "expiresOrMaxAge": "supported_by_controlled_expiry_policy",
         "partitioned": "unsupported_partitioned_cookie",
         "invalid": "invalid_controlled_cookie",
         "boundary": "before_cookie_jar_mutation"
@@ -1221,7 +1265,7 @@
           "set": {
             "supported": true,
             "policy": "supported_atomic_controlled_policy",
-            "persistentError": "unsupported_persistent_cookie",
+            "expiry": "supported_by_controlled_expiry_policy",
             "partitionedError": "unsupported_partitioned_cookie",
             "invalidError": "invalid_controlled_cookie"
           },
@@ -1248,9 +1292,8 @@
     "serviceWorkerRegistrations": "unsupported",
     "exportIsSensitive": true,
     "excludedFromDiagnostics": true,
-    "artifactProfile": "controlled-web-session-v1",
+    "artifactProfile": "controlled-web-session-v2",
     "compatibleSelectedProfiles": [
-      "controlled-web-session-v1",
       "controlled-web-session-v2"
     ]
   },
@@ -1261,7 +1304,7 @@
       "cookiesArrayBytes": 256000,
       "originsArrayBytes": 256000,
       "envelopeAndSlackBytes": 12288,
-      "fixedV1EnvelopeBytes": 147,
+      "fixedProfileEnvelopeBytes": 147,
       "remainingSlackBytes": 12141,
       "fragmentsInclude": "array_brackets_commas_field_names_json_escaping_and_decimal_sequence_strings"
     },
@@ -1422,7 +1465,10 @@
     "controlled_top_level_synchronous_public_automation_event_timestamps_from_document_clock",
     "controlled_public_non_auxiliary_top_level_internal_CSS_animation_event_timestamps_from_document_clock",
     "bounded_controlled_top_level_direct_data_svg_HTMLImageElement_completion",
-    "bounded_controlled_top_level_internal_serialized_data_svg_inline_rendering"
+    "bounded_controlled_top_level_internal_serialized_data_svg_inline_rendering",
+    "controlled_in_memory_persistent_cookie_expiry_with_explicit_v2_state_portability",
+    "bounded_schemeful_SameSite_request_cookie_selection",
+    "bounded_schemeful_SameSite_response_cookie_storage"
   ],
   "deferredProductSurface": [
     "iframes",
@@ -1457,7 +1503,11 @@
     "external_message_channels",
     "general_image_source_ownership",
     "srcset_picture_and_environment_change_image_ownership",
-    "nested_or_external_svg_resource_ownership"
+    "nested_or_external_svg_resource_ownership",
+    "partitioned_cookies",
+    "cookie_store_read_get_all_and_delete",
+    "disk_or_host_persistent_cookie_jar",
+    "unknown_or_opaque_cookie_same_site_context"
   ],
   "determinismExcludes": [
     "mixed_network",

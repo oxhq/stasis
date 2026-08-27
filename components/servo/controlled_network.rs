@@ -3,7 +3,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use embedder_traits::{
-    WebResourceCookiePolicyFailure, WebResourceLoadTerminal, WebResourceResponse,
+    ControlledCookieContext, WebResourceCookiePolicyFailure, WebResourceLoadTerminal,
+    WebResourceResponse,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use net_traits::controlled_network::{
@@ -17,9 +18,8 @@ use crate::webview_delegate::WebResourceLoad;
 pub(crate) fn handle_request(
     session: &ControlledNetworkSession,
     mut load: WebResourceLoad,
-    top_level_url: url::Url,
+    site_for_cookies: Option<url::Url>,
 ) {
-    load.mark_controlled_session(top_level_url);
     let request = load.request();
     let header_names = request
         .headers
@@ -28,7 +28,8 @@ pub(crate) fn handle_request(
         .map(HeaderName::as_str)
         .collect::<Vec<_>>();
     let resource_kind = EvidenceResourceKind::from(request.controlled_resource_kind);
-    let action = session.begin(ControlledNetworkRequest {
+    let top_level_navigation = request.is_for_main_frame;
+    let (action, policy) = session.begin_with_cookie_policy(ControlledNetworkRequest {
         load_id: request.controlled_load_id,
         method: request.method.as_str(),
         url: &request.url,
@@ -36,6 +37,11 @@ pub(crate) fn handle_request(
         main_frame: request.is_for_main_frame,
         header_names: &header_names,
         body_bytes: request.controlled_body_bytes,
+    });
+    load.mark_controlled_session(ControlledCookieContext {
+        policy,
+        site_for_cookies,
+        top_level_navigation,
     });
     match action {
         ControlledNetworkAction::Fulfill { handle, response } => {
@@ -100,6 +106,9 @@ pub(crate) fn handle_terminal(
                 },
                 WebResourceCookiePolicyFailure::PartitionedCookieUnsupported => {
                     ControlledNetworkCookieFailure::PartitionedCookieUnsupported
+                },
+                WebResourceCookiePolicyFailure::TimeRangeUnsupported => {
+                    ControlledNetworkCookieFailure::TimeRangeUnsupported
                 },
                 WebResourceCookiePolicyFailure::InvalidCookie => {
                     ControlledNetworkCookieFailure::InvalidCookie

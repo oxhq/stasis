@@ -9,7 +9,10 @@ use std::rc::Rc;
 
 use cookie::{Cookie, SameSite};
 use dom_struct::dom_struct;
-use embedder_traits::DocumentControlProfile;
+use embedder_traits::{
+    ControlledCookieContext, ControlledCookiePolicy, DocumentControlProfile,
+    DocumentExecutionProfile,
+};
 use hyper_serde::Serde;
 use itertools::Itertools;
 use js::context::JSContext;
@@ -93,6 +96,9 @@ fn controlled_cookie_policy_dom_error(error: ControlledCookiePolicyError) -> Err
         },
         ControlledCookiePolicyError::PartitionedCookieUnsupported => {
             Error::NotSupported(Some("unsupported_partitioned_cookie".to_owned()))
+        },
+        ControlledCookiePolicyError::TimeRangeUnsupported => {
+            Error::NotSupported(Some("unsupported_cookie_time_range".to_owned()))
         },
         ControlledCookiePolicyError::InvalidCookie => {
             Error::Type(c"invalid_controlled_cookie".to_owned())
@@ -224,13 +230,51 @@ impl CookieStore {
             );
             return;
         };
-        if !window.is_top_level() {
-            promise.reject_error(
-                cx,
-                Error::NotSupported(Some("unsupported_cookie_same_site_context".to_owned())),
-            );
-            return;
-        }
+        let policy = match ScriptThread::current_document_execution_profile() {
+            DocumentExecutionProfile::Baseline => {
+                if !window.is_top_level() {
+                    promise.reject_error(
+                        cx,
+                        Error::NotSupported(Some(
+                            "unsupported_cookie_same_site_context".to_owned(),
+                        )),
+                    );
+                    return;
+                }
+                ControlledCookiePolicy::SessionV1
+            },
+            DocumentExecutionProfile::ControlledWebSessionV2 => {
+                if !ScriptThread::current_controlled_top_level_target_matches(&window) {
+                    promise.reject_error(
+                        cx,
+                        Error::NotSupported(Some(
+                            "unsupported_cookie_same_site_context".to_owned(),
+                        )),
+                    );
+                    return;
+                }
+                let Ok(unix_time) = global.document_clock().unix_time_ns() else {
+                    promise.reject_error(
+                        cx,
+                        Error::NotSupported(Some("unsupported_cookie_time_range".to_owned())),
+                    );
+                    return;
+                };
+                let Ok(unix_time_ns) = u128::try_from(unix_time.as_nanos()) else {
+                    promise.reject_error(
+                        cx,
+                        Error::NotSupported(Some("unsupported_cookie_time_range".to_owned())),
+                    );
+                    return;
+                };
+                ControlledCookiePolicy::SessionV2 { unix_time_ns }
+            },
+        };
+        let cookie_context = ControlledCookieContext {
+            policy,
+            site_for_cookies: Some(window.get_url().into_url()),
+            top_level_navigation: false,
+        };
 
         let (consumer, response) =
             profile_generic_channel::channel(global.time_profiler_chan().clone()).unwrap();
@@ -238,7 +282,7 @@ impl CookieStore {
             .resource_threads()
             .send(CoreResourceMsg::SetControlledCookieForUrl(
                 request_url,
-                window.get_url(),
+                cookie_context,
                 cookie.to_string(),
                 consumer,
             ))

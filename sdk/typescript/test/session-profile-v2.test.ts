@@ -8,23 +8,29 @@ import {
   SESSION_SUPPORT_PROFILES,
   StasisStateError,
   StasisTransportError,
+  crawlWithStasis,
   createStasisSessionPool,
   launch,
   settlementEvidence,
   type AnySupportProfile,
+  type ReferenceCrawlerOptions,
+  type ReferenceCrawlerPool,
+  type ReferenceCrawlerSession,
   type Runtime,
   type SelectableSessionProfile,
   type Session,
+  type SessionCookieV2,
   type SessionOpenOptions,
   type SessionSettleResult,
   type SessionState,
+  type SessionStateV2,
   type SessionSupportProfile,
   type SettlementEvidenceV2,
 } from "../src/index.js";
 
 const fixture = fileURLToPath(new URL("./fixtures/fake-shell.mjs", import.meta.url));
 
-const stateArtifact = {
+const v1StateArtifact = {
   schemaVersion: 1,
   profile: CONTROLLED_WEB_SESSION_V1_PROFILE,
   sensitive: true,
@@ -32,6 +38,30 @@ const stateArtifact = {
   cookies: [],
   origins: [],
 } as const satisfies SessionState;
+
+const persistentCookie = {
+  name: "remember_me",
+  value: "sensitive-cookie-value",
+  domain: "example.test",
+  path: "/",
+  hostOnly: true,
+  secure: true,
+  httpOnly: true,
+  sameSite: "lax",
+  expiresUnixTimeNs: 2_592_000_000_000_000n,
+  partitioned: false,
+  creationSequence: 1n,
+  lastAccessSequence: 2n,
+} as const satisfies SessionCookieV2;
+
+const v2StateArtifact = {
+  schemaVersion: 1,
+  profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+  sensitive: true,
+  sessionStorageScope: "top_level_browsing_context",
+  cookies: [persistentCookie],
+  origins: [],
+} as const satisfies SessionStateV2;
 
 if (false) {
   const runtime = null as unknown as Runtime;
@@ -60,7 +90,7 @@ if (false) {
     readonly profile: typeof CONTROLLED_WEB_SESSION_V2_PROFILE;
   } = {
     profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
-    state: stateArtifact,
+    state: v2StateArtifact,
   };
   const candidateSession: Promise<Session<typeof CONTROLLED_WEB_SESSION_V2_PROFILE>> =
     runtime.openSession("https://example.test/", candidateOptions);
@@ -89,6 +119,85 @@ if (false) {
   const stablePool = createStasisSessionPool({ maxProcesses: 1, maxQueue: 0 });
   const stablePooledSession: Promise<Session<typeof CONTROLLED_WEB_SESSION_V1_PROFILE>> =
     stablePool.acquire({ url: "https://example.test/" }).then((lease) => lease.session);
+  const stableCookieExpiry: null = (
+    null as unknown as Awaited<ReturnType<Session["getCookies"]>>
+  ).cookies[0]!.expiresUnixTimeNs;
+  const candidateSessionValue = null as unknown as Session<
+    typeof CONTROLLED_WEB_SESSION_V2_PROFILE
+  >;
+  const candidateCookieExpiry: bigint | null = (
+    null as unknown as Awaited<ReturnType<typeof candidateSessionValue.getCookies>>
+  ).cookies[0]!.expiresUnixTimeNs;
+  const mismatchedCandidateState: SessionOpenOptions<typeof CONTROLLED_WEB_SESSION_V2_PROFILE> = {
+    profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+    // @ts-expect-error A v1 state artifact cannot be imported into a v2 session.
+    state: v1StateArtifact,
+  };
+  // @ts-expect-error Direct open inference must not widen v2 into a v1-or-v2 state union.
+  const mismatchedCandidateOpen = runtime.openSession("https://example.test/", {
+    profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+    state: v1StateArtifact,
+  });
+  const stableCrawlerOptions: ReferenceCrawlerOptions = {
+    start: "https://example.test/",
+    maxPages: 1,
+    maxDepth: 0,
+    concurrency: 1,
+    state: v1StateArtifact,
+  };
+  const candidateCrawlerOptions: ReferenceCrawlerOptions<
+    typeof CONTROLLED_WEB_SESSION_V2_PROFILE
+  > = {
+    start: "https://example.test/",
+    maxPages: 1,
+    maxDepth: 0,
+    concurrency: 1,
+    profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+    state: v2StateArtifact,
+  };
+  const incompleteCandidateCrawlerOptions: ReferenceCrawlerOptions<
+    typeof CONTROLLED_WEB_SESSION_V2_PROFILE
+  > = {
+    start: "https://example.test/",
+    maxPages: 1,
+    maxDepth: 0,
+    concurrency: 1,
+    state: v2StateArtifact,
+  };
+  const mismatchedCandidateCrawlerOptions: ReferenceCrawlerOptions<
+    typeof CONTROLLED_WEB_SESSION_V2_PROFILE
+  > = {
+    start: "https://example.test/",
+    maxPages: 1,
+    maxDepth: 0,
+    concurrency: 1,
+    profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+    // @ts-expect-error Reference-crawler v2 selection requires an exact v2 state artifact.
+    state: v1StateArtifact,
+  };
+  const implicitCandidateCrawlerState: ReferenceCrawlerOptions = {
+    start: "https://example.test/",
+    maxPages: 1,
+    maxDepth: 0,
+    concurrency: 1,
+    // @ts-expect-error A v2 crawler state cannot select the omitted/default v1 profile.
+    state: v2StateArtifact,
+  };
+  const referenceCrawlerPool = null as unknown as ReferenceCrawlerPool<ReferenceCrawlerSession>;
+  const incompleteCandidateCrawl = crawlWithStasis(
+    referenceCrawlerPool,
+    // @ts-expect-error A candidate-aware annotation is not callable until profile is explicit.
+    incompleteCandidateCrawlerOptions,
+  );
+  // @ts-expect-error Direct crawler inference must not widen v2 into a v1-or-v2 state union.
+  const mismatchedCandidateCrawl = crawlWithStasis(referenceCrawlerPool, {
+    start: "https://example.test/",
+    maxPages: 1,
+    maxDepth: 0,
+    concurrency: 1,
+    profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+    state: v1StateArtifact,
+  });
   void stableAlias;
   void stableAnyAlias;
   void selectableCandidate;
@@ -109,6 +218,18 @@ if (false) {
   void falselyBoundCopy;
   void stablePool;
   void stablePooledSession;
+  void stableCookieExpiry;
+  void candidateCookieExpiry;
+  void mismatchedCandidateState;
+  void mismatchedCandidateOpen;
+  void stableCrawlerOptions;
+  void candidateCrawlerOptions;
+  void incompleteCandidateCrawlerOptions;
+  void mismatchedCandidateCrawlerOptions;
+  void implicitCandidateCrawlerState;
+  void referenceCrawlerPool;
+  void incompleteCandidateCrawl;
+  void mismatchedCandidateCrawl;
 }
 
 async function fakeRuntime(
@@ -144,7 +265,7 @@ test("explicit v2 selection binds capability, response, state, and evidence iden
   const runtime = await fakeRuntime(context, "session-profile-v2");
   const session = await runtime.openSession("https://example.test/", {
     profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
-    state: stateArtifact,
+    state: v2StateArtifact,
   });
 
   assert.ok(runtime.info.capabilities.profiles.includes(CONTROLLED_WEB_SESSION_V2_PROFILE));
@@ -192,9 +313,22 @@ test("explicit v2 selection binds capability, response, state, and evidence iden
   const exported = await session.exportState();
   assert.equal(
     exported.state.profile,
-    CONTROLLED_WEB_SESSION_V1_PROFILE,
-    "v2 expands execution sources but deliberately reuses the v1 state artifact",
+    CONTROLLED_WEB_SESSION_V2_PROFILE,
+    "v2 exports a profile-matched state artifact",
   );
+  assert.equal(exported.state.schemaVersion, 1);
+  assert.equal(exported.state.cookies[0]?.expiresUnixTimeNs, persistentCookie.expiresUnixTimeNs);
+
+  const cookies = await session.getCookies();
+  assert.equal(cookies.cookies[0]?.expiresUnixTimeNs, persistentCookie.expiresUnixTimeNs);
+  const replacementExpiry = persistentCookie.expiresUnixTimeNs + 1n;
+  const mutation = await session.setCookies(
+    [{ ...persistentCookie, expiresUnixTimeNs: replacementExpiry }],
+    cookies.sessionStateToken,
+  );
+  const replaced = await session.getCookies();
+  assert.notEqual(mutation.sessionStateToken, cookies.sessionStateToken);
+  assert.equal(replaced.cookies[0]?.expiresUnixTimeNs, replacementExpiry);
   await session.close();
 });
 
@@ -228,19 +362,18 @@ test("explicit v2 selection rejects a mismatched open response profile", async (
   );
 });
 
-test("v2 rejects a state artifact that claims a new profile identity", async (context) => {
+test("v2 rejects a v1 state artifact instead of migrating it implicitly", async (context) => {
   const runtime = await fakeRuntime(context, "session-profile-v2-state-boundary");
   const invalidState = {
-    ...stateArtifact,
-    profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
-  } as unknown as SessionState;
+    ...v1StateArtifact,
+  } as unknown as SessionStateV2;
 
   await assert.rejects(
     runtime.openSession("https://example.test/", {
       profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
       state: invalidState,
     }),
-    /state\.profile must be controlled-web-session-v1/u,
+    /state\.profile must be controlled-web-session-v2/u,
   );
 });
 

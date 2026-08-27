@@ -410,15 +410,16 @@ impl ServoInner {
                         // top-level URL. This distinction is part of controlled-web-session-v1:
                         // without it, a supported cross-origin document replacement cannot send
                         // cookies belonging to its target origin.
-                        let top_level_url = controlled_cookie_context_url(
+                        let site_for_cookies = controlled_cookie_context_url_for_policy(
                             &web_resource_load.request().url,
                             web_resource_load.request().is_for_main_frame,
                             webview.controlled_cookie_top_level_url(),
+                            session.cookie_policy(),
                         );
                         crate::controlled_network::handle_request(
                             &session,
                             web_resource_load,
-                            top_level_url,
+                            site_for_cookies,
                         );
                     } else {
                         webview
@@ -888,16 +889,38 @@ fn controlled_cookie_context_url(
     is_for_main_frame: bool,
     active_top_level_url: Option<url::Url>,
 ) -> url::Url {
-    if is_for_main_frame {
-        request_url.clone()
-    } else {
-        active_top_level_url.unwrap_or_else(|| request_url.clone())
+    controlled_cookie_context_url_for_policy(
+        request_url,
+        is_for_main_frame,
+        active_top_level_url,
+        ControlledCookiePolicy::SessionV1,
+    )
+    .expect("the frozen v1 cookie context always has a site")
+}
+
+fn controlled_cookie_context_url_for_policy(
+    request_url: &url::Url,
+    is_for_main_frame: bool,
+    active_top_level_url: Option<url::Url>,
+    policy: ControlledCookiePolicy,
+) -> Option<url::Url> {
+    match policy {
+        ControlledCookiePolicy::SessionV1 if is_for_main_frame => Some(request_url.clone()),
+        ControlledCookiePolicy::SessionV1 => {
+            Some(active_top_level_url.unwrap_or_else(|| request_url.clone()))
+        },
+        // V2 captures the pre-navigation client site for both navigation and subresource hops.
+        // The builder URL is installed before the first navigation; `None` therefore represents
+        // genuinely unproven provenance and must stay explicit.
+        ControlledCookiePolicy::SessionV2 { .. } => active_top_level_url,
     }
 }
 
 #[cfg(test)]
 mod controlled_cookie_context_tests {
-    use super::controlled_cookie_context_url;
+    use embedder_traits::ControlledCookiePolicy;
+
+    use super::{controlled_cookie_context_url, controlled_cookie_context_url_for_policy};
 
     #[test]
     fn main_frame_cross_origin_navigation_uses_the_target_context() {
@@ -926,6 +949,30 @@ mod controlled_cookie_context_tests {
         let target = url::Url::parse("https://source.example/app.js").unwrap();
 
         assert_eq!(controlled_cookie_context_url(&target, false, None), target,);
+    }
+
+    #[test]
+    fn v2_preserves_the_pre_navigation_site_for_every_request_kind() {
+        let active = url::Url::parse("https://source.example/account").unwrap();
+        let target = url::Url::parse("https://target.example/dashboard").unwrap();
+        let policy = ControlledCookiePolicy::SessionV2 { unix_time_ns: 7 };
+
+        assert_eq!(
+            controlled_cookie_context_url_for_policy(&target, true, Some(active.clone()), policy,),
+            Some(active.clone()),
+        );
+        assert_eq!(
+            controlled_cookie_context_url_for_policy(&target, false, Some(active.clone()), policy,),
+            Some(active),
+        );
+        assert_eq!(
+            controlled_cookie_context_url_for_policy(&target, true, None, policy),
+            None,
+        );
+        assert_eq!(
+            controlled_cookie_context_url_for_policy(&target, false, None, policy),
+            None,
+        );
     }
 }
 

@@ -717,6 +717,7 @@ jobs:
             --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
             --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
             --session-v2-css-animation-event-fixture ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html \
+            --session-v2-cookie-fixture sdk/typescript/test/fixtures/controlled-v2-cookie-login.html \
             --consumer-root "$consumer" \
             --package "$NPM_TARBALL" \
             --revision "$STASIS_REVISION" \
@@ -1014,6 +1015,34 @@ jobs:
                       "unsupportedTimeSurface": "host_timestamp",
                       "evidenceProfile": "controlled-web-session-v2",
                       "sameControlledSession": True,
+                      "exactBinaryLaunch": True,
+                      "closeResponseAndEof": True,
+                  },
+                  "v2CookieSession": {
+                      "profile": "controlled-web-session-v2",
+                      "stateSchemaVersion": "1",
+                      "stateProfile": "controlled-web-session-v2",
+                      "responseCookieName": "remember_me",
+                      "responseCookieExpiryUnixTimeNs": "2592000000000000",
+                      "maxAgePrecedenceOverPastExpires": True,
+                      "restoredSameSiteCookieSent": True,
+                      "crossSiteResourceReachedServer": True,
+                      "crossSiteLaxCookieFiltered": True,
+                      "crossSiteRequestMethod": "GET",
+                      "crossSiteRequestPath": "/probe.js",
+                      "evidenceProfile": "controlled-web-session-v2",
+                      "memoryOnlyExplicitStatePortability": True,
+                      "noImportControlCookieCount": "0",
+                      "noImportControlRequestCookieHeaderEmpty": True,
+                      "noImportControlSameHostContext": True,
+                      "cookieTimeRangeFailureCode": "unsupported_cookie_time_range",
+                      "cookieTimeRangeFatal": False,
+                      "cookieTimeRangeStateEffect": "partial",
+                      "cookieTimeRangeRequestReachedServer": False,
+                      "credentialEnvironmentMode": "explicit_allowlist",
+                      "freshExactBinaryProcesses": "4",
+                      "gracefulCookieSessionProcesses": "4",
+                      "managedRuntimeFallbackAccesses": "0",
                       "exactBinaryLaunch": True,
                       "closeResponseAndEof": True,
                   },
@@ -1412,7 +1441,7 @@ jobs:
               raise SystemExit("SDK gate proof size is outside the release limit")
           proof = strict_json_loads(proof_file.read_text(encoding="utf-8"), "SDK gate proof")
           expected_proof = {
-              "schema": 6,
+              "schema": 7,
               "gate": "sdk-act-settle-inspect",
               "package": f"@oxhq/stasis@{version}",
               "revision": revision,
@@ -1438,6 +1467,7 @@ jobs:
                       "v2InlineSvgRendering", "v2InputMethodFocus",
                       "v2AutomationEventTimestamps",
                       "v2CssAnimationEventTimestamps",
+                      "v2CookieSession",
                   }
           ):
               raise SystemExit("staged SDK proof schema changed")
@@ -1538,6 +1568,7 @@ jobs:
                       "v2InlineSvgRendering", "v2InputMethodFocus",
                       "v2AutomationEventTimestamps",
                       "v2CssAnimationEventTimestamps",
+                      "v2CookieSession",
                   }
               or type(prepublish_proof.get("schema")) is not int
           ):
@@ -1746,6 +1777,7 @@ jobs:
               "v2MessageChannel", "v2DirectDataSvg", "v2InlineSvgRendering",
               "v2InputMethodFocus", "v2AutomationEventTimestamps",
               "v2CssAnimationEventTimestamps",
+              "v2CookieSession",
           }
           v2_message_channel = gate_record.get("v2MessageChannel")
           expected_v2_message_channel_fields = {
@@ -1813,6 +1845,7 @@ jobs:
               "v2DirectDataSvg", "v2InlineSvgRendering", "v2InputMethodFocus",
               "v2AutomationEventTimestamps",
               "v2CssAnimationEventTimestamps",
+              "v2CookieSession",
           ):
               if prepublish_proof.get(field) != gate_record.get(field):
                   raise SystemExit(
@@ -3061,6 +3094,7 @@ jobs:
             --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
             --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
             --session-v2-css-animation-event-fixture ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html \
+            --session-v2-cookie-fixture sdk/typescript/test/fixtures/controlled-v2-cookie-login.html \
             --consumer-root "$consumer" \
             --package "${registry_packages[0]}" \
             --revision "$STASIS_REVISION" \

@@ -22,7 +22,8 @@ use data_url::mime::Mime;
 use devtools_traits::ScriptToDevtoolsControlMsg;
 use dom_struct::dom_struct;
 use embedder_traits::{
-    AllowOrDeny, AnimationState, CustomHandlersAutomationMode, DocumentControlProfile, EmbedderMsg,
+    AllowOrDeny, AnimationState, ControlledCookieContext, ControlledCookiePolicy,
+    CustomHandlersAutomationMode, DocumentControlProfile, DocumentExecutionProfile, EmbedderMsg,
     Image, LoadStatus, Theme,
 };
 use encoding_rs::{Encoding, UTF_8};
@@ -900,6 +901,9 @@ fn controlled_cookie_policy_dom_error(error: ControlledCookiePolicyError) -> Err
         },
         ControlledCookiePolicyError::PartitionedCookieUnsupported => {
             Error::NotSupported(Some("unsupported_partitioned_cookie".to_owned()))
+        },
+        ControlledCookiePolicyError::TimeRangeUnsupported => {
+            Error::NotSupported(Some("unsupported_cookie_time_range".to_owned()))
         },
         ControlledCookiePolicyError::InvalidCookie => {
             Error::Type(c"invalid_controlled_cookie".to_owned())
@@ -3280,19 +3284,18 @@ impl Document {
     }
 
     fn get_controlled_session_cookie(&self) -> Fallible<DOMString> {
-        if !self.window.is_top_level() {
-            return Err(Error::NotSupported(Some(
-                "unsupported_cookie_same_site_context".to_owned(),
-            )));
-        }
-
         let url = self.url();
+        let cookie_context = self.controlled_cookie_context(&url)?;
         let (consumer, response) =
             profile_generic_channel::channel(self.global().time_profiler_chan().clone()).unwrap();
         self.window
             .as_global_scope()
             .resource_threads()
-            .send(GetControlledCookieStringForUrl(url.clone(), url, consumer))
+            .send(GetControlledCookieStringForUrl(
+                url,
+                cookie_context,
+                consumer,
+            ))
             .map_err(|_| {
                 Error::InvalidState(Some("controlled_cookie_resource_unavailable".to_owned()))
             })?;
@@ -3308,13 +3311,8 @@ impl Document {
     fn set_controlled_session_cookie(&self, cookie: String) -> ErrorResult {
         // The session profile intentionally excludes nested browsing contexts. Do not borrow the
         // current frame URL as a false top-level cookie context if one nevertheless reaches here.
-        if !self.window.is_top_level() {
-            return Err(Error::NotSupported(Some(
-                "unsupported_cookie_same_site_context".to_owned(),
-            )));
-        }
-
         let url = self.url();
+        let cookie_context = self.controlled_cookie_context(&url)?;
         let (consumer, response) =
             profile_generic_channel::channel(self.global().time_profiler_chan().clone()).unwrap();
         self.window
@@ -3322,7 +3320,7 @@ impl Document {
             .resource_threads()
             .send(SetControlledCookieForUrl(
                 url.clone(),
-                url,
+                cookie_context,
                 cookie,
                 consumer,
             ))
@@ -3335,6 +3333,44 @@ impl Document {
                 Error::InvalidState(Some("controlled_cookie_resource_unavailable".to_owned()))
             })?
             .map_err(controlled_cookie_policy_dom_error)
+    }
+
+    fn controlled_cookie_context(&self, url: &ServoUrl) -> Fallible<ControlledCookieContext> {
+        let execution_profile = ScriptThread::current_document_execution_profile();
+        let policy = match execution_profile {
+            DocumentExecutionProfile::Baseline => {
+                if !self.window.is_top_level() {
+                    return Err(Error::NotSupported(Some(
+                        "unsupported_cookie_same_site_context".to_owned(),
+                    )));
+                }
+                ControlledCookiePolicy::SessionV1
+            },
+            DocumentExecutionProfile::ControlledWebSessionV2 => {
+                if !ScriptThread::current_controlled_top_level_target_matches(&self.window) {
+                    return Err(Error::NotSupported(Some(
+                        "unsupported_cookie_same_site_context".to_owned(),
+                    )));
+                }
+                let unix_time = self
+                    .global()
+                    .document_clock()
+                    .unix_time_ns()
+                    .map_err(|_| {
+                        Error::NotSupported(Some("unsupported_cookie_time_range".to_owned()))
+                    })?
+                    .as_nanos();
+                let unix_time_ns = u128::try_from(unix_time).map_err(|_| {
+                    Error::NotSupported(Some("unsupported_cookie_time_range".to_owned()))
+                })?;
+                ControlledCookiePolicy::SessionV2 { unix_time_ns }
+            },
+        };
+        Ok(ControlledCookieContext {
+            policy,
+            site_for_cookies: Some(url.as_url().clone()),
+            top_level_navigation: false,
+        })
     }
 
     pub(crate) fn custom_element_registry(&self) -> Option<DomRoot<CustomElementRegistry>> {

@@ -18,7 +18,7 @@ import { constants as fsConstants } from "node:fs";
 import { createServer } from "node:http";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
-import { parseArgs } from "node:util";
+import { isDeepStrictEqual, parseArgs } from "node:util";
 import { performance } from "node:perf_hooks";
 
 const REQUIRED_METHODS = [
@@ -41,7 +41,95 @@ const CONTROLLED_WEBAPP_V1_PROFILE = "controlled-webapp-v1";
 const CONTROLLED_WEB_SESSION_V2_PROFILE = "controlled-web-session-v2";
 const INITIAL_VIRTUAL_TIME_NS = 1_000_000_000n;
 const TEN_SECONDS_NS = 10_000_000_000n;
+const MAX_U64_VIRTUAL_TIME_NS = (1n << 64n) - 1n;
 const commandDeadline = () => ({ signal: AbortSignal.timeout(30_000) });
+
+// The release subject receives only runtime environment needed by the packaged GUI/runtime.
+// In particular, workflow credentials, package-manager authentication, cloud credentials,
+// agent sockets, preload hooks, and unrelated STASIS_* controls are not inherited by the exact
+// binary under test. XAUTHORITY is deliberately retained because xvfb-run may require it.
+const EXACT_BINARY_INHERITED_ENVIRONMENT = Object.freeze([
+  "APPDATA",
+  "COMSPEC",
+  "DISPLAY",
+  "DYLD_FALLBACK_LIBRARY_PATH",
+  "DYLD_LIBRARY_PATH",
+  "FONTCONFIG_FILE",
+  "FONTCONFIG_PATH",
+  "GDK_PIXBUF_MODULE_FILE",
+  "GST_PLUGIN_PATH",
+  "GST_PLUGIN_SYSTEM_PATH",
+  "GST_REGISTRY",
+  "HOME",
+  "LANG",
+  "LD_LIBRARY_PATH",
+  "LOCALAPPDATA",
+  "LOGNAME",
+  "PATH",
+  "PATHEXT",
+  "RUST_BACKTRACE",
+  "SYSTEMROOT",
+  "TEMP",
+  "TMP",
+  "TMPDIR",
+  "USER",
+  "USERPROFILE",
+  "WAYLAND_DISPLAY",
+  "WINDIR",
+  "XAUTHORITY",
+  "XDG_RUNTIME_DIR",
+]);
+const EXACT_BINARY_OVERRIDE_ENVIRONMENT = Object.freeze([
+  "STASIS_EXPLICIT_OVERRIDE_BINARY",
+  "STASIS_EXPLICIT_OVERRIDE_MARKER",
+  "STASIS_EXPLICIT_OVERRIDE_PROOF",
+]);
+const EXACT_BINARY_LOCALE_ENVIRONMENT = Object.freeze([
+  "LC_ADDRESS",
+  "LC_ALL",
+  "LC_COLLATE",
+  "LC_CTYPE",
+  "LC_IDENTIFICATION",
+  "LC_MEASUREMENT",
+  "LC_MESSAGES",
+  "LC_MONETARY",
+  "LC_NAME",
+  "LC_NUMERIC",
+  "LC_PAPER",
+  "LC_TELEPHONE",
+  "LC_TIME",
+]);
+
+function exactBinaryChildEnvironment(overrides) {
+  const environment = {};
+  for (const name of [
+    ...EXACT_BINARY_INHERITED_ENVIRONMENT,
+    ...EXACT_BINARY_LOCALE_ENVIRONMENT,
+  ]) {
+    const value = process.env[name];
+    if (value !== undefined) environment[name] = value;
+  }
+  assert.deepEqual(
+    Object.keys(overrides).sort(),
+    [...EXACT_BINARY_OVERRIDE_ENVIRONMENT].sort(),
+    "exact-binary environment overrides escaped the release-gate allowlist",
+  );
+  for (const [name, value] of Object.entries(overrides)) {
+    assert.equal(typeof value, "string", `${name} must be a string`);
+    environment[name] = value;
+  }
+  const allowedNames = new Set([
+    ...EXACT_BINARY_INHERITED_ENVIRONMENT,
+    ...EXACT_BINARY_LOCALE_ENVIRONMENT,
+    ...EXACT_BINARY_OVERRIDE_ENVIRONMENT,
+  ]);
+  assert.deepEqual(
+    Object.keys(environment).filter((name) => !allowedNames.has(name)),
+    [],
+    "exact-binary child environment contains a non-allowlisted name",
+  );
+  return environment;
+}
 
 function countMessagePortSources(snapshot) {
   return snapshot.sources.filter(
@@ -157,6 +245,35 @@ function parseStrictJson(source, label) {
   }
 }
 
+function writeServerText(response, status, contentType, body, headers = {}) {
+  const bytes = Buffer.from(body, "utf8");
+  response.writeHead(status, {
+    "cache-control": "no-store",
+    "content-length": bytes.length,
+    "content-type": contentType,
+    ...headers,
+  });
+  response.end(bytes);
+}
+
+async function listenLoopback(server, host) {
+  await new Promise((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, host, resolveListen);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  return `http://${host}:${address.port}`;
+}
+
+async function closeServer(server) {
+  if (!server.listening) return;
+  await new Promise((resolveClose) => {
+    server.close(resolveClose);
+    server.closeAllConnections?.();
+  });
+}
+
 const { values } = parseArgs({
   options: {
     binary: { type: "string" },
@@ -170,6 +287,7 @@ const { values } = parseArgs({
     "session-v2-focus-fixture": { type: "string" },
     "session-v2-automation-event-fixture": { type: "string" },
     "session-v2-css-animation-event-fixture": { type: "string" },
+    "session-v2-cookie-fixture": { type: "string" },
     version: { type: "string" },
   },
   strict: true,
@@ -187,6 +305,7 @@ for (const field of [
   "session-v2-focus-fixture",
   "session-v2-automation-event-fixture",
   "session-v2-css-animation-event-fixture",
+  "session-v2-cookie-fixture",
   "version",
 ]) {
   if (typeof values[field] !== "string" || values[field].length === 0) {
@@ -204,6 +323,7 @@ const sessionV2AutomationEventFixture = resolve(values["session-v2-automation-ev
 const sessionV2CssAnimationEventFixture = resolve(
   values["session-v2-css-animation-event-fixture"],
 );
+const sessionV2CookieFixture = resolve(values["session-v2-cookie-fixture"]);
 const consumerRoot = resolve(values["consumer-root"]);
 const packageTarball = resolve(values.package);
 assert.ok(isAbsolute(fixture), "--fixture must resolve to an absolute path before launch");
@@ -230,6 +350,10 @@ assert.ok(
 assert.ok(
   isAbsolute(sessionV2CssAnimationEventFixture),
   "--session-v2-css-animation-event-fixture must resolve to an absolute path before launch",
+);
+assert.ok(
+  isAbsolute(sessionV2CookieFixture),
+  "--session-v2-cookie-fixture must resolve to an absolute path before launch",
 );
 const packageRoot = join(consumerRoot, "node_modules", "@oxhq", "stasis");
 const expectedRevision = values.revision.toLowerCase();
@@ -293,7 +417,7 @@ assert.deepEqual(packageMetadata.exports, {
 const importProbe = join(consumerRoot, `.stasis-release-import-${process.pid}.mjs`);
 await writeFile(
   importProbe,
-  'export { CONTROLLED_WEB_SESSION_V2_PROFILE, launch } from "@oxhq/stasis";\n',
+  'export { CONTROLLED_WEB_SESSION_V2_PROFILE, StasisProtocolError, launch } from "@oxhq/stasis";\n',
   {
   encoding: "utf8",
   flag: "wx",
@@ -359,6 +483,12 @@ const sessionV2CssAnimationEventFixtureBody = await readFile(
   sessionV2CssAnimationEventFixture,
   "utf8",
 );
+const sessionV2CookieFixtureStatus = await lstat(sessionV2CookieFixture);
+assert.ok(
+  sessionV2CookieFixtureStatus.isFile() && !sessionV2CookieFixtureStatus.isSymbolicLink(),
+  "--session-v2-cookie-fixture must be a regular file",
+);
+const sessionV2CookieFixtureBody = await readFile(sessionV2CookieFixture, "utf8");
 const invocationRoot = await realpath(process.cwd());
 const fixtureRealPath = await realpath(fixture);
 const checkoutRelativeFixture = relative(invocationRoot, fixtureRealPath);
@@ -389,6 +519,96 @@ const address = server.address();
 assert.ok(address && typeof address === "object");
 const fixtureUrl = `http://127.0.0.1:${address.port}/`;
 
+const cookieMainRequests = [];
+const cookieCrossRequests = [];
+let cookieCrossUrl;
+const cookieCrossServer = createServer((request, response) => {
+  cookieCrossRequests.push({
+    method: request.method ?? "",
+    url: request.url ?? "",
+    cookie: request.headers.cookie ?? "",
+  });
+  if (request.method === "GET" && request.url === "/probe.js") {
+    writeServerText(
+      response,
+      200,
+      "text/javascript; charset=utf-8",
+      'globalThis.__stasisCrossSiteProbe = "loaded";\n',
+    );
+    return;
+  }
+  writeServerText(response, 404, "text/plain; charset=utf-8", "not found\n");
+});
+const cookieMainServer = createServer((request, response) => {
+  cookieMainRequests.push({
+    method: request.method ?? "",
+    url: request.url ?? "",
+    cookie: request.headers.cookie ?? "",
+  });
+  if (request.method === "GET" && request.url === "/login") {
+    writeServerText(response, 200, "text/html; charset=utf-8", sessionV2CookieFixtureBody);
+    return;
+  }
+  if (request.method === "POST" && request.url === "/login") {
+    request.resume();
+    writeServerText(
+      response,
+      200,
+      "text/html; charset=utf-8",
+      '<!doctype html><html><body><output id="authenticated">remembered</output></body></html>',
+      {
+        "set-cookie": [
+          "remember_me=controlled; Path=/; HttpOnly; SameSite=Lax; " +
+            "Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=2592000",
+        ],
+      },
+    );
+    return;
+  }
+  if (request.method === "GET" && request.url === "/fresh-no-import") {
+    writeServerText(
+      response,
+      200,
+      "text/html; charset=utf-8",
+      '<!doctype html><html><body><output id="fresh-no-import">fresh</output></body></html>',
+    );
+    return;
+  }
+  if (request.method === "GET" && request.url === "/time-range-arm") {
+    writeServerText(
+      response,
+      200,
+      "text/html; charset=utf-8",
+      `<!doctype html><html><body>
+        <output id="time-range-arm">pending</output>
+        <script>
+          setTimeout(() => {
+            document.querySelector("#time-range-arm").textContent = "advanced";
+          }, 1);
+        </script>
+      </body></html>`,
+    );
+    return;
+  }
+  if (request.method === "GET" && request.url === "/restored") {
+    writeServerText(
+      response,
+      200,
+      "text/html; charset=utf-8",
+      `<!doctype html><html><body>
+        <script src="${cookieCrossUrl}/probe.js"></script>
+        <output id="cross-site-result">pending</output>
+        <script>
+          document.querySelector("#cross-site-result").textContent =
+            globalThis.__stasisCrossSiteProbe === "loaded" ? "loaded-without-cookie" : "missing";
+        </script>
+      </body></html>`,
+    );
+    return;
+  }
+  writeServerText(response, 404, "text/plain; charset=utf-8", "not found\n");
+});
+
 let runtime;
 let app;
 let closedCleanly = false;
@@ -401,15 +621,34 @@ let v2InlineSvgRendering;
 let v2InputMethodFocus;
 let v2AutomationEventTimestamps;
 let v2CssAnimationEventTimestamps;
+let v2CookieSession;
 let v2CssRuntime;
 let v2CssSession;
 let v2CssClosedCleanly = false;
+let v2CookieRuntime;
+let v2CookieSessionHandle;
+let v2CookieClosedCleanly = false;
+let v2CookieRestoreRuntime;
+let v2CookieRestoreSession;
+let v2CookieRestoreClosedCleanly = false;
+let v2CookieNoImportRuntime;
+let v2CookieNoImportSession;
+let v2CookieNoImportClosedCleanly = false;
+let v2CookieTimeRangeRuntime;
+let v2CookieTimeRangeSession;
+let v2CookieTimeRangeClosed = false;
 let explicitOverrideCacheDirectory;
 let explicitOverrideProbeDirectory;
 let runtimeWorkingDirectory;
 let v2RuntimeWorkingDirectory;
 let v2CssRuntimeWorkingDirectory;
+let v2CookieRuntimeWorkingDirectory;
+let v2CookieRestoreRuntimeWorkingDirectory;
+let v2CookieNoImportRuntimeWorkingDirectory;
+let v2CookieTimeRangeRuntimeWorkingDirectory;
 try {
+  cookieCrossUrl = await listenLoopback(cookieCrossServer, "127.0.0.2");
+  const cookieMainUrl = await listenLoopback(cookieMainServer, "127.0.0.1");
   explicitOverrideCacheDirectory = await mkdtemp(
     join(consumerRoot, ".stasis-explicit-override-cache-"),
   );
@@ -437,6 +676,15 @@ try {
     { encoding: "utf8", flag: "wx", mode: 0o700 },
   );
   await access(explicitOverrideWrapper, fsConstants.X_OK);
+  const exactBinaryEnvironment = exactBinaryChildEnvironment({
+    STASIS_EXPLICIT_OVERRIDE_BINARY: binary,
+    STASIS_EXPLICIT_OVERRIDE_MARKER: explicitOverrideMarker,
+    STASIS_EXPLICIT_OVERRIDE_PROOF: explicitOverrideProof,
+  });
+  assert.ok(
+    typeof exactBinaryEnvironment.HOME === "string" && exactBinaryEnvironment.HOME.length > 0,
+    "exact-binary cookie controls require one retained host HOME context",
+  );
   await assert.rejects(
     access(explicitOverrideMarker, fsConstants.F_OK),
     (error) => error?.code === "ENOENT",
@@ -481,12 +729,7 @@ try {
   runtime = await sdk.launch({
     executablePath: explicitOverrideWrapper,
     runtimeCacheDirectory: explicitOverrideCacheDirectory,
-    env: {
-      ...process.env,
-      STASIS_EXPLICIT_OVERRIDE_BINARY: binary,
-      STASIS_EXPLICIT_OVERRIDE_MARKER: explicitOverrideMarker,
-      STASIS_EXPLICIT_OVERRIDE_PROOF: explicitOverrideProof,
-    },
+    env: exactBinaryEnvironment,
     cwd: runtimeWorkingDirectoryRealPath,
     closeTimeoutMs: 30_000,
     ...commandDeadline(),
@@ -602,12 +845,7 @@ try {
   v2Runtime = await sdk.launch({
     executablePath: explicitOverrideWrapper,
     runtimeCacheDirectory: explicitOverrideCacheDirectory,
-    env: {
-      ...process.env,
-      STASIS_EXPLICIT_OVERRIDE_BINARY: binary,
-      STASIS_EXPLICIT_OVERRIDE_MARKER: explicitOverrideMarker,
-      STASIS_EXPLICIT_OVERRIDE_PROOF: explicitOverrideProof,
-    },
+    env: exactBinaryEnvironment,
     cwd: v2RuntimeWorkingDirectoryRealPath,
     closeTimeoutMs: 30_000,
     ...commandDeadline(),
@@ -1137,12 +1375,7 @@ try {
   v2CssRuntime = await sdk.launch({
     executablePath: explicitOverrideWrapper,
     runtimeCacheDirectory: explicitOverrideCacheDirectory,
-    env: {
-      ...process.env,
-      STASIS_EXPLICIT_OVERRIDE_BINARY: binary,
-      STASIS_EXPLICIT_OVERRIDE_MARKER: explicitOverrideMarker,
-      STASIS_EXPLICIT_OVERRIDE_PROOF: explicitOverrideProof,
-    },
+    env: exactBinaryEnvironment,
     cwd: v2CssRuntimeWorkingDirectoryRealPath,
     closeTimeoutMs: 30_000,
     ...commandDeadline(),
@@ -1359,6 +1592,570 @@ try {
     closeResponseAndEof: true,
   };
 
+  const wrapperInvocationLinesBeforeCookieProof = (
+    await readFile(explicitOverrideMarker, "utf8")
+  )
+    .trimEnd()
+    .split("\n");
+  assert.equal(
+    wrapperInvocationLinesBeforeCookieProof.length,
+    3,
+    "pre-cookie exact-binary launch count changed",
+  );
+
+  v2CookieRuntimeWorkingDirectory = await mkdtemp(
+    join(consumerRoot, ".stasis-v2-cookie-runtime-cwd-"),
+  );
+  const v2CookieRuntimeWorkingDirectoryRealPath = await realpath(
+    v2CookieRuntimeWorkingDirectory,
+  );
+  assert.equal(
+    dirname(v2CookieRuntimeWorkingDirectoryRealPath),
+    consumerRootRealPath,
+    "cookie v2 runtime cwd escaped the clean consumer root",
+  );
+  assert.deepEqual(
+    await readdir(v2CookieRuntimeWorkingDirectoryRealPath),
+    [],
+    "cookie v2 runtime cwd must start empty",
+  );
+  v2CookieRuntime = await sdk.launch({
+    executablePath: explicitOverrideWrapper,
+    runtimeCacheDirectory: explicitOverrideCacheDirectory,
+    env: exactBinaryEnvironment,
+    cwd: v2CookieRuntimeWorkingDirectoryRealPath,
+    closeTimeoutMs: 30_000,
+    ...commandDeadline(),
+  });
+  const v2CookieChildPid = v2CookieRuntime.pid;
+  assert.ok(Number.isSafeInteger(v2CookieChildPid) && v2CookieChildPid > 0);
+  assert.equal(v2CookieRuntime.info.implementation.version, expectedVersion);
+  assert.deepEqual(v2CookieRuntime.info.implementation.source, expectedSource);
+  assert.ok(
+    v2CookieRuntime.info.capabilities.profiles.includes(CONTROLLED_WEB_SESSION_V2_PROFILE),
+    "exact cookie proof runtime did not advertise controlled-web-session-v2",
+  );
+  assert.equal(
+    await readFile(explicitOverrideMarker, "utf8"),
+    `${explicitOverrideProof}\n${explicitOverrideProof}\n${explicitOverrideProof}\n${explicitOverrideProof}\n`,
+    "the packed-SDK cookie process did not launch through the exact-binary wrapper",
+  );
+
+  const loginUrl = `${cookieMainUrl}/login`;
+  v2CookieSessionHandle = await v2CookieRuntime.openSession(loginUrl, {
+    profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+    clock: {
+      mode: "controlled",
+      initialVirtualTimeNs: 0n,
+      unixTimeOriginNs: 0n,
+    },
+    network: { mode: "live", routes: [] },
+    ...commandDeadline(),
+  });
+  const cookieLoginReady = await v2CookieSessionHandle.settle(
+    v2CookieSessionHandle.stateToken,
+    {},
+    commandDeadline(),
+  );
+  assert.equal(cookieLoginReady.outcome, "quiescent");
+  const cookieSubmitted = await v2CookieSessionHandle.submit(
+    "#login-form",
+    cookieLoginReady.stateToken,
+    commandDeadline(),
+  );
+  assert.equal(cookieSubmitted.submitted, true);
+  const cookieAuthenticated = await v2CookieSessionHandle.settle(
+    cookieSubmitted.stateToken,
+    {},
+    commandDeadline(),
+  );
+  assert.equal(cookieAuthenticated.outcome, "quiescent");
+  assert.equal(
+    (await v2CookieSessionHandle.text(
+      "#authenticated",
+      cookieAuthenticated.stateToken,
+      commandDeadline(),
+    )).value,
+    "remembered",
+  );
+  const cookieSnapshot = await v2CookieSessionHandle.getCookies(commandDeadline());
+  const rememberedCookie = cookieSnapshot.cookies.find(
+    (cookie) => cookie.name === "remember_me",
+  );
+  assert.ok(rememberedCookie, "v2 cookie snapshot omitted the persistent response cookie");
+  const expectedRememberedExpiryNs = 2_592_000_000_000_000n;
+  assert.equal(rememberedCookie.expiresUnixTimeNs, expectedRememberedExpiryNs);
+  assert.equal(rememberedCookie.sameSite, "lax");
+  assert.equal(rememberedCookie.httpOnly, true);
+
+  const crossSiteCookieExpiryNs = 34_560_000_000_000_000n;
+  const cookieMutation = await v2CookieSessionHandle.setCookies(
+    [
+      ...cookieSnapshot.cookies,
+      {
+        name: "cross_lax",
+        value: "must-not-cross",
+        domain: "127.0.0.2",
+        path: "/",
+        hostOnly: true,
+        secure: false,
+        httpOnly: true,
+        sameSite: "lax",
+        expiresUnixTimeNs: crossSiteCookieExpiryNs,
+        partitioned: false,
+        creationSequence: 100n,
+        lastAccessSequence: 101n,
+      },
+    ],
+    cookieSnapshot.sessionStateToken,
+    commandDeadline(),
+  );
+  assert.notEqual(cookieMutation.sessionStateToken, cookieSnapshot.sessionStateToken);
+  const portableV2State = await v2CookieSessionHandle.exportState(commandDeadline());
+  assert.equal(portableV2State.state.schemaVersion, 1);
+  assert.equal(portableV2State.state.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
+  assert.equal(
+    portableV2State.state.cookies.find((cookie) => cookie.name === "remember_me")
+      ?.expiresUnixTimeNs,
+    expectedRememberedExpiryNs,
+  );
+  const portableCrossSiteCookie = portableV2State.state.cookies.find(
+    (cookie) => cookie.name === "cross_lax",
+  );
+  assert.ok(portableCrossSiteCookie, "portable v2 state omitted the cross-site Lax control");
+  assert.equal(portableCrossSiteCookie.expiresUnixTimeNs, crossSiteCookieExpiryNs);
+
+  await v2CookieSessionHandle.close(commandDeadline());
+  await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
+  let v2CookieProcessStillExists = true;
+  try {
+    process.kill(v2CookieChildPid, 0);
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+    v2CookieProcessStillExists = false;
+  }
+  assert.equal(v2CookieProcessStillExists, false, "v2 cookie child still exists after close");
+  assert.deepEqual(
+    await readdir(v2CookieRuntimeWorkingDirectoryRealPath),
+    [],
+    "cookie v2 runtime cwd must remain empty after the controlled session closes",
+  );
+  v2CookieClosedCleanly = true;
+
+  v2CookieRestoreRuntimeWorkingDirectory = await mkdtemp(
+    join(consumerRoot, ".stasis-v2-cookie-restore-runtime-cwd-"),
+  );
+  const v2CookieRestoreRuntimeWorkingDirectoryRealPath = await realpath(
+    v2CookieRestoreRuntimeWorkingDirectory,
+  );
+  assert.equal(
+    dirname(v2CookieRestoreRuntimeWorkingDirectoryRealPath),
+    consumerRootRealPath,
+    "restored cookie v2 runtime cwd escaped the clean consumer root",
+  );
+  assert.deepEqual(
+    await readdir(v2CookieRestoreRuntimeWorkingDirectoryRealPath),
+    [],
+    "restored cookie v2 runtime cwd must start empty",
+  );
+  v2CookieRestoreRuntime = await sdk.launch({
+    executablePath: explicitOverrideWrapper,
+    runtimeCacheDirectory: explicitOverrideCacheDirectory,
+    env: exactBinaryEnvironment,
+    cwd: v2CookieRestoreRuntimeWorkingDirectoryRealPath,
+    closeTimeoutMs: 30_000,
+    ...commandDeadline(),
+  });
+  const v2CookieRestoreChildPid = v2CookieRestoreRuntime.pid;
+  assert.ok(Number.isSafeInteger(v2CookieRestoreChildPid) && v2CookieRestoreChildPid > 0);
+  assert.equal(v2CookieRestoreRuntime.info.implementation.version, expectedVersion);
+  assert.deepEqual(v2CookieRestoreRuntime.info.implementation.source, expectedSource);
+  assert.equal(
+    await readFile(explicitOverrideMarker, "utf8"),
+    `${explicitOverrideProof}\n${explicitOverrideProof}\n${explicitOverrideProof}\n${explicitOverrideProof}\n${explicitOverrideProof}\n`,
+    "the packed-SDK restored-cookie process did not launch through the exact-binary wrapper",
+  );
+  v2CookieRestoreSession = await v2CookieRestoreRuntime.openSession(
+    `${cookieMainUrl}/restored`,
+    {
+      profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+      state: portableV2State.state,
+      clock: {
+        mode: "controlled",
+        initialVirtualTimeNs: 0n,
+        unixTimeOriginNs: 0n,
+      },
+      network: { mode: "live", routes: [] },
+      ...commandDeadline(),
+    },
+  );
+  const restoredCookieSettled = await v2CookieRestoreSession.settle(
+    v2CookieRestoreSession.stateToken,
+    {},
+    commandDeadline(),
+  );
+  assert.equal(restoredCookieSettled.outcome, "quiescent");
+  assert.equal(
+    (await v2CookieRestoreSession.text(
+      "#cross-site-result",
+      restoredCookieSettled.stateToken,
+      commandDeadline(),
+    )).value,
+    "loaded-without-cookie",
+  );
+  const restoredMainRequest = cookieMainRequests.find(
+    (request) => request.method === "GET" && request.url === "/restored",
+  );
+  assert.ok(restoredMainRequest, "restored v2 request did not reach the same-site server");
+  const restoredSameSiteCookieSent =
+    /(?:^|;\s*)remember_me=controlled(?:;|$)/u.test(restoredMainRequest.cookie);
+  assert.equal(restoredSameSiteCookieSent, true);
+  assert.equal(cookieCrossRequests.length, 1);
+  assert.deepEqual(cookieCrossRequests[0], {
+    method: "GET",
+    url: "/probe.js",
+    cookie: "",
+  });
+  const restoredCookieState = await v2CookieRestoreSession.exportState(commandDeadline());
+  assert.equal(restoredCookieState.state.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
+  assert.equal(
+    restoredCookieState.state.cookies.find((cookie) => cookie.name === "remember_me")
+      ?.expiresUnixTimeNs,
+    expectedRememberedExpiryNs,
+  );
+  const restoredCrossSiteCookie = restoredCookieState.state.cookies.find(
+    (cookie) => cookie.name === "cross_lax",
+  );
+  assert.deepEqual(
+    restoredCrossSiteCookie,
+    portableCrossSiteCookie,
+    "cross-site Lax filtering must retain the imported cookie identity in v2 state",
+  );
+  const crossSiteLaxCookieFiltered =
+    cookieCrossRequests[0].cookie === "" &&
+    isDeepStrictEqual(restoredCrossSiteCookie, portableCrossSiteCookie);
+  assert.equal(crossSiteLaxCookieFiltered, true);
+  const v2CookieEvidence = v2CookieRestoreSession.settlementEvidence(
+    restoredCookieSettled,
+  );
+  assert.equal(v2CookieEvidence.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
+
+  await v2CookieRestoreSession.close(commandDeadline());
+  await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
+  let v2CookieRestoreProcessStillExists = true;
+  try {
+    process.kill(v2CookieRestoreChildPid, 0);
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+    v2CookieRestoreProcessStillExists = false;
+  }
+  assert.equal(
+    v2CookieRestoreProcessStillExists,
+    false,
+    "restored v2 cookie child still exists after close",
+  );
+  assert.deepEqual(
+    await readdir(explicitOverrideCacheDirectory),
+    [],
+    "the v2 cookie proof unexpectedly accessed the managed runtime cache",
+  );
+  assert.deepEqual(
+    await readdir(v2CookieRestoreRuntimeWorkingDirectoryRealPath),
+    [],
+    "restored cookie v2 runtime cwd must remain empty after the controlled session closes",
+  );
+  v2CookieRestoreClosedCleanly = true;
+
+  v2CookieNoImportRuntimeWorkingDirectory = await mkdtemp(
+    join(consumerRoot, ".stasis-v2-cookie-no-import-runtime-cwd-"),
+  );
+  const v2CookieNoImportRuntimeWorkingDirectoryRealPath = await realpath(
+    v2CookieNoImportRuntimeWorkingDirectory,
+  );
+  assert.equal(
+    dirname(v2CookieNoImportRuntimeWorkingDirectoryRealPath),
+    consumerRootRealPath,
+    "no-import cookie v2 runtime cwd escaped the clean consumer root",
+  );
+  assert.notEqual(
+    v2CookieNoImportRuntimeWorkingDirectoryRealPath,
+    v2CookieRuntimeWorkingDirectoryRealPath,
+  );
+  assert.notEqual(
+    v2CookieNoImportRuntimeWorkingDirectoryRealPath,
+    v2CookieRestoreRuntimeWorkingDirectoryRealPath,
+  );
+  assert.deepEqual(
+    await readdir(v2CookieNoImportRuntimeWorkingDirectoryRealPath),
+    [],
+    "no-import cookie v2 runtime cwd must start empty",
+  );
+  v2CookieNoImportRuntime = await sdk.launch({
+    executablePath: explicitOverrideWrapper,
+    runtimeCacheDirectory: explicitOverrideCacheDirectory,
+    env: exactBinaryEnvironment,
+    cwd: v2CookieNoImportRuntimeWorkingDirectoryRealPath,
+    closeTimeoutMs: 30_000,
+    ...commandDeadline(),
+  });
+  const v2CookieNoImportChildPid = v2CookieNoImportRuntime.pid;
+  assert.ok(Number.isSafeInteger(v2CookieNoImportChildPid) && v2CookieNoImportChildPid > 0);
+  assert.equal(v2CookieNoImportRuntime.info.implementation.version, expectedVersion);
+  assert.deepEqual(v2CookieNoImportRuntime.info.implementation.source, expectedSource);
+  assert.equal(
+    await readFile(explicitOverrideMarker, "utf8"),
+    `${explicitOverrideProof}\n`.repeat(6),
+    "the packed-SDK no-import cookie process did not launch through the exact-binary wrapper",
+  );
+  v2CookieNoImportSession = await v2CookieNoImportRuntime.openSession(
+    `${cookieMainUrl}/fresh-no-import`,
+    {
+      profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+      clock: {
+        mode: "controlled",
+        initialVirtualTimeNs: 0n,
+        unixTimeOriginNs: 0n,
+      },
+      network: { mode: "live", routes: [] },
+      ...commandDeadline(),
+    },
+  );
+  const noImportSettled = await v2CookieNoImportSession.settle(
+    v2CookieNoImportSession.stateToken,
+    {},
+    commandDeadline(),
+  );
+  assert.equal(noImportSettled.outcome, "quiescent");
+  assert.equal(
+    (await v2CookieNoImportSession.text(
+      "#fresh-no-import",
+      noImportSettled.stateToken,
+      commandDeadline(),
+    )).value,
+    "fresh",
+  );
+  const noImportMainRequests = cookieMainRequests.filter(
+    (request) => request.method === "GET" && request.url === "/fresh-no-import",
+  );
+  assert.deepEqual(noImportMainRequests, [
+    { method: "GET", url: "/fresh-no-import", cookie: "" },
+  ]);
+  const noImportCookieSnapshot = await v2CookieNoImportSession.getCookies(commandDeadline());
+  assert.deepEqual(noImportCookieSnapshot.cookies, []);
+  const noImportState = await v2CookieNoImportSession.exportState(commandDeadline());
+  assert.equal(noImportState.state.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
+  assert.deepEqual(noImportState.state.cookies, []);
+
+  await v2CookieNoImportSession.close(commandDeadline());
+  await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
+  let v2CookieNoImportProcessStillExists = true;
+  try {
+    process.kill(v2CookieNoImportChildPid, 0);
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+    v2CookieNoImportProcessStillExists = false;
+  }
+  assert.equal(
+    v2CookieNoImportProcessStillExists,
+    false,
+    "no-import v2 cookie child still exists after close",
+  );
+  assert.deepEqual(
+    await readdir(v2CookieNoImportRuntimeWorkingDirectoryRealPath),
+    [],
+    "no-import cookie v2 runtime cwd must remain empty after the controlled session closes",
+  );
+  v2CookieNoImportClosedCleanly = true;
+
+  v2CookieTimeRangeRuntimeWorkingDirectory = await mkdtemp(
+    join(consumerRoot, ".stasis-v2-cookie-time-range-runtime-cwd-"),
+  );
+  const v2CookieTimeRangeRuntimeWorkingDirectoryRealPath = await realpath(
+    v2CookieTimeRangeRuntimeWorkingDirectory,
+  );
+  assert.equal(
+    dirname(v2CookieTimeRangeRuntimeWorkingDirectoryRealPath),
+    consumerRootRealPath,
+    "cookie time-range runtime cwd escaped the clean consumer root",
+  );
+  assert.deepEqual(
+    await readdir(v2CookieTimeRangeRuntimeWorkingDirectoryRealPath),
+    [],
+    "cookie time-range runtime cwd must start empty",
+  );
+  v2CookieTimeRangeRuntime = await sdk.launch({
+    executablePath: explicitOverrideWrapper,
+    runtimeCacheDirectory: explicitOverrideCacheDirectory,
+    env: exactBinaryEnvironment,
+    cwd: v2CookieTimeRangeRuntimeWorkingDirectoryRealPath,
+    closeTimeoutMs: 30_000,
+    ...commandDeadline(),
+  });
+  const v2CookieTimeRangeChildPid = v2CookieTimeRangeRuntime.pid;
+  assert.ok(Number.isSafeInteger(v2CookieTimeRangeChildPid) && v2CookieTimeRangeChildPid > 0);
+  assert.equal(v2CookieTimeRangeRuntime.info.implementation.version, expectedVersion);
+  assert.deepEqual(v2CookieTimeRangeRuntime.info.implementation.source, expectedSource);
+  assert.equal(
+    await readFile(explicitOverrideMarker, "utf8"),
+    `${explicitOverrideProof}\n`.repeat(7),
+    "the packed-SDK cookie time-range process did not launch through the exact-binary wrapper",
+  );
+  const requestsBeforeTimeRangeArm = cookieMainRequests.length;
+  let cookieTimeRangeError;
+  v2CookieTimeRangeSession = await v2CookieTimeRangeRuntime.openSession(
+    `${cookieMainUrl}/time-range-arm`,
+    {
+      profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+      clock: {
+        mode: "controlled",
+        initialVirtualTimeNs: MAX_U64_VIRTUAL_TIME_NS,
+        unixTimeOriginNs: 0n,
+      },
+      network: { mode: "live", routes: [] },
+      ...commandDeadline(),
+    },
+  );
+  assert.equal(cookieMainRequests.length, requestsBeforeTimeRangeArm + 1);
+  assert.deepEqual(cookieMainRequests.at(-1), {
+    method: "GET",
+    url: "/time-range-arm",
+    cookie: "",
+  });
+  const timeRangeArmed = await v2CookieTimeRangeSession.settle(
+    v2CookieTimeRangeSession.stateToken,
+    {},
+    commandDeadline(),
+  );
+  assert.equal(timeRangeArmed.outcome, "quiescent");
+  assert.ok(timeRangeArmed.virtualTimeNs > MAX_U64_VIRTUAL_TIME_NS);
+  assert.equal(
+    (await v2CookieTimeRangeSession.text(
+      "#time-range-arm",
+      timeRangeArmed.stateToken,
+      commandDeadline(),
+    )).value,
+    "advanced",
+  );
+  const requestsBeforeTimeRangeNavigation = cookieMainRequests.length;
+  await assert.rejects(
+    v2CookieTimeRangeSession.navigate(
+      `${cookieMainUrl}/time-range`,
+      timeRangeArmed.stateToken,
+      commandDeadline(),
+    ),
+    (error) => {
+      cookieTimeRangeError = error;
+      assert.ok(error instanceof sdk.StasisProtocolError);
+      assert.equal(error.code, "unsupported_cookie_time_range");
+      assert.equal(error.fatal, false);
+      assert.equal(error.stateEffect, "partial");
+      return true;
+    },
+  );
+  assert.equal(
+    cookieMainRequests.length,
+    requestsBeforeTimeRangeNavigation,
+    "post-open cookie time-range terminal must occur before the request reaches the server",
+  );
+  await v2CookieTimeRangeSession.close(commandDeadline());
+  await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
+  let v2CookieTimeRangeProcessStillExists = true;
+  try {
+    process.kill(v2CookieTimeRangeChildPid, 0);
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+    v2CookieTimeRangeProcessStillExists = false;
+  }
+  assert.equal(
+    v2CookieTimeRangeProcessStillExists,
+    false,
+    "cookie time-range child still exists after session close",
+  );
+  assert.deepEqual(
+    await readdir(v2CookieTimeRangeRuntimeWorkingDirectoryRealPath),
+    [],
+    "cookie time-range runtime cwd must remain empty after the controlled session closes",
+  );
+  v2CookieTimeRangeClosed = true;
+  const finalManagedRuntimeCacheEntries = await readdir(explicitOverrideCacheDirectory);
+  assert.deepEqual(
+    finalManagedRuntimeCacheEntries,
+    [],
+    "the complete v2 cookie proof unexpectedly accessed the managed runtime cache",
+  );
+  const cookieWorkingDirectoriesRemainEmpty = (
+    await Promise.all([
+      readdir(v2CookieRuntimeWorkingDirectoryRealPath),
+      readdir(v2CookieRestoreRuntimeWorkingDirectoryRealPath),
+      readdir(v2CookieNoImportRuntimeWorkingDirectoryRealPath),
+    ])
+  ).every((entries) => entries.length === 0);
+  const noImportControlSameHostContext =
+    exactBinaryEnvironment.HOME === process.env.HOME;
+  const memoryOnlyExplicitStatePortability =
+    restoredSameSiteCookieSent &&
+    noImportState.state.cookies.length === 0 &&
+    noImportMainRequests[0].cookie === "" &&
+    noImportControlSameHostContext &&
+    cookieWorkingDirectoriesRemainEmpty;
+  assert.equal(memoryOnlyExplicitStatePortability, true);
+  const exactBinaryEnvironmentIsAllowlisted = Object.keys(exactBinaryEnvironment).every(
+    (name) =>
+      EXACT_BINARY_INHERITED_ENVIRONMENT.includes(name) ||
+      EXACT_BINARY_LOCALE_ENVIRONMENT.includes(name) ||
+      EXACT_BINARY_OVERRIDE_ENVIRONMENT.includes(name),
+  );
+  assert.equal(exactBinaryEnvironmentIsAllowlisted, true);
+  const wrapperInvocationLines = (await readFile(explicitOverrideMarker, "utf8"))
+    .trimEnd()
+    .split("\n");
+  const exactBinaryLaunch =
+    wrapperInvocationLines.length === 7 &&
+    wrapperInvocationLines.every((line) => line === explicitOverrideProof);
+  assert.equal(exactBinaryLaunch, true);
+  const gracefulCookieSessionProcesses = [
+    v2CookieClosedCleanly,
+    v2CookieRestoreClosedCleanly,
+    v2CookieNoImportClosedCleanly,
+    v2CookieTimeRangeClosed,
+  ].filter(Boolean).length;
+  const cookieCloseResponseAndEof = gracefulCookieSessionProcesses === 4;
+  assert.equal(cookieCloseResponseAndEof, true);
+  v2CookieSession = {
+    profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+    stateSchemaVersion: "1",
+    stateProfile: portableV2State.state.profile,
+    responseCookieName: rememberedCookie.name,
+    responseCookieExpiryUnixTimeNs: String(rememberedCookie.expiresUnixTimeNs),
+    maxAgePrecedenceOverPastExpires:
+      rememberedCookie.expiresUnixTimeNs === expectedRememberedExpiryNs,
+    restoredSameSiteCookieSent,
+    crossSiteResourceReachedServer: cookieCrossRequests.length === 1,
+    crossSiteLaxCookieFiltered,
+    crossSiteRequestMethod: cookieCrossRequests[0].method,
+    crossSiteRequestPath: cookieCrossRequests[0].url,
+    evidenceProfile: v2CookieEvidence.profile,
+    memoryOnlyExplicitStatePortability,
+    noImportControlCookieCount: String(noImportState.state.cookies.length),
+    noImportControlRequestCookieHeaderEmpty: noImportMainRequests[0].cookie === "",
+    noImportControlSameHostContext,
+    cookieTimeRangeFailureCode: cookieTimeRangeError.code,
+    cookieTimeRangeFatal: cookieTimeRangeError.fatal,
+    cookieTimeRangeStateEffect: cookieTimeRangeError.stateEffect,
+    cookieTimeRangeRequestReachedServer:
+      cookieMainRequests.length !== requestsBeforeTimeRangeNavigation,
+    credentialEnvironmentMode: exactBinaryEnvironmentIsAllowlisted
+      ? "explicit_allowlist"
+      : "invalid",
+    freshExactBinaryProcesses: String(
+      wrapperInvocationLines.length - wrapperInvocationLinesBeforeCookieProof.length,
+    ),
+    gracefulCookieSessionProcesses: String(gracefulCookieSessionProcesses),
+    managedRuntimeFallbackAccesses: String(finalManagedRuntimeCacheEntries.length),
+    exactBinaryLaunch,
+    closeResponseAndEof: cookieCloseResponseAndEof,
+  };
+
   process.stdout.write(
     `${JSON.stringify({
       gate: "sdk-act-settle-inspect",
@@ -1377,6 +2174,7 @@ try {
       v2InputMethodFocus,
       v2AutomationEventTimestamps,
       v2CssAnimationEventTimestamps,
+      v2CookieSession,
     })}\n`,
   );
 } finally {
@@ -1395,10 +2193,33 @@ try {
   if (!v2CssClosedCleanly && v2CssRuntime !== undefined) {
     await v2CssRuntime.close().catch(() => undefined);
   }
-  await new Promise((resolveClose) => {
-    server.close(resolveClose);
-    server.closeAllConnections?.();
-  });
+  if (!v2CookieClosedCleanly && v2CookieSessionHandle !== undefined) {
+    await v2CookieSessionHandle.close().catch(() => undefined);
+  }
+  if (!v2CookieClosedCleanly && v2CookieRuntime !== undefined) {
+    await v2CookieRuntime.close().catch(() => undefined);
+  }
+  if (!v2CookieRestoreClosedCleanly && v2CookieRestoreSession !== undefined) {
+    await v2CookieRestoreSession.close().catch(() => undefined);
+  }
+  if (!v2CookieRestoreClosedCleanly && v2CookieRestoreRuntime !== undefined) {
+    await v2CookieRestoreRuntime.close().catch(() => undefined);
+  }
+  if (!v2CookieNoImportClosedCleanly && v2CookieNoImportSession !== undefined) {
+    await v2CookieNoImportSession.close().catch(() => undefined);
+  }
+  if (!v2CookieNoImportClosedCleanly && v2CookieNoImportRuntime !== undefined) {
+    await v2CookieNoImportRuntime.close().catch(() => undefined);
+  }
+  if (!v2CookieTimeRangeClosed && v2CookieTimeRangeSession !== undefined) {
+    await v2CookieTimeRangeSession.close().catch(() => undefined);
+  }
+  if (!v2CookieTimeRangeClosed && v2CookieTimeRangeRuntime !== undefined) {
+    await v2CookieTimeRangeRuntime.close().catch(() => undefined);
+  }
+  await closeServer(server);
+  await closeServer(cookieMainServer);
+  await closeServer(cookieCrossServer);
   if (runtimeWorkingDirectory !== undefined) {
     await rm(runtimeWorkingDirectory, { recursive: true });
   }
@@ -1407,6 +2228,18 @@ try {
   }
   if (v2CssRuntimeWorkingDirectory !== undefined) {
     await rm(v2CssRuntimeWorkingDirectory, { recursive: true });
+  }
+  if (v2CookieRuntimeWorkingDirectory !== undefined) {
+    await rm(v2CookieRuntimeWorkingDirectory, { recursive: true });
+  }
+  if (v2CookieRestoreRuntimeWorkingDirectory !== undefined) {
+    await rm(v2CookieRestoreRuntimeWorkingDirectory, { recursive: true });
+  }
+  if (v2CookieNoImportRuntimeWorkingDirectory !== undefined) {
+    await rm(v2CookieNoImportRuntimeWorkingDirectory, { recursive: true });
+  }
+  if (v2CookieTimeRangeRuntimeWorkingDirectory !== undefined) {
+    await rm(v2CookieTimeRangeRuntimeWorkingDirectory, { recursive: true });
   }
   if (explicitOverrideCacheDirectory !== undefined) {
     await rm(explicitOverrideCacheDirectory, { recursive: true });

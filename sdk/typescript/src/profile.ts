@@ -4,7 +4,7 @@ export const CONTROLLED_WEBAPP_V1_PROFILE = "controlled-webapp-v1" as const;
 /** The bounded controlled session subset introduced by the additive Stasis 0.2 API. */
 export const CONTROLLED_WEB_SESSION_V1_PROFILE = "controlled-web-session-v1" as const;
 
-/** Candidate Stasis 0.3 session profile with controlled local MessageChannel delivery. */
+/** Candidate Stasis 0.3 session profile with bounded modern-web and cookie-state authority. */
 export const CONTROLLED_WEB_SESSION_V2_PROFILE = "controlled-web-session-v2" as const;
 
 /** Session profiles understood by this SDK, in compatibility order. */

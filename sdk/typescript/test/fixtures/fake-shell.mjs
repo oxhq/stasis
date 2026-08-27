@@ -48,7 +48,7 @@ const rotateSessionStateToken = () => {
 
 const sessionState = () => ({
   schemaVersion: 1,
-  profile: sessionV1Profile,
+  profile: openParams?.profile ?? sessionV1Profile,
   sensitive: true,
   sessionStorageScope: "top_level_browsing_context",
   cookies: sessionCookies,

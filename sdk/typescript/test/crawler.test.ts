@@ -19,7 +19,7 @@ import type {
   DocumentStateToken,
   SessionExtractPlan,
   SessionNetworkOptions,
-  SessionState,
+  SessionStateV2,
   SettleOutcome,
 } from "../src/types.js";
 
@@ -368,12 +368,12 @@ test("crawler forwards immutable fixtures/state and validates all finite bounds"
   } as const satisfies SessionNetworkOptions;
   const state = {
     schemaVersion: 1,
-    profile: "controlled-web-session-v1",
+    profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
     sensitive: true,
     sessionStorageScope: "top_level_browsing_context",
     cookies: [],
     origins: [],
-  } as const satisfies SessionState;
+  } as const satisfies SessionStateV2;
   await crawlWithStasis(harness.pool, {
     start: "https://example.test/",
     maxPages: 1,

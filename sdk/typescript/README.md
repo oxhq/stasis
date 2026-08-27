@@ -120,7 +120,8 @@ V2 adds bounded same-global, untransferred `MessageChannel` delivery; a bounded 
 `<svg>` path for its exact cached internally serialized data-SVG request and cache-ID owner; and
 suppression of only
 page-driven, single-line text InputMethod presentation when no virtual keyboard is requested in the
-exact public non-auxiliary controlled top-level document. The image path requires direct `src` selection without
+exact public non-auxiliary controlled top-level document. It also adds controlled in-memory
+persistent-cookie expiry and bounded schemeful SameSite request selection. The image path requires direct `src` selection without
 `srcset`/`picture`/environment changes, exact `image/svg+xml` from the canonical data-URL parser, a
 serialized URL no larger than 65,536 bytes, the same ScriptThread/ImageCache, and room within the
 512-record retained controlled-ownership cap. Its cache-hit or finite asynchronous completion is
@@ -160,9 +161,30 @@ behavior, CSS animation semantics and limits, and predecessor rejection authorit
 When pending animation events still have a live scheduled opportunity, settlement treats them as
 finite demand for guarded `AdvanceTo` at the exact retained scheduler head; only an unscheduled
 batch is `Drive`-ready. This is a liveness correction, not another task source or limit.
-It reuses the `controlled-web-session-v1` cookie/Web Storage artifact, so exported
-`state.profile` intentionally remains `controlled-web-session-v1`; settlement evidence instead
-carries the runtime-bound selected execution-profile identity. One-argument
+V2 cookie expiry uses controlled Unix nanoseconds with origin zero. `Max-Age` precedes `Expires`,
+lifetime is clamped to 400 days, and expired records are lazily purged before observation, request
+selection, and export. SameSite uses the captured schemeful site-for-cookies, current redirect-hop
+method, and top-level-navigation bit. Strict is same-site only; Lax and unspecified also admit
+cross-site top-level safe methods; Secure None cookies may cross site. Unknown or opaque context
+remains typed unsupported before network start. Cross-site subresource responses retain only valid
+Secure SameSite=None cookies; top-level-navigation responses admit all otherwise valid
+unpartitioned cookies. A post-open request at controlled Unix time above u64 fails nonfatally as
+`unsupported_cookie_time_range` before network start instead of truncating; initial controlled
+open hardens the same code to fatal fail-stop. Partitioned cookies
+plus CookieStore read/getAll/delete remain unsupported.
+
+The SDK keeps `SessionCookie` and `SessionState` as frozen v1-compatible names. Explicit v2 code
+uses `SessionCookieV2` and `SessionStateV2`; `Session<Profile>` makes cookie reads, writes, imports,
+and exports profile-specific. A v2 artifact keeps `schemaVersion: 1` but has literal
+`profile: "controlled-web-session-v2"` and `expiresUnixTimeNs: bigint | null`. It is portable only
+through explicit export and initial import; no v1 migration or disk-backed browser jar is implied.
+`ReferenceCrawlerOptions` likewise defaults to v1. Its optional `profile` member remains source
+compatible for existing v1 annotations. A standalone candidate annotation can therefore describe
+an incompletely constructed value, but it cannot be passed to `crawlWithStasis()` until it carries
+`profile: CONTROLLED_WEB_SESSION_V2_PROFILE`; at that call boundary the explicit profile is inferred
+and a v1 state artifact is rejected.
+Settlement evidence
+carries the runtime-bound selected profile identity. One-argument
 `settlementEvidence(settled)` preserves that binding for SDK-produced results, and contradictory
 explicit profile claims are rejected. See the
 [candidate contract](../../docs/stasis/session-v0.3-candidate.md).

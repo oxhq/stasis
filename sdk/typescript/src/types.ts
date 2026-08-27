@@ -1,4 +1,5 @@
 import type {
+  CONTROLLED_WEB_SESSION_V2_PROFILE,
   CONTROLLED_WEB_SESSION_V1_PROFILE,
   LegacySupportProfile,
   SelectableSessionProfile,
@@ -160,12 +161,27 @@ export interface SessionCookie {
   readonly secure: boolean;
   readonly httpOnly: boolean;
   readonly sameSite: CookieSameSite;
-  /** Session-profile state artifacts currently import only session cookies. */
+  /** The frozen v1 artifact imports only session cookies. */
   readonly expiresUnixTimeNs: null;
   readonly partitioned: false;
   readonly creationSequence: bigint;
   readonly lastAccessSequence: bigint;
 }
+
+/** The byte- and behavior-frozen controlled-web-session-v1 cookie record. */
+export type SessionCookieV1 = SessionCookie;
+
+/** Cookie record owned by the explicitly selected controlled-web-session-v2 profile. */
+export interface SessionCookieV2 extends Omit<SessionCookie, "expiresUnixTimeNs"> {
+  /** Controlled Unix-nanosecond expiry, or null for a session cookie. */
+  readonly expiresUnixTimeNs: bigint | null;
+}
+
+/** Cookie record selected by an exact controlled-session profile. */
+export type SessionCookieFor<Profile extends SelectableSessionProfile> =
+  Profile extends typeof CONTROLLED_WEB_SESSION_V2_PROFILE
+    ? SessionCookieV2
+    : SessionCookieV1;
 
 export interface SessionStorageEntry {
   readonly key: string;
@@ -187,6 +203,25 @@ export interface SessionState {
   readonly origins: readonly SessionOriginState[];
 }
 
+/** The byte- and behavior-frozen controlled-web-session-v1 state artifact. */
+export type SessionStateV1 = SessionState;
+
+/** Portable state artifact owned by the explicitly selected v2 profile. */
+export interface SessionStateV2 {
+  readonly schemaVersion: 1;
+  readonly profile: typeof CONTROLLED_WEB_SESSION_V2_PROFILE;
+  readonly sensitive: true;
+  readonly sessionStorageScope: "top_level_browsing_context";
+  readonly cookies: readonly SessionCookieV2[];
+  readonly origins: readonly SessionOriginState[];
+}
+
+/** State artifact selected by an exact controlled-session profile. */
+export type SessionStateFor<Profile extends SelectableSessionProfile> =
+  Profile extends typeof CONTROLLED_WEB_SESSION_V2_PROFILE
+    ? SessionStateV2
+    : SessionStateV1;
+
 export interface SessionOpenOptions<
   Profile extends SelectableSessionProfile = SessionSupportProfile,
 > extends CommandOptions {
@@ -194,10 +229,10 @@ export interface SessionOpenOptions<
   /** Defaults to controlled-web-session-v1. Candidate profiles require explicit selection. */
   profile?: Profile;
   /**
-   * Imported atomically before the initial navigation begins. The v2 execution profile deliberately
-   * reuses the controlled-web-session-v1 state artifact and does not define an implicit migration.
+   * Imported atomically before the initial navigation begins. The artifact profile must exactly
+   * match the selected session profile; there is no implicit v1-to-v2 migration.
    */
-  state?: SessionState;
+  state?: SessionStateFor<Profile>;
   /** Immutable interception policy for the lifetime of this session. */
   network?: SessionNetworkOptions;
 }
@@ -763,8 +798,10 @@ export interface SessionNavigateResult {
   stateToken: DocumentStateToken;
 }
 
-export interface SessionCookiesResult {
-  cookies: SessionCookie[];
+export interface SessionCookiesResult<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+> {
+  cookies: SessionCookieFor<Profile>[];
   sessionStateToken: SessionStateToken;
 }
 
@@ -773,8 +810,10 @@ export interface SessionStorageResult {
   sessionStateToken: SessionStateToken;
 }
 
-export interface SessionStateExportResult {
-  state: SessionState;
+export interface SessionStateExportResult<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+> {
+  state: SessionStateFor<Profile>;
   sessionStateToken: SessionStateToken;
 }
 

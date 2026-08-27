@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 use content_security_policy as csp;
 use crossbeam_channel::{Sender, unbounded};
 use devtools_traits::{HttpRequest as DevtoolsHttpRequest, HttpResponse as DevtoolsHttpResponse};
+use embedder_traits::{ControlledCookieContext, ControlledCookiePolicy};
 use headers::{
     AccessControlAllowCredentials, AccessControlAllowHeaders, AccessControlAllowMethods,
     AccessControlAllowOrigin, AccessControlMaxAge, CacheControl, ContentLength, ContentType, ETag,
@@ -1629,6 +1630,26 @@ fn controlled_fixture_cookie_fetch(
     embedder_traits::WebResourceLoadTerminal,
     Option<String>,
 ) {
+    controlled_fixture_cookie_fetch_with_context(
+        credentials_mode,
+        cookie_headers,
+        ControlledCookieContext {
+            policy: ControlledCookiePolicy::SessionV1,
+            site_for_cookies: Some(url::Url::parse("https://www.example.org/").unwrap()),
+            top_level_navigation: false,
+        },
+    )
+}
+
+fn controlled_fixture_cookie_fetch_with_context(
+    credentials_mode: CredentialsMode,
+    cookie_headers: &'static [&'static str],
+    cookie_context: ControlledCookieContext,
+) -> (
+    Response,
+    embedder_traits::WebResourceLoadTerminal,
+    Option<String>,
+) {
     let (embedder_proxy, embedder_receiver) = create_generic_embedder_proxy_and_receiver();
     let (terminal_sender, terminal_receiver) = std::sync::mpsc::sync_channel(1);
 
@@ -1642,7 +1663,7 @@ fn controlled_fixture_cookie_fetch(
                 ) => {
                     response_sender
                         .send(embedder_traits::WebResourceResponseMsg::ControlledSession {
-                            top_level_url: web_resource_request.url.clone(),
+                            cookie_context: cookie_context.clone(),
                         })
                         .unwrap();
                     let mut headers = HeaderMap::new();
@@ -1862,7 +1883,11 @@ fn controlled_follow_redirect_evidence(
                     ));
                     response_sender
                         .send(embedder_traits::WebResourceResponseMsg::ControlledSession {
-                            top_level_url: top_level_url.clone(),
+                            cookie_context: ControlledCookieContext {
+                                policy: ControlledCookiePolicy::SessionV1,
+                                site_for_cookies: Some(top_level_url.clone()),
+                                top_level_navigation: web_resource_request.is_for_main_frame,
+                            },
                         })
                         .unwrap();
                     response_sender
@@ -1971,6 +1996,132 @@ fn controlled_xhr_follow_redirect_records_each_hop_terminal() {
 }
 
 #[test]
+fn controlled_v2_redirect_uses_current_hop_method_and_pre_navigation_site_for_lax_cookie() {
+    let (request_sender, request_receiver) = unbounded();
+    let handler_sender = Arc::new(request_sender);
+    let handler =
+        move |request: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            handler_sender
+                .send((
+                    request.uri().path().to_owned(),
+                    request.method().clone(),
+                    request
+                        .headers()
+                        .get(header::COOKIE)
+                        .map(|value| value.to_str().unwrap().to_owned()),
+                ))
+                .unwrap();
+            match request.uri().path() {
+                "/start" => {
+                    *response.status_mut() = StatusCode::SEE_OTHER;
+                    response
+                        .headers_mut()
+                        .insert(header::LOCATION, HeaderValue::from_static("/final"));
+                },
+                "/final" => {
+                    *response.body_mut() = make_body(b"redirect-complete".to_vec());
+                },
+                path => panic!("unexpected controlled cookie redirect path: {path}"),
+            }
+        };
+    let (_server, mut start_url) = make_server(handler);
+    start_url.as_mut_url().set_path("/start");
+    let request_url = start_url.url();
+    let pre_navigation_site = url::Url::parse("https://source.example/").unwrap();
+    let policy = ControlledCookiePolicy::SessionV2 { unix_time_ns: 7 };
+
+    let (embedder_proxy, embedder_receiver) = create_generic_embedder_proxy_and_receiver();
+    let controlled_site = pre_navigation_site.clone();
+    let embedder_thread = std::thread::spawn(move || {
+        let mut requested_methods = Vec::new();
+        let mut terminal_count = 0;
+        loop {
+            match embedder_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("timed out waiting for controlled cookie redirect lifecycle")
+            {
+                net::embedder::NetToEmbedderMsg::WebResourceRequested(
+                    _,
+                    web_resource_request,
+                    response_sender,
+                ) => {
+                    assert!(web_resource_request.is_for_main_frame);
+                    requested_methods.push(web_resource_request.method.clone());
+                    response_sender
+                        .send(embedder_traits::WebResourceResponseMsg::ControlledSession {
+                            cookie_context: ControlledCookieContext {
+                                policy,
+                                site_for_cookies: Some(controlled_site.clone()),
+                                top_level_navigation: true,
+                            },
+                        })
+                        .unwrap();
+                    response_sender
+                        .send(embedder_traits::WebResourceResponseMsg::DoNotIntercept)
+                        .unwrap();
+                },
+                net::embedder::NetToEmbedderMsg::WebResourceFinished(..) => {
+                    terminal_count += 1;
+                    if requested_methods.len() == 2 && terminal_count == 3 {
+                        break;
+                    }
+                },
+                _ => {},
+            }
+        }
+        assert_eq!(requested_methods, [Method::POST, Method::GET]);
+    });
+
+    let mut context = new_fetch_context(None, Some(embedder_proxy));
+    let same_site_context = ControlledCookieContext {
+        policy,
+        site_for_cookies: Some(request_url.clone().into_url()),
+        top_level_navigation: false,
+    };
+    context
+        .state
+        .cookie_jar
+        .write()
+        .set_controlled_session_cookie_from_header_with_context(
+            &request_url,
+            &Method::GET,
+            &same_site_context,
+            "lax=redirect; Path=/; SameSite=Lax",
+        )
+        .unwrap();
+
+    let request = RequestBuilder::new(
+        Some(TEST_WEBVIEW_ID),
+        UrlWithBlobClaim::new(request_url.clone(), None),
+        Referrer::NoReferrer,
+    )
+    .origin(request_url.origin())
+    .method(Method::POST)
+    .destination(Destination::Document)
+    .credentials_mode(CredentialsMode::Include)
+    .policy_container(Default::default())
+    .build();
+    let response = fetch_with_context(request, &mut context);
+    assert_eq!(response.status.code(), StatusCode::OK);
+    embedder_thread.join().unwrap();
+
+    assert_eq!(
+        request_receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ("/start".to_owned(), Method::POST, None),
+    );
+    assert_eq!(
+        request_receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (
+            "/final".to_owned(),
+            Method::GET,
+            Some("lax=redirect".to_owned()),
+        ),
+    );
+    assert!(request_receiver.try_recv().is_err());
+}
+
+#[test]
 fn controlled_fixture_cookie_failure_is_atomic_and_reaches_typed_terminal() {
     let (response, terminal, cookies) = controlled_fixture_cookie_fetch(
         CredentialsMode::Include,
@@ -1990,6 +2141,26 @@ fn controlled_fixture_cookie_failure_is_atomic_and_reaches_typed_terminal() {
 fn controlled_fixture_credentials_omit_never_mutates_cookie_jar() {
     let (response, terminal, cookies) =
         controlled_fixture_cookie_fetch(CredentialsMode::Omit, &["omitted=never-stored"]);
+    assert!(!response.is_network_error());
+    assert_eq!(cookies, None);
+    assert!(matches!(
+        terminal,
+        embedder_traits::WebResourceLoadTerminal::Completed { status: 200, .. }
+    ));
+}
+
+#[test]
+fn controlled_v2_cross_site_fixture_cookie_is_ignored_without_a_terminal() {
+    let (response, terminal, cookies) = controlled_fixture_cookie_fetch_with_context(
+        CredentialsMode::Include,
+        &["cross-site=ignored; Secure; SameSite=Lax"],
+        ControlledCookieContext {
+            policy: ControlledCookiePolicy::SessionV2 { unix_time_ns: 7 },
+            site_for_cookies: Some(url::Url::parse("https://cross-site.test/").unwrap()),
+            top_level_navigation: false,
+        },
+    );
+
     assert!(!response.is_network_error());
     assert_eq!(cookies, None);
     assert!(matches!(
@@ -2025,7 +2196,11 @@ fn controlled_live_cookie_failure_survives_http_fetch_param_replacement() {
                 ) => {
                     response_sender
                         .send(embedder_traits::WebResourceResponseMsg::ControlledSession {
-                            top_level_url: web_resource_request.url,
+                            cookie_context: ControlledCookieContext {
+                                policy: ControlledCookiePolicy::SessionV1,
+                                site_for_cookies: Some(web_resource_request.url.clone()),
+                                top_level_navigation: web_resource_request.is_for_main_frame,
+                            },
                         })
                         .unwrap();
                     response_sender

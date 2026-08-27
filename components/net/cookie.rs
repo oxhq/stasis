@@ -11,8 +11,8 @@ use std::time::SystemTime;
 
 use cookie::Cookie;
 use malloc_size_of_derive::MallocSizeOf;
-use net_traits::CookieSource;
 use net_traits::pub_domains::is_pub_domain;
+use net_traits::{ControlledCookiePolicyError, CookieSource};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case, take, take_while_m_n};
 use nom::combinator::{opt, recognize};
@@ -47,6 +47,10 @@ pub struct ServoCookie {
     /// Controller-owned last-access order for deterministic controlled sessions.
     #[serde(default)]
     pub(crate) controlled_last_access_sequence: Option<u64>,
+    /// Controller-owned expiry for controlled-web-session-v2. Ordinary cookie operations leave
+    /// this unset and continue to use `expiry_time`.
+    #[serde(default)]
+    pub(crate) controlled_expiry_time_ns: Option<u64>,
 }
 
 impl ServoCookie {
@@ -130,6 +134,131 @@ impl ServoCookie {
             expiry_time = None;
         }
 
+        ServoCookie::finish_new_wrapped(
+            cookie,
+            request,
+            source,
+            persistent,
+            SystemTime::now(),
+            SystemTime::now(),
+            expiry_time,
+            None,
+        )
+    }
+
+    /// Parse a cookie using an explicit controller-owned Unix time. This path deliberately never
+    /// samples the host clock; it is the only constructor used by controlled-web-session-v2.
+    pub fn from_controlled_cookie_string(
+        cookie_str: &str,
+        request: &ServoUrl,
+        source: CookieSource,
+        unix_time_ns: u128,
+    ) -> Result<Option<ServoCookie>, ControlledCookiePolicyError> {
+        let mut cookie = match Cookie::parse(cookie_str.to_owned()) {
+            Ok(cookie) => cookie,
+            Err(_) => return Ok(None),
+        };
+        if cookie.expires_datetime().is_none() {
+            let parsed_expiry = cookie_str
+                .split(';')
+                .filter_map(|key_value| {
+                    key_value
+                        .find('=')
+                        .map(|i| (key_value[..i].trim(), key_value[(i + 1)..].trim()))
+                })
+                .filter_map(|(key, value)| {
+                    key.eq_ignore_ascii_case("expires")
+                        .then(|| Self::parse_date(value))
+                        .flatten()
+                })
+                .last();
+            if let Some(expiry) = parsed_expiry {
+                cookie.set_expires(Some(expiry));
+            }
+        }
+        Self::new_controlled_wrapped(cookie, request, source, unix_time_ns)
+    }
+
+    /// Wrap a parsed cookie using exact controlled time and a bounded u64 state-artifact range.
+    pub fn new_controlled_wrapped(
+        mut cookie: Cookie<'static>,
+        request: &ServoUrl,
+        source: CookieSource,
+        unix_time_ns: u128,
+    ) -> Result<Option<ServoCookie>, ControlledCookiePolicyError> {
+        const MAX_COOKIE_AGE_SECONDS: i64 = 34_560_000;
+        const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+        let now = u64::try_from(unix_time_ns)
+            .map_err(|_| ControlledCookiePolicyError::TimeRangeUnsupported)?;
+
+        let (persistent, controlled_expiry_time_ns) = if let Some(max_age) = cookie.max_age() {
+            let seconds = max_age.whole_seconds().min(MAX_COOKIE_AGE_SECONDS);
+            let expiry = if seconds <= 0 {
+                now
+            } else {
+                now.checked_add(
+                    (seconds as u64)
+                        .checked_mul(NANOS_PER_SECOND)
+                        .ok_or(ControlledCookiePolicyError::TimeRangeUnsupported)?,
+                )
+                .ok_or(ControlledCookiePolicyError::TimeRangeUnsupported)?
+            };
+            let clamped_max_age = Duration::seconds(seconds);
+            cookie.set_max_age(clamped_max_age);
+            let expiry_date = OffsetDateTime::from_unix_timestamp_nanos(expiry as i128)
+                .map_err(|_| ControlledCookiePolicyError::TimeRangeUnsupported)?;
+            cookie.set_expires(Some(expiry_date));
+            (true, Some(expiry))
+        } else if let Some(date_time) = cookie.expires_datetime() {
+            let parsed = date_time.unix_timestamp_nanos();
+            let parsed = if parsed <= 0 {
+                0
+            } else if parsed <= i128::from(now) {
+                u64::try_from(parsed)
+                    .map_err(|_| ControlledCookiePolicyError::TimeRangeUnsupported)?
+            } else {
+                let maximum_expiry = now
+                    .checked_add(
+                        (MAX_COOKIE_AGE_SECONDS as u64)
+                            .checked_mul(NANOS_PER_SECOND)
+                            .ok_or(ControlledCookiePolicyError::TimeRangeUnsupported)?,
+                    )
+                    .ok_or(ControlledCookiePolicyError::TimeRangeUnsupported)?;
+                u64::try_from(parsed.min(i128::from(maximum_expiry)))
+                    .map_err(|_| ControlledCookiePolicyError::TimeRangeUnsupported)?
+            };
+            let expiry = parsed;
+            let expiry_date = OffsetDateTime::from_unix_timestamp_nanos(expiry as i128)
+                .map_err(|_| ControlledCookiePolicyError::TimeRangeUnsupported)?;
+            cookie.set_expires(Some(expiry_date));
+            (true, Some(expiry))
+        } else {
+            (false, None)
+        };
+
+        Ok(ServoCookie::finish_new_wrapped(
+            cookie,
+            request,
+            source,
+            persistent,
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            None,
+            controlled_expiry_time_ns,
+        ))
+    }
+
+    fn finish_new_wrapped(
+        mut cookie: Cookie<'static>,
+        request: &ServoUrl,
+        source: CookieSource,
+        persistent: bool,
+        creation_time: SystemTime,
+        last_access: SystemTime,
+        expiry_time: Option<SystemTime>,
+        controlled_expiry_time_ns: Option<u64>,
+    ) -> Option<ServoCookie> {
         let url_host = request.host_str().unwrap_or("").to_owned();
 
         // Step 7. If the cookie-attribute-list contains an attribute with an attribute-name of "Domain":
@@ -282,11 +411,12 @@ impl ServoCookie {
             cookie,
             host_only,
             persistent,
-            creation_time: SystemTime::now(),
-            last_access: SystemTime::now(),
+            creation_time,
+            last_access,
             expiry_time,
             controlled_creation_sequence: None,
             controlled_last_access_sequence: None,
+            controlled_expiry_time_ns,
         })
     }
 
@@ -295,7 +425,10 @@ impl ServoCookie {
     }
 
     pub fn set_expiry_time_in_past(&mut self) {
-        self.expiry_time = Some(SystemTime::UNIX_EPOCH)
+        self.expiry_time = Some(SystemTime::UNIX_EPOCH);
+        if self.controlled_expiry_time_ns.is_some() {
+            self.controlled_expiry_time_ns = Some(0);
+        }
     }
 
     /// <http://tools.ietf.org/html/rfc6265#section-5.1.4>

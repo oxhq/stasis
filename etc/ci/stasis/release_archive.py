@@ -35,11 +35,11 @@ FROZEN_V2_PROFILE_SHA256 = (
 )
 CANDIDATE_V2_PROFILE = Path("profiles/controlled-web-session-v2.json")
 CANDIDATE_V2_PROFILE_SHA256 = (
-    "ced49928c0c5f77669285a658434209101d27907bd26d07296d5d40e2ad7a412"
+    "b42c0a588b4b01007b7df82d32e06877918e54879b2aaa1773f9c4b6ed4cec07"
 )
 CANDIDATE_V2_CONTRACT = Path("docs/stasis/session-v0.3-candidate.md")
 CANDIDATE_V2_CONTRACT_SHA256 = (
-    "e9360693e31c248c2acb55ac097977a9fdf590976743f60b270390f503d8a524"
+    "e403337eaa8893815157d6f4e1cef58da050ee4245c98efd800f28318f291816"
 )
 MESSAGE_CHANNEL_LIMITS_SOURCE = Path(
     "components/script/dom/globalscope/globalscope.rs"
@@ -137,6 +137,15 @@ CONTROLLED_IMAGE_ELEMENT_PRODUCT_SURFACE = (
 )
 CONTROLLED_INLINE_SVG_PRODUCT_SURFACE = (
     "bounded_controlled_top_level_internal_serialized_data_svg_inline_rendering"
+)
+CONTROLLED_COOKIE_EXPIRY_PRODUCT_SURFACE = (
+    "controlled_in_memory_persistent_cookie_expiry_with_explicit_v2_state_portability"
+)
+CONTROLLED_COOKIE_SAME_SITE_PRODUCT_SURFACE = (
+    "bounded_schemeful_SameSite_request_cookie_selection"
+)
+CONTROLLED_COOKIE_SAME_SITE_RESPONSE_PRODUCT_SURFACE = (
+    "bounded_schemeful_SameSite_response_cookie_storage"
 )
 
 BINARY_NAME = "stasis"
@@ -3503,6 +3512,52 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     compatibility = require_json_object(
         profile.get("compatibility"), "controlled-web-session-v2 compatibility"
     )
+    session_state = require_json_object(
+        profile.get("sessionState"), "controlled-web-session-v2 sessionState"
+    )
+    session_cookies = require_json_object(
+        session_state.get("cookies"), "controlled-web-session-v2 session cookies"
+    )
+    cookie_persistence = require_json_object(
+        session_cookies.get("persistence"),
+        "controlled-web-session-v2 cookie persistence",
+    )
+    cookie_time_range = require_json_object(
+        session_cookies.get("timeRange"),
+        "controlled-web-session-v2 cookie time range",
+    )
+    cookie_post_open_time_range = require_json_object(
+        cookie_time_range.get("postOpenNetworkRequestAboveMaximum"),
+        "controlled-web-session-v2 post-open cookie time-range boundary",
+    )
+    cookie_same_site = require_json_object(
+        session_cookies.get("sameSite"),
+        "controlled-web-session-v2 SameSite policy",
+    )
+    cookie_same_site_context = require_json_object(
+        cookie_same_site.get("context"),
+        "controlled-web-session-v2 SameSite request context",
+    )
+    cookie_same_site_response_storage = require_json_object(
+        cookie_same_site.get("responseStorage"),
+        "controlled-web-session-v2 SameSite response-storage policy",
+    )
+    cookie_unknown_or_opaque_context = require_json_object(
+        cookie_same_site_context.get("unknownOrOpaque"),
+        "controlled-web-session-v2 opaque SameSite context boundary",
+    )
+    cookie_set_cookie = require_json_object(
+        session_cookies.get("setCookie"),
+        "controlled-web-session-v2 Set-Cookie policy",
+    )
+    cookie_page_api = require_json_object(
+        session_cookies.get("pageApi"),
+        "controlled-web-session-v2 page cookie API",
+    )
+    cookie_store = require_json_object(
+        cookie_page_api.get("cookieStore"),
+        "controlled-web-session-v2 Cookie Store boundary",
+    )
     execution = require_json_object(
         profile.get("execution"), "controlled-web-session-v2 execution"
     )
@@ -3652,11 +3707,171 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "controlled-web-session-v2 predecessorContractUnchanged must remain true"
         )
     if compatibility.get("profileExpansion") != (
-        "execution_and_headless_presentation_surfaces_only"
+        "execution_headless_presentation_and_controlled_cookie_state_surfaces"
     ):
         raise ReleaseError(
             "controlled-web-session-v2 profile expansion identity changed"
         )
+    if compatibility.get("stateArtifactProfile") != (
+        "selected_controlled_session_profile_exact"
+    ):
+        raise ReleaseError(
+            "controlled-web-session-v2 state artifact selection identity changed"
+        )
+    require_exact_fields(
+        cookie_persistence,
+        {
+            "mode": "controlled_session_owned_expiry",
+            "storage": "memory_only_for_session_lifetime",
+            "diskOrHostPersistence": False,
+            "portablePersistence": (
+                "explicit_profile_v2_state_export_and_initial_import_only"
+            ),
+            "clock": "controlled_unix_time_ns_with_origin_zero",
+            "maxAgePrecedence": "last_valid_Max-Age_over_Expires",
+            "maximumLifetimeSeconds": 34_560_000,
+            "clamp": "now_plus_400_days",
+            "purge": (
+                "lazily_before_cookie_observation_request_selection_and_state_export"
+            ),
+            "expiresAtOrBeforeNow": "delete_instead_of_retain",
+        },
+        "controlled-web-session-v2 cookie persistence",
+    )
+    require_exact_fields(
+        cookie_post_open_time_range,
+        {
+            "code": "unsupported_cookie_time_range",
+            "boundary": "before_network_start_and_cookie_header_construction",
+            "fatal": False,
+            "stateEffect": "partial",
+            "processEffect": "continue",
+        },
+        "controlled-web-session-v2 post-open cookie time-range boundary",
+    )
+    require_exact_fields(
+        cookie_time_range,
+        {
+            "maximumControlledUnixTimeNsInclusive": "18446744073709551615",
+            "postOpenNetworkRequestAboveMaximum": cookie_post_open_time_range,
+            "controlledOpenFailurePrecedence": (
+                "same_code_hardened_to_fatal_fail_stop"
+            ),
+            "persistentExpiryWithoutU64Headroom": "unsupported_cookie_time_range",
+            "pageApiDomException": "NotSupportedError",
+        },
+        "controlled-web-session-v2 cookie time range",
+    )
+    require_exact_fields(
+        cookie_unknown_or_opaque_context,
+        {
+            "code": "unsupported_cookie_same_site_context",
+            "boundary": "before_network_start_and_cookie_header_construction",
+        },
+        "controlled-web-session-v2 opaque SameSite context boundary",
+    )
+    require_exact_fields(
+        cookie_same_site_context,
+        {
+            "requestClient": "captured_at_request_creation",
+            "siteForCookies": "captured_from_request_client",
+            "requestMethod": "current_redirect_hop_method",
+            "topLevelNavigation": "captured_request_boolean",
+            "unknownOrOpaque": cookie_unknown_or_opaque_context,
+        },
+        "controlled-web-session-v2 SameSite request context",
+    )
+    require_exact_fields(
+        cookie_same_site_response_storage,
+        {
+            "sameSiteOrTopLevelNavigation": (
+                "all_valid_unpartitioned_response_cookies_eligible"
+            ),
+            "crossSiteSubresource": (
+                "only_secure_SameSite_None_eligible_Strict_Lax_and_"
+                "unspecified_ignored_without_terminal"
+            ),
+            "requestMethod": "not_an_admission_input",
+        },
+        "controlled-web-session-v2 SameSite response-storage policy",
+    )
+    require_exact_fields(
+        cookie_same_site,
+        {
+            "metadataRoundTrip": True,
+            "siteModel": "schemeful_site",
+            "context": cookie_same_site_context,
+            "none": "requires_secure",
+            "strict": "included_only_for_schemeful_same_site_requests",
+            "lax": (
+                "included_for_schemeful_same_site_or_cross_site_top_level_safe_method"
+            ),
+            "unspecified": "same_request_filter_as_lax",
+            "safeMethods": ["GET", "HEAD", "OPTIONS", "TRACE"],
+            "noneSelection": "included_cross_site_when_secure",
+            "ineligibleCookie": (
+                "filtered_before_cookie_header_construction_without_terminal"
+            ),
+            "responseStorage": cookie_same_site_response_storage,
+        },
+        "controlled-web-session-v2 SameSite policy",
+    )
+    require_exact_fields(
+        cookie_set_cookie,
+        {
+            "expiresOrMaxAge": "supported_by_controlled_expiry_policy",
+            "partitioned": "unsupported_partitioned_cookie",
+            "invalid": "invalid_controlled_cookie",
+            "boundary": "before_cookie_jar_mutation",
+        },
+        "controlled-web-session-v2 Set-Cookie policy",
+    )
+    require_exact_fields(
+        cookie_store,
+        {
+            "set": {
+                "supported": True,
+                "policy": "supported_atomic_controlled_policy",
+                "expiry": "supported_by_controlled_expiry_policy",
+                "partitionedError": "unsupported_partitioned_cookie",
+                "invalidError": "invalid_controlled_cookie",
+            },
+            "get": {
+                "supported": False,
+                "code": "controlled_cookie_store_read_delete_unsupported",
+            },
+            "getAll": {
+                "supported": False,
+                "code": "controlled_cookie_store_read_delete_unsupported",
+            },
+            "delete": {
+                "supported": False,
+                "code": "controlled_cookie_store_read_delete_unsupported",
+            },
+        },
+        "controlled-web-session-v2 Cookie Store boundary",
+    )
+    require_expected_fields(
+        session_cookies,
+        {
+            "supported": True,
+            "persistence": cookie_persistence,
+            "timeRange": cookie_time_range,
+            "partitioning": "unpartitioned_only",
+            "sameSite": cookie_same_site,
+            "setCookie": cookie_set_cookie,
+            "pageApi": cookie_page_api,
+        },
+        "controlled-web-session-v2 session cookies",
+    )
+    require_expected_fields(
+        session_state,
+        {
+            "artifactProfile": "controlled-web-session-v2",
+            "compatibleSelectedProfiles": ["controlled-web-session-v2"],
+        },
+        "controlled-web-session-v2 session state",
+    )
     require_exact_fields(
         controlled_input_method,
         {
@@ -4256,6 +4471,38 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "controlled-web-session-v2 supportedProductSurface must contain exactly the "
             "bounded top-level internal serialized data-SVG inline-rendering summary"
         )
+    cookie_expiry_product_surfaces = [
+        entry
+        for entry in supported_product_surface
+        if "persistent_cookie_expiry" in entry.lower()
+    ]
+    if cookie_expiry_product_surfaces != [CONTROLLED_COOKIE_EXPIRY_PRODUCT_SURFACE]:
+        raise ReleaseError(
+            "controlled-web-session-v2 supportedProductSurface must contain exactly the "
+            "controlled in-memory persistent-cookie expiry summary"
+        )
+    cookie_same_site_product_surfaces = [
+        entry
+        for entry in supported_product_surface
+        if "samesite_request_cookie_selection" in entry.lower()
+    ]
+    if cookie_same_site_product_surfaces != [CONTROLLED_COOKIE_SAME_SITE_PRODUCT_SURFACE]:
+        raise ReleaseError(
+            "controlled-web-session-v2 supportedProductSurface must contain exactly the "
+            "bounded schemeful SameSite request-cookie selection summary"
+        )
+    cookie_same_site_response_product_surfaces = [
+        entry
+        for entry in supported_product_surface
+        if "samesite_response_cookie_storage" in entry.lower()
+    ]
+    if cookie_same_site_response_product_surfaces != [
+        CONTROLLED_COOKIE_SAME_SITE_RESPONSE_PRODUCT_SURFACE
+    ]:
+        raise ReleaseError(
+            "controlled-web-session-v2 supportedProductSurface must contain exactly the "
+            "bounded schemeful SameSite response-cookie storage summary"
+        )
     require_expected_fields(
         message_channel,
         {"mode": "controlled_same_global_untransferred"},
@@ -4549,6 +4796,24 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "not converted into producer abandonment",
         "missing identity, mismatched cached URL, non-internal request, capacity",
         "completion creates no DOM `load`, `error`, or `loadend` event",
+        "V2 owns persistent cookies in memory for the lifetime of its single controlled session",
+        "Persistence\nacross processes is available only through an explicit `controlled-web-session-v2` state export",
+        "its literal `state.profile`\nis `controlled-web-session-v2`; a v1 artifact is not silently migrated",
+        "A valid\n`Max-Age` takes precedence over `Expires`",
+        "retained expiry is clamped to at most 400 days",
+        "expired\nrecords are lazily purged before cookie observation, request selection, and state export",
+        "schemeful site-for-cookies captured from the request client",
+        "current redirect-hop method",
+        "cross-site\ntop-level `GET`, `HEAD`, `OPTIONS`, or `TRACE`",
+        "Ineligible cookies are filtered before Cookie header construction",
+        "`unsupported_cookie_same_site_context` before network start",
+        "post-open request observes controlled Unix time above\n`18446744073709551615`",
+        "`unsupported_cookie_time_range` with partial request\nstate effect before network start",
+        "initial controlled open,\nthe shell hardens that same code to a fatal fail-stop",
+        "cross-site subresource response, only a valid Secure `SameSite=None` cookie is eligible",
+        "redirect-hop method is not an\ninput to this response-storage admission rule",
+        "Partitioned cookies remain `unsupported_partitioned_cookie`",
+        "`delete()` retain `controlled_cookie_store_read_delete_unsupported`",
         FROZEN_V2_PROFILE_SHA256,
     )
     for marker in contract_markers:
@@ -4708,6 +4973,9 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "controlledCssAnimationEventTimestamps": controlled_css_animation_event_timestamps,
         "controlledImageElement": controlled_image_element,
         "controlledInlineSvgRendering": controlled_inline_svg,
+        "controlledCookiePersistence": cookie_persistence,
+        "controlledCookieTimeRange": cookie_time_range,
+        "controlledCookieSameSite": cookie_same_site,
         "embedderControls": embedder_controls,
         "portBackedTransferInterfaces": transfer_preflight["interfaces"],
         "retainedWorkProjection": retained_work_projection,
@@ -5382,6 +5650,32 @@ def self_test() -> None:
         reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(
             (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test candidate cookie time-range boundary",
+        )
+        candidate_profile["sessionState"]["cookies"]["timeRange"][
+            "postOpenNetworkRequestAboveMaximum"
+        ]["fatal"] = True
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("post-open cookie time-range fatality")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test candidate SameSite response storage",
+        )
+        candidate_profile["sessionState"]["cookies"]["sameSite"][
+            "responseStorage"
+        ]["crossSiteSubresource"] = "all_valid_cookies_eligible"
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("cross-site response-cookie storage")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
             "self-test candidate profile router ownership",
         )
         candidate_profile["execution"]["messageChannel"]["construction"][
@@ -5454,6 +5748,32 @@ def self_test() -> None:
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
         require_candidate_mutation_rejected("predecessor contract identity")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test controlled cookie lifetime",
+        )
+        candidate_profile["sessionState"]["cookies"]["persistence"][
+            "maximumLifetimeSeconds"
+        ] = 34_560_001
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("controlled cookie lifetime expansion")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test v2 state artifact compatibility",
+        )
+        candidate_profile["sessionState"]["compatibleSelectedProfiles"].append(
+            "controlled-web-session-v1"
+        )
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("implicit v1-to-v2 state migration")
 
         reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(

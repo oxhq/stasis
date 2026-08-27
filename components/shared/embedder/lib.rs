@@ -999,14 +999,42 @@ pub enum WebResourceCookiePolicyFailure {
     SameSiteContextUnsupported,
     PersistentCookieUnsupported,
     PartitionedCookieUnsupported,
+    TimeRangeUnsupported,
     InvalidCookie,
+}
+
+/// Immutable controlled-cookie policy selected before a request or privileged state operation.
+///
+/// The v1 branch intentionally carries no clock authority and preserves the frozen
+/// controlled-web-session-v1 behavior. V2 receives an exact controller-owned Unix-time sample;
+/// Net must never substitute the host clock while evaluating that branch.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ControlledCookiePolicy {
+    SessionV1,
+    SessionV2 { unix_time_ns: u128 },
+}
+
+/// Captured request provenance used by deterministic SameSite selection.
+///
+/// `site_for_cookies` is `None` when the controlled single-context model cannot prove a client
+/// site. Such requests fail closed rather than borrowing a later history entry. The HTTP method
+/// remains part of the request itself so redirect hops use their actual current-hop method.
+#[doc(hidden)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ControlledCookieContext {
+    pub policy: ControlledCookiePolicy,
+    pub site_for_cookies: Option<Url>,
+    pub top_level_navigation: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 pub enum WebResourceResponseMsg {
     /// Mark this hop as owned by a controlled top-level session. Net validates this schemeful
     /// site context before either request Cookie emission or response Set-Cookie mutation.
-    ControlledSession { top_level_url: Url },
+    ControlledSession {
+        cookie_context: ControlledCookieContext,
+    },
     /// Start an interception of this web resource load. It's expected that the client subsequently
     /// send either a `CancelLoad` or `FinishLoad` message after optionally sending chunks of body
     /// data via `SendBodyData`.

@@ -1899,6 +1899,7 @@ jobs:
             --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
             --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
             --session-v2-css-animation-event-fixture ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html \
+            --session-v2-cookie-fixture sdk/typescript/test/fixtures/controlled-v2-cookie-login.html \
             --consumer-root "$consumer" \
             --package "$STASIS_SDK_TARBALL" \
             --revision "$GITHUB_SHA" \
@@ -2226,6 +2227,34 @@ jobs:
                       "unsupportedTimeSurface": "host_timestamp",
                       "evidenceProfile": "controlled-web-session-v2",
                       "sameControlledSession": True,
+                      "exactBinaryLaunch": True,
+                      "closeResponseAndEof": True,
+                  },
+                  "v2CookieSession": {
+                      "profile": "controlled-web-session-v2",
+                      "stateSchemaVersion": "1",
+                      "stateProfile": "controlled-web-session-v2",
+                      "responseCookieName": "remember_me",
+                      "responseCookieExpiryUnixTimeNs": "2592000000000000",
+                      "maxAgePrecedenceOverPastExpires": True,
+                      "restoredSameSiteCookieSent": True,
+                      "crossSiteResourceReachedServer": True,
+                      "crossSiteLaxCookieFiltered": True,
+                      "crossSiteRequestMethod": "GET",
+                      "crossSiteRequestPath": "/probe.js",
+                      "evidenceProfile": "controlled-web-session-v2",
+                      "memoryOnlyExplicitStatePortability": True,
+                      "noImportControlCookieCount": "0",
+                      "noImportControlRequestCookieHeaderEmpty": True,
+                      "noImportControlSameHostContext": True,
+                      "cookieTimeRangeFailureCode": "unsupported_cookie_time_range",
+                      "cookieTimeRangeFatal": False,
+                      "cookieTimeRangeStateEffect": "partial",
+                      "cookieTimeRangeRequestReachedServer": False,
+                      "credentialEnvironmentMode": "explicit_allowlist",
+                      "freshExactBinaryProcesses": "4",
+                      "gracefulCookieSessionProcesses": "4",
+                      "managedRuntimeFallbackAccesses": "0",
                       "exactBinaryLaunch": True,
                       "closeResponseAndEof": True,
                   },
@@ -2923,7 +2952,7 @@ jobs:
               sdk_proof_file.read_text(encoding="utf-8"), "SDK gate proof"
           )
           expected_sdk = {
-              "schema": 6,
+              "schema": 7,
               "gate": "sdk-act-settle-inspect",
               "package": f"@oxhq/stasis@{version}",
               "revision": revision,
@@ -2941,6 +2970,7 @@ jobs:
                       "v2InlineSvgRendering", "v2InputMethodFocus",
                       "v2AutomationEventTimestamps",
                       "v2CssAnimationEventTimestamps",
+                      "v2CookieSession",
                   }
               or type(sdk_proof.get("schema")) is not int
           ):
@@ -4124,6 +4154,15 @@ jobs:
           top-level WebView/document. TransitionEvent stamping is conditional on an existing owned
           transition record reaching that queue; general transition settlement is not claimed.
           Auxiliary WebViews remain host-stamped.
+          The v2 profile also owns persistent-cookie expiry inside the controlled session: the
+          document clock is Unix-nanosecond authority, the last valid Max-Age takes precedence
+          over Expires, lifetime is clamped to 400 days, expiry is lazily purged, and an expiry at
+          or before controlled now deletes the cookie. SameSite selection uses the captured
+          schemeful site-for-cookies, the current redirect-hop method, and the top-level-navigation
+          bit; ineligible cookies are filtered before a request. Persistent cookies remain
+          memory-only and become portable only through explicit controlled-web-session-v2 state
+          export/import. A v1 artifact is never migrated implicitly, opaque or unknown SameSite
+          context is typed unsupported, and partitioned cookies remain outside the profile.
           The HTML image path requires canonical exact-MIME
           direct-src selection within its URL and retained-ownership limits. The inline path also
           requires an internal request and exact cached-URL/cache-ID join; it is fenced through

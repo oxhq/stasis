@@ -548,7 +548,7 @@ pub async fn main_fetch(
         .intercept_request(request, &mut response, context)
         .await;
     let controlled_load_id = intercepted_request.load_id;
-    fetch_params.controlled_cookie_site = intercepted_request.controlled_cookie_site;
+    fetch_params.controlled_cookie_context = intercepted_request.controlled_cookie_context;
     fetch_params.controlled_fixture_response = intercepted_request.fixture_response;
 
     let mut response = match response {
@@ -668,12 +668,13 @@ pub async fn main_fetch(
     if fetch_params.controlled_fixture_response
         && fixture_includes_credentials
         && !response.is_network_error()
-        && let Some(top_level_url) = &fetch_params.controlled_cookie_site
+        && let Some(cookie_context) = &fetch_params.controlled_cookie_context
     {
         let request_url = fetch_params.request.current_url();
         if let Err(error) = set_controlled_cookies_from_headers(
             &request_url,
-            top_level_url,
+            &fetch_params.request.method,
+            cookie_context,
             &response.headers,
             &context.state.cookie_jar,
         ) {

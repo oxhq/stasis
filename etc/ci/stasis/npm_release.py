@@ -942,6 +942,83 @@ def require_v2_css_animation_event_timestamps_proof(
     return value
 
 
+def require_v2_cookie_session_proof(
+    value: object, description: str
+) -> dict[str, object]:
+    expected_fields = {
+        "profile",
+        "stateSchemaVersion",
+        "stateProfile",
+        "responseCookieName",
+        "responseCookieExpiryUnixTimeNs",
+        "maxAgePrecedenceOverPastExpires",
+        "restoredSameSiteCookieSent",
+        "crossSiteResourceReachedServer",
+        "crossSiteLaxCookieFiltered",
+        "crossSiteRequestMethod",
+        "crossSiteRequestPath",
+        "evidenceProfile",
+        "memoryOnlyExplicitStatePortability",
+        "noImportControlCookieCount",
+        "noImportControlRequestCookieHeaderEmpty",
+        "noImportControlSameHostContext",
+        "cookieTimeRangeFailureCode",
+        "cookieTimeRangeFatal",
+        "cookieTimeRangeStateEffect",
+        "cookieTimeRangeRequestReachedServer",
+        "credentialEnvironmentMode",
+        "freshExactBinaryProcesses",
+        "gracefulCookieSessionProcesses",
+        "managedRuntimeFallbackAccesses",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    }
+    if type(value) is not dict or set(value) != expected_fields:
+        raise NpmReleaseError(f"{description} has an unexpected schema")
+    expected_values = {
+        "profile": "controlled-web-session-v2",
+        "stateSchemaVersion": "1",
+        "stateProfile": "controlled-web-session-v2",
+        "responseCookieName": "remember_me",
+        "responseCookieExpiryUnixTimeNs": "2592000000000000",
+        "crossSiteRequestMethod": "GET",
+        "crossSiteRequestPath": "/probe.js",
+        "evidenceProfile": "controlled-web-session-v2",
+        "noImportControlCookieCount": "0",
+        "cookieTimeRangeFailureCode": "unsupported_cookie_time_range",
+        "cookieTimeRangeStateEffect": "partial",
+        "credentialEnvironmentMode": "explicit_allowlist",
+        "freshExactBinaryProcesses": "4",
+        "gracefulCookieSessionProcesses": "4",
+        "managedRuntimeFallbackAccesses": "0",
+    }
+    for field, expected in expected_values.items():
+        if require_json_string(value.get(field), f"{description} {field}") != expected:
+            raise NpmReleaseError(f"{description} field does not match: {field}")
+    fullmatch(
+        POSITIVE_INTEGER_RE,
+        value["responseCookieExpiryUnixTimeNs"],
+        f"{description} response-cookie expiry",
+    )
+    for field in (
+        "maxAgePrecedenceOverPastExpires",
+        "restoredSameSiteCookieSent",
+        "crossSiteResourceReachedServer",
+        "crossSiteLaxCookieFiltered",
+        "memoryOnlyExplicitStatePortability",
+        "noImportControlRequestCookieHeaderEmpty",
+        "noImportControlSameHostContext",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    ):
+        if value.get(field) is not True:
+            raise NpmReleaseError(f"{description} field is not true: {field}")
+    for field in ("cookieTimeRangeFatal", "cookieTimeRangeRequestReachedServer"):
+        if value.get(field) is not False:
+            raise NpmReleaseError(f"{description} field is not false: {field}")
+    return value
+
+
 def parse_gate_log(
     gate_log: Path, package: Path, version: str, revision: str
 ) -> dict[str, object]:
@@ -979,6 +1056,7 @@ def parse_gate_log(
         "v2InputMethodFocus",
         "v2AutomationEventTimestamps",
         "v2CssAnimationEventTimestamps",
+        "v2CookieSession",
     }
     if set(value) != required:
         raise NpmReleaseError("SDK gate success has an unexpected schema")
@@ -1025,6 +1103,9 @@ def parse_gate_log(
         value.get("v2CssAnimationEventTimestamps"),
         "SDK gate v2 CSS animation-event timestamps proof",
     )
+    require_v2_cookie_session_proof(
+        value.get("v2CookieSession"), "SDK gate v2 cookie/session proof"
+    )
     return value
 
 
@@ -1048,7 +1129,7 @@ def create_proof(
     if gate["binarySha256"] != native_binary_sha256:
         raise NpmReleaseError("SDK gate tested a different native binary digest")
     document: dict[str, object] = {
-        "schema": 6,
+        "schema": 7,
         "gate": GATE_NAME,
         "package": f"{PACKAGE_NAME}@{version}",
         "revision": revision,
@@ -1064,6 +1145,7 @@ def create_proof(
         "v2InputMethodFocus": gate["v2InputMethodFocus"],
         "v2AutomationEventTimestamps": gate["v2AutomationEventTimestamps"],
         "v2CssAnimationEventTimestamps": gate["v2CssAnimationEventTimestamps"],
+        "v2CookieSession": gate["v2CookieSession"],
     }
     if output.exists():
         raise NpmReleaseError(f"refusing to overwrite SDK gate proof: {output}")
@@ -1125,6 +1207,7 @@ def verify_proof(
         "v2InputMethodFocus",
         "v2AutomationEventTimestamps",
         "v2CssAnimationEventTimestamps",
+        "v2CookieSession",
     }
     if not isinstance(document, dict) or set(document) != expected_keys:
         raise NpmReleaseError("SDK gate proof has an unexpected schema")
@@ -1168,8 +1251,11 @@ def verify_proof(
         document.get("v2CssAnimationEventTimestamps"),
         "SDK gate proof v2 CSS animation-event timestamps proof",
     )
+    require_v2_cookie_session_proof(
+        document.get("v2CookieSession"), "SDK gate proof v2 cookie/session proof"
+    )
     expected = {
-        "schema": 6,
+        "schema": 7,
         "gate": GATE_NAME,
         "package": f"{PACKAGE_NAME}@{version}",
         "revision": revision,
@@ -1381,6 +1467,34 @@ def self_test() -> None:
                 "exactBinaryLaunch": True,
                 "closeResponseAndEof": True,
             },
+            "v2CookieSession": {
+                "profile": "controlled-web-session-v2",
+                "stateSchemaVersion": "1",
+                "stateProfile": "controlled-web-session-v2",
+                "responseCookieName": "remember_me",
+                "responseCookieExpiryUnixTimeNs": "2592000000000000",
+                "maxAgePrecedenceOverPastExpires": True,
+                "restoredSameSiteCookieSent": True,
+                "crossSiteResourceReachedServer": True,
+                "crossSiteLaxCookieFiltered": True,
+                "crossSiteRequestMethod": "GET",
+                "crossSiteRequestPath": "/probe.js",
+                "evidenceProfile": "controlled-web-session-v2",
+                "memoryOnlyExplicitStatePortability": True,
+                "noImportControlCookieCount": "0",
+                "noImportControlRequestCookieHeaderEmpty": True,
+                "noImportControlSameHostContext": True,
+                "cookieTimeRangeFailureCode": "unsupported_cookie_time_range",
+                "cookieTimeRangeFatal": False,
+                "cookieTimeRangeStateEffect": "partial",
+                "cookieTimeRangeRequestReachedServer": False,
+                "credentialEnvironmentMode": "explicit_allowlist",
+                "freshExactBinaryProcesses": "4",
+                "gracefulCookieSessionProcesses": "4",
+                "managedRuntimeFallbackAccesses": "0",
+                "exactBinaryLaunch": True,
+                "closeResponseAndEof": True,
+            },
         }
         gate_log = root / "gate.log"
         gate_log.write_text(
@@ -1398,7 +1512,7 @@ def self_test() -> None:
             run_id="123",
             run_attempt="1",
         )
-        assert document["schema"] == 6
+        assert document["schema"] == 7
         assert document["tarball"] == gate_record["tarball"]
         assert document["v2MessageChannel"] == gate_record["v2MessageChannel"]
         assert document["v2DirectDataSvg"] == gate_record["v2DirectDataSvg"]
@@ -1412,6 +1526,7 @@ def self_test() -> None:
             document["v2CssAnimationEventTimestamps"]
             == gate_record["v2CssAnimationEventTimestamps"]
         )
+        assert document["v2CookieSession"] == gate_record["v2CookieSession"]
         verify_proof(
             directory=artifact,
             version=version,
@@ -2052,6 +2167,53 @@ def self_test() -> None:
             ],
         ]
 
+        base_v2_cookie_session = gate_record["v2CookieSession"]
+        assert isinstance(base_v2_cookie_session, dict)
+        v2_cookie_session_record_mutations = [
+            (
+                "missing cookie/session proof field",
+                {
+                    key: value
+                    for key, value in base_v2_cookie_session.items()
+                    if key != "crossSiteLaxCookieFiltered"
+                },
+            ),
+            (
+                "extra cookie/session proof field",
+                {**base_v2_cookie_session, "diskCookieJar": True},
+            ),
+            *[
+                (label, {**base_v2_cookie_session, field: value})
+                for label, field, value in (
+                    ("wrong cookie state profile", "stateProfile", "controlled-web-session-v1"),
+                    ("wrong cookie state schema", "stateSchemaVersion", "2"),
+                    ("wrong persistent expiry", "responseCookieExpiryUnixTimeNs", "0"),
+                    ("numeric persistent expiry", "responseCookieExpiryUnixTimeNs", 2592000000000000),
+                    ("lost Max-Age precedence", "maxAgePrecedenceOverPastExpires", False),
+                    ("restored cookie not sent", "restoredSameSiteCookieSent", False),
+                    ("cross-site resource blocked", "crossSiteResourceReachedServer", False),
+                    ("cross-site Lax cookie leaked", "crossSiteLaxCookieFiltered", False),
+                    ("wrong cross-site method", "crossSiteRequestMethod", "POST"),
+                    ("wrong cross-site path", "crossSiteRequestPath", "/other.js"),
+                    ("wrong cookie evidence profile", "evidenceProfile", "controlled-web-session-v1"),
+                    ("cookie proof claimed disk state", "memoryOnlyExplicitStatePortability", False),
+                    ("no-import control retained a cookie", "noImportControlCookieCount", "1"),
+                    ("no-import request sent a cookie", "noImportControlRequestCookieHeaderEmpty", False),
+                    ("no-import control changed host context", "noImportControlSameHostContext", False),
+                    ("wrong cookie time-range code", "cookieTimeRangeFailureCode", "other"),
+                    ("cookie time-range failure became fatal", "cookieTimeRangeFatal", True),
+                    ("wrong cookie time-range effect", "cookieTimeRangeStateEffect", "none"),
+                    ("cookie time-range request reached server", "cookieTimeRangeRequestReachedServer", True),
+                    ("cookie child environment not allowlisted", "credentialEnvironmentMode", "inherited"),
+                    ("cookie proof reused a process", "freshExactBinaryProcesses", "3"),
+                    ("cookie proof missed a graceful session close", "gracefulCookieSessionProcesses", "3"),
+                    ("cookie proof used managed fallback", "managedRuntimeFallbackAccesses", "1"),
+                    ("cookie proof not exact binary", "exactBinaryLaunch", False),
+                    ("cookie proof missing close and EOF", "closeResponseAndEof", False),
+                )
+            ],
+        ]
+
         v2_fixture_gate_mutations = [
             (
                 "missing v2 direct data-SVG proof",
@@ -2112,6 +2274,18 @@ def self_test() -> None:
             *[
                 (label, {**gate_record, "v2CssAnimationEventTimestamps": mutation})
                 for label, mutation in v2_css_animation_event_timestamps_record_mutations
+            ],
+            (
+                "missing v2 cookie/session proof",
+                {
+                    key: value
+                    for key, value in gate_record.items()
+                    if key != "v2CookieSession"
+                },
+            ),
+            *[
+                (label, {**gate_record, "v2CookieSession": mutation})
+                for label, mutation in v2_cookie_session_record_mutations
             ],
         ]
         for index, (label, mutated_gate) in enumerate(v2_fixture_gate_mutations):
@@ -2227,6 +2401,18 @@ def self_test() -> None:
                 )
                 for label, mutation in v2_css_animation_event_timestamps_record_mutations
             ],
+            (
+                "missing durable v2 cookie/session proof",
+                {
+                    key: value
+                    for key, value in proof_document.items()
+                    if key != "v2CookieSession"
+                },
+            ),
+            *[
+                (label, {**proof_document, "v2CookieSession": mutation})
+                for label, mutation in v2_cookie_session_record_mutations
+            ],
         ]
         for label, mutated_proof in v2_fixture_proof_mutations:
             proof.write_text(
@@ -2246,7 +2432,7 @@ def self_test() -> None:
             )
         proof.write_text(proof_text, encoding="utf-8")
 
-        proof.write_text('{"schema":6,' + proof_text.lstrip()[1:], encoding="utf-8")
+        proof.write_text('{"schema":7,' + proof_text.lstrip()[1:], encoding="utf-8")
         expect_error(
             "duplicate proof key",
             lambda: verify_proof(
@@ -2259,7 +2445,7 @@ def self_test() -> None:
             ),
         )
         proof.write_text(
-            proof_text.replace('"schema": 6', '"schema": 1e400'), encoding="utf-8"
+            proof_text.replace('"schema": 7', '"schema": 1e400'), encoding="utf-8"
         )
         expect_error(
             "non-finite proof number",
@@ -2273,7 +2459,7 @@ def self_test() -> None:
             ),
         )
         proof.write_text(
-            proof_text.replace('"schema": 6', '"schema": 6.0'), encoding="utf-8"
+            proof_text.replace('"schema": 7', '"schema": 7.0'), encoding="utf-8"
         )
         expect_error(
             "floating-point proof schema",

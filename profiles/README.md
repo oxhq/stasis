@@ -22,7 +22,8 @@ delivery; one narrow direct `HTMLImageElement.src` `data:image/svg+xml` cache/de
 distinct inline `<svg>` path whose internally serialized data-SVG URL is the exact cached URL for
 that SVG owner in the exact public non-auxiliary controlled top-level document; and suppression of page-driven, single-line
 text InputMethod
-presentation when no virtual keyboard is requested there. Image admission requires the canonical
+presentation when no virtual keyboard is requested there. It also adds an exact v2 cookie-state
+artifact with controlled in-memory expiry and bounded schemeful SameSite request selection. Image admission requires the canonical
 data-URL parser, exact `image/svg+xml`, no `srcset`/`picture`/environment-change selection, a
 serialized URL of at most 65,536 bytes, the same ScriptThread/ImageCache, and capacity within 512
 total retained controlled image ownership records. Cache hits and finite asynchronous completion
@@ -69,9 +70,23 @@ not promoted by the image slice. Web Animations API semantics, event ordering/ca
 `elapsedTime`, and CSS animation limits are unchanged. Scheduled pending animation-event batches
 are finite rendering demand owned by guarded `AdvanceTo` at the exact retained scheduler head;
 only an unscheduled batch is `Drive`-ready. This prevents a checkpoint spin without adding a task
-source or limit. Baseline and v1 profile contracts are unchanged. V2
-deliberately reuses the
-`controlled-web-session-v1` state artifact rather than inventing an implicit state migration. See
+source or limit. Baseline and v1 profile contracts are unchanged.
+
+V2 persistent cookies are memory-owned by the controlled session and use its Unix-nanosecond
+clock with origin zero. `Max-Age` precedes `Expires`, lifetime is clamped to 400 days, expiry at or
+before controlled now deletes, and lazy purge runs before observation, request selection, and
+export. SameSite uses captured schemeful site-for-cookies, the current redirect-hop method, and
+the top-level-navigation bit: Strict is same-site only; Lax and unspecified also admit cross-site
+top-level safe methods; Secure None cookies may cross site. Unknown or opaque context remains typed
+unsupported before network start. Cross-site subresource responses store only valid Secure
+SameSite=None cookies; Strict, Lax, and unspecified response cookies are ignored, while top-level
+navigation responses admit all otherwise valid unpartitioned cookies. A post-open request at
+controlled Unix time above u64 fails nonfatally as `unsupported_cookie_time_range` before network
+start rather than wrapping; initial controlled open hardens the same code to fatal fail-stop.
+Partitioned cookies and CookieStore read/getAll/delete remain unsupported. The schema remains 1,
+but V2 exports and imports only a literal
+`controlled-web-session-v2` state artifact; it never silently migrates v1 state or persists a host
+cookie jar to disk. See
 `docs/stasis/session-v0.3-candidate.md` for the concise boundary.
 
 Each JSON file is canonical release source: automation, inspection, execution, network, state,

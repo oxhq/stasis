@@ -9,6 +9,7 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
+use embedder_traits::ControlledCookiePolicy;
 use net_traits::controlled_network::ControlledNetworkSnapshot;
 use net_traits::network_evidence::{
     EvidenceLedgerError, EvidenceSequence, NetworkEvidencePage, NetworkFailureReason,
@@ -434,7 +435,7 @@ impl EngineSession {
         )
     }
 
-    /// Construct a session with every stateful v0.2 input installed before initial navigation.
+    /// Construct a session with every versioned stateful input installed before initial navigation.
     pub fn start_with_options(
         url: Url,
         waker: ShellWaker,
@@ -453,31 +454,50 @@ impl EngineSession {
                 "state and network configuration require a top-level controlled session",
             ));
         }
+        let initial_virtual_time_ns = match clock_mode {
+            EngineClockMode::Controlled { initial_time_ns } => initial_time_ns,
+            EngineClockMode::Real => 0,
+        };
+        let initial_controlled_cookie_policy = match document_execution_profile {
+            DocumentExecutionProfile::Baseline => ControlledCookiePolicy::SessionV1,
+            DocumentExecutionProfile::ControlledWebSessionV2 => ControlledCookiePolicy::SessionV2 {
+                unix_time_ns: initial_virtual_time_ns,
+            },
+        };
         if let Some(state) = state.as_ref() {
-            session_state::validate_state(state).map_err(EngineError::SessionStateValidation)?;
+            session_state::validate_state_for_policy(state, initial_controlled_cookie_policy)
+                .map_err(EngineError::SessionStateValidation)?;
         }
         let controlled_network = if top_level_session {
+            if clock_mode == EngineClockMode::Real {
+                return Err(EngineError::SessionConfiguration(
+                    "top-level controlled sessions require a controlled clock",
+                ));
+            }
             let fixture_value = network.unwrap_or_else(|| {
                 json!({
                     "mode": "live",
                     "routes": [],
                 })
             });
-            let initial_virtual_time_ns = match clock_mode {
-                EngineClockMode::Controlled { initial_time_ns } => initial_time_ns,
-                EngineClockMode::Real => {
-                    return Err(EngineError::SessionConfiguration(
-                        "top-level controlled sessions require a controlled clock",
-                    ));
-                },
-            };
             Some(
-                ControlledNetworkSession::from_json(fixture_value, initial_virtual_time_ns)
-                    .map_err(EngineError::NetworkFixture)?,
+                ControlledNetworkSession::from_json_with_execution_profile(
+                    fixture_value,
+                    initial_virtual_time_ns,
+                    document_execution_profile,
+                )
+                .map_err(EngineError::NetworkFixture)?,
             )
         } else {
             None
         };
+        if let Some(network) = controlled_network.as_ref() {
+            debug_assert_eq!(
+                initial_controlled_cookie_policy,
+                network.cookie_policy(),
+                "controlled-network cookie policy must match the validated initial state profile",
+            );
+        }
         let session_state_authority =
             top_level_session.then(|| Rc::new(RefCell::new(SessionStateAuthority::new())));
 
@@ -525,6 +545,7 @@ impl EngineSession {
                         site_data,
                         webview_id,
                         &mut authority.borrow_mut(),
+                        initial_controlled_cookie_policy,
                         state,
                     ) {
                         Ok(_) => Ok(()),
@@ -592,8 +613,12 @@ impl EngineSession {
 
     pub fn session_state_token(&self) -> Result<SessionStateToken, SessionStateError> {
         let authority = self.session_state_authority()?;
-        let backend =
-            ServoSessionStateBackend::new(self.servo().site_data_manager(), self.webview().id());
+        session_state::validate_controlled_cookie_policy_time(self.controlled_cookie_policy())?;
+        let backend = ServoSessionStateBackend::new(
+            self.servo().site_data_manager(),
+            self.webview().id(),
+            self.controlled_cookie_policy(),
+        );
         let revisions = backend.revisions().map_err(|_| {
             SessionStateError::BackendRejected(session_state::SessionStateBackendStage::Observe)
         })?;
@@ -602,22 +627,31 @@ impl EngineSession {
 
     pub fn session_cookies_get(&self) -> Result<SessionCookiesResultV1, SessionStateError> {
         let authority = self.session_state_authority()?;
-        let backend =
-            ServoSessionStateBackend::new(self.servo().site_data_manager(), self.webview().id());
+        let backend = ServoSessionStateBackend::new(
+            self.servo().site_data_manager(),
+            self.webview().id(),
+            self.controlled_cookie_policy(),
+        );
         session_state::session_cookies_get(&backend, &mut authority.borrow_mut())
     }
 
     pub fn session_storage_get(&self) -> Result<SessionStorageResultV1, SessionStateError> {
         let authority = self.session_state_authority()?;
-        let backend =
-            ServoSessionStateBackend::new(self.servo().site_data_manager(), self.webview().id());
+        let backend = ServoSessionStateBackend::new(
+            self.servo().site_data_manager(),
+            self.webview().id(),
+            self.controlled_cookie_policy(),
+        );
         session_state::session_storage_get(&backend, &mut authority.borrow_mut())
     }
 
     pub fn session_state_export(&self) -> Result<SessionStateExportResultV1, SessionStateError> {
         let authority = self.session_state_authority()?;
-        let backend =
-            ServoSessionStateBackend::new(self.servo().site_data_manager(), self.webview().id());
+        let backend = ServoSessionStateBackend::new(
+            self.servo().site_data_manager(),
+            self.webview().id(),
+            self.controlled_cookie_policy(),
+        );
         session_state::session_state_export(&backend, &mut authority.borrow_mut())
     }
 
@@ -626,8 +660,11 @@ impl EngineSession {
         params: SessionCookiesSetParamsV1,
     ) -> Result<SessionStateMutationResultV1, SessionStateError> {
         let authority = self.session_state_authority()?;
-        let mut backend =
-            ServoSessionStateBackend::new(self.servo().site_data_manager(), self.webview().id());
+        let mut backend = ServoSessionStateBackend::new(
+            self.servo().site_data_manager(),
+            self.webview().id(),
+            self.controlled_cookie_policy(),
+        );
         session_state::session_cookies_set(&mut backend, &mut authority.borrow_mut(), params)
     }
 
@@ -636,8 +673,11 @@ impl EngineSession {
         params: SessionStorageSetParamsV1,
     ) -> Result<SessionStateMutationResultV1, SessionStateError> {
         let authority = self.session_state_authority()?;
-        let mut backend =
-            ServoSessionStateBackend::new(self.servo().site_data_manager(), self.webview().id());
+        let mut backend = ServoSessionStateBackend::new(
+            self.servo().site_data_manager(),
+            self.webview().id(),
+            self.controlled_cookie_policy(),
+        );
         session_state::session_storage_set(&mut backend, &mut authority.borrow_mut(), params)
     }
 
@@ -734,6 +774,10 @@ impl EngineSession {
         self.controlled_network
             .as_ref()
             .expect("top-level controlled sessions always install a network controller")
+    }
+
+    fn controlled_cookie_policy(&self) -> ControlledCookiePolicy {
+        self.controlled_network().cookie_policy()
     }
 
     /// Capture exact engine-owned controlled-session identity without blocking the owner loop.
@@ -1039,7 +1083,7 @@ impl EngineError {
                 code: session_state_error_code(*error),
                 message: "session state configuration was rejected before engine construction"
                     .into(),
-                fatal: false,
+                fatal: matches!(error, SessionStateError::CookieTimeRangeUnsupported),
                 state_effect: "none",
                 details: None,
             },
@@ -1191,6 +1235,103 @@ mod tests {
         assert_eq!(unix_time_origin_ns.as_nanos(), 0);
         assert!(!mode.paints_frames_automatically());
         assert!(mode.is_controlled());
+    }
+
+    #[test]
+    fn frozen_v1_state_validation_precedes_invalid_network_fixture_parsing() {
+        let invalid_state = SessionStateV1 {
+            schema_version: session_state::SESSION_STATE_SCHEMA_VERSION_V1,
+            profile: session_state::CONTROLLED_WEB_SESSION_V1_PROFILE.into(),
+            sensitive: false,
+            session_storage_scope: session_state::TOP_LEVEL_SESSION_STORAGE_SCOPE.into(),
+            cookies: Vec::new(),
+            origins: Vec::new(),
+        };
+        let result = EngineSession::start_with_options(
+            Url::parse("https://precedence.example.test/").unwrap(),
+            ShellWaker::default(),
+            EngineSessionOpenOptions {
+                clock_mode: EngineClockMode::Controlled { initial_time_ns: 0 },
+                document_control_profile: DocumentControlProfile::TopLevelSession,
+                document_execution_profile: DocumentExecutionProfile::Baseline,
+                state: Some(invalid_state),
+                network: Some(json!({"mode": "invalid", "routes": []})),
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(EngineError::SessionStateValidation(
+                SessionStateError::SensitiveMarkerRequired,
+            )),
+        ));
+    }
+
+    #[test]
+    fn frozen_v1_state_validation_precedes_real_clock_configuration() {
+        let invalid_state = SessionStateV1 {
+            schema_version: session_state::SESSION_STATE_SCHEMA_VERSION_V1,
+            profile: session_state::CONTROLLED_WEB_SESSION_V1_PROFILE.into(),
+            sensitive: false,
+            session_storage_scope: session_state::TOP_LEVEL_SESSION_STORAGE_SCOPE.into(),
+            cookies: Vec::new(),
+            origins: Vec::new(),
+        };
+        let result = EngineSession::start_with_options(
+            Url::parse("https://precedence.example.test/").unwrap(),
+            ShellWaker::default(),
+            EngineSessionOpenOptions {
+                clock_mode: EngineClockMode::Real,
+                document_control_profile: DocumentControlProfile::TopLevelSession,
+                document_execution_profile: DocumentExecutionProfile::Baseline,
+                state: Some(invalid_state),
+                network: None,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(EngineError::SessionStateValidation(
+                SessionStateError::SensitiveMarkerRequired,
+            )),
+        ));
+    }
+
+    #[test]
+    fn v2_initial_state_time_range_is_typed_and_fatal_before_engine_construction() {
+        let result = EngineSession::start_with_options(
+            Url::parse("https://time-range.example.test/").unwrap(),
+            ShellWaker::default(),
+            EngineSessionOpenOptions {
+                clock_mode: EngineClockMode::Controlled {
+                    initial_time_ns: u128::from(u64::MAX) + 1,
+                },
+                document_control_profile: DocumentControlProfile::TopLevelSession,
+                document_execution_profile: DocumentExecutionProfile::ControlledWebSessionV2,
+                state: Some(SessionStateV1 {
+                    schema_version: session_state::SESSION_STATE_SCHEMA_VERSION_V1,
+                    profile: session_state::CONTROLLED_WEB_SESSION_V2_PROFILE.into(),
+                    sensitive: true,
+                    session_storage_scope: session_state::TOP_LEVEL_SESSION_STORAGE_SCOPE.into(),
+                    cookies: Vec::new(),
+                    origins: Vec::new(),
+                }),
+                network: None,
+            },
+        );
+        let Err(error) = result else {
+            panic!("out-of-range v2 state unexpectedly constructed an engine");
+        };
+        assert!(matches!(
+            &error,
+            EngineError::SessionStateValidation(
+                SessionStateError::CookieTimeRangeUnsupported,
+            ),
+        ));
+        let protocol = error.to_protocol_error();
+        assert_eq!(protocol.code, "unsupported_cookie_time_range");
+        assert!(protocol.fatal);
+        assert_eq!(protocol.state_effect, "none");
     }
 
     #[test]

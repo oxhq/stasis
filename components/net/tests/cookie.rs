@@ -4,6 +4,8 @@
 
 use std::time::{Duration, SystemTime};
 
+use embedder_traits::{ControlledCookieContext, ControlledCookiePolicy};
+use http::Method;
 use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
 use net_traits::{
@@ -227,6 +229,19 @@ fn add_cookie_to_storage(storage: &mut CookieStorage, url: &ServoUrl, cookie_str
     let cookie = cookie::Cookie::parse(cookie_str.to_owned()).unwrap();
     let cookie = ServoCookie::new_wrapped(cookie, url, source).unwrap();
     storage.push(cookie, url, source);
+}
+
+fn controlled_cookie_context(
+    policy: ControlledCookiePolicy,
+    site_for_cookies: Option<&str>,
+    top_level_navigation: bool,
+) -> ControlledCookieContext {
+    ControlledCookieContext {
+        policy,
+        site_for_cookies: site_for_cookies
+            .map(|url| ServoUrl::parse(url).unwrap().as_url().clone()),
+        top_level_navigation,
+    }
 }
 
 fn state_cookie(
@@ -1528,4 +1543,536 @@ fn controlled_cookie_sequence_exhaustion_compacts_without_wrapping() {
     assert_eq!(second.creation_sequence, 1);
     assert_eq!(first.last_access_sequence, 0);
     assert_eq!(second.last_access_sequence, 1);
+}
+
+#[test]
+fn controlled_cookie_v1_context_preserves_frozen_rejections() {
+    let mut storage = CookieStorage::new(8);
+    let request = ServoUrl::parse("https://api.example.com/account").unwrap();
+    let same_site = controlled_cookie_context(
+        ControlledCookiePolicy::SessionV1,
+        Some("https://www.example.com/"),
+        false,
+    );
+    let cross_site = controlled_cookie_context(
+        ControlledCookiePolicy::SessionV1,
+        Some("https://example.org/"),
+        false,
+    );
+    let initial = storage.export_state().unwrap();
+
+    assert_eq!(
+        storage.controlled_session_cookies_for_url_with_context(
+            &request,
+            &Method::GET,
+            &cross_site,
+            CookieSource::HTTP,
+        ),
+        Err(ControlledCookiePolicyError::SameSiteContextUnsupported),
+    );
+    assert_eq!(
+        storage.set_controlled_session_cookie_from_header_with_context(
+            &request,
+            &Method::GET,
+            &same_site,
+            "persistent=blocked; Max-Age=60; Secure",
+        ),
+        Err(ControlledCookiePolicyError::PersistentCookieUnsupported),
+    );
+    assert_eq!(
+        storage.set_controlled_session_cookie_from_header_with_context(
+            &request,
+            &Method::GET,
+            &same_site,
+            "partitioned=blocked; Partitioned; Secure; SameSite=None",
+        ),
+        Err(ControlledCookiePolicyError::PartitionedCookieUnsupported),
+    );
+    assert_eq!(storage.export_state().unwrap(), initial);
+}
+
+#[test]
+fn controlled_cookie_v2_retrieval_obeys_the_samesite_matrix() {
+    let mut storage = CookieStorage::new(8);
+    let request = ServoUrl::parse("https://api.example.com/account").unwrap();
+    let policy = ControlledCookiePolicy::SessionV2 {
+        unix_time_ns: 1_700_000_000_000_000_000,
+    };
+    let same_site = controlled_cookie_context(policy, Some("https://www.example.com/"), false);
+    storage
+        .set_controlled_session_cookies_from_headers_with_context(
+            &request,
+            &Method::GET,
+            &same_site,
+            &[
+                "strict=s; Secure; SameSite=Strict",
+                "lax=l; Secure; SameSite=Lax",
+                "default=d; Secure",
+                "none=n; Secure; SameSite=None",
+            ],
+        )
+        .unwrap();
+
+    let read =
+        |storage: &mut CookieStorage, method: Method, site: &str, top_level_navigation: bool| {
+            storage
+                .controlled_session_cookies_for_url_with_context(
+                    &request,
+                    &method,
+                    &controlled_cookie_context(policy, Some(site), top_level_navigation),
+                    CookieSource::HTTP,
+                )
+                .unwrap()
+        };
+    assert_eq!(
+        read(
+            &mut storage,
+            Method::GET,
+            "https://shop.example.com/",
+            false,
+        )
+        .as_deref(),
+        Some("strict=s; lax=l; default=d; none=n"),
+    );
+    assert_eq!(
+        read(&mut storage, Method::GET, "https://cross-site.test/", false,).as_deref(),
+        Some("none=n"),
+    );
+    assert_eq!(
+        read(&mut storage, Method::GET, "https://cross-site.test/", true,).as_deref(),
+        Some("lax=l; default=d; none=n"),
+    );
+    assert_eq!(
+        read(&mut storage, Method::POST, "https://cross-site.test/", true,).as_deref(),
+        Some("none=n"),
+    );
+    assert_eq!(
+        storage.controlled_session_cookies_for_url_with_context(
+            &request,
+            &Method::GET,
+            &controlled_cookie_context(policy, None, false),
+            CookieSource::HTTP,
+        ),
+        Err(ControlledCookiePolicyError::SameSiteContextUnsupported),
+    );
+}
+
+#[test]
+fn controlled_cookie_v2_storage_obeys_the_samesite_matrix() {
+    let request = ServoUrl::parse("https://api.example.com/account").unwrap();
+    let policy = ControlledCookiePolicy::SessionV2 {
+        unix_time_ns: 1_700_000_000_000_000_000,
+    };
+    let cross_site_subresource =
+        controlled_cookie_context(policy, Some("https://cross-site.test/"), false);
+    let mut subresource_storage = CookieStorage::new(8);
+    subresource_storage
+        .set_controlled_session_cookies_from_headers_with_context(
+            &request,
+            &Method::GET,
+            &cross_site_subresource,
+            &[
+                "strict=ignored; Secure; SameSite=Strict",
+                "lax=ignored; Secure; SameSite=Lax",
+                "default=ignored; Secure",
+                "none=stored; Secure; SameSite=None",
+            ],
+        )
+        .unwrap();
+    let stored = subresource_storage
+        .export_state_with_policy(policy)
+        .unwrap();
+    assert_eq!(stored.cookies.len(), 1);
+    assert_eq!(stored.cookies[0].name, "none");
+
+    let cross_site_navigation =
+        controlled_cookie_context(policy, Some("https://cross-site.test/"), true);
+    let mut navigation_storage = CookieStorage::new(8);
+    navigation_storage
+        .set_controlled_session_cookies_from_headers_with_context(
+            &request,
+            &Method::POST,
+            &cross_site_navigation,
+            &[
+                "strict=stored; Secure; SameSite=Strict",
+                "lax=stored; Secure; SameSite=Lax",
+                "default=stored; Secure",
+                "none=stored; Secure; SameSite=None",
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        navigation_storage
+            .export_state_with_policy(policy)
+            .unwrap()
+            .cookies
+            .len(),
+        4,
+    );
+
+    let baseline = navigation_storage.export_state_with_policy(policy).unwrap();
+    assert_eq!(
+        navigation_storage.set_controlled_session_cookie_from_header_with_context(
+            &request,
+            &Method::GET,
+            &controlled_cookie_context(policy, None, false),
+            "missing=site; Secure",
+        ),
+        Err(ControlledCookiePolicyError::SameSiteContextUnsupported),
+    );
+    assert_eq!(
+        navigation_storage.export_state_with_policy(policy).unwrap(),
+        baseline,
+    );
+}
+
+#[test]
+fn controlled_cookie_v2_persistent_precedence_clamp_and_deletion() {
+    const NOW: u128 = 1_700_000_000_000_000_000;
+    const SECOND_NS: u64 = 1_000_000_000;
+    const MAX_AGE_SECONDS: u64 = 34_560_000;
+
+    let request = ServoUrl::parse("https://example.com/account").unwrap();
+    let policy = ControlledCookiePolicy::SessionV2 { unix_time_ns: NOW };
+    let context = controlled_cookie_context(policy, Some("https://example.com/"), false);
+    let mut storage = CookieStorage::new(8);
+    storage
+        .set_controlled_session_cookies_from_headers_with_context(
+            &request,
+            &Method::GET,
+            &context,
+            &[
+                "precedence=live; Max-Age=60; Expires=Thu, 01 Jan 1970 00:00:01 GMT; Secure",
+                "last-valid=live; Max-Age=10; Max-Age=invalid; Max-Age=20; Secure",
+                "clamped=live; Max-Age=40000000; Secure",
+                "far-future=live; Expires=Fri, 31 Dec 9999 23:59:59 GMT; Secure",
+            ],
+        )
+        .unwrap();
+    let state = storage.export_state_with_policy(policy).unwrap();
+    let expires = |name: &str| {
+        state
+            .cookies
+            .iter()
+            .find(|cookie| cookie.name == name)
+            .unwrap()
+            .expires_unix_time_ns
+            .unwrap()
+    };
+    assert_eq!(expires("precedence"), NOW as u64 + 60 * SECOND_NS);
+    assert_eq!(expires("last-valid"), NOW as u64 + 20 * SECOND_NS);
+    assert_eq!(expires("clamped"), NOW as u64 + MAX_AGE_SECONDS * SECOND_NS,);
+    assert_eq!(
+        expires("far-future"),
+        NOW as u64 + MAX_AGE_SECONDS * SECOND_NS,
+    );
+
+    let later_policy = ControlledCookiePolicy::SessionV2 {
+        unix_time_ns: NOW + u128::from(SECOND_NS),
+    };
+    storage
+        .set_controlled_session_cookie_from_header_with_context(
+            &request,
+            &Method::GET,
+            &controlled_cookie_context(later_policy, Some("https://example.com/"), false),
+            "precedence=deleted; Max-Age=0; Secure",
+        )
+        .unwrap();
+    let deleted = storage.export_state_with_policy(later_policy).unwrap();
+    assert_eq!(deleted.revision, state.revision + 1);
+    assert_eq!(
+        deleted
+            .cookies
+            .iter()
+            .map(|cookie| cookie.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["clamped", "far-future", "last-valid"],
+    );
+
+    storage
+        .set_controlled_session_cookie_from_header_with_context(
+            &request,
+            &Method::GET,
+            &controlled_cookie_context(later_policy, Some("https://example.com/"), false),
+            "absent=delete-noop; Max-Age=0; Secure",
+        )
+        .unwrap();
+    assert_eq!(
+        storage.export_state_with_policy(later_policy).unwrap(),
+        deleted,
+    );
+}
+
+#[test]
+fn controlled_cookie_v2_lazy_purge_is_revisioned_once_for_reads_and_exports() {
+    const NOW: u128 = 1_700_000_000_000_000_000;
+    const SECOND_NS: u128 = 1_000_000_000;
+    let request = ServoUrl::parse("https://example.com/").unwrap();
+    let initial_policy = ControlledCookiePolicy::SessionV2 { unix_time_ns: NOW };
+    let initial_context =
+        controlled_cookie_context(initial_policy, Some("https://example.com/"), false);
+    let expired_policy = ControlledCookiePolicy::SessionV2 {
+        unix_time_ns: NOW + SECOND_NS,
+    };
+    let expired_context =
+        controlled_cookie_context(expired_policy, Some("https://example.com/"), false);
+
+    let mut read_purge = CookieStorage::new(8);
+    read_purge
+        .set_controlled_session_cookie_from_header_with_context(
+            &request,
+            &Method::GET,
+            &initial_context,
+            "short=live; Max-Age=1; Secure",
+        )
+        .unwrap();
+    let before_read = read_purge.export_state_with_policy(initial_policy).unwrap();
+    assert_eq!(
+        read_purge
+            .controlled_session_cookies_for_url_with_context(
+                &request,
+                &Method::GET,
+                &expired_context,
+                CookieSource::HTTP,
+            )
+            .unwrap(),
+        None,
+    );
+    let after_read = read_purge.export_state_with_policy(expired_policy).unwrap();
+    assert!(after_read.cookies.is_empty());
+    assert_eq!(after_read.revision, before_read.revision + 1);
+    assert_eq!(
+        read_purge.export_state_with_policy(expired_policy).unwrap(),
+        after_read,
+    );
+
+    let mut export_purge = CookieStorage::new(8);
+    export_purge
+        .set_controlled_session_cookie_from_header_with_context(
+            &request,
+            &Method::GET,
+            &initial_context,
+            "short=live; Max-Age=1; Secure",
+        )
+        .unwrap();
+    let before_export = export_purge
+        .export_state_with_policy(initial_policy)
+        .unwrap();
+    let after_export = export_purge
+        .export_state_with_policy(expired_policy)
+        .unwrap();
+    assert!(after_export.cookies.is_empty());
+    assert_eq!(after_export.revision, before_export.revision + 1);
+    assert_eq!(
+        export_purge
+            .export_state_with_policy(expired_policy)
+            .unwrap(),
+        after_export,
+    );
+}
+
+#[test]
+fn controlled_cookie_v2_persistent_state_round_trips_and_batches_are_atomic() {
+    const NOW: u128 = 1_700_000_000_000_000_000;
+    const SECOND_NS: u128 = 1_000_000_000;
+    let request = ServoUrl::parse("https://example.com/").unwrap();
+    let policy = ControlledCookiePolicy::SessionV2 { unix_time_ns: NOW };
+    let context = controlled_cookie_context(policy, Some("https://example.com/"), false);
+
+    let mut source = CookieStorage::new(8);
+    source
+        .set_controlled_session_cookie_from_header_with_context(
+            &request,
+            &Method::GET,
+            &context,
+            "persistent=value; Max-Age=60; Secure; SameSite=Lax",
+        )
+        .unwrap();
+    let snapshot = source.export_state_with_policy(policy).unwrap();
+
+    let mut restored = CookieStorage::new(8);
+    assert_eq!(
+        restored.replace_state_with_policy(policy, 0, snapshot.clone()),
+        Ok(1),
+    );
+    assert_eq!(
+        restored
+            .controlled_session_cookies_for_url_with_context(
+                &request,
+                &Method::GET,
+                &context,
+                CookieSource::HTTP,
+            )
+            .unwrap()
+            .as_deref(),
+        Some("persistent=value"),
+    );
+    assert_eq!(
+        restored.export_state_with_policy(policy).unwrap().cookies[0].expires_unix_time_ns,
+        snapshot.cookies[0].expires_unix_time_ns,
+    );
+
+    let mut frozen_v1 = CookieStorage::new(8);
+    assert_eq!(
+        frozen_v1.replace_state(0, snapshot.clone()),
+        Err(CookieStateError::PersistentCookieUnsupported),
+    );
+    assert!(frozen_v1.export_state().unwrap().cookies.is_empty());
+
+    let expired_policy = ControlledCookiePolicy::SessionV2 {
+        unix_time_ns: NOW + 61 * SECOND_NS,
+    };
+    let mut expired_import = CookieStorage::new(8);
+    assert_eq!(
+        expired_import.replace_state_with_policy(expired_policy, 0, snapshot),
+        Ok(1),
+    );
+    assert!(
+        expired_import
+            .export_state_with_policy(expired_policy)
+            .unwrap()
+            .cookies
+            .is_empty(),
+    );
+
+    let baseline = restored.export_state_with_policy(policy).unwrap();
+    assert_eq!(
+        restored.set_controlled_session_cookies_from_headers_with_context(
+            &request,
+            &Method::GET,
+            &context,
+            &[
+                "accepted=only-if-whole-batch-is-valid; Max-Age=120; Secure",
+                "invalid=none-without-secure; SameSite=None",
+            ],
+        ),
+        Err(ControlledCookiePolicyError::InvalidCookie),
+    );
+    assert_eq!(restored.export_state_with_policy(policy).unwrap(), baseline);
+}
+
+#[test]
+fn controlled_cookie_v2_time_bounds_fail_before_mutation() {
+    let request = ServoUrl::parse("https://example.com/").unwrap();
+    let baseline_policy = ControlledCookiePolicy::SessionV2 { unix_time_ns: 0 };
+    let baseline_context =
+        controlled_cookie_context(baseline_policy, Some("https://example.com/"), false);
+    let mut storage = CookieStorage::new(8);
+    storage
+        .set_controlled_session_cookie_from_header_with_context(
+            &request,
+            &Method::GET,
+            &baseline_context,
+            "lower-bound=live; Max-Age=1; Secure",
+        )
+        .unwrap();
+    let baseline = storage.export_state_with_policy(baseline_policy).unwrap();
+    assert_eq!(
+        baseline.cookies[0].expires_unix_time_ns,
+        Some(1_000_000_000)
+    );
+
+    let above_u64 = ControlledCookiePolicy::SessionV2 {
+        unix_time_ns: u128::from(u64::MAX) + 1,
+    };
+    let above_u64_context =
+        controlled_cookie_context(above_u64, Some("https://example.com/"), false);
+    assert_eq!(
+        storage.set_controlled_session_cookie_from_header_with_context(
+            &request,
+            &Method::GET,
+            &above_u64_context,
+            "never=stored; Max-Age=1; Secure",
+        ),
+        Err(ControlledCookiePolicyError::TimeRangeUnsupported),
+    );
+    assert_eq!(
+        storage.controlled_session_cookies_for_url_with_context(
+            &request,
+            &Method::GET,
+            &above_u64_context,
+            CookieSource::HTTP,
+        ),
+        Err(ControlledCookiePolicyError::TimeRangeUnsupported),
+    );
+    assert_eq!(
+        storage.export_state_with_policy(above_u64),
+        Err(CookieStateError::TimeRangeUnsupported),
+    );
+    assert_eq!(
+        storage.export_state_with_policy(baseline_policy).unwrap(),
+        baseline
+    );
+
+    let no_persistence_headroom = ControlledCookiePolicy::SessionV2 {
+        unix_time_ns: u128::from(u64::MAX),
+    };
+    let no_persistence_headroom_context =
+        controlled_cookie_context(no_persistence_headroom, Some("https://example.com/"), false);
+    let mut edge_storage = CookieStorage::new(8);
+    edge_storage
+        .set_controlled_session_cookie_from_header_with_context(
+            &request,
+            &Method::GET,
+            &no_persistence_headroom_context,
+            "session=stored; Secure",
+        )
+        .unwrap();
+    let edge_state = edge_storage
+        .export_state_with_policy(no_persistence_headroom)
+        .unwrap();
+    assert_eq!(edge_state.cookies.len(), 1);
+    assert_eq!(edge_state.cookies[0].name, "session");
+    assert_eq!(edge_state.cookies[0].expires_unix_time_ns, None);
+    edge_storage
+        .set_controlled_session_cookie_from_header_with_context(
+            &request,
+            &Method::GET,
+            &no_persistence_headroom_context,
+            "session=deleted; Expires=Thu, 01 Jan 1970 00:00:01 GMT; Secure",
+        )
+        .unwrap();
+    assert!(
+        edge_storage
+            .export_state_with_policy(no_persistence_headroom)
+            .unwrap()
+            .cookies
+            .is_empty(),
+    );
+
+    let mut expired_import_at_boundary = CookieStorage::new(8);
+    let mut expired_record = state_cookie("expired-import", "example.com", "/", 0);
+    expired_record.expires_unix_time_ns = Some(u64::MAX);
+    assert_eq!(
+        expired_import_at_boundary.replace_state_with_policy(
+            no_persistence_headroom,
+            0,
+            CookieStateSnapshotV1 {
+                schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+                revision: 0,
+                cookies: vec![expired_record],
+            },
+        ),
+        Ok(1),
+    );
+    let expired_import_state = expired_import_at_boundary
+        .export_state_with_policy(no_persistence_headroom)
+        .unwrap();
+    assert_eq!(expired_import_state.revision, 1);
+    assert!(expired_import_state.cookies.is_empty());
+
+    let mut rejected_import = CookieStorage::new(8);
+    assert_eq!(
+        rejected_import.replace_state_with_policy(
+            above_u64,
+            0,
+            CookieStateSnapshotV1 {
+                schema_version: COOKIE_STATE_SCHEMA_VERSION_V1,
+                revision: 0,
+                cookies: vec![state_cookie("import", "example.com", "/", 0)],
+            },
+        ),
+        Err(CookieStateError::TimeRangeUnsupported),
+    );
+    assert!(rejected_import.export_state().unwrap().cookies.is_empty());
 }

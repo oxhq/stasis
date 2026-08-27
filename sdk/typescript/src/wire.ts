@@ -2,6 +2,7 @@ import { StasisTransportError } from "./errors.js";
 import {
   CONTROLLED_WEBAPP_V1_PROFILE,
   CONTROLLED_WEB_SESSION_V1_PROFILE,
+  CONTROLLED_WEB_SESSION_V2_PROFILE,
   isSelectableSessionProfile,
   type LegacySupportProfile,
   type SelectableSessionProfile,
@@ -24,6 +25,7 @@ import type {
   SessionAuditOptions,
   SessionAutomationMutationResult,
   SessionCookie,
+  SessionCookieFor,
   SessionCookiesResult,
   SessionEvidenceEvent,
   SessionEvidenceFailureReason,
@@ -43,6 +45,7 @@ import type {
   SessionSelectResult,
   SessionSettleResult,
   SessionState,
+  SessionStateFor,
   SessionStateExportResult,
   SessionStateMutationResult,
   SessionStateToken,
@@ -409,7 +412,7 @@ export function encodeSessionOpenParams(
     throw new RangeError("unixTimeOriginNs must be 0 in the controlled MVP");
   }
   params.unixTimeOriginNs = encodeU128(unixTimeOriginNs, "unixTimeOriginNs");
-  if (options.state !== undefined) params.state = encodeSessionState(options.state);
+  if (options.state !== undefined) params.state = encodeSessionState(options.state, profile);
   if (options.network !== undefined) params.network = encodeSessionNetwork(options.network);
   return params;
 }
@@ -518,7 +521,12 @@ function encodeNetworkRoute(routeValue: NetworkRoute, index: number): Record<str
   return encoded;
 }
 
-export function encodeSessionState(stateValue: SessionState): Record<string, unknown> {
+export function encodeSessionState<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+>(
+  stateValue: SessionStateFor<Profile>,
+  profile: Profile = CONTROLLED_WEB_SESSION_V1_PROFILE as Profile,
+): Record<string, unknown> {
   const state = inputRecord(stateValue, "state");
   inputExactKeysSecretSafe(
     state,
@@ -533,8 +541,8 @@ export function encodeSessionState(stateValue: SessionState): Record<string, unk
     "state",
   );
   if (state.schemaVersion !== 1) throw new TypeError("state.schemaVersion must be 1");
-  if (state.profile !== CONTROLLED_WEB_SESSION_V1_PROFILE) {
-    throw new TypeError(`state.profile must be ${CONTROLLED_WEB_SESSION_V1_PROFILE}`);
+  if (state.profile !== profile) {
+    throw new TypeError(`state.profile must be ${profile}`);
   }
   if (state.sensitive !== true) throw new TypeError("state.sensitive must be true");
   if (state.sessionStorageScope !== "top_level_browsing_context") {
@@ -542,11 +550,11 @@ export function encodeSessionState(stateValue: SessionState): Record<string, unk
       "state.sessionStorageScope must be top_level_browsing_context",
     );
   }
-  const cookies = encodeSessionCookieArray(state.cookies, "state.cookies");
+  const cookies = encodeSessionCookieArray(state.cookies, "state.cookies", profile);
   const origins = encodeSessionOriginArray(state.origins, "state.origins");
   const encoded = {
     schemaVersion: 1,
-    profile: CONTROLLED_WEB_SESSION_V1_PROFILE,
+    profile,
     sensitive: true,
     sessionStorageScope: "top_level_browsing_context",
     cookies,
@@ -559,6 +567,7 @@ export function encodeSessionState(stateValue: SessionState): Record<string, unk
 function encodeSessionCookieArray(
   cookiesValue: unknown,
   label: string,
+  profile: SelectableSessionProfile = CONTROLLED_WEB_SESSION_V1_PROFILE,
 ): Record<string, unknown>[] {
   const cookies = inputBoundedArray(cookiesValue, label, MAX_SESSION_COOKIES);
   const encoded: Record<string, unknown>[] = [];
@@ -567,7 +576,7 @@ function encodeSessionCookieArray(
   const accessSequences = new Set<string>();
   let encodedBytes = 2;
   for (let index = 0; index < cookies.length; index += 1) {
-    const cookie = encodeSessionCookie(cookies[index], index, label);
+    const cookie = encodeSessionCookie(cookies[index], index, label, profile);
     const identity = JSON.stringify([cookie.domain, cookie.path, cookie.name]);
     if (identities.has(identity)) {
       throw new TypeError(`${label} must not contain duplicate cookie identities`);
@@ -599,6 +608,7 @@ function encodeSessionCookie(
   cookieValue: unknown,
   index: number,
   parentLabel: string,
+  profile: SelectableSessionProfile,
 ): Record<string, unknown> {
   const label = `${parentLabel}[${index}]`;
   const cookie = inputRecord(cookieValue, label);
@@ -652,11 +662,22 @@ function encodeSessionCookie(
   if (!new Set(["unspecified", "strict", "lax", "none"]).has(sameSite)) {
     throw new TypeError(`${label}.sameSite is invalid`);
   }
-  if (cookie.expiresUnixTimeNs !== null) {
+  const expiresUnixTimeNs =
+    profile === CONTROLLED_WEB_SESSION_V2_PROFILE
+      ? cookie.expiresUnixTimeNs === null
+        ? null
+        : encodeU64(cookie.expiresUnixTimeNs as bigint, `${label}.expiresUnixTimeNs`)
+      : null;
+  if (
+    profile === CONTROLLED_WEB_SESSION_V1_PROFILE &&
+    cookie.expiresUnixTimeNs !== null
+  ) {
     throw new TypeError(`${label}.expiresUnixTimeNs must be null in session state v1`);
   }
   if (cookie.partitioned !== false) {
-    throw new TypeError(`${label}.partitioned must be false in session state v1`);
+    throw new TypeError(
+      `${label}.partitioned must be false in session state ${profile === CONTROLLED_WEB_SESSION_V2_PROFILE ? "v2" : "v1"}`,
+    );
   }
   const secure = inputBoolean(cookie.secure, `${label}.secure`);
   if (sameSite === "none" && !secure) {
@@ -681,7 +702,7 @@ function encodeSessionCookie(
     secure,
     httpOnly: inputBoolean(cookie.httpOnly, `${label}.httpOnly`),
     sameSite,
-    expiresUnixTimeNs: null,
+    expiresUnixTimeNs,
     partitioned: false,
     creationSequence: encodeU64(
       cookie.creationSequence as bigint,
@@ -986,13 +1007,16 @@ export function encodeSessionStateTokenParams(
   };
 }
 
-export function encodeSessionCookiesSetParams(
-  cookies: readonly SessionCookie[],
+export function encodeSessionCookiesSetParams<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+>(
+  cookies: readonly SessionCookieFor<Profile>[],
   expectedSessionStateToken: SessionStateToken,
+  profile: Profile = CONTROLLED_WEB_SESSION_V1_PROFILE as Profile,
 ): Record<string, unknown> {
   const token = encodeSessionStateTokenParams(expectedSessionStateToken);
   return {
-    cookies: encodeSessionCookieArray(cookies, "cookies"),
+    cookies: encodeSessionCookieArray(cookies, "cookies", profile),
     ...token,
   };
 }
@@ -1008,13 +1032,16 @@ export function encodeSessionStorageSetParams(
   };
 }
 
-export function encodeSessionStateImportParams(
-  state: SessionState,
+export function encodeSessionStateImportParams<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+>(
+  state: SessionStateFor<Profile>,
   expectedSessionStateToken: SessionStateToken,
+  profile: Profile = CONTROLLED_WEB_SESSION_V1_PROFILE as Profile,
 ): Record<string, unknown> {
   const token = encodeSessionStateTokenParams(expectedSessionStateToken);
   return {
-    state: encodeSessionState(state),
+    state: encodeSessionState(state, profile),
     ...token,
   };
 }
@@ -1653,7 +1680,12 @@ export function decodeSessionNavigate(value: unknown): SessionNavigateResult {
   };
 }
 
-export function decodeSessionCookies(value: unknown): SessionCookiesResult {
+export function decodeSessionCookies<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+>(
+  value: unknown,
+  profile: Profile = CONTROLLED_WEB_SESSION_V1_PROFILE as Profile,
+): SessionCookiesResult<Profile> {
   const result = record(value, "session.cookies.get result");
   exactKeysSecretSafe(result, ["cookies", "sessionStateToken"]);
   const cookieValues = decodedBoundedArray(
@@ -1662,10 +1694,10 @@ export function decodeSessionCookies(value: unknown): SessionCookiesResult {
     MAX_SESSION_COOKIES,
   );
   const cookies = cookieValues.map((cookie, index) =>
-    decodeSessionCookie(cookie, index, "session.cookies.get result.cookies"),
+    decodeSessionCookie(cookie, index, "session.cookies.get result.cookies", profile),
   );
   validateDecodedSessionStateInput(() => {
-    encodeSessionCookieArray(cookies, "session.cookies.get result.cookies");
+    encodeSessionCookieArray(cookies, "session.cookies.get result.cookies", profile);
   });
   return {
     cookies,
@@ -1699,11 +1731,16 @@ export function decodeSessionStorage(value: unknown): SessionStorageResult {
   };
 }
 
-export function decodeSessionStateExport(value: unknown): SessionStateExportResult {
+export function decodeSessionStateExport<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+>(
+  value: unknown,
+  profile: Profile = CONTROLLED_WEB_SESSION_V1_PROFILE as Profile,
+): SessionStateExportResult<Profile> {
   const result = record(value, "session.state.export result");
   exactKeysSecretSafe(result, ["state", "sessionStateToken"]);
   return {
-    state: decodeSessionState(result.state, "session.state.export result.state"),
+    state: decodeSessionState(result.state, "session.state.export result.state", profile),
     sessionStateToken: decodeSessionStateToken(
       result.sessionStateToken,
       "session.state.export result.sessionStateToken",
@@ -1821,7 +1858,11 @@ export function decodeSessionEvidence(value: unknown): SessionEvidenceResult {
   };
 }
 
-function decodeSessionState(value: unknown, label: string): SessionState {
+function decodeSessionState<Profile extends SelectableSessionProfile>(
+  value: unknown,
+  label: string,
+  profile: Profile,
+): SessionStateFor<Profile> {
   const state = record(value, label);
   exactKeysSecretSafe(state, [
     "schemaVersion",
@@ -1832,8 +1873,8 @@ function decodeSessionState(value: unknown, label: string): SessionState {
     "origins",
   ]);
   if (state.schemaVersion !== 1) invalid(`${label}.schemaVersion must be 1`);
-  if (state.profile !== CONTROLLED_WEB_SESSION_V1_PROFILE) {
-    invalid(`${label}.profile must be ${CONTROLLED_WEB_SESSION_V1_PROFILE}`);
+  if (state.profile !== profile) {
+    invalid(`${label}.profile must be ${profile}`);
   }
   if (state.sensitive !== true) invalid(`${label}.sensitive must be true`);
   if (state.sessionStorageScope !== "top_level_browsing_context") {
@@ -1849,29 +1890,30 @@ function decodeSessionState(value: unknown, label: string): SessionState {
     `${label}.origins`,
     MAX_SESSION_STORAGE_ORIGINS,
   );
-  const decoded: SessionState = {
+  const decoded = {
     schemaVersion: 1,
-    profile: CONTROLLED_WEB_SESSION_V1_PROFILE,
+    profile,
     sensitive: true,
     sessionStorageScope: "top_level_browsing_context",
     cookies: cookieValues.map((cookie, index) =>
-      decodeSessionCookie(cookie, index, `${label}.cookies`),
+      decodeSessionCookie(cookie, index, `${label}.cookies`, profile),
     ),
     origins: originValues.map((origin, index) =>
       decodeSessionOrigin(origin, index, `${label}.origins`),
     ),
   };
   validateDecodedSessionStateInput(() => {
-    encodeSessionState(decoded);
+    encodeSessionState(decoded as SessionStateFor<Profile>, profile);
   });
-  return decoded;
+  return decoded as SessionStateFor<Profile>;
 }
 
-function decodeSessionCookie(
+function decodeSessionCookie<Profile extends SelectableSessionProfile>(
   value: unknown,
   index: number,
   parentLabel: string,
-): SessionCookie {
+  profile: Profile,
+): SessionCookieFor<Profile> {
   const label = `${parentLabel}[${index}]`;
   const cookie = record(value, label);
   exactKeysSecretSafe(cookie, [
@@ -1895,12 +1937,21 @@ function decodeSessionCookie(
     invalid(`${label}.sameSite is invalid`);
   }
   const sameSite = cookie.sameSite as SessionCookie["sameSite"];
-  if (cookie.expiresUnixTimeNs !== null) {
+  if (
+    profile === CONTROLLED_WEB_SESSION_V1_PROFILE &&
+    cookie.expiresUnixTimeNs !== null
+  ) {
     invalid(`${label}.expiresUnixTimeNs must be null in session state v1`);
   }
   if (cookie.partitioned !== false) {
-    invalid(`${label}.partitioned must be false in session state v1`);
+    invalid(
+      `${label}.partitioned must be false in session state ${profile === CONTROLLED_WEB_SESSION_V2_PROFILE ? "v2" : "v1"}`,
+    );
   }
+  const expiresUnixTimeNs =
+    cookie.expiresUnixTimeNs === null
+      ? null
+      : decodeU64(cookie.expiresUnixTimeNs, `${label}.expiresUnixTimeNs`);
   return {
     name: requireString(cookie.name, `${label}.name`),
     value: requireString(cookie.value, `${label}.value`),
@@ -1910,11 +1961,11 @@ function decodeSessionCookie(
     secure: requireBoolean(cookie.secure, `${label}.secure`),
     httpOnly: requireBoolean(cookie.httpOnly, `${label}.httpOnly`),
     sameSite,
-    expiresUnixTimeNs: null,
+    expiresUnixTimeNs,
     partitioned: false,
     creationSequence: decodeU64(cookie.creationSequence, `${label}.creationSequence`),
     lastAccessSequence: decodeU64(cookie.lastAccessSequence, `${label}.lastAccessSequence`),
-  };
+  } as SessionCookieFor<Profile>;
 }
 
 function decodeSessionOrigin(

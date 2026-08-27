@@ -5,10 +5,11 @@
 > claim. `Runtime.openSession()` continues to default to `controlled-web-session-v1`; v2 must be
 > selected explicitly and the native runtime must advertise it.
 
-`controlled-web-session-v2` preserves the complete v1 session contract and adds six
+`controlled-web-session-v2` preserves the complete v1 session contract and adds seven
 benchmark-driven compatibility slices: controlled-local messaging, direct data-SVG image
 completion, inline-SVG rendering completion, single-line text-focus presentation and focus-event
-time, synchronous public-automation event time, and internal CSS animation-event time. The owned
+time, synchronous public-automation event time, internal CSS animation-event time, and controlled
+persistent-cookie expiry plus SameSite request selection. The owned
 source added by this candidate is a constructor-created
 `MessageChannel` whose two ports remain in the active controlled top-level document global, and a
 bounded direct `HTMLImageElement.src` `data:image/svg+xml` completion path in the same controlled
@@ -355,6 +356,47 @@ detached `MessagePort` or locked stream retains its platform `DataCloneError` pr
 Stasis applies its boundary to that entry. This is a typed rejection boundary, not
 transferable-stream support or general transactional rollback for other transfer failures.
 
+## Controlled cookie/session-state boundary
+
+V2 owns persistent cookies in memory for the lifetime of its single controlled session. It never
+loads or writes a host browser profile, cookie database, or other disk-backed jar. Persistence
+across processes is available only through an explicit `controlled-web-session-v2` state export
+and initial import. The state envelope remains `schemaVersion: 1`, but its literal `state.profile`
+is `controlled-web-session-v2`; a v1 artifact is not silently migrated or accepted as v2.
+
+Cookie expiry is measured against the session's controlled Unix clock with origin zero. A valid
+`Max-Age` takes precedence over `Expires`; retained expiry is clamped to at most 400 days from the
+controlled receipt time. Expiry at or before controlled now deletes the cookie, and expired
+records are lazily purged before cookie observation, request selection, and state export. The
+portable wire field remains the canonical decimal-u64 `expiresUnixTimeNs` string, decoded by the
+TypeScript SDK as `bigint | null`. Session cookies retain `null`.
+
+Cookie authority is bounded by that same u64 Unix-nanosecond domain even though the general
+controlled clock accepts u128 values. When a post-open request observes controlled Unix time above
+`18446744073709551615`, it fails nonfatally as `unsupported_cookie_time_range` with partial request
+state effect before network start or Cookie header construction. During initial controlled open,
+the shell hardens that same code to a fatal fail-stop because no usable session can be returned. A
+persistent expiry that has no u64 headroom uses the same typed boundary. Page-authored cookie APIs
+surface the equivalent `NotSupportedError`; they do not truncate or wrap time.
+
+SameSite selection uses the schemeful site-for-cookies captured from the request client, the
+current redirect-hop method, and whether the request is a top-level navigation. `Strict` cookies
+are selected only same-site. `Lax` and unspecified cookies are also eligible on cross-site
+top-level `GET`, `HEAD`, `OPTIONS`, or `TRACE`; `None` requires `Secure` and may be selected
+cross-site. Ineligible cookies are filtered before Cookie header construction without creating a
+settlement terminal. An unknown or opaque request context still fails closed as
+`unsupported_cookie_same_site_context` before network start.
+
+Response-cookie storage uses the same captured schemeful context. A same-site response or any
+top-level-navigation response may store every otherwise valid unpartitioned cookie. For a
+cross-site subresource response, only a valid Secure `SameSite=None` cookie is eligible; Strict,
+Lax, and unspecified cookies are ignored without a terminal. The redirect-hop method is not an
+input to this response-storage admission rule.
+
+Partitioned cookies remain `unsupported_partitioned_cookie`. `cookieStore.get()`, `getAll()`, and
+`delete()` retain `controlled_cookie_store_read_delete_unsupported`; this slice does not create a
+general Cookie Store API or durable browser profile.
+
 ## Identity and compatibility
 
 The protocol envelope remains version 1. Open requests and responses carry the explicitly selected
@@ -368,7 +410,6 @@ The candidate pins its predecessor profile by SHA-256
 re-hashes that frozen `controlled-web-session-v1` file independently; naming the predecessor is not
 accepted as evidence that its bytes stayed unchanged.
 
-V2 expands only the declared execution and headless-presentation surfaces. Cookies and Web Storage
-continue to use the existing `controlled-web-session-v1` state artifact, including its literal
-`state.profile`. Import and export do not rewrite that identity and there is no implicit state
-migration.
+V2 expands only the declared execution, headless-presentation, and controlled cookie-state
+surfaces. Web Storage retains its predecessor behavior inside a profile-matched v2 artifact.
+Import and export preserve that exact v2 identity and there is no implicit state migration.

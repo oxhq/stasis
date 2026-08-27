@@ -6721,6 +6721,14 @@ fn controlled_network_failure(
             ),
             false,
         ),
+        ControlledNetworkFailure::CookieTimeRangeUnsupported => (
+            ProtocolError::operation(
+                "unsupported_cookie_time_range",
+                "controlled cookie time is outside the bounded persistence range",
+                effect,
+            ),
+            false,
+        ),
         ControlledNetworkFailure::InvalidCookie => (
             ProtocolError::operation(
                 "invalid_controlled_cookie",
@@ -9165,6 +9173,20 @@ mod tests {
         assert!(!error.fatal);
         assert_eq!(error.state_effect, "none");
         assert!(error.details.is_none());
+    }
+
+    #[test]
+    fn cookie_time_range_has_a_distinct_nonfatal_live_mutation_code() {
+        let error =
+            session_state_protocol_error(SessionStateError::CookieTimeRangeUnsupported);
+        assert_eq!(error.code, "unsupported_cookie_time_range");
+        assert!(!error.fatal);
+        assert_eq!(error.state_effect, "none");
+        assert!(error.details.is_none());
+
+        let hardened = harden_session_state_mutation_error("session.cookies.set", error);
+        assert!(!hardened.fatal);
+        assert_eq!(hardened.state_effect, "none");
     }
 
     #[test]

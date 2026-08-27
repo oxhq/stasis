@@ -13,6 +13,8 @@ use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
 use cookie::{Cookie, SameSite};
+use embedder_traits::{ControlledCookieContext, ControlledCookiePolicy};
+use http::Method;
 use itertools::Itertools;
 use malloc_size_of_derive::MallocSizeOf;
 use net_traits::pub_domains::{is_same_site, reg_suffix};
@@ -337,7 +339,32 @@ impl CookieStorage {
         top_level_url: &ServoUrl,
         source: CookieSource,
     ) -> Result<Option<String>, ControlledCookiePolicyError> {
-        ensure_controlled_same_site(url, top_level_url)?;
+        let context = ControlledCookieContext {
+            policy: ControlledCookiePolicy::SessionV1,
+            site_for_cookies: Some(top_level_url.as_url().clone()),
+            top_level_navigation: false,
+        };
+        self.controlled_session_cookies_for_url_with_context(url, &Method::GET, &context, source)
+    }
+
+    /// Return a controlled Cookie header using captured request provenance and explicit time.
+    pub fn controlled_session_cookies_for_url_with_context(
+        &mut self,
+        url: &ServoUrl,
+        method: &Method,
+        context: &ControlledCookieContext,
+        source: CookieSource,
+    ) -> Result<Option<String>, ControlledCookiePolicyError> {
+        let same_site = controlled_same_site(url, context)?;
+        match context.policy {
+            ControlledCookiePolicy::SessionV1 if !same_site => {
+                return Err(ControlledCookiePolicyError::SameSiteContextUnsupported);
+            },
+            ControlledCookiePolicy::SessionV1 => {},
+            ControlledCookiePolicy::SessionV2 { unix_time_ns } => {
+                self.remove_controlled_expired_cookies_for_url(url, unix_time_ns)?;
+            },
+        }
         self.ensure_controlled_ordering()
             .map_err(|()| ControlledCookiePolicyError::InvalidCookie)?;
 
@@ -347,7 +374,10 @@ impl CookieStorage {
             .entry(domain.clone())
             .or_default()
             .iter()
-            .filter(|cookie| cookie.appropriate_for_url(url, source))
+            .filter(|cookie| {
+                cookie.appropriate_for_url(url, source)
+                    && controlled_same_site_allows_cookie(cookie, same_site, method, context)
+            })
             .count();
         let access_sequences = self
             .reserve_controlled_access_sequences(matching_count)
@@ -355,7 +385,10 @@ impl CookieStorage {
         let cookies = self.cookies_map.entry(domain).or_default();
         let mut matching: Vec<_> = cookies
             .iter_mut()
-            .filter(|cookie| cookie.appropriate_for_url(url, source))
+            .filter(|cookie| {
+                cookie.appropriate_for_url(url, source)
+                    && controlled_same_site_allows_cookie(cookie, same_site, method, context)
+            })
             .collect();
         matching.sort_by(|a, b| controlled_cookie_comparator(a, b));
 
@@ -392,6 +425,21 @@ impl CookieStorage {
         )
     }
 
+    pub fn set_controlled_session_cookie_from_header_with_context(
+        &mut self,
+        request_url: &ServoUrl,
+        method: &Method,
+        context: &ControlledCookieContext,
+        cookie_value: &str,
+    ) -> Result<(), ControlledCookiePolicyError> {
+        self.set_controlled_session_cookies_from_headers_with_context(
+            request_url,
+            method,
+            context,
+            &[cookie_value],
+        )
+    }
+
     /// Parse and store one cookie authored by a page API under controlled-session policy. This
     /// deliberately accepts the original cookie string so attribute *presence* (including an
     /// invalid `Max-Age`) is rejected before parsing can erase that evidence.
@@ -404,6 +452,21 @@ impl CookieStorage {
         self.set_controlled_session_cookie_values(
             request_url,
             top_level_url,
+            &[cookie_value],
+            CookieSource::NonHTTP,
+        )
+    }
+
+    pub fn set_controlled_session_cookie_from_non_http_with_context(
+        &mut self,
+        request_url: &ServoUrl,
+        context: &ControlledCookieContext,
+        cookie_value: &str,
+    ) -> Result<(), ControlledCookiePolicyError> {
+        self.set_controlled_session_cookie_values_with_context(
+            request_url,
+            &Method::GET,
+            context,
             &[cookie_value],
             CookieSource::NonHTTP,
         )
@@ -425,6 +488,22 @@ impl CookieStorage {
         )
     }
 
+    pub fn set_controlled_session_cookies_from_headers_with_context(
+        &mut self,
+        request_url: &ServoUrl,
+        method: &Method,
+        context: &ControlledCookieContext,
+        cookie_values: &[&str],
+    ) -> Result<(), ControlledCookiePolicyError> {
+        self.set_controlled_session_cookie_values_with_context(
+            request_url,
+            method,
+            context,
+            cookie_values,
+            CookieSource::HTTP,
+        )
+    }
+
     fn set_controlled_session_cookie_values(
         &mut self,
         request_url: &ServoUrl,
@@ -432,7 +511,33 @@ impl CookieStorage {
         cookie_values: &[&str],
         source: CookieSource,
     ) -> Result<(), ControlledCookiePolicyError> {
-        ensure_controlled_same_site(request_url, top_level_url)?;
+        let context = ControlledCookieContext {
+            policy: ControlledCookiePolicy::SessionV1,
+            site_for_cookies: Some(top_level_url.as_url().clone()),
+            top_level_navigation: false,
+        };
+        self.set_controlled_session_cookie_values_with_context(
+            request_url,
+            &Method::GET,
+            &context,
+            cookie_values,
+            source,
+        )
+    }
+
+    fn set_controlled_session_cookie_values_with_context(
+        &mut self,
+        request_url: &ServoUrl,
+        method: &Method,
+        context: &ControlledCookieContext,
+        cookie_values: &[&str],
+        source: CookieSource,
+    ) -> Result<(), ControlledCookiePolicyError> {
+        let _ = method;
+        let same_site = controlled_same_site(request_url, context)?;
+        if matches!(context.policy, ControlledCookiePolicy::SessionV1) && !same_site {
+            return Err(ControlledCookiePolicyError::SameSiteContextUnsupported);
+        }
         if cookie_values.len() > CONTROLLED_COOKIE_MAX_BATCH_VALUES_V1 {
             return Err(ControlledCookiePolicyError::InvalidCookie);
         }
@@ -441,23 +546,43 @@ impl CookieStorage {
             if cookie_value.len() > CONTROLLED_COOKIE_MAX_RAW_VALUE_BYTES_V1 {
                 return Err(ControlledCookiePolicyError::InvalidCookie);
             }
-            if has_cookie_attribute(cookie_value, "expires")
-                || has_cookie_attribute(cookie_value, "max-age")
+            if matches!(context.policy, ControlledCookiePolicy::SessionV1)
+                && (has_cookie_attribute(cookie_value, "expires")
+                    || has_cookie_attribute(cookie_value, "max-age"))
             {
                 return Err(ControlledCookiePolicyError::PersistentCookieUnsupported);
             }
             if has_cookie_attribute(cookie_value, "partitioned") {
                 return Err(ControlledCookiePolicyError::PartitionedCookieUnsupported);
             }
-            let cookie = ServoCookie::from_cookie_string(cookie_value, request_url, source)
-                .ok_or(ControlledCookiePolicyError::InvalidCookie)?;
+            let cookie = match context.policy {
+                ControlledCookiePolicy::SessionV1 => {
+                    ServoCookie::from_cookie_string(cookie_value, request_url, source)
+                },
+                ControlledCookiePolicy::SessionV2 { unix_time_ns } => {
+                    ServoCookie::from_controlled_cookie_string(
+                        cookie_value,
+                        request_url,
+                        source,
+                        unix_time_ns,
+                    )?
+                },
+            }
+            .ok_or(ControlledCookiePolicyError::InvalidCookie)?;
             if !is_valid_cookie_state_name_and_value(cookie.cookie.name(), cookie.cookie.value())
                 || (cookie.cookie.same_site() == Some(SameSite::None)
                     && cookie.cookie.secure() != Some(true))
             {
                 return Err(ControlledCookiePolicyError::InvalidCookie);
             }
-            cookies.push(cookie);
+            let cross_site_subresource_ignored =
+                matches!(context.policy, ControlledCookiePolicy::SessionV2 { .. })
+                    && !same_site
+                    && !context.top_level_navigation
+                    && cookie.cookie.same_site() != Some(SameSite::None);
+            if !cross_site_subresource_ignored {
+                cookies.push(cookie);
+            }
         }
         // Apply the whole response/page mutation to a private jar. Ordinary `push` intentionally
         // reports no result and can ignore a cookie (for example, a non-HTTP overwrite of an
@@ -466,10 +591,22 @@ impl CookieStorage {
         // silent no-ops, while the staged export proves the final global count and byte bounds.
         let mut staged = self.clone();
         let initial_revision = staged.revision;
+        if let ControlledCookiePolicy::SessionV2 { unix_time_ns } = context.policy {
+            staged.remove_controlled_expired_cookies_for_url(request_url, unix_time_ns)?;
+        }
         for cookie in cookies {
             let previous_revision = staged.revision;
-            staged.push_controlled(cookie, request_url, source)?;
-            if staged.revision == previous_revision {
+            let allow_noop_deletion = matches!(context.policy, ControlledCookiePolicy::SessionV2 { unix_time_ns }
+                if cookie.controlled_expiry_time_ns.is_some_and(|expiry| expiry <= u64::try_from(unix_time_ns).unwrap_or(u64::MAX)));
+            match context.policy {
+                ControlledCookiePolicy::SessionV1 => {
+                    staged.push_controlled(cookie, request_url, source)?;
+                },
+                ControlledCookiePolicy::SessionV2 { unix_time_ns } => {
+                    staged.push_controlled_v2(cookie, request_url, source, unix_time_ns)?;
+                },
+            }
+            if staged.revision == previous_revision && !allow_noop_deletion {
                 return Err(ControlledCookiePolicyError::InvalidCookie);
             }
         }
@@ -477,8 +614,8 @@ impl CookieStorage {
             return Ok(());
         }
         staged
-            .export_state()
-            .map_err(|_| ControlledCookiePolicyError::InvalidCookie)?;
+            .export_state_with_policy(context.policy)
+            .map_err(state_error_to_controlled_policy)?;
         *self = staged;
         Ok(())
     }
@@ -536,7 +673,21 @@ impl CookieStorage {
     /// controller-owned stamps rather than Servo's ordinary wall-clock timestamps. Partitioned
     /// cookies are rejected because the current jar has no partition key.
     pub fn export_state(&mut self) -> Result<CookieStateSnapshotV1, CookieStateError> {
-        self.remove_all_expired_cookies();
+        self.export_state_with_policy(ControlledCookiePolicy::SessionV1)
+    }
+
+    /// Export state using either the frozen v1 session-cookie boundary or v2 controlled time.
+    pub fn export_state_with_policy(
+        &mut self,
+        policy: ControlledCookiePolicy,
+    ) -> Result<CookieStateSnapshotV1, CookieStateError> {
+        match policy {
+            ControlledCookiePolicy::SessionV1 => self.remove_all_expired_cookies(),
+            ControlledCookiePolicy::SessionV2 { unix_time_ns } => {
+                self.remove_all_controlled_expired_cookies(unix_time_ns)
+                    .map_err(controlled_policy_to_state_error)?;
+            },
+        }
         if self.revision_exhausted {
             return Err(CookieStateError::RevisionExhausted);
         }
@@ -545,7 +696,16 @@ impl CookieStorage {
         if cookies.len() > COOKIE_STATE_MAX_COOKIES_V1 {
             return Err(CookieStateError::TooManyCookies);
         }
-        if cookies.iter().any(|cookie| cookie.persistent) {
+        if matches!(policy, ControlledCookiePolicy::SessionV1)
+            && cookies.iter().any(|cookie| cookie.persistent)
+        {
+            return Err(CookieStateError::PersistentCookieUnsupported);
+        }
+        if matches!(policy, ControlledCookiePolicy::SessionV2 { .. })
+            && cookies
+                .iter()
+                .any(|cookie| cookie.persistent && cookie.controlled_expiry_time_ns.is_none())
+        {
             return Err(CookieStateError::PersistentCookieUnsupported);
         }
         if cookies
@@ -610,7 +770,10 @@ impl CookieStorage {
                 secure: cookie.cookie.secure().unwrap_or(false),
                 http_only: cookie.cookie.http_only().unwrap_or(false),
                 same_site: project_same_site(cookie.cookie.same_site()),
-                expires_unix_time_ns: None,
+                expires_unix_time_ns: match policy {
+                    ControlledCookiePolicy::SessionV1 => None,
+                    ControlledCookiePolicy::SessionV2 { .. } => cookie.controlled_expiry_time_ns,
+                },
                 partitioned: false,
                 creation_sequence: creation_sequences[&identity],
                 last_access_sequence: access_sequences[&identity],
@@ -629,6 +792,20 @@ impl CookieStorage {
     /// Atomically replace this jar from a fully validated session-cookie snapshot.
     pub fn replace_state(
         &mut self,
+        expected_revision: u64,
+        snapshot: CookieStateSnapshotV1,
+    ) -> Result<u64, CookieStateError> {
+        self.replace_state_with_policy(
+            ControlledCookiePolicy::SessionV1,
+            expected_revision,
+            snapshot,
+        )
+    }
+
+    /// Atomically replace this jar under an explicit controlled-session cookie policy.
+    pub fn replace_state_with_policy(
+        &mut self,
+        policy: ControlledCookiePolicy,
         expected_revision: u64,
         snapshot: CookieStateSnapshotV1,
     ) -> Result<u64, CookieStateError> {
@@ -661,7 +838,9 @@ impl CookieStorage {
             if record.partitioned {
                 return Err(CookieStateError::PartitionedCookieUnsupported);
             }
-            if record.expires_unix_time_ns.is_some() {
+            if matches!(policy, ControlledCookiePolicy::SessionV1)
+                && record.expires_unix_time_ns.is_some()
+            {
                 return Err(CookieStateError::PersistentCookieUnsupported);
             }
             let identity = cookie_record_identity(&record);
@@ -696,7 +875,18 @@ impl CookieStorage {
                 return Err(CookieStateError::SnapshotTooLarge);
             }
 
-            let cookie = cookie_from_state_record(record)?;
+            if let ControlledCookiePolicy::SessionV2 { unix_time_ns } = policy {
+                let now = u64::try_from(unix_time_ns)
+                    .map_err(|_| CookieStateError::TimeRangeUnsupported)?;
+                if record
+                    .expires_unix_time_ns
+                    .is_some_and(|expiry| expiry <= now)
+                {
+                    continue;
+                }
+            }
+
+            let cookie = cookie_from_state_record_with_policy(record, policy)?;
             let host = reg_host(cookie.cookie.domain().as_deref().unwrap_or(""));
             let host_cookies = replacement.entry(host).or_default();
             if host_cookies.len() == self.max_per_host {
@@ -738,6 +928,114 @@ impl CookieStorage {
                 .ok_or(ControlledCookiePolicyError::InvalidCookie)?,
         );
         self.push(cookie, url, source);
+        Ok(())
+    }
+
+    fn push_controlled_v2(
+        &mut self,
+        mut cookie: ServoCookie,
+        url: &ServoUrl,
+        source: CookieSource,
+        unix_time_ns: u128,
+    ) -> Result<(), ControlledCookiePolicyError> {
+        let now = u64::try_from(unix_time_ns)
+            .map_err(|_| ControlledCookiePolicyError::TimeRangeUnsupported)?;
+        self.ensure_controlled_ordering()
+            .map_err(|()| ControlledCookiePolicyError::InvalidCookie)?;
+
+        if cookie
+            .controlled_expiry_time_ns
+            .is_some_and(|expiry| expiry <= now)
+        {
+            self.remove(&cookie, url, source)
+                .map_err(|_| ControlledCookiePolicyError::InvalidCookie)?;
+            return Ok(());
+        }
+
+        cookie.controlled_creation_sequence = Some(
+            self.reserve_controlled_creation_sequence()
+                .map_err(|()| ControlledCookiePolicyError::InvalidCookie)?,
+        );
+        cookie.controlled_last_access_sequence = Some(
+            self.reserve_controlled_access_sequences(1)
+                .map_err(|()| ControlledCookiePolicyError::InvalidCookie)?
+                .into_iter()
+                .next()
+                .ok_or(ControlledCookiePolicyError::InvalidCookie)?,
+        );
+
+        if cookie.cookie.secure().unwrap_or(false) && !url.is_secure_scheme() {
+            return Err(ControlledCookiePolicyError::InvalidCookie);
+        }
+        let old_cookie = self
+            .remove(&cookie, url, source)
+            .map_err(|_| ControlledCookiePolicyError::InvalidCookie)?;
+        if let Some(old_cookie) = old_cookie {
+            cookie.creation_time = old_cookie.creation_time;
+            cookie.controlled_creation_sequence = old_cookie
+                .controlled_creation_sequence
+                .or(cookie.controlled_creation_sequence);
+        }
+
+        let domain = reg_host(cookie.cookie.domain().as_ref().unwrap_or(&""));
+        let cookies = self.cookies_map.entry(domain).or_default();
+        if cookies.len() == self.max_per_host
+            && !evict_one_controlled_cookie(cookie.cookie.secure().unwrap_or(false), cookies)
+        {
+            return Err(ControlledCookiePolicyError::InvalidCookie);
+        }
+        cookies.push(cookie);
+        self.bump_revision();
+        Ok(())
+    }
+
+    fn remove_controlled_expired_cookies_for_url(
+        &mut self,
+        url: &ServoUrl,
+        unix_time_ns: u128,
+    ) -> Result<(), ControlledCookiePolicyError> {
+        let now = u64::try_from(unix_time_ns)
+            .map_err(|_| ControlledCookiePolicyError::TimeRangeUnsupported)?;
+        let domain = reg_host(url.host_str().unwrap_or(""));
+        let mut changed = false;
+        if let Entry::Occupied(mut entry) = self.cookies_map.entry(domain) {
+            let cookies = entry.get_mut();
+            let old_len = cookies.len();
+            cookies.retain(|cookie| {
+                !cookie
+                    .controlled_expiry_time_ns
+                    .is_some_and(|expiry| expiry <= now)
+            });
+            changed = cookies.len() != old_len;
+            if cookies.is_empty() {
+                entry.remove_entry();
+            }
+        }
+        if changed {
+            self.bump_revision();
+        }
+        Ok(())
+    }
+
+    fn remove_all_controlled_expired_cookies(
+        &mut self,
+        unix_time_ns: u128,
+    ) -> Result<(), ControlledCookiePolicyError> {
+        let now = u64::try_from(unix_time_ns)
+            .map_err(|_| ControlledCookiePolicyError::TimeRangeUnsupported)?;
+        let old_len: usize = self.cookies_map.values().map(Vec::len).sum();
+        self.cookies_map.retain(|_, cookies| {
+            cookies.retain(|cookie| {
+                !cookie
+                    .controlled_expiry_time_ns
+                    .is_some_and(|expiry| expiry <= now)
+            });
+            !cookies.is_empty()
+        });
+        let new_len: usize = self.cookies_map.values().map(Vec::len).sum();
+        if new_len != old_len {
+            self.bump_revision();
+        }
         Ok(())
     }
 
@@ -995,17 +1293,77 @@ fn cookie_record_identity(record: &CookieStateRecordV1) -> (String, String, Stri
     )
 }
 
-fn ensure_controlled_same_site(
+fn controlled_same_site(
     request_url: &ServoUrl,
-    top_level_url: &ServoUrl,
-) -> Result<(), ControlledCookiePolicyError> {
-    if !matches!(request_url.scheme(), "http" | "https")
-        || !matches!(top_level_url.scheme(), "http" | "https")
-        || !is_same_site(&request_url.origin(), &top_level_url.origin())
-    {
+    context: &ControlledCookieContext,
+) -> Result<bool, ControlledCookiePolicyError> {
+    if !matches!(request_url.scheme(), "http" | "https") {
         return Err(ControlledCookiePolicyError::SameSiteContextUnsupported);
     }
-    Ok(())
+    let site_for_cookies = context
+        .site_for_cookies
+        .as_ref()
+        .ok_or(ControlledCookiePolicyError::SameSiteContextUnsupported)?;
+    let site_for_cookies = ServoUrl::from_url(site_for_cookies.clone());
+    if !matches!(site_for_cookies.scheme(), "http" | "https") {
+        return Err(ControlledCookiePolicyError::SameSiteContextUnsupported);
+    }
+    Ok(is_same_site(
+        &request_url.origin(),
+        &site_for_cookies.origin(),
+    ))
+}
+
+fn controlled_same_site_allows_cookie(
+    cookie: &ServoCookie,
+    same_site: bool,
+    method: &Method,
+    context: &ControlledCookieContext,
+) -> bool {
+    if same_site || matches!(context.policy, ControlledCookiePolicy::SessionV1) {
+        return true;
+    }
+    match cookie.cookie.same_site() {
+        Some(SameSite::None) => true,
+        Some(SameSite::Strict) => false,
+        Some(SameSite::Lax) | None => {
+            context.top_level_navigation && controlled_method_is_safe(method)
+        },
+    }
+}
+
+fn controlled_method_is_safe(method: &Method) -> bool {
+    method == Method::GET
+        || method == Method::HEAD
+        || method == Method::OPTIONS
+        || method == Method::TRACE
+}
+
+fn controlled_policy_to_state_error(error: ControlledCookiePolicyError) -> CookieStateError {
+    match error {
+        ControlledCookiePolicyError::TimeRangeUnsupported => CookieStateError::TimeRangeUnsupported,
+        ControlledCookiePolicyError::PartitionedCookieUnsupported => {
+            CookieStateError::PartitionedCookieUnsupported
+        },
+        ControlledCookiePolicyError::PersistentCookieUnsupported => {
+            CookieStateError::PersistentCookieUnsupported
+        },
+        ControlledCookiePolicyError::SameSiteContextUnsupported
+        | ControlledCookiePolicyError::InvalidCookie => CookieStateError::InvalidCookie,
+    }
+}
+
+fn state_error_to_controlled_policy(error: CookieStateError) -> ControlledCookiePolicyError {
+    match error {
+        CookieStateError::TimeRangeUnsupported => ControlledCookiePolicyError::TimeRangeUnsupported,
+        CookieStateError::PartitionedCookieUnsupported => {
+            ControlledCookiePolicyError::PartitionedCookieUnsupported
+        },
+        CookieStateError::PersistentCookieUnsupported => {
+            ControlledCookiePolicyError::PersistentCookieUnsupported
+        },
+        _ => ControlledCookiePolicyError::InvalidCookie,
+    }
 }
 
 fn has_cookie_attribute(cookie_value: &str, expected: &str) -> bool {
@@ -1027,7 +1385,10 @@ fn project_same_site(same_site: Option<SameSite>) -> CookieStateSameSite {
     }
 }
 
-fn cookie_from_state_record(record: CookieStateRecordV1) -> Result<ServoCookie, CookieStateError> {
+fn cookie_from_state_record_with_policy(
+    record: CookieStateRecordV1,
+    policy: ControlledCookiePolicy,
+) -> Result<ServoCookie, CookieStateError> {
     if !is_canonical_cookie_state_domain(&record.domain)
         || !record.path.starts_with('/')
         || !is_valid_cookie_state_name_and_value(&record.name, &record.value)
@@ -1046,6 +1407,19 @@ fn cookie_from_state_record(record: CookieStateRecordV1) -> Result<ServoCookie, 
 
     let creation_sequence = record.creation_sequence;
     let last_access_sequence = record.last_access_sequence;
+    let expires_unix_time_ns = record.expires_unix_time_ns;
+    if let (ControlledCookiePolicy::SessionV2 { unix_time_ns }, Some(expiry)) =
+        (policy, expires_unix_time_ns)
+    {
+        let now =
+            u64::try_from(unix_time_ns).map_err(|_| CookieStateError::TimeRangeUnsupported)?;
+        let maximum = now
+            .checked_add(34_560_000_u64 * 1_000_000_000)
+            .ok_or(CookieStateError::TimeRangeUnsupported)?;
+        if expiry > maximum {
+            return Err(CookieStateError::TimeRangeUnsupported);
+        }
+    }
     let mut cookie = Cookie::new(record.name.clone(), record.value.clone());
     if !record.host_only {
         cookie.set_domain(internal_cookie_state_domain(&record.domain));
@@ -1064,8 +1438,16 @@ fn cookie_from_state_record(record: CookieStateRecordV1) -> Result<ServoCookie, 
     let scheme = if record.secure { "https" } else { "http" };
     let request = ServoUrl::parse(&format!("{scheme}://{authority}{}", record.path))
         .map_err(|_| CookieStateError::InvalidCookie)?;
-    let mut wrapped = ServoCookie::new_wrapped(cookie, &request, CookieSource::HTTP)
-        .ok_or(CookieStateError::InvalidCookie)?;
+    let mut wrapped = match policy {
+        ControlledCookiePolicy::SessionV1 => {
+            ServoCookie::new_wrapped(cookie, &request, CookieSource::HTTP)
+        },
+        ControlledCookiePolicy::SessionV2 { unix_time_ns } => {
+            ServoCookie::new_controlled_wrapped(cookie, &request, CookieSource::HTTP, unix_time_ns)
+                .map_err(controlled_policy_to_state_error)?
+        },
+    }
+    .ok_or(CookieStateError::InvalidCookie)?;
     // Servo's public-suffix helper treats every dotless string as a suffix, including its
     // bracketed internal IPv6 host spelling, and therefore converts an IPv6 Domain attribute to
     // host-only. Portable state keeps the caller's explicit flag. Restoring `false` here is safe:
@@ -1086,8 +1468,9 @@ fn cookie_from_state_record(record: CookieStateRecordV1) -> Result<ServoCookie, 
         .ok_or(CookieStateError::InvalidCookie)?;
     wrapped.controlled_creation_sequence = Some(creation_sequence);
     wrapped.controlled_last_access_sequence = Some(last_access_sequence);
-    wrapped.persistent = false;
+    wrapped.persistent = expires_unix_time_ns.is_some();
     wrapped.expiry_time = None;
+    wrapped.controlled_expiry_time_ns = expires_unix_time_ns;
     Ok(wrapped)
 }
 
@@ -1139,6 +1522,33 @@ fn evict_one_cookie(is_secure_cookie: bool, cookies: &mut Vec<ServoCookie>) -> b
         }
     }
     true
+}
+
+fn evict_one_controlled_cookie(is_secure_cookie: bool, cookies: &mut Vec<ServoCookie>) -> bool {
+    let oldest = |secure: bool, cookies: &[ServoCookie]| {
+        cookies
+            .iter()
+            .enumerate()
+            .filter(|(_, cookie)| cookie.cookie.secure().unwrap_or(false) == secure)
+            .min_by(|(_, left), (_, right)| {
+                left.controlled_last_access_sequence
+                    .cmp(&right.controlled_last_access_sequence)
+                    .then_with(|| cookie_identity(left).cmp(&cookie_identity(right)))
+            })
+            .map(|(index, _)| index)
+    };
+    if let Some(index) = oldest(false, cookies) {
+        cookies.remove(index);
+        return true;
+    }
+    if !is_secure_cookie {
+        return false;
+    }
+    if let Some(index) = oldest(true, cookies) {
+        cookies.remove(index);
+        return true;
+    }
+    false
 }
 
 fn get_oldest_accessed(

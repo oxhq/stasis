@@ -4936,14 +4936,14 @@ mod tests {
     }
 
     #[test]
-    fn controlled_web_session_v2_profile_is_an_explicit_execution_and_presentation_expansion() {
+    fn controlled_web_session_v2_profile_is_an_explicit_bounded_surface_expansion() {
         let profile_bytes = include_bytes!("../../../profiles/controlled-web-session-v2.json");
         assert_eq!(
             Sha256::digest(profile_bytes)
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>(),
-            "ced49928c0c5f77669285a658434209101d27907bd26d07296d5d40e2ad7a412",
+            "b42c0a588b4b01007b7df82d32e06877918e54879b2aaa1773f9c4b6ed4cec07",
             "the candidate test must be closed over every advertised profile field",
         );
         let profile: Value = serde_json::from_slice(profile_bytes)
@@ -4959,7 +4959,7 @@ mod tests {
         assert_eq!(profile["compatibility"]["predecessorContractUnchanged"], true);
         assert_eq!(
             profile["compatibility"]["profileExpansion"],
-            "execution_and_headless_presentation_surfaces_only"
+            "execution_headless_presentation_and_controlled_cookie_state_surfaces"
         );
         assert_eq!(
             profile["execution"]["messageChannel"]["construction"]["interface"],
@@ -5302,6 +5302,17 @@ mod tests {
             inline_svg_product_surfaces,
             ["bounded_controlled_top_level_internal_serialized_data_svg_inline_rendering"]
         );
+        let cookie_response_product_surfaces: Vec<_> = profile["supportedProductSurface"]
+            .as_array()
+            .expect("supportedProductSurface must be an array")
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|surface| surface.contains("SameSite_response_cookie_storage"))
+            .collect();
+        assert_eq!(
+            cookie_response_product_surfaces,
+            ["bounded_schemeful_SameSite_response_cookie_storage"]
+        );
         assert_eq!(
             profile["unsupportedClasses"]["hostTimestamp"],
             json!({
@@ -5325,19 +5336,93 @@ mod tests {
                 "nestedOrExternalSvgResources": "not_proven",
             })
         );
-        // SessionStateV1 is intentionally the portable artifact for both runtime profiles. Its
-        // frozen state.profile identity remains controlled-web-session-v1.
+        // V2 state is profile-discriminated. V1 remains frozen and is never migrated implicitly.
         assert_eq!(
             profile["compatibility"]["stateArtifactProfile"],
-            "controlled-web-session-v1"
+            "selected_controlled_session_profile_exact"
         );
         assert_eq!(
             profile["sessionState"]["artifactProfile"],
-            "controlled-web-session-v1"
+            "controlled-web-session-v2"
         );
         assert_eq!(
             profile["sessionState"]["compatibleSelectedProfiles"],
-            json!(["controlled-web-session-v1", "controlled-web-session-v2"])
+            json!(["controlled-web-session-v2"])
+        );
+        assert_eq!(
+            profile["sessionState"]["cookies"]["persistence"],
+            json!({
+                "mode": "controlled_session_owned_expiry",
+                "storage": "memory_only_for_session_lifetime",
+                "diskOrHostPersistence": false,
+                "portablePersistence":
+                    "explicit_profile_v2_state_export_and_initial_import_only",
+                "clock": "controlled_unix_time_ns_with_origin_zero",
+                "maxAgePrecedence": "last_valid_Max-Age_over_Expires",
+                "maximumLifetimeSeconds": 34_560_000,
+                "clamp": "now_plus_400_days",
+                "purge":
+                    "lazily_before_cookie_observation_request_selection_and_state_export",
+                "expiresAtOrBeforeNow": "delete_instead_of_retain",
+            })
+        );
+        assert_eq!(
+            profile["sessionState"]["cookies"]["timeRange"],
+            json!({
+                "maximumControlledUnixTimeNsInclusive": "18446744073709551615",
+                "postOpenNetworkRequestAboveMaximum": {
+                    "code": "unsupported_cookie_time_range",
+                    "boundary": "before_network_start_and_cookie_header_construction",
+                    "fatal": false,
+                    "stateEffect": "partial",
+                    "processEffect": "continue",
+                },
+                "controlledOpenFailurePrecedence": "same_code_hardened_to_fatal_fail_stop",
+                "persistentExpiryWithoutU64Headroom": "unsupported_cookie_time_range",
+                "pageApiDomException": "NotSupportedError",
+            })
+        );
+        assert_eq!(
+            profile["sessionState"]["cookies"]["sameSite"],
+            json!({
+                "metadataRoundTrip": true,
+                "siteModel": "schemeful_site",
+                "context": {
+                    "requestClient": "captured_at_request_creation",
+                    "siteForCookies": "captured_from_request_client",
+                    "requestMethod": "current_redirect_hop_method",
+                    "topLevelNavigation": "captured_request_boolean",
+                    "unknownOrOpaque": {
+                        "code": "unsupported_cookie_same_site_context",
+                        "boundary": "before_network_start_and_cookie_header_construction",
+                    },
+                },
+                "none": "requires_secure",
+                "strict": "included_only_for_schemeful_same_site_requests",
+                "lax":
+                    "included_for_schemeful_same_site_or_cross_site_top_level_safe_method",
+                "unspecified": "same_request_filter_as_lax",
+                "safeMethods": ["GET", "HEAD", "OPTIONS", "TRACE"],
+                "noneSelection": "included_cross_site_when_secure",
+                "ineligibleCookie":
+                    "filtered_before_cookie_header_construction_without_terminal",
+                "responseStorage": {
+                    "sameSiteOrTopLevelNavigation":
+                        "all_valid_unpartitioned_response_cookies_eligible",
+                    "crossSiteSubresource":
+                        "only_secure_SameSite_None_eligible_Strict_Lax_and_unspecified_ignored_without_terminal",
+                    "requestMethod": "not_an_admission_input",
+                },
+            })
+        );
+        assert_eq!(
+            profile["sessionState"]["cookies"]["setCookie"],
+            json!({
+                "expiresOrMaxAge": "supported_by_controlled_expiry_policy",
+                "partitioned": "unsupported_partitioned_cookie",
+                "invalid": "invalid_controlled_cookie",
+                "boundary": "before_cookie_jar_mutation",
+            })
         );
     }
 

@@ -4,7 +4,8 @@ import type {
   SessionExtractPlan,
   SessionNetworkOptions,
   SessionOpenOptions,
-  SessionState,
+  SessionStateFor,
+  SessionStateV1,
   SettleOutcome,
   SettlePolicy,
 } from "./types.js";
@@ -70,7 +71,15 @@ export interface ReferenceCrawlerPool<SessionType extends ReferenceCrawlerSessio
   ): Promise<Result>;
 }
 
-export interface ReferenceCrawlerOptions {
+/**
+ * Reference-crawler options keep the selected profile and imported state artifact discriminated.
+ * Omitting the generic retains the frozen v1 default. The optional `profile` member is preserved
+ * for v1 source compatibility; candidate-aware values must carry an explicit candidate profile at
+ * the `crawlWithStasis()` call boundary, where no implicit artifact migration can type-check.
+ */
+export interface ReferenceCrawlerOptions<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+> {
   readonly start: string | URL | readonly (string | URL)[];
   readonly maxPages: number;
   readonly maxDepth: number;
@@ -81,9 +90,9 @@ export interface ReferenceCrawlerOptions {
    */
   readonly allowedOrigins?: readonly (string | URL)[];
   /** Defaults to controlled-web-session-v1; candidate profiles require explicit selection. */
-  readonly profile?: SelectableSessionProfile;
+  readonly profile?: Profile;
   /** Imported into every fresh session before its first request. */
-  readonly state?: SessionState;
+  readonly state?: SessionStateFor<Profile>;
   /** Use fixtures_only for a cross-run reproducible crawl. */
   readonly network?: SessionNetworkOptions;
   readonly settle?: SettlePolicy;
@@ -133,9 +142,20 @@ interface FrontierEntry {
  * Each page gets one fresh process/session from the pool. It performs no sleep,
  * retry, proxy, stealth, robots, or distributed-frontier behavior.
  */
+export function crawlWithStasis<SessionType extends ReferenceCrawlerSession>(
+  pool: ReferenceCrawlerPool<SessionType>,
+  options: ReferenceCrawlerOptions<SessionSupportProfile>,
+): Promise<ReferenceCrawlResult>;
+export function crawlWithStasis<
+  Profile extends SelectableSessionProfile,
+  SessionType extends ReferenceCrawlerSession,
+>(
+  pool: ReferenceCrawlerPool<SessionType>,
+  options: ReferenceCrawlerOptions<Profile> & { readonly profile: Profile },
+): Promise<ReferenceCrawlResult>;
 export async function crawlWithStasis<SessionType extends ReferenceCrawlerSession>(
   pool: ReferenceCrawlerPool<SessionType>,
-  options: ReferenceCrawlerOptions,
+  options: ReferenceCrawlerOptions<SelectableSessionProfile>,
 ): Promise<ReferenceCrawlResult> {
   const maxPages = positiveFiniteInteger(options.maxPages, "maxPages");
   const maxDepth = nonNegativeFiniteInteger(options.maxDepth, "maxDepth");
@@ -201,10 +221,9 @@ async function crawlOne<SessionType extends ReferenceCrawlerSession>(
   pool: ReferenceCrawlerPool<SessionType>,
   entry: FrontierEntry,
   allowedOrigins: ReadonlySet<string>,
-  options: ReferenceCrawlerOptions,
+  options: ReferenceCrawlerOptions<SelectableSessionProfile>,
 ): Promise<CrawlPageResult> {
-  const sharedOpenOptions: SessionOpenOptions<SessionSupportProfile> = {
-    ...(options.state === undefined ? {} : { state: options.state }),
+  const sharedOpenOptions: Omit<SessionOpenOptions<SessionSupportProfile>, "state"> = {
     ...(options.network === undefined ? {} : { network: options.network }),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   };
@@ -215,12 +234,22 @@ async function crawlOne<SessionType extends ReferenceCrawlerSession>(
           options: {
             ...sharedOpenOptions,
             profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+            ...(options.state === undefined
+              ? {}
+              : {
+                  state: options.state as SessionStateFor<
+                    typeof CONTROLLED_WEB_SESSION_V2_PROFILE
+                  >,
+                }),
           },
         }
       : {
           url: entry.url,
           options: {
             ...sharedOpenOptions,
+            ...(options.state === undefined
+              ? {}
+              : { state: options.state as SessionStateV1 }),
             ...(options.profile === undefined ? {} : { profile: options.profile }),
           },
         };
