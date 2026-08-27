@@ -16,6 +16,7 @@ import {
 } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { createServer } from "node:http";
+import { isIP } from "node:net";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual, parseArgs } from "node:util";
@@ -257,13 +258,21 @@ function writeServerText(response, status, contentType, body, headers = {}) {
 }
 
 async function listenLoopback(server, host) {
+  const addressFamily = isIP(host);
+  assert.ok(
+    host === "127.0.0.1" || host === "::1",
+    "release proof server must use an exact local-only loopback literal",
+  );
+  assert.ok(addressFamily === 4 || addressFamily === 6, "loopback host must be an IP literal");
   await new Promise((resolveListen, rejectListen) => {
     server.once("error", rejectListen);
     server.listen(0, host, resolveListen);
   });
   const address = server.address();
   assert.ok(address && typeof address === "object");
-  return `http://${host}:${address.port}`;
+  assert.equal(address.address, host, "server did not bind the requested loopback address");
+  const urlHost = addressFamily === 6 ? `[${host}]` : host;
+  return new URL(`http://${urlHost}:${address.port}`).origin;
 }
 
 async function closeServer(server) {
@@ -647,8 +656,21 @@ let v2CookieRestoreRuntimeWorkingDirectory;
 let v2CookieNoImportRuntimeWorkingDirectory;
 let v2CookieTimeRangeRuntimeWorkingDirectory;
 try {
-  cookieCrossUrl = await listenLoopback(cookieCrossServer, "127.0.0.2");
+  // IPv4 and IPv6 loopback are distinct IP-literal sites while remaining local-only on every
+  // supported runner. Using ::1 avoids assuming that an OS exposes arbitrary 127/8 aliases.
+  cookieCrossUrl = await listenLoopback(cookieCrossServer, "::1");
   const cookieMainUrl = await listenLoopback(cookieMainServer, "127.0.0.1");
+  const cookieMainSite = new URL(cookieMainUrl);
+  const cookieCrossSite = new URL(cookieCrossUrl);
+  assert.equal(cookieMainSite.protocol, "http:");
+  assert.equal(cookieCrossSite.protocol, "http:");
+  assert.equal(cookieMainSite.hostname, "127.0.0.1");
+  assert.equal(cookieCrossSite.hostname, "[::1]");
+  assert.notEqual(
+    cookieMainSite.hostname,
+    cookieCrossSite.hostname,
+    "cookie proof requires distinct schemeful IP-literal sites",
+  );
   explicitOverrideCacheDirectory = await mkdtemp(
     join(consumerRoot, ".stasis-explicit-override-cache-"),
   );
@@ -1695,7 +1717,7 @@ try {
       {
         name: "cross_lax",
         value: "must-not-cross",
-        domain: "127.0.0.2",
+        domain: "::1",
         path: "/",
         hostOnly: true,
         secure: false,
@@ -1723,6 +1745,11 @@ try {
     (cookie) => cookie.name === "cross_lax",
   );
   assert.ok(portableCrossSiteCookie, "portable v2 state omitted the cross-site Lax control");
+  assert.equal(
+    portableCrossSiteCookie.domain,
+    "::1",
+    "portable v2 state must retain the canonical unbracketed IPv6 cookie domain",
+  );
   assert.equal(portableCrossSiteCookie.expiresUnixTimeNs, crossSiteCookieExpiryNs);
 
   await v2CookieSessionHandle.close(commandDeadline());
@@ -1826,6 +1853,7 @@ try {
   const restoredCrossSiteCookie = restoredCookieState.state.cookies.find(
     (cookie) => cookie.name === "cross_lax",
   );
+  assert.equal(restoredCrossSiteCookie?.domain, "::1");
   assert.deepEqual(
     restoredCrossSiteCookie,
     portableCrossSiteCookie,
