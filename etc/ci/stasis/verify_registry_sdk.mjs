@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { lookup } from "node:dns/promises";
 import { createReadStream } from "node:fs";
 import {
   access,
@@ -15,7 +16,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, get as httpGet } from "node:http";
 import { isIP } from "node:net";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -257,7 +258,7 @@ function writeServerText(response, status, contentType, body, headers = {}) {
   response.end(bytes);
 }
 
-async function listenLoopback(server, host) {
+async function listenLoopback(server, host, port = 0) {
   const addressFamily = isIP(host);
   assert.ok(
     host === "127.0.0.1" || host === "::1",
@@ -266,13 +267,46 @@ async function listenLoopback(server, host) {
   assert.ok(addressFamily === 4 || addressFamily === 6, "loopback host must be an IP literal");
   await new Promise((resolveListen, rejectListen) => {
     server.once("error", rejectListen);
-    server.listen(0, host, resolveListen);
+    const options = { host, port };
+    if (addressFamily === 6) options.ipv6Only = true;
+    server.listen(options, resolveListen);
   });
   const address = server.address();
   assert.ok(address && typeof address === "object");
   assert.equal(address.address, host, "server did not bind the requested loopback address");
+  if (port !== 0) {
+    assert.equal(address.port, port, "loopback server did not retain the requested port");
+  }
   const urlHost = addressFamily === 6 ? `[${host}]` : host;
   return new URL(`http://${urlHost}:${address.port}`).origin;
+}
+
+async function readLocalHttpText(url) {
+  return await new Promise((resolveRead, rejectRead) => {
+    const request = httpGet(url, { headers: { connection: "close" } }, (response) => {
+      if (response.statusCode !== 200) {
+        response.resume();
+        rejectRead(new Error(`localhost preflight returned HTTP ${response.statusCode ?? 0}`));
+        return;
+      }
+      const chunks = [];
+      let bytes = 0;
+      response.on("data", (chunk) => {
+        bytes += chunk.length;
+        if (bytes > 1024) {
+          request.destroy(new Error("localhost preflight response exceeded 1024 bytes"));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.once("error", rejectRead);
+      response.once("end", () => resolveRead(Buffer.concat(chunks).toString("utf8")));
+    });
+    request.setTimeout(5_000, () => {
+      request.destroy(new Error("localhost preflight timed out"));
+    });
+    request.once("error", rejectRead);
+  });
 }
 
 async function closeServer(server) {
@@ -531,10 +565,17 @@ const fixtureUrl = `http://127.0.0.1:${address.port}/`;
 const cookieMainRequests = [];
 const cookieCrossRequests = [];
 let cookieCrossUrl;
-const cookieCrossServer = createServer((request, response) => {
+const cookieCrossPreflightPath = "/__stasis-localhost-preflight__";
+const cookieCrossPreflightBody = "stasis-localhost-loopback\n";
+const handleCookieCrossRequest = (request, response) => {
+  if (request.method === "GET" && request.url === cookieCrossPreflightPath) {
+    writeServerText(response, 200, "text/plain; charset=utf-8", cookieCrossPreflightBody);
+    return;
+  }
   cookieCrossRequests.push({
     method: request.method ?? "",
     url: request.url ?? "",
+    host: request.headers.host ?? "",
     cookie: request.headers.cookie ?? "",
   });
   if (request.method === "GET" && request.url === "/probe.js") {
@@ -547,7 +588,9 @@ const cookieCrossServer = createServer((request, response) => {
     return;
   }
   writeServerText(response, 404, "text/plain; charset=utf-8", "not found\n");
-});
+};
+const cookieCrossIpv4Server = createServer(handleCookieCrossRequest);
+const cookieCrossIpv6Server = createServer(handleCookieCrossRequest);
 const cookieMainServer = createServer((request, response) => {
   cookieMainRequests.push({
     method: request.method ?? "",
@@ -656,20 +699,46 @@ let v2CookieRestoreRuntimeWorkingDirectory;
 let v2CookieNoImportRuntimeWorkingDirectory;
 let v2CookieTimeRangeRuntimeWorkingDirectory;
 try {
-  // IPv4 and IPv6 loopback are distinct IP-literal sites while remaining local-only on every
-  // supported runner. Using ::1 avoids assuming that an OS exposes arbitrary 127/8 aliases.
-  cookieCrossUrl = await listenLoopback(cookieCrossServer, "::1");
+  // localhost is a distinct schemeful site from the main 127.0.0.1 document. Both exact loopback
+  // families serve one port so resolver ordering cannot create a same-site or external fallback.
+  const cookieCrossIpv4Url = await listenLoopback(cookieCrossIpv4Server, "127.0.0.1");
+  const cookieCrossPort = Number.parseInt(new URL(cookieCrossIpv4Url).port, 10);
+  assert.ok(Number.isInteger(cookieCrossPort) && cookieCrossPort > 0);
+  const cookieCrossIpv6Url = await listenLoopback(
+    cookieCrossIpv6Server,
+    "::1",
+    cookieCrossPort,
+  );
+  assert.equal(Number.parseInt(new URL(cookieCrossIpv6Url).port, 10), cookieCrossPort);
+  const localhostAddresses = await lookup("localhost", { all: true, verbatim: true });
+  assert.ok(localhostAddresses.length > 0, "localhost did not resolve");
+  assert.equal(
+    localhostAddresses.every(
+      ({ address: resolvedAddress, family }) =>
+        (resolvedAddress === "127.0.0.1" || resolvedAddress === "::1") &&
+        isIP(resolvedAddress) === family,
+    ),
+    true,
+    "localhost resolved outside the exact IPv4/IPv6 loopback listeners",
+  );
+  cookieCrossUrl = new URL(`http://localhost:${cookieCrossPort}`).origin;
+  assert.equal(
+    await readLocalHttpText(`${cookieCrossUrl}${cookieCrossPreflightPath}`),
+    cookieCrossPreflightBody,
+    "localhost HTTP preflight did not reach the shared loopback handler",
+  );
+  assert.deepEqual(cookieCrossRequests, [], "localhost preflight contaminated proof requests");
   const cookieMainUrl = await listenLoopback(cookieMainServer, "127.0.0.1");
   const cookieMainSite = new URL(cookieMainUrl);
   const cookieCrossSite = new URL(cookieCrossUrl);
   assert.equal(cookieMainSite.protocol, "http:");
   assert.equal(cookieCrossSite.protocol, "http:");
   assert.equal(cookieMainSite.hostname, "127.0.0.1");
-  assert.equal(cookieCrossSite.hostname, "[::1]");
+  assert.equal(cookieCrossSite.hostname, "localhost");
   assert.notEqual(
     cookieMainSite.hostname,
     cookieCrossSite.hostname,
-    "cookie proof requires distinct schemeful IP-literal sites",
+    "cookie proof requires distinct schemeful sites",
   );
   explicitOverrideCacheDirectory = await mkdtemp(
     join(consumerRoot, ".stasis-explicit-override-cache-"),
@@ -1717,7 +1786,7 @@ try {
       {
         name: "cross_lax",
         value: "must-not-cross",
-        domain: "::1",
+        domain: "localhost",
         path: "/",
         hostOnly: true,
         secure: false,
@@ -1747,8 +1816,8 @@ try {
   assert.ok(portableCrossSiteCookie, "portable v2 state omitted the cross-site Lax control");
   assert.equal(
     portableCrossSiteCookie.domain,
-    "::1",
-    "portable v2 state must retain the canonical unbracketed IPv6 cookie domain",
+    "localhost",
+    "portable v2 state must retain the canonical localhost cookie domain",
   );
   assert.equal(portableCrossSiteCookie.expiresUnixTimeNs, crossSiteCookieExpiryNs);
 
@@ -1841,6 +1910,7 @@ try {
   assert.deepEqual(cookieCrossRequests[0], {
     method: "GET",
     url: "/probe.js",
+    host: new URL(cookieCrossUrl).host,
     cookie: "",
   });
   const restoredCookieState = await v2CookieRestoreSession.exportState(commandDeadline());
@@ -1853,7 +1923,7 @@ try {
   const restoredCrossSiteCookie = restoredCookieState.state.cookies.find(
     (cookie) => cookie.name === "cross_lax",
   );
-  assert.equal(restoredCrossSiteCookie?.domain, "::1");
+  assert.equal(restoredCrossSiteCookie?.domain, "localhost");
   assert.deepEqual(
     restoredCrossSiteCookie,
     portableCrossSiteCookie,
@@ -2247,7 +2317,8 @@ try {
   }
   await closeServer(server);
   await closeServer(cookieMainServer);
-  await closeServer(cookieCrossServer);
+  await closeServer(cookieCrossIpv4Server);
+  await closeServer(cookieCrossIpv6Server);
   if (runtimeWorkingDirectory !== undefined) {
     await rm(runtimeWorkingDirectory, { recursive: true });
   }
