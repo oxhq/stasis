@@ -28,6 +28,7 @@ REVISION_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 POSITIVE_INTEGER_RE = re.compile(r"[1-9][0-9]*")
 CANONICAL_NONNEGATIVE_INTEGER_RE = re.compile(r"(?:0|[1-9][0-9]*)")
+MAX_U128 = (1 << 128) - 1
 PACKAGE_NAME = "@oxhq/stasis"
 REPOSITORY = "https://github.com/oxhq/stasis.git"
 GATE_NAME = "sdk-act-settle-inspect"
@@ -810,6 +811,15 @@ def require_v2_automation_event_timestamps_proof(
     initial_virtual_time_ns = int(value["initialVirtualTimeNs"])
     advanced_virtual_time_ns = int(value["advancedVirtualTimeNs"])
     dispatched_virtual_time_ns = int(value["dispatchedVirtualTimeNs"])
+    if any(
+        virtual_time_ns > MAX_U128
+        for virtual_time_ns in (
+            initial_virtual_time_ns,
+            advanced_virtual_time_ns,
+            dispatched_virtual_time_ns,
+        )
+    ):
+        raise NpmReleaseError(f"{description} virtual time exceeds u128")
     if advanced_virtual_time_ns != initial_virtual_time_ns + 5_000_000:
         raise NpmReleaseError(
             f"{description} did not advance exactly five milliseconds from its session baseline"
@@ -1989,6 +1999,17 @@ def self_test() -> None:
             "v2AutomationEventTimestamps"
         ]
         assert isinstance(base_v2_automation_event_timestamps, dict)
+        translated_v2_automation_event_timestamps = {
+            **base_v2_automation_event_timestamps,
+            "initialVirtualTimeNs": "240000000",
+            "advancedVirtualTimeNs": "245000000",
+            "dispatchedVirtualTimeNs": "245000000",
+            "controlledTrace": v2_automation_controlled_trace(45, 40),
+        }
+        require_v2_automation_event_timestamps_proof(
+            translated_v2_automation_event_timestamps,
+            "translated self-test automation event-timestamps proof",
+        )
         v2_automation_event_timestamps_record_mutations = [
             (
                 "missing automation event-timestamps lifecycle field",
@@ -2058,6 +2079,16 @@ def self_test() -> None:
                         "wrong automation dispatch virtual time",
                         "dispatchedVirtualTimeNs",
                         "140000000",
+                    ),
+                    (
+                        "numeric automation dispatch virtual time",
+                        "dispatchedVirtualTimeNs",
+                        145000000,
+                    ),
+                    (
+                        "noncanonical automation dispatch virtual time",
+                        "dispatchedVirtualTimeNs",
+                        "0145000000",
                     ),
                     ("wrong controlled automation event count", "controlledEventCount", "10"),
                     ("numeric controlled automation event count", "controlledEventCount", 11),
@@ -2153,6 +2184,15 @@ def self_test() -> None:
                     ),
                 )
             ],
+            (
+                "automation virtual time exceeds u128",
+                {
+                    **base_v2_automation_event_timestamps,
+                    "initialVirtualTimeNs": str(MAX_U128),
+                    "advancedVirtualTimeNs": str(MAX_U128 + 5_000_000),
+                    "dispatchedVirtualTimeNs": str(MAX_U128 + 5_000_000),
+                },
+            ),
         ]
 
         base_v2_css_animation_event_timestamps = gate_record[

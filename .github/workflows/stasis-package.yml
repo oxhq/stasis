@@ -2217,33 +2217,6 @@ jobs:
                       "exactBinaryLaunch": True,
                       "closeResponseAndEof": True,
                   },
-                  "v2AutomationEventTimestamps": {
-                      "profile": "controlled-web-session-v2",
-                      "navigationBoundary": "controlled_ready",
-                      "initialOutcome": "quiescent",
-                      "initialVirtualTimeNs": "140000000",
-                      "advancedVirtualTimeNs": "145000000",
-                      "dispatchedVirtualTimeNs": "145000000",
-                      "controlledEventCount": "11",
-                      "controlledTrace": (
-                          "25|fill:input:25>activate:click:25>reset:reset:25>check:click:25>"
-                          "check:input:25>check:change:25>select:input:25>select:change:25>"
-                          "invalid:invalid:25>submit:submit:25>submit:formdata:25|not-read|20"
-                      ),
-                      "browserEventCountAfterScriptProbe": "12",
-                      "scriptCreatedConstructorCount": "5",
-                      "scriptCreatedTrace": "0,0,0,0,0",
-                      "rejectedOutcome": "unsupported_work",
-                      "failureCode": "unsupported_clock_surface",
-                      "unsupportedKind": "other",
-                      "unsupportedCount": "1",
-                      "unsupportedReason": "time_surface",
-                      "unsupportedTimeSurface": "host_timestamp",
-                      "evidenceProfile": "controlled-web-session-v2",
-                      "sameControlledSession": True,
-                      "exactBinaryLaunch": True,
-                      "closeResponseAndEof": True,
-                  },
                   "v2CookieSession": {
                       "profile": "controlled-web-session-v2",
                       "stateSchemaVersion": "1",
@@ -2285,6 +2258,126 @@ jobs:
                       )
                   ):
                       raise SystemExit(f"{context} lost exact {field} evidence")
+              automation_record = document.get("v2AutomationEventTimestamps")
+              automation_expected_fixed = {
+                  "profile": "controlled-web-session-v2",
+                  "navigationBoundary": "controlled_ready",
+                  "initialOutcome": "quiescent",
+                  "controlledEventCount": "11",
+                  "browserEventCountAfterScriptProbe": "12",
+                  "scriptCreatedConstructorCount": "5",
+                  "scriptCreatedTrace": "0,0,0,0,0",
+                  "rejectedOutcome": "unsupported_work",
+                  "failureCode": "unsupported_clock_surface",
+                  "unsupportedKind": "other",
+                  "unsupportedCount": "1",
+                  "unsupportedReason": "time_surface",
+                  "unsupportedTimeSurface": "host_timestamp",
+                  "evidenceProfile": "controlled-web-session-v2",
+                  "sameControlledSession": True,
+                  "exactBinaryLaunch": True,
+                  "closeResponseAndEof": True,
+              }
+              automation_time_fields = (
+                  "initialVirtualTimeNs",
+                  "advancedVirtualTimeNs",
+                  "dispatchedVirtualTimeNs",
+              )
+              automation_dynamic_fields = set(automation_time_fields) | {"controlledTrace"}
+              if (
+                  type(automation_record) is not dict
+                  or set(automation_record)
+                      != set(automation_expected_fixed) | automation_dynamic_fields
+                  or any(
+                      type(automation_record.get(key)) is not type(value)
+                      or automation_record.get(key) != value
+                      for key, value in automation_expected_fixed.items()
+                  )
+                  or any(
+                      type(automation_record.get(field)) is not str
+                      or re.fullmatch(
+                          r"(?:0|[1-9][0-9]*)", automation_record[field]
+                      ) is None
+                      for field in automation_time_fields
+                  )
+              ):
+                  raise SystemExit(
+                      f"{context} lost exact v2AutomationEventTimestamps evidence"
+                  )
+              initial_virtual_time_ns = int(automation_record["initialVirtualTimeNs"])
+              advanced_virtual_time_ns = int(automation_record["advancedVirtualTimeNs"])
+              dispatched_virtual_time_ns = int(
+                  automation_record["dispatchedVirtualTimeNs"]
+              )
+              max_u128 = (1 << 128) - 1
+              if (
+                  any(
+                      virtual_time_ns > max_u128
+                      for virtual_time_ns in (
+                          initial_virtual_time_ns,
+                          advanced_virtual_time_ns,
+                          dispatched_virtual_time_ns,
+                      )
+                  )
+                  or advanced_virtual_time_ns
+                      != initial_virtual_time_ns + 5_000_000
+                  or dispatched_virtual_time_ns != advanced_virtual_time_ns
+              ):
+                  raise SystemExit(
+                      f"{context} lost the v2AutomationEventTimestamps clock invariant"
+                  )
+              controlled_trace = automation_record.get("controlledTrace")
+              if type(controlled_trace) is not str:
+                  raise SystemExit(
+                      f"{context} lost the v2AutomationEventTimestamps trace"
+                  )
+              controlled_trace_parts = controlled_trace.split("|")
+              if (
+                  len(controlled_trace_parts) != 4
+                  or controlled_trace_parts[2] != "not-read"
+                  or any(
+                      re.fullmatch(r"(?:0|[1-9][0-9]*)", part) is None
+                      for part in (
+                          controlled_trace_parts[0],
+                          controlled_trace_parts[3],
+                      )
+                  )
+              ):
+                  raise SystemExit(
+                      f"{context} lost the canonical v2AutomationEventTimestamps trace"
+                  )
+              controlled_event_time_ms = int(controlled_trace_parts[0])
+              controlled_baseline_time_ms = int(controlled_trace_parts[3])
+              controlled_timestamp = str(controlled_event_time_ms)
+              controlled_events = ">".join(
+                  f"{event_kind}:{controlled_timestamp}"
+                  for event_kind in (
+                      "fill:input",
+                      "activate:click",
+                      "reset:reset",
+                      "check:click",
+                      "check:input",
+                      "check:change",
+                      "select:input",
+                      "select:change",
+                      "invalid:invalid",
+                      "submit:submit",
+                      "submit:formdata",
+                  )
+              )
+              expected_controlled_trace = (
+                  f"{controlled_timestamp}|{controlled_events}|not-read|"
+                  f"{controlled_baseline_time_ms}"
+              )
+              if (
+                  controlled_event_time_ms != controlled_baseline_time_ms + 5
+                  or controlled_baseline_time_ms * 1_000_000
+                      >= initial_virtual_time_ns
+                  or controlled_trace != expected_controlled_trace
+              ):
+                  raise SystemExit(
+                      f"{context} lost the v2AutomationEventTimestamps trace invariant"
+                  )
               css_record = document.get("v2CssAnimationEventTimestamps")
               css_expected_fixed = {
                   "profile": "controlled-web-session-v2",

@@ -39,6 +39,7 @@ PUBLIC_PROFILE_README = Path("profiles/README.md")
 PUBLIC_TYPESCRIPT_SDK_README = Path("sdk/typescript/README.md")
 PUBLIC_RELEASE_RUNBOOK = Path("docs/stasis/releases.md")
 PUBLIC_RELEASE_WORKFLOW = Path(".github/workflows/stasis-package.yml")
+PUBLIC_NPM_PUBLISH_WORKFLOW = Path(".github/workflows/stasis-publish-npm.yml")
 MESSAGE_CHANNEL_LIMITS_SOURCE = Path("components/script/dom/globalscope/globalscope.rs")
 MESSAGE_CHANNEL_BASELINE_TEST_SOURCE = Path("ports/stasis/tests/baseline_protocol.rs")
 MESSAGE_CHANNEL_MULTI_PAIR_FIXTURE = Path("ports/stasis/tests/fixtures/message_channel_multi_pair.html")
@@ -3363,6 +3364,46 @@ def require_public_surface_markers(
             raise ReleaseError(f"{description} retains the contradictory public marker {marker!r}")
 
 
+def credential_free_v2_automation_verifier_block(source: str, description: str) -> str:
+    start = 'automation_record = document.get("v2AutomationEventTimestamps")'
+    end = 'css_record = document.get("v2CssAnimationEventTimestamps")'
+    if source.count(start) != 1 or source.count(end) != 1:
+        raise ReleaseError(f"{description} does not contain one v2 automation verifier block")
+    start_index = source.index(start)
+    end_index = source.index(end, start_index)
+    block = source[start_index:end_index]
+    require_public_surface_markers(
+        block,
+        description,
+        (
+            'automation_dynamic_fields = set(automation_time_fields) | {"controlledTrace"}',
+            'r"(?:0|[1-9][0-9]*)", automation_record[field]',
+            "max_u128 = (1 << 128) - 1",
+            "virtual_time_ns > max_u128",
+            "!= initial_virtual_time_ns + 5_000_000",
+            "dispatched_virtual_time_ns != advanced_virtual_time_ns",
+            'controlled_trace_parts = controlled_trace.split("|")',
+            'controlled_trace_parts[2] != "not-read"',
+            "controlled_event_time_ms != controlled_baseline_time_ms + 5",
+            "controlled_baseline_time_ms * 1_000_000",
+            ">= initial_virtual_time_ns",
+            "controlled_trace != expected_controlled_trace",
+            '"fill:input"',
+            '"submit:formdata"',
+        ),
+        forbidden=(
+            '"initialVirtualTimeNs": "140000000"',
+            '"advancedVirtualTimeNs": "145000000"',
+            '"dispatchedVirtualTimeNs": "145000000"',
+            '"initialVirtualTimeNs": "180000000"',
+            '"advancedVirtualTimeNs": "185000000"',
+            '"dispatchedVirtualTimeNs": "185000000"',
+            '"controlledTrace": (',
+        ),
+    )
+    return block
+
+
 def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     profile_filename = source_root / CANDIDATE_V2_PROFILE
     contract_filename = source_root / CANDIDATE_V2_CONTRACT
@@ -3372,6 +3413,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     public_typescript_sdk_readme_filename = source_root / PUBLIC_TYPESCRIPT_SDK_README
     public_release_runbook_filename = source_root / PUBLIC_RELEASE_RUNBOOK
     public_release_workflow_filename = source_root / PUBLIC_RELEASE_WORKFLOW
+    public_npm_publish_workflow_filename = source_root / PUBLIC_NPM_PUBLISH_WORKFLOW
     message_limits_filename = source_root / MESSAGE_CHANNEL_LIMITS_SOURCE
     message_baseline_test_filename = source_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
     message_multi_pair_fixture_filename = source_root / MESSAGE_CHANNEL_MULTI_PAIR_FIXTURE
@@ -3418,6 +3460,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     require_regular_file(public_typescript_sdk_readme_filename, "public TypeScript SDK README")
     require_regular_file(public_release_runbook_filename, "public release runbook")
     require_regular_file(public_release_workflow_filename, "public release-note workflow")
+    require_regular_file(public_npm_publish_workflow_filename, "public npm publish workflow")
     require_regular_file(message_limits_filename, "MessageChannel native limit source")
     require_regular_file(message_baseline_test_filename, "MessageChannel native baseline proof source")
     require_regular_file(message_multi_pair_fixture_filename, "MessageChannel multi-pair fixture")
@@ -3524,6 +3567,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         public_typescript_sdk_readme = public_typescript_sdk_readme_filename.read_text(encoding="utf-8")
         public_release_runbook = public_release_runbook_filename.read_text(encoding="utf-8")
         public_release_workflow = public_release_workflow_filename.read_text(encoding="utf-8")
+        public_npm_publish_workflow = public_npm_publish_workflow_filename.read_text(encoding="utf-8")
         message_limits_source = message_limits_filename.read_text(encoding="utf-8")
         message_baseline_test_source = message_baseline_test_filename.read_text(encoding="utf-8")
         message_multi_pair_fixture_source = message_multi_pair_fixture_filename.read_text(encoding="utf-8")
@@ -4798,6 +4842,16 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "the fatal blocked_on_external_io boundary",
         ),
     )
+    package_v2_automation_verifier = credential_free_v2_automation_verifier_block(
+        public_release_workflow,
+        "credential-free package v2 automation verifier",
+    )
+    publish_v2_automation_verifier = credential_free_v2_automation_verifier_block(
+        public_npm_publish_workflow,
+        "credential-free npm-publish v2 automation verifier",
+    )
+    if package_v2_automation_verifier != publish_v2_automation_verifier:
+        raise ReleaseError("credential-free package and npm-publish v2 automation verifiers diverged")
     verify_message_port_router_source(message_limits_source)
     verify_controlled_local_pending_projection_source(message_limits_source)
     verify_controlled_local_fifo_source(message_limits_source)
@@ -5543,6 +5597,7 @@ def self_test() -> None:
             PUBLIC_TYPESCRIPT_SDK_README,
             PUBLIC_RELEASE_RUNBOOK,
             PUBLIC_RELEASE_WORKFLOW,
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
             MESSAGE_CHANNEL_LIMITS_SOURCE,
             MESSAGE_CHANNEL_BASELINE_TEST_SOURCE,
             MESSAGE_CHANNEL_MULTI_PAIR_FIXTURE,
@@ -5770,6 +5825,30 @@ def self_test() -> None:
                 "one pipeline's image-cache store under immutable fixture routes",
                 "a global image-cache store under live routes",
                 "release-note HTTP image cache-provenance boundary",
+            ),
+            (
+                PUBLIC_RELEASE_WORKFLOW,
+                'automation_dynamic_fields = set(automation_time_fields) | {"controlledTrace"}',
+                "automation_dynamic_fields = set(automation_time_fields)",
+                "package attestation dynamic automation timestamp evidence",
+            ),
+            (
+                PUBLIC_RELEASE_WORKFLOW,
+                "max_u128 = (1 << 128) - 1",
+                "max_u128 = (1 << 64) - 1",
+                "package attestation u128 automation timestamp bound",
+            ),
+            (
+                PUBLIC_NPM_PUBLISH_WORKFLOW,
+                "controlled_trace != expected_controlled_trace",
+                "controlled_trace == expected_controlled_trace",
+                "npm-publish attestation exact automation trace reconstruction",
+            ),
+            (
+                PUBLIC_NPM_PUBLISH_WORKFLOW,
+                "dispatched_virtual_time_ns != advanced_virtual_time_ns",
+                "dispatched_virtual_time_ns == advanced_virtual_time_ns",
+                "npm-publish attestation automation dispatch-time equality",
             ),
         )
         for source_name, marker, replacement, description in public_surface_mutations:
