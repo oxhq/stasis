@@ -65,6 +65,7 @@ CONTROLLED_CSS_ANIMATION_EVENT_FIXTURE = Path(
     "ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html"
 )
 CONTROLLED_RENDERING_SETTLEMENT_SOURCE = Path("ports/stasis/src/settle.rs")
+CONTROLLED_SESSION_SHELL_SOURCE = Path("ports/stasis/src/main.rs")
 CONTROLLED_IMAGE_ELEMENT_SOURCE = Path("components/script/dom/html/embedded_content/htmlimageelement.rs")
 CONTROLLED_IMAGE_WINDOW_SOURCE = Path("components/script/dom/window/window.rs")
 CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE = Path("components/script/event_loop/script_thread.rs")
@@ -2173,6 +2174,41 @@ def verify_controlled_http_image_protocol_proof_source(
     )
 
 
+def verify_controlled_http_image_replacement_authority_source(
+    shell_source: str,
+    settlement_source: str,
+) -> None:
+    require_source_fragments_in_order(
+        shell_source,
+        (
+            "source_external_io_active_at_authorization:\n"
+            "                        controlled_network_blocks_document_replacement(\n"
+            "                            active_profile,\n"
+            "                            controlled_network_active_operations,\n"
+            "                        ),",
+            "fn controlled_network_blocks_document_replacement(",
+            "profile == Some(SessionProfile::ControlledWebSessionV2) && active_operations != 0",
+            "coordinator.latch_additional_foreground_external_io_active(\n"
+            "                    *source_external_io_active_at_authorization,\n"
+            "                );",
+            "fn active_controlled_network_latches_v2_document_replacement_only()",
+        ),
+        "v2 source-document external-I/O replacement latch",
+    )
+    require_source_fragments_in_order(
+        settlement_source,
+        (
+            "latched_additional_foreground_external_io_active: bool,",
+            "pub fn latch_additional_foreground_external_io_active(&mut self, active: bool)",
+            "self.latched_additional_foreground_external_io_active |= active;",
+            "if self.latched_additional_foreground_external_io_active\n"
+            "            || self.additional_foreground_external_io_active",
+            "fn latched_additional_foreground_io_survives_refresh_and_fails_closed()",
+        ),
+        "monotonic source-document external-I/O settlement gate",
+    )
+
+
 def verify_controlled_image_per_pipeline_cache_source(source: str) -> None:
     create_start = source.find("impl ImageCacheFactory for ImageCacheFactoryImpl")
     create_end = source.find("pub struct ImageCacheImpl", create_start)
@@ -3201,20 +3237,46 @@ def verify_controlled_inline_svg_rendering_source(
         (
             'include_bytes!("fixtures/controlled_v2_inline_svg.html")',
             'include_bytes!("fixtures/controlled_v2_inline_svg_advanced.html")',
+            "fn controlled_session_v2_direct_data_svg_is_owned_without_v1_promotion()",
+            '"controlled-web-session-v2"',
+            'ControlledImageProfileExpectation::Owned("load:0>loadend:0|now:0")',
+            '"controlled-web-session-v1"',
+            "ControlledImageProfileExpectation::Unsupported",
             "fn controlled_session_v2_inline_svg_rendering_is_owned_without_v1_promotion()",
             '"controlled-web-session-v2"',
-            'Some("inline-svg:4x3|events:0|now:0")',
+            'ControlledImageProfileExpectation::Owned("inline-svg:4x3|events:0|now:0")',
             '"controlled-web-session-v1"',
             "CONTROLLED_V2_INLINE_SVG_FIXTURE",
-            "None",
+            "ControlledImageProfileExpectation::PredecessorMayQuiesce(",
+            '"inline-svg:4x3|events:0|now:0"',
             "fn controlled_session_v2_inline_svg_raster_completes_after_advanced_document_time()",
             "fn exercise_controlled_inline_svg_advanced()",
             '"5000000"',
             'settled["result"]["snapshot"]["producers"]["pending"]',
             'settled["result"]["snapshot"]["rendering"]["updateRequired"]',
             '"inline-svg:5|load-events:0"',
+            "enum ControlledImageProfileExpectation<'a>",
+            "PredecessorMayQuiesce(&'a str)",
+            'if opened["error"]["code"] == "unsupported_work"',
+            "ControlledImageProfileExpectation::Unsupported |",
+            "ControlledImageProfileExpectation::PredecessorMayQuiesce(_)",
+            "v2-owned image work must not fall back to predecessor rejection",
+            "ControlledImageProfileExpectation::Owned(expected_text) |",
+            "ControlledImageProfileExpectation::PredecessorMayQuiesce(expected_text)",
+            "predecessor image work must remain typed unsupported",
+            'opened["result"]["boundary"], "controlled_ready"',
+            "successful predecessor retirement must still cross the exact controlled-ready boundary",
+            'settled["result"]["unsupportedWork"]',
+            'settled["result"]["externalIo"]',
+            'settled["result"]["snapshot"]["producers"]["pending"]',
+            'settled["result"]["snapshot"]["producers"]["terminal"]',
+            'settled["result"]["snapshot"]["rendering"]["pendingImages"]',
+            'settled["result"]["snapshot"]["rendering"]["updateRequired"]',
+            'settled["result"]["snapshot"]["rendering"]["nextOpportunityNs"]',
+            'settled["result"]["snapshot"]["runtimeFailures"]',
+            'text["result"]["value"], expected_text',
         ),
-        "controlled inline SVG direct, predecessor, and advanced protocol proof",
+        "controlled direct and inline SVG owned, predecessor, and advanced protocol proof",
     )
     require_source_fragments_in_order(
         fixture_source,
@@ -3334,6 +3396,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     controlled_css_document_filename = source_root / CONTROLLED_CSS_DOCUMENT_SOURCE
     controlled_css_animation_event_fixture_filename = source_root / CONTROLLED_CSS_ANIMATION_EVENT_FIXTURE
     controlled_rendering_settlement_filename = source_root / CONTROLLED_RENDERING_SETTLEMENT_SOURCE
+    controlled_session_shell_filename = source_root / CONTROLLED_SESSION_SHELL_SOURCE
     controlled_image_element_filename = source_root / CONTROLLED_IMAGE_ELEMENT_SOURCE
     controlled_image_window_filename = source_root / CONTROLLED_IMAGE_WINDOW_SOURCE
     controlled_image_script_thread_filename = source_root / CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE
@@ -3408,6 +3471,10 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     require_regular_file(
         controlled_rendering_settlement_filename,
         "controlled rendering settlement source",
+    )
+    require_regular_file(
+        controlled_session_shell_filename,
+        "controlled session shell source",
     )
     require_regular_file(controlled_image_element_filename, "controlled HTMLImageElement source")
     require_regular_file(controlled_image_window_filename, "controlled image Window source")
@@ -3495,6 +3562,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             encoding="utf-8"
         )
         controlled_rendering_settlement_source = controlled_rendering_settlement_filename.read_text(encoding="utf-8")
+        controlled_session_shell_source = controlled_session_shell_filename.read_text(encoding="utf-8")
         controlled_image_element_source = controlled_image_element_filename.read_text(encoding="utf-8")
         controlled_image_window_source = controlled_image_window_filename.read_text(encoding="utf-8")
         controlled_image_script_thread_source = controlled_image_script_thread_filename.read_text(encoding="utf-8")
@@ -4780,6 +4848,10 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         controlled_http_image_fixture_source,
         controlled_http_image_multipart_fixture_source,
     )
+    verify_controlled_http_image_replacement_authority_source(
+        controlled_session_shell_source,
+        controlled_rendering_settlement_source,
+    )
     verify_controlled_image_per_pipeline_cache_source(controlled_image_cache_source)
     verify_controlled_profile_wire_source(controlled_profile_wire_source)
     verify_controlled_image_transport_source(
@@ -5495,6 +5567,7 @@ def self_test() -> None:
             CONTROLLED_CSS_DOCUMENT_SOURCE,
             CONTROLLED_CSS_ANIMATION_EVENT_FIXTURE,
             CONTROLLED_RENDERING_SETTLEMENT_SOURCE,
+            CONTROLLED_SESSION_SHELL_SOURCE,
             CONTROLLED_IMAGE_ELEMENT_SOURCE,
             CONTROLLED_IMAGE_WINDOW_SOURCE,
             CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE,
@@ -6102,6 +6175,127 @@ def self_test() -> None:
             encoding="utf-8",
         )
         require_candidate_mutation_rejected("scheduled pending animation-event finite demand")
+
+        reset_candidate_authority_sources()
+        shell_filename = candidate_profile_root / CONTROLLED_SESSION_SHELL_SOURCE
+        shell_source = shell_filename.read_text(encoding="utf-8")
+        v2_replacement_profile_fence = (
+            "profile == Some(SessionProfile::ControlledWebSessionV2) && active_operations != 0"
+        )
+        if shell_source.count(v2_replacement_profile_fence) != 1:
+            raise ReleaseError("self-test cannot uniquely locate the v2 replacement I/O profile fence")
+        shell_filename.write_text(
+            shell_source.replace(
+                v2_replacement_profile_fence,
+                "profile.is_some_and(SessionProfile::supports_session_api) && active_operations != 0",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("v1 replacement external-I/O promotion")
+
+        reset_candidate_authority_sources()
+        shell_filename = candidate_profile_root / CONTROLLED_SESSION_SHELL_SOURCE
+        shell_source = shell_filename.read_text(encoding="utf-8")
+        replacement_authorization_call = (
+            "source_external_io_active_at_authorization:\n"
+            "                        controlled_network_blocks_document_replacement(\n"
+            "                            active_profile,\n"
+            "                            controlled_network_active_operations,\n"
+            "                        ),"
+        )
+        if shell_source.count(replacement_authorization_call) != 1:
+            raise ReleaseError("self-test cannot uniquely locate the replacement I/O authorization call")
+        shell_filename.write_text(
+            shell_source.replace(
+                replacement_authorization_call,
+                "source_external_io_active_at_authorization:\n"
+                "                        controlled_network_blocks_document_replacement(\n"
+                "                            active_profile,\n"
+                "                            0,\n"
+                "                        ),",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("hardcoded-inactive replacement authorization")
+
+        reset_candidate_authority_sources()
+        shell_filename = candidate_profile_root / CONTROLLED_SESSION_SHELL_SOURCE
+        shell_source = shell_filename.read_text(encoding="utf-8")
+        replacement_latch_handoff = (
+            "coordinator.latch_additional_foreground_external_io_active(\n"
+            "                    *source_external_io_active_at_authorization,\n"
+            "                );"
+        )
+        if shell_source.count(replacement_latch_handoff) != 1:
+            raise ReleaseError("self-test cannot uniquely locate the replacement I/O latch handoff")
+        shell_filename.write_text(
+            shell_source.replace(
+                replacement_latch_handoff,
+                "coordinator.latch_additional_foreground_external_io_active(\n"
+                "                    false,\n"
+                "                );",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("hardcoded-false replacement I/O latch handoff")
+
+        reset_candidate_authority_sources()
+        settlement_filename = candidate_profile_root / CONTROLLED_RENDERING_SETTLEMENT_SOURCE
+        settlement_source = settlement_filename.read_text(encoding="utf-8")
+        monotonic_replacement_latch = "self.latched_additional_foreground_external_io_active |= active;"
+        if settlement_source.count(monotonic_replacement_latch) != 1:
+            raise ReleaseError("self-test cannot uniquely locate the monotonic replacement I/O latch")
+        settlement_filename.write_text(
+            settlement_source.replace(
+                monotonic_replacement_latch,
+                "self.latched_additional_foreground_external_io_active = active;",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("reversible replacement external-I/O latch")
+
+        reset_candidate_authority_sources()
+        settlement_filename = candidate_profile_root / CONTROLLED_RENDERING_SETTLEMENT_SOURCE
+        settlement_source = settlement_filename.read_text(encoding="utf-8")
+        latched_replacement_decision = (
+            "if self.latched_additional_foreground_external_io_active\n"
+            "            || self.additional_foreground_external_io_active"
+        )
+        if settlement_source.count(latched_replacement_decision) != 1:
+            raise ReleaseError("self-test cannot uniquely locate the replacement I/O decision latch")
+        settlement_filename.write_text(
+            settlement_source.replace(
+                latched_replacement_decision,
+                "if self.additional_foreground_external_io_active",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("ignored replacement external-I/O latch")
+
+        reset_candidate_authority_sources()
+        settlement_filename = candidate_profile_root / CONTROLLED_RENDERING_SETTLEMENT_SOURCE
+        settlement_source = settlement_filename.read_text(encoding="utf-8")
+        latched_replacement_decision = (
+            "if self.latched_additional_foreground_external_io_active\n"
+            "            || self.additional_foreground_external_io_active"
+        )
+        if settlement_source.count(latched_replacement_decision) != 1:
+            raise ReleaseError("self-test cannot uniquely locate the replacement I/O decision latch")
+        settlement_filename.write_text(
+            settlement_source.replace(
+                latched_replacement_decision,
+                "if self.latched_additional_foreground_external_io_active && false\n"
+                "            || self.additional_foreground_external_io_active",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("logically neutralized replacement external-I/O latch")
 
         reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(
@@ -7646,6 +7840,54 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             encoding="utf-8",
         )
         require_candidate_mutation_rejected("inline SVG zero-event native proof")
+
+        reset_candidate_authority_sources()
+        inline_protocol_filename = candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
+        inline_protocol_source = inline_protocol_filename.read_text(encoding="utf-8")
+        strict_direct_v1_expectation = (
+            '"direct-v1",\n'
+            "        CONTROLLED_V2_IMAGE_DATA_SVG_FIXTURE,\n"
+            "        ControlledImageProfileExpectation::Unsupported,"
+        )
+        if inline_protocol_source.count(strict_direct_v1_expectation) != 1:
+            raise ReleaseError("self-test cannot uniquely locate strict direct-image v1 expectation")
+        inline_protocol_filename.write_text(
+            inline_protocol_source.replace(
+                strict_direct_v1_expectation,
+                '"direct-v1",\n'
+                "        CONTROLLED_V2_IMAGE_DATA_SVG_FIXTURE,\n"
+                "        ControlledImageProfileExpectation::PredecessorMayQuiesce(\n"
+                '            "load:0>loadend:0|now:0",\n'
+                "        ),",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("direct image v1 quiescence promotion")
+
+        reset_candidate_authority_sources()
+        inline_protocol_filename = candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
+        inline_protocol_source = inline_protocol_filename.read_text(encoding="utf-8")
+        dual_inline_v1_expectation = (
+            '"inline-svg-v1",\n'
+            "        CONTROLLED_V2_INLINE_SVG_FIXTURE,\n"
+            "        ControlledImageProfileExpectation::PredecessorMayQuiesce(\n"
+            '            "inline-svg:4x3|events:0|now:0",\n'
+            "        ),"
+        )
+        if inline_protocol_source.count(dual_inline_v1_expectation) != 1:
+            raise ReleaseError("self-test cannot uniquely locate dual inline-SVG v1 expectation")
+        inline_protocol_filename.write_text(
+            inline_protocol_source.replace(
+                dual_inline_v1_expectation,
+                '"inline-svg-v1",\n'
+                "        CONTROLLED_V2_INLINE_SVG_FIXTURE,\n"
+                "        ControlledImageProfileExpectation::Unsupported,",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG v1 transient-retirement false-red")
 
         reset_candidate_authority_sources()
         inline_protocol_filename = candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE

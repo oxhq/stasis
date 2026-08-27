@@ -294,6 +294,7 @@ pub struct SettleCoordinator {
     cumulative_external_io_wall_time: Duration,
     final_external_io_observation_required: bool,
     additional_foreground_external_io_active: bool,
+    latched_additional_foreground_external_io_active: bool,
 }
 
 impl SettleCoordinator {
@@ -312,6 +313,7 @@ impl SettleCoordinator {
             cumulative_external_io_wall_time: Duration::ZERO,
             final_external_io_observation_required: false,
             additional_foreground_external_io_active: false,
+            latched_additional_foreground_external_io_active: false,
         }
     }
 
@@ -321,6 +323,15 @@ impl SettleCoordinator {
     /// network counts in the document snapshot, and an absent gate preserves v1 behavior.
     pub fn set_additional_foreground_external_io_active(&mut self, active: bool) {
         self.additional_foreground_external_io_active = active;
+    }
+
+    /// Preserve an embedder-owned foreground-I/O fact for this settlement attempt.
+    ///
+    /// A document replacement cannot erase source-document I/O that was active when the
+    /// replacement was authorized merely because a later snapshot observes the operation after
+    /// it drained. Ordinary embedder I/O refreshes remain reversible; this gate is monotonic.
+    pub fn latch_additional_foreground_external_io_active(&mut self, active: bool) {
+        self.latched_additional_foreground_external_io_active |= active;
     }
 
     /// Begin with a non-mutating authoritative observation.
@@ -880,7 +891,8 @@ impl SettleCoordinator {
 
         // Real external I/O freezes virtual time. A wall expiry never trusts this observation: it
         // requests one final Observe and only that response may become BlockedOnExternalIo.
-        if self.additional_foreground_external_io_active
+        if self.latched_additional_foreground_external_io_active
+            || self.additional_foreground_external_io_active
             || !classification.foreground_network.is_empty()
             || classification.has_source_only_external_io
         {
@@ -1966,6 +1978,47 @@ mod tests {
             },
             other => panic!("clearing additional foreground I/O did not resume: {other:?}"),
         }
+    }
+
+    #[test]
+    fn latched_additional_foreground_io_survives_refresh_and_fails_closed() {
+        let mut fixture = Fixture::new();
+        fixture.schedule(Duration::from_nanos(20));
+        let pending = fixture.snapshot(2, 1);
+        let policy = SettlePolicy {
+            wall_io_timeout: Duration::from_millis(50),
+            ..SettlePolicy::default()
+        };
+        let mut coordinator = SettleCoordinator::new(policy);
+        coordinator.latch_additional_foreground_external_io_active(true);
+        coordinator.set_additional_foreground_external_io_active(false);
+        assert_observe(coordinator.start().unwrap());
+        assert!(matches!(
+            observe(&mut coordinator, pending.clone(), None).unwrap(),
+            SettleProgress::Wait(SettleWait::ForegroundExternalIo { network, .. })
+                if network.is_empty()
+        ));
+
+        coordinator.set_additional_foreground_external_io_active(false);
+        assert_observe(
+            coordinator
+                .external_io_wait_expired(Duration::from_millis(50))
+                .unwrap(),
+        );
+        coordinator.set_additional_foreground_external_io_active(false);
+        assert!(matches!(
+            coordinator
+                .consume_receive_outcome(
+                    received(DocumentControlAction::Observed, pending, None),
+                    Duration::from_millis(50),
+                )
+                .unwrap(),
+            SettleProgress::Complete(SettleCompletion::BlockedOnExternalIo {
+                network,
+                control_turns: 0,
+                ..
+            }) if network.is_empty()
+        ));
     }
 
     #[test]

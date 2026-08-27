@@ -757,13 +757,13 @@ fn controlled_session_v2_direct_data_svg_is_owned_without_v1_promotion() {
         "controlled-web-session-v2",
         "direct-v2",
         CONTROLLED_V2_IMAGE_DATA_SVG_FIXTURE,
-        Some("load:0>loadend:0|now:0"),
+        ControlledImageProfileExpectation::Owned("load:0>loadend:0|now:0"),
     );
     exercise_controlled_data_svg_profile(
         "controlled-web-session-v1",
         "direct-v1",
         CONTROLLED_V2_IMAGE_DATA_SVG_FIXTURE,
-        None,
+        ControlledImageProfileExpectation::Unsupported,
     );
 }
 
@@ -773,13 +773,15 @@ fn controlled_session_v2_inline_svg_rendering_is_owned_without_v1_promotion() {
         "controlled-web-session-v2",
         "inline-svg-v2",
         CONTROLLED_V2_INLINE_SVG_FIXTURE,
-        Some("inline-svg:4x3|events:0|now:0"),
+        ControlledImageProfileExpectation::Owned("inline-svg:4x3|events:0|now:0"),
     );
     exercise_controlled_data_svg_profile(
         "controlled-web-session-v1",
         "inline-svg-v1",
         CONTROLLED_V2_INLINE_SVG_FIXTURE,
-        None,
+        ControlledImageProfileExpectation::PredecessorMayQuiesce(
+            "inline-svg:4x3|events:0|now:0",
+        ),
     );
 }
 
@@ -789,7 +791,7 @@ fn controlled_session_v2_data_svg_cache_hit_keeps_exact_generation_time() {
         "controlled-web-session-v2",
         "cache-hit-v2",
         CONTROLLED_V2_IMAGE_DATA_SVG_CACHE_HIT_FIXTURE,
-        Some("first:0|second:0|now:0"),
+        ControlledImageProfileExpectation::Owned("first:0|second:0|now:0"),
     );
 }
 
@@ -799,7 +801,7 @@ fn controlled_session_v2_data_svg_decode_error_uses_owned_completion_time() {
         "controlled-web-session-v2",
         "decode-error-v2",
         CONTROLLED_V2_IMAGE_DATA_SVG_ERROR_FIXTURE,
-        Some("error:0>loadend:0|now:0"),
+        ControlledImageProfileExpectation::Owned("error:0>loadend:0|now:0"),
     );
 }
 
@@ -809,7 +811,7 @@ fn controlled_session_v2_reuses_image_identity_capacity_across_520_requests() {
         "controlled-web-session-v2",
         "identity-reuse-v2",
         CONTROLLED_V2_IMAGE_IDENTITY_REUSE_FIXTURE,
-        Some("completed:520|exact-time:true"),
+        ControlledImageProfileExpectation::Owned("completed:520|exact-time:true"),
     );
 }
 
@@ -5848,11 +5850,20 @@ fn exercise_script_created_css_event_timestamp_boundary() {
     );
 }
 
+enum ControlledImageProfileExpectation<'a> {
+    Owned(&'a str),
+    Unsupported,
+    // V1 has no sticky image provenance: a finite inline-SVG raster may retire before the first
+    // pending observation. Preserve that predecessor outcome only after proving zero residual
+    // work and the exact zero-event document result below.
+    PredecessorMayQuiesce(&'a str),
+}
+
 fn exercise_controlled_data_svg_profile(
     profile: &str,
     case_id: &str,
     fixture: &[u8],
-    expected_text: Option<&str>,
+    expectation: ControlledImageProfileExpectation<'_>,
 ) {
     let url = format!("https://controlled-image-{case_id}.example.test/");
     let mut child = Command::new(env!("CARGO_BIN_EXE_stasis"))
@@ -5911,7 +5922,15 @@ fn exercise_controlled_data_svg_profile(
         "{opened:#}",
     );
 
-    let Some(expected_text) = expected_text else {
+    if opened["error"]["code"] == "unsupported_work" {
+        assert!(
+            matches!(
+                expectation,
+                ControlledImageProfileExpectation::Unsupported |
+                    ControlledImageProfileExpectation::PredecessorMayQuiesce(_)
+            ),
+            "v2-owned image work must not fall back to predecessor rejection: {opened:#}",
+        );
         assert_eq!(opened["error"]["code"], "unsupported_work", "{opened:#}");
         assert_eq!(opened["error"]["fatal"], true, "{opened:#}");
         let failure_code = opened["error"]["details"]["failure"]["code"]
@@ -5934,9 +5953,21 @@ fn exercise_controlled_data_svg_profile(
             "fatal v1 image rejection must use the documented exit code: {status}",
         );
         return;
+    }
+
+    let expected_text = match expectation {
+        ControlledImageProfileExpectation::Owned(expected_text) |
+        ControlledImageProfileExpectation::PredecessorMayQuiesce(expected_text) => expected_text,
+        ControlledImageProfileExpectation::Unsupported => {
+            panic!("predecessor image work must remain typed unsupported: {opened:#}")
+        },
     };
 
     assert_eq!(opened["sessionId"], "s-1", "{opened:#}");
+    assert_eq!(
+        opened["result"]["boundary"], "controlled_ready",
+        "successful predecessor retirement must still cross the exact controlled-ready boundary: {opened:#}",
+    );
     assert_eq!(opened["result"]["profile"], profile, "{opened:#}");
     let open_token = opened["result"]["stateToken"]
         .as_str()
@@ -5974,6 +6005,23 @@ fn exercise_controlled_data_svg_profile(
     assert_eq!(
         settled["result"]["snapshot"]["producers"]["terminal"], false,
         "{settled:#}"
+    );
+    assert_eq!(
+        settled["result"]["snapshot"]["rendering"]["pendingImages"], "0",
+        "{settled:#}",
+    );
+    assert_eq!(
+        settled["result"]["snapshot"]["rendering"]["updateRequired"], false,
+        "{settled:#}",
+    );
+    assert!(
+        settled["result"]["snapshot"]["rendering"]["nextOpportunityNs"].is_null(),
+        "{settled:#}",
+    );
+    assert_eq!(
+        settled["result"]["snapshot"]["runtimeFailures"],
+        json!([]),
+        "{settled:#}",
     );
     let settled_token = settled["result"]["stateToken"]
         .as_str()

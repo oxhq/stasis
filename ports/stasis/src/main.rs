@@ -750,6 +750,7 @@ enum NavigatePhase {
     },
     AwaitingAdmission {
         source: SessionNavigationAuthority,
+        source_external_io_active_at_authorization: bool,
     },
     Settling {
         source: SessionNavigationAuthority,
@@ -3802,6 +3803,11 @@ fn transition_from_control_completion(
                 let url = state.requested_url.clone();
                 state.phase = NavigatePhase::AwaitingAdmission {
                     source: expected.clone(),
+                    source_external_io_active_at_authorization:
+                        controlled_network_blocks_document_replacement(
+                            active_profile,
+                            controlled_network_active_operations,
+                        ),
                 };
                 return ActiveTransition::SubmitSessionNavigation { expected, url };
             }
@@ -3929,6 +3935,13 @@ fn controlled_network_blocks_virtual_advance(
     active_operations: usize,
 ) -> bool {
     profile.is_some_and(SessionProfile::supports_session_api) && active_operations != 0
+}
+
+fn controlled_network_blocks_document_replacement(
+    profile: Option<SessionProfile>,
+    active_operations: usize,
+) -> bool {
+    profile == Some(SessionProfile::ControlledWebSessionV2) && active_operations != 0
 }
 
 fn public_automation_is_mutating(kind: wire::PublicAutomationKind) -> bool {
@@ -4577,7 +4590,10 @@ fn transition_from_navigation_completion(
                 };
                 ActiveTransition::Submit(DocumentControlCommand::Observe)
             },
-            NavigatePhase::AwaitingAdmission { source }
+            NavigatePhase::AwaitingAdmission {
+                source,
+                source_external_io_active_at_authorization,
+            }
                 if kind == NavigationOperationKind::Navigate =>
             {
                 let profile = active
@@ -4596,6 +4612,9 @@ fn transition_from_navigation_completion(
                 };
                 let effective_policy = default_resolved_settle_policy();
                 let mut coordinator = settle::SettleCoordinator::new(effective_policy.engine);
+                coordinator.latch_additional_foreground_external_io_active(
+                    *source_external_io_active_at_authorization,
+                );
                 let command = match coordinator.start_with_replacement_bootstrap(bootstrap.clone())
                 {
                     Ok(settle::SettleProgress::Command(command)) if command == bootstrap => command,
@@ -9200,6 +9219,26 @@ mod tests {
             0,
         ));
         assert!(!controlled_network_blocks_virtual_advance(
+            Some(SessionProfile::ControlledWebappV1),
+            1,
+        ));
+    }
+
+    #[test]
+    fn active_controlled_network_latches_v2_document_replacement_only() {
+        assert!(controlled_network_blocks_document_replacement(
+            Some(SessionProfile::ControlledWebSessionV2),
+            1,
+        ));
+        assert!(!controlled_network_blocks_document_replacement(
+            Some(SessionProfile::ControlledWebSessionV2),
+            0,
+        ));
+        assert!(!controlled_network_blocks_document_replacement(
+            Some(SessionProfile::ControlledWebSessionV1),
+            1,
+        ));
+        assert!(!controlled_network_blocks_document_replacement(
             Some(SessionProfile::ControlledWebappV1),
             1,
         ));
