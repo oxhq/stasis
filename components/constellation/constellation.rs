@@ -959,7 +959,15 @@ where
                     user_contents_for_manager_id: Default::default(),
                 };
 
+                let shutdown_complete_proxy =
+                    constellation.constellation_to_embedder_proxy.clone();
                 constellation.run();
+
+                // Drop all Constellation-owned state before telling the embedder that shutdown is
+                // complete. The embedder uses this signal as its boundary for de-initializing Servo.
+                drop(constellation);
+                debug!("Asking embedding layer to complete shutdown.");
+                shutdown_complete_proxy.send(ConstellationToEmbedderMsg::ShutdownComplete);
             })
             .expect("Thread spawning failed");
     }
@@ -1004,13 +1012,6 @@ where
 
         // Shut down the `FetchThread` if it has been started at any time.
         FetchThread::exit();
-
-        // Note: the last thing the constellation does, is asking the embedder to
-        // shut down. This helps ensure we've shut down all our internal threads before
-        // de-initializing Servo (see the `thread_count` warning on MacOS).
-        debug!("Asking embedding layer to complete shutdown.");
-        self.constellation_to_embedder_proxy
-            .send(ConstellationToEmbedderMsg::ShutdownComplete);
     }
 
     /// Helper that sends a message to the event loop of a given pipeline, logging the
