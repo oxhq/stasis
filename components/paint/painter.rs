@@ -24,8 +24,10 @@ use paint_api::rendering_context::RenderingContext;
 use paint_api::viewport_description::ViewportDescription;
 use paint_api::{
     ImageUpdate, PipelineExitSource, SendableFrameTree, SerializableDisplayListPayload,
-    SerializableImageData, WebRenderExternalImageHandlers, WebRenderImageHandlerType, WebViewTrait,
+    SerializableImageData, WebRenderExternalImageHandlers, WebViewTrait,
 };
+#[cfg(any(feature = "webgl", feature = "webgpu"))]
+use paint_api::WebRenderImageHandlerType;
 use profile_traits::time::{ProfilerCategory, ProfilerChan};
 use profile_traits::time_profile;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -63,6 +65,7 @@ use crate::paint::{RepaintReason, WebRenderDebugOption};
 use crate::refresh_driver::{AnimationRefreshDriverObserver, BaseRefreshDriver};
 use crate::render_notifier::RenderNotifier;
 use crate::screenshot::ScreenshotTaker;
+use crate::thread_ownership::RayonWorkerOwner;
 use crate::web_content_animation::WebContentAnimator;
 #[cfg(feature = "webgl")]
 use crate::webrender_external_images::WebGLExternalImages;
@@ -108,6 +111,9 @@ pub(crate) struct Painter {
     /// The webrender renderer.
     pub(crate) webrender_renderer: Option<webrender::Renderer>,
 
+    /// Physical ownership of the custom Rayon workers supplied to WebRender.
+    webrender_worker_owner: Arc<RayonWorkerOwner>,
+
     /// The GL bindings for webrender
     webrender_gl: Rc<dyn gleam::gl::Gl>,
 
@@ -150,12 +156,45 @@ impl Drop for Painter {
         self.webrender_api.shut_down(true);
         emit_lifecycle_phase(LifecyclePhase::PainterWebRenderShutdownAckObserved);
 
-        if let Some(renderer) = self.webrender_renderer.take() {
+        let mut first_thread_failure = None;
+        if let Some(mut renderer) = self.webrender_renderer.take() {
+            emit_lifecycle_phase(LifecyclePhase::PainterWebRenderThreadsJoinBegin);
+            match renderer.join_backend_threads() {
+                Ok(()) => {
+                    emit_lifecycle_phase(LifecyclePhase::PainterWebRenderThreadsJoinEnd);
+                },
+                Err(payload) => {
+                    emit_lifecycle_phase(LifecyclePhase::PainterWebRenderThreadsJoinFailed);
+                    first_thread_failure = Some(payload);
+                },
+            }
+
+            emit_lifecycle_phase(LifecyclePhase::PainterWebRenderWorkersJoinBegin);
+            match self.webrender_worker_owner.join_all() {
+                Ok(()) => {
+                    emit_lifecycle_phase(LifecyclePhase::PainterWebRenderWorkersJoinEnd);
+                },
+                Err(payload) => {
+                    emit_lifecycle_phase(LifecyclePhase::PainterWebRenderWorkersJoinFailed);
+                    if first_thread_failure.is_none() {
+                        first_thread_failure = Some(payload);
+                    }
+                },
+            }
+
             emit_lifecycle_phase(LifecyclePhase::PainterRendererDeinitBegin);
             renderer.deinit();
             emit_lifecycle_phase(LifecyclePhase::PainterRendererDeinitEnd);
         }
         emit_lifecycle_phase(LifecyclePhase::PainterDropBodyEnd);
+
+        if let Some(payload) = first_thread_failure {
+            if std::thread::panicking() {
+                error!("A WebRender thread panicked while Painter was already unwinding");
+            } else {
+                std::panic::resume_unwind(payload);
+            }
+        }
     }
 }
 
@@ -223,22 +262,30 @@ impl Painter {
             .map(|i| i.get())
             .unwrap_or(pref!(thread_pool_fallback_workers) as usize)
             .min(pref!(thread_pool_webrender_workers_max).max(1) as usize);
+        let webrender_worker_owner = Arc::new(RayonWorkerOwner::new());
+        let spawn_owner = webrender_worker_owner.clone();
+        let workers = rayon::ThreadPoolBuilder::new()
+            .num_threads(worker_threads)
+            .thread_name(|idx| format!("WRWorker#{}", idx))
+            .start_handler(|_| {
+                servo_base::threadboost::boost_thread(
+                    ThreadPriority::Elevated,
+                    BoostAffinity::Boost,
+                )
+            })
+            .spawn_handler(move |rayon_thread| spawn_owner.spawn(rayon_thread))
+            .build();
+        if workers.is_err()
+            && let Err(payload) = webrender_worker_owner.join_all()
+        {
+            std::panic::resume_unwind(payload);
+        }
         let workers = Some(Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(worker_threads)
-                .thread_name(|idx| format!("WRWorker#{}", idx))
-                .start_handler(|_| {
-                    servo_base::threadboost::boost_thread(
-                        ThreadPriority::Elevated,
-                        BoostAffinity::Boost,
-                    )
-                })
-                .build()
-                .expect("Unable to initialize WebRender worker pool."),
+            workers.expect("Unable to initialize WebRender worker pool."),
         ));
 
         let painter_id = PainterId::next();
-        let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
+        let webrender = webrender::create_webrender_instance(
             webrender_gl.clone(),
             Box::new(RenderNotifier::new(painter_id, paint.paint_proxy.clone())),
             webrender::WebRenderOptions {
@@ -271,8 +318,14 @@ impl Painter {
                 ..Default::default()
             },
             None,
-        )
-        .expect("Unable to initialize WebRender.");
+        );
+        if webrender.is_err()
+            && let Err(payload) = webrender_worker_owner.join_all()
+        {
+            std::panic::resume_unwind(payload);
+        }
+        let (mut webrender_renderer, webrender_api_sender) =
+            webrender.expect("Unable to initialize WebRender.");
 
         webrender_renderer.set_external_image_handler(external_image_handlers);
 
@@ -294,6 +347,7 @@ impl Painter {
             refresh_driver,
             animation_refresh_driver_observer,
             webrender_renderer: Some(webrender_renderer),
+            webrender_worker_owner,
             webrender_api,
             webrender_document,
             webrender_gl,

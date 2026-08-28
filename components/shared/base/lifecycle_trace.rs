@@ -25,6 +25,12 @@ pub enum LifecyclePhase {
     PainterDropBegin,
     PainterWebRenderShutdownBegin,
     PainterWebRenderShutdownAckObserved,
+    PainterWebRenderThreadsJoinBegin,
+    PainterWebRenderThreadsJoinEnd,
+    PainterWebRenderThreadsJoinFailed,
+    PainterWebRenderWorkersJoinBegin,
+    PainterWebRenderWorkersJoinEnd,
+    PainterWebRenderWorkersJoinFailed,
     PainterRendererDeinitBegin,
     PainterRendererDeinitEnd,
     PainterDropBodyEnd,
@@ -74,6 +80,12 @@ impl LifecyclePhase {
         Self::PainterDropBegin,
         Self::PainterWebRenderShutdownBegin,
         Self::PainterWebRenderShutdownAckObserved,
+        Self::PainterWebRenderThreadsJoinBegin,
+        Self::PainterWebRenderThreadsJoinEnd,
+        Self::PainterWebRenderThreadsJoinFailed,
+        Self::PainterWebRenderWorkersJoinBegin,
+        Self::PainterWebRenderWorkersJoinEnd,
+        Self::PainterWebRenderWorkersJoinFailed,
         Self::PainterRendererDeinitBegin,
         Self::PainterRendererDeinitEnd,
         Self::PainterDropBodyEnd,
@@ -126,6 +138,20 @@ impl LifecyclePhase {
             Self::PainterWebRenderShutdownBegin => "painter_webrender_shutdown_begin",
             Self::PainterWebRenderShutdownAckObserved => {
                 "painter_webrender_shutdown_ack_observed"
+            },
+            Self::PainterWebRenderThreadsJoinBegin => {
+                "painter_webrender_threads_join_begin"
+            },
+            Self::PainterWebRenderThreadsJoinEnd => "painter_webrender_threads_join_end",
+            Self::PainterWebRenderThreadsJoinFailed => {
+                "painter_webrender_threads_join_failed"
+            },
+            Self::PainterWebRenderWorkersJoinBegin => {
+                "painter_webrender_workers_join_begin"
+            },
+            Self::PainterWebRenderWorkersJoinEnd => "painter_webrender_workers_join_end",
+            Self::PainterWebRenderWorkersJoinFailed => {
+                "painter_webrender_workers_join_failed"
             },
             Self::PainterRendererDeinitBegin => "painter_renderer_deinit_begin",
             Self::PainterRendererDeinitEnd => "painter_renderer_deinit_end",

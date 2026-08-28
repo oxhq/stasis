@@ -47,6 +47,10 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "$PACKAGE_RUN_ID" && -z "$RELEASE_TAG" ]]; then
+            if [[ "$GITHUB_RUN_ATTEMPT" != '1' ]]; then
+              echo 'Stasis 0.3 package qualification requires a fresh workflow run at attempt 1' >&2
+              exit 1
+            fi
             echo 'mode=package' >> "$GITHUB_OUTPUT"
           elif [[ -n "$PACKAGE_RUN_ID" && -n "$RELEASE_TAG" && "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
             echo 'mode=promote' >> "$GITHUB_OUTPUT"
@@ -201,6 +205,57 @@ jobs:
           fi
           cargo build --locked -p stasis-shell --profile production-stripped
           file target/production-stripped/stasis | grep -F 'ELF 64-bit LSB'
+
+          ownership_log="$RUNNER_TEMP/stasis-lifecycle-${{ matrix.lane }}-ownership.log"
+          # Keep the standalone ownership tests in Stasis's bundled-FreeType feature graph.
+          set +e
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-paint --lib thread_ownership \
+            -- --test-threads=1 --show-output > "$ownership_log" 2>&1
+          ownership_status=$?
+          set -e
+          if (( ownership_status != 0 )); then
+            cat "$ownership_log"
+            rm -f -- "$ownership_log"
+            exit "$ownership_status"
+          fi
+          expected_ownership_tests=(
+            backend_join_continues_after_the_first_panicking_handle
+            backend_join_fences_post_ack_thread_owned_state
+            backend_shutdown_ack_does_not_hide_a_later_thread_panic
+            production_spawn_handler_joins_every_custom_rayon_worker
+            worker_join_continues_after_the_first_panicking_handle
+          )
+          for test_name in "${expected_ownership_tests[@]}"; do
+            test "$(grep -Fxc "test thread_ownership::tests::${test_name} ... ok" "$ownership_log")" = '1'
+          done
+          test "$(grep -Ec '^test thread_ownership::tests::.* \.\.\. ok$' "$ownership_log")" = '5'
+          cat "$ownership_log"
+          rm -f -- "$ownership_log"
+
+          oracle_log="$RUNNER_TEMP/stasis-lifecycle-${{ matrix.lane }}-source-oracle.raw.log"
+          set +e
+          xvfb-run -a cargo test --locked --profile production-stripped \
+            -p stasis-shell --test controlled_mvp \
+            source_binary_single_close_lifecycle_is_owner_ordered \
+            -- --exact --test-threads=1 --show-output > "$oracle_log" 2>&1
+          oracle_status=$?
+          set -e
+          if (( oracle_status != 0 )); then
+            oracle_summary="$RUNNER_TEMP/stasis-lifecycle-${{ matrix.lane }}-source-oracle-summary.log"
+            python3 etc/ci/stasis/sanitize_lifecycle_diagnostics.py sanitize \
+              --input "$oracle_log" \
+              --output "$oracle_summary" \
+              --failed-gate controlled_mvp \
+              --workspace "$GITHUB_WORKSPACE" || true
+            cat "$oracle_summary"
+            rm -f -- "$oracle_log" "$oracle_summary"
+            exit "$oracle_status"
+          fi
+          test "$(grep -Fxc 'test source_binary_single_close_lifecycle_is_owner_ordered ... ok' "$oracle_log")" = '1'
+          test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s$' "$oracle_log")" = '1'
+          cat "$oracle_log"
+          rm -f -- "$oracle_log"
 
       - id: lifecycle_stress_gate
         name: Require 150 fresh single-close processes without retries

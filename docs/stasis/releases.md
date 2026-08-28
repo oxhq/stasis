@@ -272,6 +272,18 @@ On package runs, the independent Windows CI-only job must also succeed before
 the main-push package outputs can be attested. Its ZIP and logs remain
 diagnostic CI artifacts and are not inputs to the stable release attestation.
 
+Two independent native Ubuntu 22.04 lanes build the exact event revision and
+each require 150 fresh single-close Stasis processes without retries. One lane
+enables the fixed-vocabulary lifecycle trace and the other explicitly removes
+it, so tracing cannot mask or create the result. Before stressing the product,
+both lanes run the deterministic physical-ownership regressions and the real
+source-binary ordering oracle: WebRender's synchronous shutdown acknowledgement
+must precede joins of its backend/scene threads and custom Rayon workers, and
+those joins must precede renderer deinitialization and rendering-context
+destruction. A successful rerun cannot substitute for these first-attempt gates.
+Package-mode invocation itself rejects `GITHUB_RUN_ATTEMPT` values other than
+`1`; after any package-run failure, qualification requires a fresh push run.
+
 Both fixture runners and the entire session fixture directory are copied beside
 the installed tarball before execution. Credential-free package gating uses the
 dedicated `STASIS_NORTH_STAR_BINARY` and
@@ -491,8 +503,10 @@ report `immutable: true`.
 ## npm stable publication
 
 Publishing the stable GitHub release triggers
-`.github/workflows/stasis-publish-npm.yml`. Its mutating path accepts only the
-published, immutable, non-prerelease `v0.1.0` release in `oxhq/stasis`.
+`.github/workflows/stasis-publish-npm.yml`. At the immutable `v0.1.0` tag, its
+mutating path accepted only the published, immutable, non-prerelease `v0.1.0`
+release in `oxhq/stasis`; the current main workflow accepts only `v0.3.0` and
+cannot mutate that historical package.
 
 The workflow first runs without npm credentials. It verifies all nine release
 assets and attestations and requires both native proofs to identify the same
@@ -523,7 +537,8 @@ No npm token is read by the stable workflow. Trusted publishing remains bound to
 repository `oxhq/stasis`, workflow `stasis-publish-npm.yml`, environment `npm`,
 and publish permission.
 
-After publication, the exact expected dist-tag map is:
+Immediately after the historical 0.1 publication, the exact expected dist-tag
+map was:
 
 ```json
 {
@@ -549,10 +564,11 @@ launch, controlled automation, evidence, and clean shutdown from public bytes.
   publication resolve the latest exact macOS, Linux, and SDK producer jobs
   separately, then require each selected job's unique artifact pair and the
   native-before-SDK ordering.
-- **Re-run all jobs** creates fresh producers for every leg. **Re-run failed
-  jobs** may reuse a platform leg whose latest exact job already succeeded, but
-  only through verified run history and its attempt-qualified artifacts. A
-  failed or incomplete latest producer never falls back to an older attempt.
+- Historical 0.1/0.2 package trains could use **Re-run all jobs** or **Re-run
+  failed jobs** with attempt-qualified producer selection. Stasis 0.3 package
+  mode rejects every rerun attempt; it requires a fresh push run at attempt 1.
+  Promotion still rejects a failed, incomplete, missing, duplicated, or expired
+  producer and never falls back to an older run.
 - Existing version bytes are immutable. A publish retry may skip `npm publish`
   only when the registry's SHA-512 integrity equals the staged tarball exactly.
 - A failure after npm accepts bytes is a verification incident, not permission to

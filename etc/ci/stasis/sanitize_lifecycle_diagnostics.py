@@ -33,6 +33,12 @@ LIFECYCLE_PHASES = frozenset(
         "painter_drop_begin",
         "painter_webrender_shutdown_begin",
         "painter_webrender_shutdown_ack_observed",
+        "painter_webrender_threads_join_begin",
+        "painter_webrender_threads_join_end",
+        "painter_webrender_threads_join_failed",
+        "painter_webrender_workers_join_begin",
+        "painter_webrender_workers_join_end",
+        "painter_webrender_workers_join_failed",
         "painter_renderer_deinit_begin",
         "painter_renderer_deinit_end",
         "painter_drop_body_end",
@@ -252,6 +258,8 @@ def self_test() -> None:
     escaped = (
         "stderrTail: 'HOSTILE_SECRET\\n"
         "stasis_lifecycle_v1 phase=painter_webrender_shutdown_ack_observed\\n"
+        "stasis_lifecycle_v1 phase=painter_webrender_threads_join_end\\n"
+        "stasis_lifecycle_v1 phase=painter_webrender_workers_join_end\\n"
         "stasis_lifecycle_v1 phase=painter_renderer_deinit_end\\n',"
     )
     hostile = "url=https://secret.invalid/?token=HOSTILE_SECRET env=HOSTILE_SECRET"
@@ -286,13 +294,15 @@ def self_test() -> None:
     expected_phases = [
         "lifecycle_phase=close_accepted",
         "lifecycle_phase=painter_webrender_shutdown_ack_observed",
+        "lifecycle_phase=painter_webrender_threads_join_end",
+        "lifecycle_phase=painter_webrender_workers_join_end",
         "lifecycle_phase=painter_renderer_deinit_end",
     ]
     positions = [sanitized.index(phase) for phase in expected_phases]
     assert positions == sorted(positions)
     assert "north_star_lane=traced sample=047/150" in sanitized
     assert "stderr_marker=mozalloc_abort" in sanitized
-    assert "lifecycle_phase_count=3" in sanitized
+    assert "lifecycle_phase_count=5" in sanitized
     assert "HOSTILE_SECRET" not in sanitized
     assert "secret.invalid" not in sanitized
     assert "hostile_secret" not in sanitized

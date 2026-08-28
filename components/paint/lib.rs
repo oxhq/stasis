@@ -27,6 +27,7 @@ mod pipeline_details;
 mod refresh_driver;
 mod render_notifier;
 mod screenshot;
+mod thread_ownership;
 mod touch;
 mod web_content_animation;
 #[cfg(feature = "webgl")]
