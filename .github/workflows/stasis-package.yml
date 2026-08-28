@@ -177,7 +177,7 @@ jobs:
           test "$(LC_ALL=C getconf GNU_LIBC_VERSION)" = 'glibc 2.35'
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           unset PKG_CONFIG_PATH
-          echo 'PKG_CONFIG_PATH=' >> "$GITHUB_ENV"
+          printf '%s\n' 'PKG_CONFIG_PATH=' >> "$GITHUB_ENV"
           sudo apt-get update
           sudo apt-get install --yes xvfb
           ./mach bootstrap --yes --skip-lints --skip-nextest
