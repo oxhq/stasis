@@ -309,6 +309,7 @@ jobs:
           pnpm build
 
       - name: Gate the controlled-session v1 North Star on this native platform
+        id: session_north_star_gate
         shell: bash
         working-directory: sdk/typescript
         run: |
@@ -322,16 +323,28 @@ jobs:
           explicit_runtime_cache="$RUNNER_TEMP/stasis-${STASIS_PLATFORM}-explicit-runtime-cache"
           mkdir "$explicit_runtime_cache"
           session_gate_log="$RUNNER_TEMP/stasis-${STASIS_PLATFORM}-session-north-star.jsonl"
-          "${gate_runner[@]}" \
-            STASIS_SESSION_NORTH_STAR_BINARY="$binary" \
-            STASIS_SESSION_NORTH_STAR_RUNTIME_CACHE="$explicit_runtime_cache" \
-            node test/fixtures/public-package-session-north-star.mjs \
-              2>&1 | tee "$session_gate_log"
-          grep -F '"proof":"stasis-v0.2-session-north-star"' "$session_gate_log"
-          grep -F '"runs":3' "$session_gate_log"
-          grep -F '"sessions":6' "$session_gate_log"
-          grep -F '"runtimeAcquisition":"explicit-executable-override-cache-bypassed"' \
-            "$session_gate_log"
+          expected_samples=1
+          if [[ "$STASIS_PLATFORM" == 'linux-x86_64' ]]; then
+            session_gate_log="$STASIS_LINUX_CRASH_DIR/logs/session-north-star.raw.log"
+            expected_samples=50
+          fi
+          : > "$session_gate_log"
+          for ((lifecycle_sample = 1; lifecycle_sample <= expected_samples; lifecycle_sample++)); do
+            printf 'session_north_star_lifecycle_sample=%02d/%02d\n' \
+              "$lifecycle_sample" "$expected_samples" \
+              | tee -a "$session_gate_log"
+            "${gate_runner[@]}" \
+              STASIS_SESSION_NORTH_STAR_BINARY="$binary" \
+              STASIS_SESSION_NORTH_STAR_RUNTIME_CACHE="$explicit_runtime_cache" \
+              node test/fixtures/public-package-session-north-star.mjs \
+                2>&1 | tee -a "$session_gate_log"
+          done
+          test "$(grep -Fc '"proof":"stasis-v0.2-session-north-star"' "$session_gate_log")" \
+            = "$expected_samples"
+          test "$(grep -Fc '"runs":3' "$session_gate_log")" = "$expected_samples"
+          test "$(grep -Fc '"sessions":6' "$session_gate_log")" = "$expected_samples"
+          test "$(grep -Fc '"runtimeAcquisition":"explicit-executable-override-cache-bypassed"' \
+            "$session_gate_log")" = "$expected_samples"
 
       - name: Gate Stasis library and controlled-source invariants on this native platform
         shell: bash
@@ -406,11 +419,13 @@ jobs:
           && matrix.release_platform == 'linux-x86_64'
           && env.STASIS_LINUX_CRASH_DIR != ''
           && (
-            steps.controlled_mvp_gate.outcome == 'failure'
+            steps.session_north_star_gate.outcome == 'failure'
+            || steps.controlled_mvp_gate.outcome == 'failure'
             || steps.baseline_protocol_gate.outcome == 'failure'
           )
         shell: bash
         env:
+          SESSION_NORTH_STAR_OUTCOME: ${{ steps.session_north_star_gate.outcome }}
           CONTROLLED_MVP_OUTCOME: ${{ steps.controlled_mvp_gate.outcome }}
           BASELINE_PROTOCOL_OUTCOME: ${{ steps.baseline_protocol_gate.outcome }}
         run: |
@@ -423,7 +438,10 @@ jobs:
           fi
           : > "$status_file"
           echo 'schema=1' >> "$status_file"
-          if [[ "$CONTROLLED_MVP_OUTCOME" == 'failure' ]]; then
+          if [[ "$SESSION_NORTH_STAR_OUTCOME" == 'failure' ]]; then
+            failed_gate='session_north_star'
+            failed_log="$diagnostics/logs/session-north-star.raw.log"
+          elif [[ "$CONTROLLED_MVP_OUTCOME" == 'failure' ]]; then
             failed_gate='controlled_mvp'
             failed_log="$diagnostics/logs/controlled-mvp.raw.log"
           elif [[ "$BASELINE_PROTOCOL_OUTCOME" == 'failure' ]]; then
@@ -434,6 +452,11 @@ jobs:
             failed_log=''
           fi
           echo "failed_gate=$failed_gate" >> "$status_file"
+          if [[ -s "$diagnostics/logs/session-north-star.raw.log" ]]; then
+            echo 'session_north_star_raw_log=available_for_sanitization' >> "$status_file"
+          else
+            echo 'session_north_star_raw_log=missing_or_empty' >> "$status_file"
+          fi
           if [[ -s "$diagnostics/logs/controlled-mvp.raw.log" ]]; then
             echo 'controlled_mvp_raw_log=available_for_sanitization' >> "$status_file"
           else
@@ -457,7 +480,8 @@ jobs:
           fi
 
           harness_relative=''
-          if [[ -n "$failed_log" && -s "$failed_log" && "$failed_gate" != 'unknown' ]]; then
+          if [[ -n "$failed_log" && -s "$failed_log" \
+              && "$failed_gate" =~ ^(controlled_mvp|baseline_protocol)$ ]]; then
             harness_relative=$(LC_ALL=C sed -nE \
               "s|^[[:space:]]*Running tests/${failed_gate}\\.rs \\((target/production-stripped/deps/${failed_gate}-[0-9a-f]+)\\)[[:space:]]*$|\\1|p" \
               "$failed_log" | tail -n 1)
@@ -509,6 +533,27 @@ jobs:
           def sanitize_line(line):
               global failure_list_mode
               line = line.replace(workspace, "<workspace>")
+              match = re.fullmatch(
+                  r"session_north_star_lifecycle_sample=([0-4][0-9]|50)/50",
+                  line,
+              )
+              if match:
+                  return f"session_north_star_lifecycle_sample={match.group(1)}/50"
+
+              match = re.fullmatch(
+                  r"StasisProcessError: Stasis exited from signal (SIG[A-Z0-9]+)",
+                  line,
+              )
+              if match:
+                  return f"stasis_process_error signal={match.group(1)}"
+
+              match = re.fullmatch(
+                  r"\s*stderrTail: 'Redirecting call to abort\(\) to mozalloc_abort\\n\\n',",
+                  line,
+              )
+              if match:
+                  return "stderr_marker=mozalloc_abort"
+
               match = re.fullmatch(
                   r"lifecycle_fresh_process_sample=(0[1-9]|[1-4][0-9]|50)/50 "
                   r"test=ten_second_timeout_session_closes_cleanly_after_virtual_advance",
@@ -626,7 +671,7 @@ jobs:
               return None
 
           append_structural("schema=1")
-          append_structural(f"failed_gate={failed_gate if failed_gate in {'controlled_mvp', 'baseline_protocol'} else 'unknown'}")
+          append_structural(f"failed_gate={failed_gate if failed_gate in {'session_north_star', 'controlled_mvp', 'baseline_protocol'} else 'unknown'}")
           append_structural("raw_log_uploaded=false")
           source_status = "missing"
           try:
@@ -672,9 +717,11 @@ jobs:
           fi
 
           rm -f -- \
+            "$diagnostics/logs/session-north-star.raw.log" \
             "$diagnostics/logs/controlled-mvp.raw.log" \
             "$diagnostics/logs/baseline.raw.log"
-          if [[ ! -e "$diagnostics/logs/controlled-mvp.raw.log" \
+          if [[ ! -e "$diagnostics/logs/session-north-star.raw.log" \
+              && ! -e "$diagnostics/logs/controlled-mvp.raw.log" \
               && ! -e "$diagnostics/logs/baseline.raw.log" ]]; then
             echo 'raw_logs_deleted=ok' >> "$status_file"
           else
@@ -688,6 +735,7 @@ jobs:
             echo "run_id=$GITHUB_RUN_ID"
             echo "run_attempt=$GITHUB_RUN_ATTEMPT"
             echo "failed_gate=$failed_gate"
+            echo "session_north_star_outcome=$SESSION_NORTH_STAR_OUTCOME"
             echo "controlled_mvp_outcome=$CONTROLLED_MVP_OUTCOME"
             echo "baseline_protocol_outcome=$BASELINE_PROTOCOL_OUTCOME"
             echo 'raw_logs_uploaded=false'
@@ -739,7 +787,8 @@ jobs:
           && matrix.release_platform == 'linux-x86_64'
           && env.STASIS_LINUX_CRASH_DIR != ''
           && (
-            steps.controlled_mvp_gate.outcome == 'failure'
+            steps.session_north_star_gate.outcome == 'failure'
+            || steps.controlled_mvp_gate.outcome == 'failure'
             || steps.baseline_protocol_gate.outcome == 'failure'
           )
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

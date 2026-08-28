@@ -271,6 +271,67 @@ impl DeferredReplacementActivation {
     }
 }
 
+/// Join Script event-loop threads which have completed their main function and retain only the
+/// threads which are still running.
+///
+/// `JoinHandle::is_finished()` can become true immediately before the OS thread has fully stopped.
+/// Dropping such a handle would detach the thread and lose the synchronization boundary needed
+/// before process-wide JavaScript-engine teardown.
+fn join_finished_event_loop_threads(join_handles: &mut Vec<JoinHandle<()>>) -> usize {
+    let mut unfinished = Vec::with_capacity(join_handles.len());
+    let mut join_failures = 0;
+    for join_handle in join_handles.drain(..) {
+        if join_handle.is_finished() {
+            if join_handle.join().is_err() {
+                join_failures += 1;
+            }
+        } else {
+            unfinished.push(join_handle);
+        }
+    }
+    *join_handles = unfinished;
+    join_failures
+}
+
+#[cfg(test)]
+mod finished_event_loop_cleanup_tests {
+    use std::sync::mpsc;
+    use std::thread;
+
+    use super::join_finished_event_loop_threads;
+
+    #[test]
+    fn normally_finished_event_loop_handles_join_without_failure() {
+        let finished = thread::spawn(|| {});
+        while !finished.is_finished() {
+            thread::yield_now();
+        }
+
+        let mut join_handles = vec![finished];
+        assert_eq!(join_finished_event_loop_threads(&mut join_handles), 0);
+        assert!(join_handles.is_empty());
+    }
+
+    #[test]
+    fn finished_event_loop_handles_are_joined_while_running_handles_are_retained() {
+        let finished = thread::spawn(|| panic!("intentional join-observation panic"));
+        while !finished.is_finished() {
+            thread::yield_now();
+        }
+
+        let (release_sender, release_receiver) = mpsc::channel();
+        let running = thread::spawn(move || release_receiver.recv().unwrap());
+        assert!(!running.is_finished());
+
+        let mut join_handles = vec![finished, running];
+        assert_eq!(join_finished_event_loop_threads(&mut join_handles), 1);
+        assert_eq!(join_handles.len(), 1);
+
+        release_sender.send(()).unwrap();
+        join_handles.pop().unwrap().join().unwrap();
+    }
+}
+
 #[cfg(test)]
 mod deferred_replacement_activation_tests {
     use servo_base::id::{PipelineNamespaceId, TEST_PIPELINE_INDEX};
@@ -1120,8 +1181,10 @@ where
     }
 
     fn clean_up_finished_script_event_loops(&mut self) {
-        self.event_loop_join_handles
-            .retain(|join_handle| !join_handle.is_finished());
+        let join_failures = join_finished_event_loop_threads(&mut self.event_loop_join_handles);
+        if join_failures > 0 {
+            error!("Failed to join {join_failures} finished script-thread(s).");
+        }
         self.event_loops
             .retain(|event_loop| event_loop.upgrade().is_some());
     }
