@@ -18,6 +18,7 @@ use glow::{HasContext, NativeFramebuffer};
 use image::RgbaImage;
 use log::{debug, trace, warn};
 use raw_window_handle::{DisplayHandle, WindowHandle};
+use servo_base::lifecycle_trace::{LifecyclePhase, emit_lifecycle_phase};
 pub use surfman::Error;
 use surfman::chains::{PreserveBuffer, SwapChain};
 use surfman::{
@@ -105,9 +106,11 @@ struct SurfmanRenderingContext {
 
 impl Drop for SurfmanRenderingContext {
     fn drop(&mut self) {
+        emit_lifecycle_phase(LifecyclePhase::SurfmanRenderingContextDropBegin);
         let device = &mut self.device.borrow_mut();
         let context = &mut self.context.borrow_mut();
         let _ = device.destroy_context(context);
+        emit_lifecycle_phase(LifecyclePhase::SurfmanRenderingContextDropBodyEnd);
     }
 }
 
@@ -329,9 +332,11 @@ impl SoftwareRenderingContext {
 
 impl Drop for SoftwareRenderingContext {
     fn drop(&mut self) {
+        emit_lifecycle_phase(LifecyclePhase::SoftwareRenderingContextDropBegin);
         let device = &mut self.surfman_rendering_info.device.borrow_mut();
         let context = &mut self.surfman_rendering_info.context.borrow_mut();
         let _ = self.swap_chain.destroy(device, context);
+        emit_lifecycle_phase(LifecyclePhase::SoftwareRenderingContextDropBodyEnd);
     }
 }
 

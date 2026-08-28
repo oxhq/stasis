@@ -46,6 +46,7 @@ use servo_background_hang_monitor::HangMonitorRegister;
 use servo_base::generic_channel::{GenericCallback, GenericSender, RoutedReceiver};
 pub use servo_base::id::WebViewId;
 use servo_base::id::{EMBEDDER_PIPELINE_NAMESPACE_ID, PipelineNamespace};
+use servo_base::lifecycle_trace::{LifecyclePhase, emit_lifecycle_phase};
 #[cfg(feature = "bluetooth")]
 use servo_bluetooth::BluetoothThreadFactory;
 #[cfg(feature = "bluetooth")]
@@ -249,12 +250,28 @@ struct ServoInner {
     /// For single-process Servo instances, this field controls the initialization
     /// and deinitialization of the JS Engine. Multiprocess Servo instances have their
     /// own instance that exists in the content process instead.
-    _js_engine_setup: Option<JSEngineSetup>,
+    _js_engine_setup: LifecycleTracedJsEngineSetup,
     /// [`InputEventId`]s that have been handled, but for which the embedder has
     /// not been notified yet.
     pending_handled_input_events: RefCell<Vec<PendingHandledInputEvent>>,
     /// An [`EventLoopWaker`] used to wake up the main embedder event loop.
     event_loop_waker: Box<dyn EventLoopWaker>,
+}
+
+struct LifecycleTracedJsEngineSetup(Option<JSEngineSetup>);
+
+impl LifecycleTracedJsEngineSetup {
+    fn new(js_engine_setup: Option<JSEngineSetup>) -> Self {
+        Self(js_engine_setup)
+    }
+}
+
+impl Drop for LifecycleTracedJsEngineSetup {
+    fn drop(&mut self) {
+        emit_lifecycle_phase(LifecyclePhase::JsEngineDropBegin);
+        drop(self.0.take());
+        emit_lifecycle_phase(LifecyclePhase::JsEngineDropEnd);
+    }
 }
 
 impl ServoInner {
@@ -781,7 +798,10 @@ impl ServoInner {
 
     fn handle_constellation_embedder_message(&self, message: ConstellationToEmbedderMsg) {
         match message {
-            ConstellationToEmbedderMsg::ShutdownComplete => self.finish_shutting_down(),
+            ConstellationToEmbedderMsg::ShutdownComplete => {
+                emit_lifecycle_phase(LifecyclePhase::ShutdownCompleteObserved);
+                self.finish_shutting_down();
+            },
             ConstellationToEmbedderMsg::AllowNavigationRequest(
                 webview_id,
                 pipeline_id,
@@ -1028,17 +1048,24 @@ mod controlled_cookie_context_tests {
 
 impl Drop for ServoInner {
     fn drop(&mut self) {
+        emit_lifecycle_phase(LifecyclePhase::ServoInnerDropBegin);
+        emit_lifecycle_phase(LifecyclePhase::ConstellationExitSendBegin);
         self.constellation_proxy
             .send(EmbedderToConstellationMessage::Exit);
         self.shutdown_state.set(ShutdownState::ShuttingDown);
         while self.spin_event_loop() {
             std::thread::sleep(Duration::from_micros(500));
         }
-        if let Some(constellation_thread) = self.constellation_thread.take()
-            && constellation_thread.join().is_err()
-        {
-            error!("Failed to join the Constellation thread during Servo shutdown.");
+        if let Some(constellation_thread) = self.constellation_thread.take() {
+            emit_lifecycle_phase(LifecyclePhase::ConstellationJoinBegin);
+            if constellation_thread.join().is_err() {
+                emit_lifecycle_phase(LifecyclePhase::ConstellationJoinFailed);
+                error!("Failed to join the Constellation thread during Servo shutdown.");
+            } else {
+                emit_lifecycle_phase(LifecyclePhase::ConstellationJoinEnd);
+            }
         }
+        emit_lifecycle_phase(LifecyclePhase::ServoInnerDropBodyEnd);
     }
 }
 
@@ -1204,7 +1231,7 @@ impl Servo {
             constellation_thread: Some(constellation_thread),
             webviews: Default::default(),
             servo_errors: ServoErrorChannel::default(),
-            _js_engine_setup: js_engine_setup,
+            _js_engine_setup: LifecycleTracedJsEngineSetup::new(js_engine_setup),
             pending_handled_input_events: Default::default(),
             event_loop_waker,
         }))

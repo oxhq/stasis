@@ -26,6 +26,9 @@ use servo::document_control::{
     DocumentControlAction, DocumentControlAutomationKind, DocumentControlCommand,
     DocumentControlError, DocumentControlOutcome, DocumentControlReceiveOutcome,
 };
+use servo_base::lifecycle_trace::{
+    LifecyclePhase, emit_lifecycle_phase, initialize_lifecycle_trace,
+};
 use stasis_shell::session_state::{
     SessionCookiesResultV1, SessionCookiesSetParamsV1, SessionStateError,
     SessionStateExportResultV1, SessionStateMutationResultV1, SessionStateToken, SessionStateV1,
@@ -107,6 +110,10 @@ impl SessionProfile {
 }
 
 fn main() {
+    // Cache exact diagnostic enablement before the protocol reader or any Servo-owned thread
+    // starts. Later environment changes cannot turn lifecycle evidence on or off mid-process.
+    initialize_lifecycle_trace();
+
     // Claim the protocol pipe before starting any helper or Servo-owned threads. Descriptor 1 is
     // diagnostic-only after this point; only `ProtocolWriter` retains the original stdout.
     let stdout = stasis_shell::stdio::claim_protocol_stdout()
@@ -137,12 +144,17 @@ fn main() {
         last_navigation_authority: None,
     };
 
-    match shell.run() {
+    let shell_result = shell.run();
+    emit_lifecycle_phase(LifecyclePhase::ShellRunEnd);
+    match shell_result {
         Ok(()) => {
+            emit_lifecycle_phase(LifecyclePhase::ProtocolReaderJoinBegin);
             if reader.join().is_err() {
+                emit_lifecycle_phase(LifecyclePhase::ProtocolReaderJoinFailed);
                 eprintln!("stasis shell fatal error: protocol reader panicked during shutdown");
                 std::process::exit(70);
             }
+            emit_lifecycle_phase(LifecyclePhase::ProtocolReaderJoinEnd);
         },
         Err(error) => {
             eprintln!("stasis shell fatal error: {error}");
@@ -2743,6 +2755,7 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
             return Ok(false);
         }
 
+        emit_lifecycle_phase(LifecyclePhase::CloseAccepted);
         if let Some(active) = self.active.take() {
             let failure = self.cancel_active_failure(&active);
             self.write_method_result(&active.request, Err(failure.error))?;
@@ -2751,6 +2764,7 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
         self.close_engine();
         self.state = ShellState::Closed;
         self.write_method_result(&request, Ok(json!({"state": "closed"})))?;
+        emit_lifecycle_phase(LifecyclePhase::CloseResponseWritten);
         Ok(true)
     }
 

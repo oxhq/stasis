@@ -34,6 +34,8 @@ const RELEASE_GATE_NAME: &str = "act-settle-inspect";
 const RELEASE_GATE_TEST: &str = "release_gate_published_binary_completes_act_settle_inspect";
 const RELEASE_GATE_RECORD_SCHEMA: u64 = 2;
 const MAX_STDERR_TAIL_BYTES: usize = 64 * 1024;
+const LIFECYCLE_TRACE_ENV: &str = "STASIS_LIFECYCLE_TRACE_V1";
+const LIFECYCLE_TRACE_PREFIX: &str = "stasis_lifecycle_v1 phase=";
 const EXPECTED_SOURCE_IDENTITIES: &str = include_str!("../../../STASIS_UPSTREAM.toml");
 const EXPECTED_STASIS_REPOSITORY: &str = "https://github.com/oxhq/stasis.git";
 const CONTROLLED_WEBAPP_V1_PROFILE: &str = "controlled-webapp-v1";
@@ -122,6 +124,78 @@ fn release_gate_published_binary_completes_act_settle_inspect() {
         "10000"
     );
     shell.close_cleanly();
+    assert_packaged_single_close_lifecycle(&shell.read_stderr_tail());
+}
+
+#[test]
+fn source_binary_single_close_lifecycle_is_owner_ordered() {
+    let _serial = process_test_guard();
+    let server = FixtureServer::start(STATIC_FIXTURE, false);
+    let mut shell = TestShell::spawn_path_with_lifecycle_trace(PathBuf::from(env!(
+        "CARGO_BIN_EXE_stasis"
+    )));
+
+    shell.initialize();
+    shell.open_controlled(server.url());
+    assert_outcome(&shell.settle_default(), "quiescent");
+    shell.close_cleanly();
+
+    assert_packaged_single_close_lifecycle(&shell.read_stderr_tail());
+}
+
+fn assert_packaged_single_close_lifecycle(stderr: &str) {
+    let observed: Vec<_> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix(LIFECYCLE_TRACE_PREFIX))
+        .collect();
+    let expected = [
+        "close_accepted",
+        "engine_close_begin",
+        "webview_drop_begin",
+        "painter_drop_begin",
+        "painter_webrender_shutdown_begin",
+        "painter_webrender_shutdown_ack_observed",
+        "painter_renderer_deinit_begin",
+        "painter_renderer_deinit_end",
+        "painter_drop_body_end",
+        "webview_drop_end",
+        "pre_shutdown_spin_begin",
+        "pre_shutdown_spin_end",
+        "servo_owner_drop_begin",
+        "servo_inner_drop_begin",
+        "constellation_exit_send_begin",
+        "script_threads_join_begin",
+        "script_threads_join_end",
+        "subsystems_shutdown_end",
+        "constellation_run_end",
+        "constellation_state_drop_begin",
+        "constellation_state_drop_end",
+        "shutdown_complete_send_begin",
+        "shutdown_complete_observed",
+        "constellation_join_begin",
+        "constellation_join_end",
+        "servo_inner_drop_body_end",
+        "js_engine_drop_begin",
+        "js_engine_drop_end",
+        "servo_owner_drop_end",
+        "engine_close_end",
+        "engine_session_drop_begin",
+        "engine_session_drop_end",
+        "rendering_context_owner_drop_begin",
+        "software_rendering_context_drop_begin",
+        "software_rendering_context_drop_body_end",
+        "surfman_rendering_context_drop_begin",
+        "surfman_rendering_context_drop_body_end",
+        "rendering_context_owner_drop_end",
+        "close_response_written",
+        "shell_run_end",
+        "protocol_reader_join_begin",
+        "protocol_reader_join_end",
+    ];
+    assert_eq!(
+        observed, expected,
+        "the packaged product did not complete the fixed single-close lifecycle in owner order"
+    );
 }
 
 #[test]
@@ -1373,14 +1447,31 @@ impl TestShell {
                 archive.display()
             )
         });
-        (Self::spawn_path(binary.clone()), binary, archive)
+        (
+            Self::spawn_path_with_lifecycle_trace(binary.clone()),
+            binary,
+            archive,
+        )
     }
 
     fn spawn_path(binary: PathBuf) -> Self {
-        let mut child = Command::new(&binary)
+        Self::spawn_path_with_options(binary, false)
+    }
+
+    fn spawn_path_with_lifecycle_trace(binary: PathBuf) -> Self {
+        Self::spawn_path_with_options(binary, true)
+    }
+
+    fn spawn_path_with_options(binary: PathBuf, lifecycle_trace: bool) -> Self {
+        let mut command = Command::new(&binary);
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        if lifecycle_trace {
+            command.env(LIFECYCLE_TRACE_ENV, "1");
+        }
+        let mut child = command
             .spawn()
             .unwrap_or_else(|error| {
                 panic!(

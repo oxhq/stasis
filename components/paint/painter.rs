@@ -33,6 +33,7 @@ use servo_base::Epoch;
 use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::generic_channel::{GenericReceiver, GenericSharedMemory};
 use servo_base::id::{PainterId, PipelineId, WebViewId};
+use servo_base::lifecycle_trace::{LifecyclePhase, emit_lifecycle_phase};
 use servo_base::threadboost::{BoostAffinity, ThreadPriority};
 use servo_config::{opts, pref};
 use servo_constellation_traits::{EmbedderToConstellationMessage, PaintMetricEvent};
@@ -139,16 +140,22 @@ pub(crate) struct Painter {
 
 impl Drop for Painter {
     fn drop(&mut self) {
+        emit_lifecycle_phase(LifecyclePhase::PainterDropBegin);
         if let Err(error) = self.rendering_context.make_current() {
             error!("Failed to make the rendering context current: {error:?}");
         }
 
         self.webrender_api.stop_render_backend();
+        emit_lifecycle_phase(LifecyclePhase::PainterWebRenderShutdownBegin);
         self.webrender_api.shut_down(true);
+        emit_lifecycle_phase(LifecyclePhase::PainterWebRenderShutdownAckObserved);
 
         if let Some(renderer) = self.webrender_renderer.take() {
+            emit_lifecycle_phase(LifecyclePhase::PainterRendererDeinitBegin);
             renderer.deinit();
+            emit_lifecycle_phase(LifecyclePhase::PainterRendererDeinitEnd);
         }
+        emit_lifecycle_phase(LifecyclePhase::PainterDropBodyEnd);
     }
 }
 

@@ -166,6 +166,7 @@ use servo_base::id::{
     PainterId, PipelineId, PipelineNamespace, PipelineNamespaceId, PipelineNamespaceRequest,
     ScriptEventLoopId, WebViewId,
 };
+use servo_base::lifecycle_trace::{LifecyclePhase, emit_lifecycle_phase};
 use servo_base::threadboost::{BoostAffinity, ThreadPriority};
 use servo_base::{Epoch, generic_channel};
 #[cfg(feature = "bluetooth")]
@@ -1139,11 +1140,15 @@ where
                     ),
                 };
                 constellation.run();
+                emit_lifecycle_phase(LifecyclePhase::ConstellationRunEnd);
 
                 // Drop all Constellation-owned state before telling the embedder that shutdown is
                 // complete. The embedder uses this signal as its boundary for de-initializing Servo.
+                emit_lifecycle_phase(LifecyclePhase::ConstellationStateDropBegin);
                 drop(constellation);
+                emit_lifecycle_phase(LifecyclePhase::ConstellationStateDropEnd);
                 debug!("Asking embedding layer to complete shutdown.");
+                emit_lifecycle_phase(LifecyclePhase::ShutdownCompleteSendBegin);
                 match shutdown_complete_target {
                     ShutdownCompleteTarget::Waking(proxy) => {
                         proxy.send(ConstellationToEmbedderMsg::ShutdownComplete)
@@ -4333,11 +4338,19 @@ where
     fn handle_shutdown(&mut self) {
         debug!("Handling shutdown.");
 
+        emit_lifecycle_phase(LifecyclePhase::ScriptThreadsJoinBegin);
+        let mut script_thread_join_failed = false;
         for join_handle in self.event_loop_join_handles.drain(..) {
             if join_handle.join().is_err() {
+                script_thread_join_failed = true;
                 error!("Failed to join on a script-thread.");
             }
         }
+        emit_lifecycle_phase(if script_thread_join_failed {
+            LifecyclePhase::ScriptThreadsJoinFailed
+        } else {
+            LifecyclePhase::ScriptThreadsJoinEnd
+        });
 
         // In single process mode, join on the background hang monitor worker thread.
         drop(self.background_monitor_register.take());
@@ -4549,6 +4562,7 @@ where
 
         debug!("Shutting-down the async runtime in constellation.");
         self.async_runtime.shutdown();
+        emit_lifecycle_phase(LifecyclePhase::SubsystemsShutdownEnd);
     }
 
     fn handle_pipeline_exited(&mut self, pipeline_id: PipelineId) {

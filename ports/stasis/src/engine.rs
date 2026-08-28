@@ -30,6 +30,7 @@ pub use servo::{
     SessionNavigationError, SessionNavigationId,
 };
 use servo_base::generic_channel::TryReceiveError;
+use servo_base::lifecycle_trace::{LifecyclePhase, emit_lifecycle_phase};
 use stasis_shell::session_state::{
     self, LiveSessionStateBackend, ServoSessionStateBackend, SessionCookiesResultV1,
     SessionCookiesSetParamsV1, SessionStateAuthority, SessionStateError,
@@ -384,7 +385,7 @@ pub struct EngineSession {
     // Drop the WebView before Servo so its close message still has an owner.
     webview: Option<WebView>,
     servo: Option<Servo>,
-    _rendering_context: Rc<dyn RenderingContext>,
+    _rendering_context: LifecycleTracedRenderingContext,
     waker: ShellWaker,
     clock_mode: EngineClockMode,
     document_control_profile: DocumentControlProfile,
@@ -393,6 +394,22 @@ pub struct EngineSession {
     controlled_network: Option<ControlledNetworkSession>,
     pending_control: Option<PendingControlOperation>,
     pending_navigation: Option<PendingNavigationOperation>,
+}
+
+struct LifecycleTracedRenderingContext(Option<Rc<dyn RenderingContext>>);
+
+impl LifecycleTracedRenderingContext {
+    fn new(rendering_context: Rc<dyn RenderingContext>) -> Self {
+        Self(Some(rendering_context))
+    }
+}
+
+impl Drop for LifecycleTracedRenderingContext {
+    fn drop(&mut self) {
+        emit_lifecycle_phase(LifecyclePhase::RenderingContextOwnerDropBegin);
+        drop(self.0.take());
+        emit_lifecycle_phase(LifecyclePhase::RenderingContextOwnerDropEnd);
+    }
 }
 
 impl EngineSession {
@@ -585,7 +602,7 @@ impl EngineSession {
         let session = Self {
             webview: Some(webview),
             servo: Some(servo),
-            _rendering_context: rendering_context,
+            _rendering_context: LifecycleTracedRenderingContext::new(rendering_context),
             waker,
             clock_mode,
             document_control_profile,
@@ -863,15 +880,32 @@ impl EngineSession {
     }
 
     pub fn close(&mut self) {
+        let closing = self.webview.is_some() || self.servo.is_some();
+        if closing {
+            emit_lifecycle_phase(LifecyclePhase::EngineCloseBegin);
+        }
         if let Some(operation) = self.pending_control.take() {
             let _ = operation.cancel();
         }
         self.pending_navigation.take();
-        self.webview.take();
-        if let Some(servo) = self.servo.as_ref() {
-            servo.spin_event_loop();
+        if self.webview.is_some() {
+            emit_lifecycle_phase(LifecyclePhase::WebViewDropBegin);
+            drop(self.webview.take());
+            emit_lifecycle_phase(LifecyclePhase::WebViewDropEnd);
         }
-        self.servo.take();
+        if let Some(servo) = self.servo.as_ref() {
+            emit_lifecycle_phase(LifecyclePhase::PreShutdownSpinBegin);
+            servo.spin_event_loop();
+            emit_lifecycle_phase(LifecyclePhase::PreShutdownSpinEnd);
+        }
+        if self.servo.is_some() {
+            emit_lifecycle_phase(LifecyclePhase::ServoOwnerDropBegin);
+            drop(self.servo.take());
+            emit_lifecycle_phase(LifecyclePhase::ServoOwnerDropEnd);
+        }
+        if closing {
+            emit_lifecycle_phase(LifecyclePhase::EngineCloseEnd);
+        }
     }
 
     /// Submit exactly one mechanical command and retain its consuming response receiver.
@@ -1025,7 +1059,9 @@ impl EngineSession {
 
 impl Drop for EngineSession {
     fn drop(&mut self) {
+        emit_lifecycle_phase(LifecyclePhase::EngineSessionDropBegin);
         self.close();
+        emit_lifecycle_phase(LifecyclePhase::EngineSessionDropEnd);
     }
 }
 
