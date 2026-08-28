@@ -530,14 +530,23 @@ test("child death includes exit status and only the bounded stderr tail", async 
   });
 });
 
-test("unexpected stdout EOF fail-stops even while the child remains alive", async (context) => {
-  const { app } = await openFake(context, "stdout-eof-linger");
-  await assert.rejects(app.pending(), (error) => {
-    assert.ok(error instanceof StasisTransportError);
-    assert.equal(error.code, "unexpected_stdout_eof");
-    return true;
-  });
-});
+test(
+  "unexpected stdout EOF fail-stops even while the child remains alive",
+  {
+    skip:
+      process.platform === "win32"
+        ? "Node keeps the child stdout pipe open on Windows until process exit, so a live-child EOF fixture is not representable"
+        : false,
+  },
+  async (context) => {
+    const { app } = await openFake(context, "stdout-eof-linger");
+    await assert.rejects(app.pending(), (error) => {
+      assert.ok(error instanceof StasisTransportError);
+      assert.equal(error.code, "unexpected_stdout_eof");
+      return true;
+    });
+  },
+);
 
 test("graceful close waits for and validates the process exit", async (context) => {
   const { app } = await openFake(context, "close-nonzero");

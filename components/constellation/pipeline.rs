@@ -47,6 +47,10 @@ pub struct Pipeline {
     /// to a hash URL.
     pub url: ServoUrl,
 
+    /// Script-attested site-for-cookies of the active top-level Document. This remains `None`
+    /// until activation and for opaque or nested Documents; it must never be inferred from `url`.
+    pub controlled_cookie_site_for_cookies: Option<ServoUrl>,
+
     /// Whether this pipeline is currently running animations. Pipelines that are running
     /// animations cause composites to be continually scheduled.
     pub animation_state: AnimationState,
@@ -128,6 +132,7 @@ impl Pipeline {
             event_loop,
             paint_proxy,
             url: load_data.url.clone(),
+            controlled_cookie_site_for_cookies: None,
             children: vec![],
             animation_state: AnimationState::NoAnimationsPresent,
             document_callbacks_active: false,

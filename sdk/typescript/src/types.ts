@@ -374,6 +374,7 @@ export type UnsupportedReason =
   | "storage_event_listener"
   | "clock_not_controlled"
   | "canvas_upload"
+  | "render_blocking_element"
   | "font_load"
   | "image_load"
   | "inactive_rendering"
@@ -774,12 +775,17 @@ type SessionSettleProfileIdentity<Profile extends SelectableSessionProfile> =
     ? { readonly [sessionSettleProfileBrand]?: Profile }
     : BoundSessionSettleProfile<Profile>;
 
+type SessionSettleUrlProjection<Profile extends SelectableSessionProfile> =
+  Profile extends typeof CONTROLLED_WEB_SESSION_V2_PROFILE
+    ? { /** Owner-attested active top-level URL at the terminal snapshot. */ url: string }
+    : {};
+
 export type SessionSettleResult<
   Profile extends SelectableSessionProfile = SessionSupportProfile,
 > = SettleResult & {
   stateToken: DocumentStateToken;
   snapshot: SessionPendingSnapshot;
-} & SessionSettleProfileIdentity<Profile>;
+} & SessionSettleUrlProjection<Profile> & SessionSettleProfileIdentity<Profile>;
 
 export type SessionAdvanceToNextResult = AdvanceToNextResult & {
   stateToken: DocumentStateToken;

@@ -174,7 +174,7 @@ impl ImageResolver {
             // When the image loads it will trigger a reflow and/or repaint.
             ImageCacheResult::Pending(id) => {
                 let image = PendingImage {
-                    state: PendingImageState::PendingResponse,
+                    state: PendingImageState::PendingResponse(url),
                     node: node.into(),
                     id,
                     origin: self.origin.clone(),

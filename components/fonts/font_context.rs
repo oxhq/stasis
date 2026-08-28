@@ -1772,6 +1772,7 @@ mod tests {
                 policy_container: Default::default(),
                 origin: RequestOrigin::Origin(ImmutableOrigin::new_opaque()),
                 is_nested_browsing_context: false,
+                controlled_cookie_site_for_cookies: None,
                 insecure_requests_policy: InsecureRequestsPolicy::DoNotUpgrade,
                 has_trustworthy_ancestor_origin: false,
             },

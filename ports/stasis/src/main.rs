@@ -1243,6 +1243,8 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                         return self.write_method_result(&request, Err(error));
                     },
                 };
+                let effective_policy =
+                    bind_runtime_settle_profile_policy(profile, effective_policy);
                 let (authorizing_document_state, authorization_is_stale) =
                     match expected_state_token.as_ref() {
                         Some(expected) => {
@@ -1458,12 +1460,10 @@ impl<W: io::Write, E: EnginePort> Shell<W, E> {
                 );
             },
         };
-        let effective_policy = wire::RuntimeSettleParams::default()
-            .resolve(settle::SettlePolicy::default())
-            .expect("the product default settlement policy is valid");
         let profile = self
             .profile
             .expect("a session navigation has a validated session profile");
+        let effective_policy = default_resolved_settle_policy_for_profile(profile);
         let active = ActiveRequest {
             request,
             profile: Some(profile),
@@ -3324,7 +3324,8 @@ fn transition_from_control_completion(
                     deadline: state.deadline,
                     bootstrap_attempted: state.bootstrap_attempted,
                 };
-                let effective_policy = default_resolved_settle_policy();
+                let effective_policy =
+                    default_resolved_settle_policy_for_profile(state.profile);
                 let mut coordinator = settle::SettleCoordinator::new(effective_policy.engine);
                 let command = match coordinator.start() {
                     Ok(settle::SettleProgress::Command(command)) => command,
@@ -3899,7 +3900,13 @@ fn transition_from_control_completion(
                     }) &&
                 navigation.target() == &pending.target;
             if pending.as_ref() != state.pending.as_ref() && !exact_action_refresh {
-                let restart = restart_session_projection_after_drift(&state.kind, state_effect);
+                let restart = restart_session_projection_after_drift(
+                    &state.kind,
+                    active
+                        .profile
+                        .expect("session projection retains its selected session profile"),
+                    state_effect,
+                );
                 return match restart {
                     Ok((operation, transition)) => {
                         active.operation = operation;
@@ -3909,7 +3916,13 @@ fn transition_from_control_completion(
                 };
             }
             if navigation.target() != &pending.target {
-                let restart = restart_session_projection_after_drift(&state.kind, state_effect);
+                let restart = restart_session_projection_after_drift(
+                    &state.kind,
+                    active
+                        .profile
+                        .expect("session projection retains its selected session profile"),
+                    state_effect,
+                );
                 return match restart {
                     Ok((operation, transition)) => {
                         active.operation = operation;
@@ -3961,6 +3974,22 @@ fn default_resolved_settle_policy() -> wire::ResolvedSettlePolicy {
     wire::RuntimeSettleParams::default()
         .resolve(settle::SettlePolicy::default())
         .expect("the product default settlement policy is valid")
+}
+
+fn default_resolved_settle_policy_for_profile(
+    profile: SessionProfile,
+) -> wire::ResolvedSettlePolicy {
+    bind_runtime_settle_profile_policy(profile, default_resolved_settle_policy())
+}
+
+fn bind_runtime_settle_profile_policy(
+    profile: SessionProfile,
+    mut policy: wire::ResolvedSettlePolicy,
+) -> wire::ResolvedSettlePolicy {
+    policy.engine.advance_interval_head_before_finite_work =
+        profile == SessionProfile::ControlledWebSessionV2 &&
+            policy.persistent_work == wire::PersistentWorkPolicy::Report;
+    policy
 }
 
 fn active_expects_navigation_response(operation: &ActiveOperation) -> bool {
@@ -4511,7 +4540,7 @@ fn transition_from_navigation_completion(
                     source_pipeline_id: admission.source_pipeline_id,
                     pipeline_id: admission.pipeline_id,
                 };
-                let effective_policy = default_resolved_settle_policy();
+                let effective_policy = default_resolved_settle_policy_for_profile(profile);
                 let mut coordinator = settle::SettleCoordinator::new(effective_policy.engine);
                 let progress = coordinator.start_with_replacement_bootstrap(bootstrap.clone());
                 let command = match progress {
@@ -4566,7 +4595,7 @@ fn transition_from_navigation_completion(
                     kind: SessionProjectionKind::Automation {
                         settle_resume: SettleProjectionResume {
                             profile,
-                            effective_policy: default_resolved_settle_policy(),
+                            effective_policy: default_resolved_settle_policy_for_profile(profile),
                             cumulative_external_io_wall_time: Duration::ZERO,
                             authorizing_navigation: Some(navigation.clone()),
                             response,
@@ -4610,7 +4639,7 @@ fn transition_from_navigation_completion(
                     source_pipeline_id: admission.source_pipeline_id,
                     pipeline_id: admission.pipeline_id,
                 };
-                let effective_policy = default_resolved_settle_policy();
+                let effective_policy = default_resolved_settle_policy_for_profile(profile);
                 let mut coordinator = settle::SettleCoordinator::new(effective_policy.engine);
                 coordinator.latch_additional_foreground_external_io_active(
                     *source_external_io_active_at_authorization,
@@ -4755,8 +4784,13 @@ fn transition_from_navigation_completion(
                             SessionProjectionPhase::AwaitingPendingObservation { navigation };
                         return ActiveTransition::Submit(DocumentControlCommand::Observe);
                     }
-                    let restart =
-                        restart_session_projection_after_drift(&state.kind, active.state_effect);
+                    let restart = restart_session_projection_after_drift(
+                        &state.kind,
+                        active
+                            .profile
+                            .expect("session projection retains its selected session profile"),
+                        active.state_effect,
+                    );
                     return match restart {
                         Ok((operation, transition)) => {
                             active.operation = operation;
@@ -4825,8 +4859,15 @@ fn transition_from_navigation_completion(
                 SessionProjectionKind::Value {
                     value,
                     snapshot_token,
-                    ..
+                    settle_resume,
                 } => {
+                    let settlement_url = settle_resume
+                        .as_ref()
+                        .filter(|resume| {
+                            resume.profile == SessionProfile::ControlledWebSessionV2 &&
+                                matches!(&resume.response, SettleResponse::Runtime)
+                        })
+                        .map(|_| navigation.url().to_string());
                     let Some(object) = value.as_object_mut() else {
                         return projection_shape_failure(
                             "session result is not an object",
@@ -4850,6 +4891,9 @@ fn transition_from_navigation_completion(
                             "stateToken".into(),
                             serde_json::to_value(&token).expect("opaque token serializes"),
                         );
+                    }
+                    if let Some(url) = settlement_url {
+                        object.insert("url".into(), Value::String(url));
                     }
                     ActiveTransition::Complete(std::mem::take(value))
                 },
@@ -5896,6 +5940,7 @@ fn controlled_ready_pending(
 
 fn restart_session_projection_after_drift(
     kind: &SessionProjectionKind,
+    profile: SessionProfile,
     state_effect: RequestStateEffect,
 ) -> Result<(ActiveOperation, ActiveTransition), ActiveFailure> {
     if matches!(kind, SessionProjectionKind::Automation { .. }) {
@@ -5909,9 +5954,10 @@ fn restart_session_projection_after_drift(
         });
     }
     let resume = session_projection_settle_resume(kind);
-    let policy = resume.map_or_else(settle::SettlePolicy::default, |resume| {
-        resume.effective_policy.engine
-    });
+    let policy = resume.map_or_else(
+        || default_resolved_settle_policy_for_profile(profile).engine,
+        |resume| resume.effective_policy.engine,
+    );
     let mut coordinator = settle::SettleCoordinator::new(policy);
     let progress = coordinator.start().map_err(|error| match resume {
         Some(resume) => settle_failure_for_response(error, state_effect, None, &resume.response),
@@ -6432,7 +6478,7 @@ fn project_session_pending(
     pending: &servo::document_pending::RawPendingSnapshot,
     state_effect: RequestStateEffect,
 ) -> ActiveTransition {
-    let effective_policy = default_resolved_settle_policy();
+    let effective_policy = default_resolved_settle_policy_for_profile(profile);
     project_session_value_with_resume(
         result,
         pending,
@@ -9225,6 +9271,58 @@ mod tests {
     }
 
     #[test]
+    fn interval_head_progression_is_bound_only_to_v2_report_settlement() {
+        assert!(
+            default_resolved_settle_policy_for_profile(
+                SessionProfile::ControlledWebSessionV2,
+            )
+            .engine
+            .advance_interval_head_before_finite_work,
+            "implicit v2 settlement used by session.open and action/navigation readiness must opt in",
+        );
+        assert!(
+            !default_resolved_settle_policy_for_profile(
+                SessionProfile::ControlledWebSessionV1,
+            )
+            .engine
+            .advance_interval_head_before_finite_work,
+            "implicit v1 settlement must retain the frozen interval blocker",
+        );
+
+        for (profile, persistent_work, expected) in [
+            (
+                SessionProfile::ControlledWebappV1,
+                wire::PersistentWorkPolicy::Report,
+                false,
+            ),
+            (
+                SessionProfile::ControlledWebSessionV1,
+                wire::PersistentWorkPolicy::Report,
+                false,
+            ),
+            (
+                SessionProfile::ControlledWebSessionV2,
+                wire::PersistentWorkPolicy::Strict,
+                false,
+            ),
+            (
+                SessionProfile::ControlledWebSessionV2,
+                wire::PersistentWorkPolicy::Report,
+                true,
+            ),
+        ] {
+            let mut policy = default_resolved_settle_policy();
+            policy.persistent_work = persistent_work;
+            let policy = bind_runtime_settle_profile_policy(profile, policy);
+            assert_eq!(
+                policy.engine.advance_interval_head_before_finite_work,
+                expected,
+                "unexpected interval-head policy for {profile:?} with {persistent_work:?}",
+            );
+        }
+    }
+
+    #[test]
     fn active_controlled_network_latches_v2_document_replacement_only() {
         assert!(controlled_network_blocks_document_replacement(
             Some(SessionProfile::ControlledWebSessionV2),
@@ -11136,6 +11234,103 @@ mod tests {
         assert_eq!(value["stateToken"], test_document_token(1));
         assert!(value.get("outcome").is_none());
         assert!(value.get("snapshot").is_none());
+    }
+
+    #[test]
+    fn only_v2_runtime_settlement_projects_the_final_bracketed_url_for_every_outcome() {
+        let source = session_authority(1, 0, 0, 0);
+        let changed = SessionNavigationAuthority::new_internal(
+            Box::new(source.target().clone()),
+            source.document_epoch(),
+            source.navigation_id(),
+            embedder_traits::document_session::HistoryRevision::new(2),
+            source.successful_document_replacements(),
+            servo::ServoUrl::parse("https://example.test/final?proof=owner#state").unwrap(),
+            None,
+        );
+
+        for (profile, response, outcome, expected_url) in [
+            (
+                SessionProfile::ControlledWebSessionV1,
+                SettleResponse::Runtime,
+                "unsupported_work",
+                None,
+            ),
+            (
+                SessionProfile::ControlledWebSessionV2,
+                SettleResponse::Runtime,
+                "quiescent",
+                Some("https://example.test/final?proof=owner#state"),
+            ),
+            (
+                SessionProfile::ControlledWebSessionV2,
+                SettleResponse::Runtime,
+                "unsupported_work",
+                Some("https://example.test/final?proof=owner#state"),
+            ),
+            (
+                SessionProfile::ControlledWebSessionV2,
+                SettleResponse::Runtime,
+                "task_limit_exceeded",
+                Some("https://example.test/final?proof=owner#state"),
+            ),
+            (
+                SessionProfile::ControlledWebSessionV2,
+                SettleResponse::Pending,
+                "pending",
+                None,
+            ),
+        ] {
+            let terminal_pending = pending_for_authority(&changed, 7);
+            let mut active = ActiveRequest {
+                request: request("runtime.settle", Some(SESSION_ID)),
+                profile: Some(profile),
+                operation: ActiveOperation::SessionProjection(SessionProjectionState {
+                    pending: Box::new(terminal_pending.clone()),
+                    kind: SessionProjectionKind::Value {
+                        value: json!({
+                            "outcome": outcome,
+                            "snapshot": { "stateGeneration": "7" }
+                        }),
+                        snapshot_token: true,
+                        settle_resume: Some(SettleProjectionResume {
+                            profile,
+                            effective_policy: default_resolved_settle_policy(),
+                            cumulative_external_io_wall_time: Duration::ZERO,
+                            authorizing_navigation: Some(changed.clone()),
+                            response,
+                        }),
+                    },
+                    phase: SessionProjectionPhase::AwaitingStableNavigation {
+                        navigation: changed.clone(),
+                    },
+                }),
+                started_at: Instant::now(),
+                in_flight: None,
+                control_turn_observed: None,
+                needs_initial_pump: false,
+                state_effect: RequestStateEffect::None,
+            };
+            let mut projection = wire::WireProjectionContext::new_with_namespace_internal(
+                stasis_shell::token_namespace::OpaqueTokenNamespace::new_internal([0x71; 16]),
+            );
+
+            let ActiveTransition::Complete(value) = transition_from_navigation_completion(
+                &mut active,
+                NavigationOperationCompletion::test_response(
+                    NavigationOperationKind::Observe,
+                    Ok(changed.clone()),
+                ),
+                &mut projection,
+                0,
+            ) else {
+                panic!("session result did not complete from final stable N2 authority");
+            };
+
+            assert_eq!(value["outcome"], outcome);
+            assert_eq!(value["snapshot"]["stateToken"], value["stateToken"]);
+            assert_eq!(value.get("url").and_then(Value::as_str), expected_url);
+        }
     }
 
     #[test]

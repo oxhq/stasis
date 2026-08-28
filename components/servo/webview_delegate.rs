@@ -1258,6 +1258,8 @@ mod test {
             referrer_url: None,
             is_for_main_frame: false,
             is_redirect: false,
+            controlled_cookie_site_for_cookies: None,
+            controlled_cookie_top_level_navigation: false,
             controlled_load_id: WebResourceLoadId::new([0; 16], 0),
             controlled_body_bytes: Some(0),
             controlled_resource_kind: WebResourceKind::Navigation,

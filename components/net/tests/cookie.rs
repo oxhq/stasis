@@ -1655,6 +1655,15 @@ fn controlled_cookie_v2_retrieval_obeys_the_samesite_matrix() {
         ),
         Err(ControlledCookiePolicyError::SameSiteContextUnsupported),
     );
+    assert_eq!(
+        storage.controlled_session_cookies_for_url_with_context(
+            &request,
+            &Method::GET,
+            &controlled_cookie_context(policy, Some("about:blank"), false),
+            CookieSource::HTTP,
+        ),
+        Err(ControlledCookiePolicyError::SameSiteContextUnsupported),
+    );
 }
 
 #[test]

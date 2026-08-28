@@ -218,6 +218,7 @@ const UNSUPPORTED_REASONS = stringSet([
   "storage_event_listener",
   "clock_not_controlled",
   "canvas_upload",
+  "render_blocking_element",
   "font_load",
   "image_load",
   "inactive_rendering",
@@ -1553,8 +1554,17 @@ export function decodeSettle(value: unknown): SettleResult {
   return result as unknown as SettleResult;
 }
 
-export function decodeSessionSettle(value: unknown): SessionSettleResult {
+export function decodeSessionSettle<
+  Profile extends SelectableSessionProfile = SessionSupportProfile,
+>(
+  value: unknown,
+  profile: Profile = CONTROLLED_WEB_SESSION_V1_PROFILE as Profile,
+): SessionSettleResult<Profile> {
   const result = record(value, "runtime.settle result");
+  const url =
+    profile === CONTROLLED_WEB_SESSION_V2_PROFILE
+      ? requireString(result.url, "runtime.settle result.url")
+      : undefined;
   const stateToken = decodeDocumentStateToken(
     result.stateToken,
     "runtime.settle result.stateToken",
@@ -1571,12 +1581,14 @@ export function decodeSessionSettle(value: unknown): SessionSettleResult {
   delete legacySnapshot.stateToken;
   const legacyValue: Record<string, unknown> = { ...result, snapshot: legacySnapshot };
   delete legacyValue.stateToken;
+  if (profile === CONTROLLED_WEB_SESSION_V2_PROFILE) delete legacyValue.url;
   const decoded = decodeSettle(legacyValue);
   return {
     ...decoded,
+    ...(url === undefined ? {} : { url }),
     stateToken,
     snapshot: { ...decoded.snapshot, stateToken },
-  } as SessionSettleResult;
+  } as SessionSettleResult<Profile>;
 }
 
 export function decodeAdvanceToNext(value: unknown): AdvanceToNextResult {

@@ -668,6 +668,16 @@ def require_v2_inline_svg_rendering_proof(
         "fixtureTrace",
         "domCompletionEvents",
         "evidenceProfile",
+        "sharedNavigationBoundary",
+        "sharedOutcome",
+        "sharedProducerPending",
+        "sharedProducerTerminal",
+        "sharedPendingImages",
+        "sharedRuntimeFailures",
+        "sharedUnsupportedWork",
+        "sharedExternalIo",
+        "sharedFixtureTrace",
+        "sharedEvidenceProfile",
         "sameControlledSession",
         "exactBinaryLaunch",
         "closeResponseAndEof",
@@ -686,12 +696,161 @@ def require_v2_inline_svg_rendering_proof(
         "fixtureTrace": "inline-svg:4x3|events:0|now:0",
         "domCompletionEvents": "0",
         "evidenceProfile": "controlled-web-session-v2",
+        "sharedNavigationBoundary": "controlled_ready",
+        "sharedOutcome": "quiescent",
+        "sharedProducerPending": "0",
+        "sharedPendingImages": "0",
+        "sharedRuntimeFailures": "0",
+        "sharedUnsupportedWork": "0",
+        "sharedExternalIo": "0",
+        "sharedFixtureTrace": "shared-inline-svg:12|now:0",
+        "sharedEvidenceProfile": "controlled-web-session-v2",
     }
     for field, expected in expected_values.items():
         if require_json_string(value.get(field), f"{description} {field}") != expected:
             raise NpmReleaseError(f"{description} field does not match: {field}")
     if value.get("producerTerminal") is not False:
         raise NpmReleaseError(f"{description} field is not false: producerTerminal")
+    if value.get("sharedProducerTerminal") is not False:
+        raise NpmReleaseError(
+            f"{description} field is not false: sharedProducerTerminal"
+        )
+    for field in (
+        "sameControlledSession",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    ):
+        if value.get(field) is not True:
+            raise NpmReleaseError(f"{description} field is not true: {field}")
+    return value
+
+
+def require_v2_settlement_url_proof(
+    value: object, description: str
+) -> dict[str, object]:
+    expected_fields = {
+        "profile",
+        "navigationBoundary",
+        "controlledOpenUrl",
+        "initialOutcome",
+        "initialUrl",
+        "historyOutcome",
+        "historyUrl",
+        "replacementOutcome",
+        "replacementUrl",
+        "replacementTrace",
+        "sessionUrlStayedAtControlledOpen",
+        "sessionEvidenceExcludesUrl",
+        "standaloneEvidenceExcludesUrl",
+        "unsupportedOutcome",
+        "unsupportedFailureCode",
+        "unsupportedUrl",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    }
+    if type(value) is not dict or set(value) != expected_fields:
+        raise NpmReleaseError(f"{description} has an unexpected schema")
+    expected_values = {
+        "profile": "controlled-web-session-v2",
+        "navigationBoundary": "controlled_ready",
+        "controlledOpenUrl": "https://packed-sdk-message-channel-v2.example.test/",
+        "initialOutcome": "quiescent",
+        "initialUrl": (
+            "https://packed-sdk-settlement-url-v2.example.test/"
+            "settlement-url/replaced?proof=initial#attested"
+        ),
+        "historyOutcome": "quiescent",
+        "historyUrl": (
+            "https://packed-sdk-settlement-url-v2.example.test/"
+            "settlement-url/pushed?proof=history#attested"
+        ),
+        "replacementOutcome": "quiescent",
+        "replacementUrl": (
+            "https://packed-sdk-settlement-url-v2.example.test/"
+            "settlement-url/final?proof=replacement#attested"
+        ),
+        "replacementTrace": "replaced",
+        "unsupportedOutcome": "unsupported_work",
+        "unsupportedFailureCode": "unsupported_clock_surface",
+        "unsupportedUrl": (
+            "https://packed-sdk-automation-event-timestamps-v2.example.test/"
+        ),
+    }
+    for field, expected in expected_values.items():
+        if require_json_string(value.get(field), f"{description} {field}") != expected:
+            raise NpmReleaseError(f"{description} field does not match: {field}")
+    for field in (
+        "sessionUrlStayedAtControlledOpen",
+        "sessionEvidenceExcludesUrl",
+        "standaloneEvidenceExcludesUrl",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    ):
+        if value.get(field) is not True:
+            raise NpmReleaseError(f"{description} field is not true: {field}")
+    return value
+
+
+def require_v2_persistent_interval_progression_proof(
+    value: object, description: str
+) -> dict[str, object]:
+    expected_fields = {
+        "profile",
+        "navigationBoundary",
+        "implicitVirtualTimeNs",
+        "implicitPersistentTimers",
+        "implicitFutureFinite",
+        "implicitTrace",
+        "strictOutcome",
+        "strictVirtualTimeNs",
+        "strictTrace",
+        "reportOutcome",
+        "reportVirtualTimeNs",
+        "reportTrace",
+        "persistentTimers",
+        "futureFinite",
+        "persistentKind",
+        "persistentReason",
+        "persistentCount",
+        "requestedPeriodNs",
+        "runtimeFailures",
+        "unsupportedWork",
+        "externalIo",
+        "evidenceProfile",
+        "sameControlledSession",
+        "exactBinaryLaunch",
+        "closeResponseAndEof",
+    }
+    if type(value) is not dict or set(value) != expected_fields:
+        raise NpmReleaseError(f"{description} has an unexpected schema")
+    expected_trace = "interval:1@5000|interval:2@10000|finite@12000"
+    expected_values = {
+        "profile": "controlled-web-session-v2",
+        "navigationBoundary": "controlled_ready",
+        "implicitVirtualTimeNs": "12000000000",
+        "implicitPersistentTimers": "1",
+        "implicitFutureFinite": "0",
+        "implicitTrace": expected_trace,
+        "strictOutcome": "blocked_on_open_ended_work",
+        "strictVirtualTimeNs": "12000000000",
+        "strictTrace": expected_trace,
+        "reportOutcome": "quiescent_with_persistent_work",
+        "reportVirtualTimeNs": "12000000000",
+        "reportTrace": expected_trace,
+        "persistentTimers": "1",
+        "futureFinite": "0",
+        "persistentKind": "timer",
+        "persistentReason": "interval",
+        "persistentCount": "1",
+        "requestedPeriodNs": "5000000000",
+        "runtimeFailures": "0",
+        "unsupportedWork": "0",
+        "externalIo": "0",
+        "evidenceProfile": "controlled-web-session-v2",
+    }
+    for field, expected in expected_values.items():
+        if require_json_string(value.get(field), f"{description} {field}") != expected:
+            raise NpmReleaseError(f"{description} field does not match: {field}")
     for field in (
         "sameControlledSession",
         "exactBinaryLaunch",
@@ -894,6 +1053,19 @@ def require_v2_css_animation_event_timestamps_proof(
         "producerPending",
         "producerTerminal",
         "processedRenderingOpportunities",
+        "postReflowOutcome",
+        "postReflowVirtualTimeNs",
+        "postReflowTrace",
+        "postReflowEventCount",
+        "postReflowEventKinds",
+        "postReflowRuntimeFailures",
+        "postReflowUnsupportedWork",
+        "postReflowExternalIo",
+        "postReflowPendingAnimationEvents",
+        "postReflowNextOpportunityNs",
+        "postReflowProcessedRenderingOpportunities",
+        "postReflowStateTokenPreserved",
+        "postReflowOwnedQueueDrain",
         "scriptCreatedConstructorCount",
         "scriptCreatedTrace",
         "rejectedOutcome",
@@ -928,6 +1100,16 @@ def require_v2_css_animation_event_timestamps_proof(
         "infiniteAnimations": "0",
         "unsupportedAnimations": "0",
         "producerPending": "0",
+        "postReflowOutcome": "quiescent",
+        "postReflowVirtualTimeNs": "70000000",
+        "postReflowTrace": "armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70",
+        "postReflowEventCount": "2",
+        "postReflowEventKinds": "animationcancel,animationstart",
+        "postReflowRuntimeFailures": "0",
+        "postReflowUnsupportedWork": "0",
+        "postReflowExternalIo": "0",
+        "postReflowPendingAnimationEvents": "0",
+        "postReflowNextOpportunityNs": "none",
         "scriptCreatedConstructorCount": "2",
         "scriptCreatedTrace": "script:0,0",
         "rejectedOutcome": "unsupported_work",
@@ -948,6 +1130,8 @@ def require_v2_css_animation_event_timestamps_proof(
         "publicNonAuxiliaryControlledTarget",
         "sameControlledSession",
         "freshExactBinaryProcess",
+        "postReflowStateTokenPreserved",
+        "postReflowOwnedQueueDrain",
         "exactBinaryLaunch",
         "closeResponseAndEof",
     ):
@@ -972,6 +1156,15 @@ def require_v2_css_animation_event_timestamps_proof(
         POSITIVE_INTEGER_RE,
         rendering_opportunities,
         f"{description} processed rendering-opportunity count",
+    )
+    post_reflow_rendering_opportunities = require_json_string(
+        value.get("postReflowProcessedRenderingOpportunities"),
+        f"{description} postReflowProcessedRenderingOpportunities",
+    )
+    fullmatch(
+        POSITIVE_INTEGER_RE,
+        post_reflow_rendering_opportunities,
+        f"{description} post-reflow processed rendering-opportunity count",
     )
     return value
 
@@ -1087,6 +1280,8 @@ def parse_gate_log(
         "v2MessageChannel",
         "v2DirectDataSvg",
         "v2InlineSvgRendering",
+        "v2SettlementUrl",
+        "v2PersistentIntervalProgression",
         "v2InputMethodFocus",
         "v2AutomationEventTimestamps",
         "v2CssAnimationEventTimestamps",
@@ -1126,6 +1321,13 @@ def parse_gate_log(
         value.get("v2InlineSvgRendering"),
         "SDK gate v2 inline SVG rendering proof",
     )
+    require_v2_settlement_url_proof(
+        value.get("v2SettlementUrl"), "SDK gate v2 settlement URL proof"
+    )
+    require_v2_persistent_interval_progression_proof(
+        value.get("v2PersistentIntervalProgression"),
+        "SDK gate v2 persistent interval progression proof",
+    )
     require_v2_input_method_focus_proof(
         value.get("v2InputMethodFocus"), "SDK gate v2 InputMethod focus proof"
     )
@@ -1163,7 +1365,7 @@ def create_proof(
     if gate["binarySha256"] != native_binary_sha256:
         raise NpmReleaseError("SDK gate tested a different native binary digest")
     document: dict[str, object] = {
-        "schema": 7,
+        "schema": 10,
         "gate": GATE_NAME,
         "package": f"{PACKAGE_NAME}@{version}",
         "revision": revision,
@@ -1176,6 +1378,8 @@ def create_proof(
         "v2MessageChannel": gate["v2MessageChannel"],
         "v2DirectDataSvg": gate["v2DirectDataSvg"],
         "v2InlineSvgRendering": gate["v2InlineSvgRendering"],
+        "v2SettlementUrl": gate["v2SettlementUrl"],
+        "v2PersistentIntervalProgression": gate["v2PersistentIntervalProgression"],
         "v2InputMethodFocus": gate["v2InputMethodFocus"],
         "v2AutomationEventTimestamps": gate["v2AutomationEventTimestamps"],
         "v2CssAnimationEventTimestamps": gate["v2CssAnimationEventTimestamps"],
@@ -1238,6 +1442,8 @@ def verify_proof(
         "v2MessageChannel",
         "v2DirectDataSvg",
         "v2InlineSvgRendering",
+        "v2SettlementUrl",
+        "v2PersistentIntervalProgression",
         "v2InputMethodFocus",
         "v2AutomationEventTimestamps",
         "v2CssAnimationEventTimestamps",
@@ -1273,6 +1479,14 @@ def verify_proof(
         document.get("v2InlineSvgRendering"),
         "SDK gate proof v2 inline SVG rendering proof",
     )
+    require_v2_settlement_url_proof(
+        document.get("v2SettlementUrl"),
+        "SDK gate proof v2 settlement URL proof",
+    )
+    require_v2_persistent_interval_progression_proof(
+        document.get("v2PersistentIntervalProgression"),
+        "SDK gate proof v2 persistent interval progression proof",
+    )
     require_v2_input_method_focus_proof(
         document.get("v2InputMethodFocus"),
         "SDK gate proof v2 InputMethod focus proof",
@@ -1289,7 +1503,7 @@ def verify_proof(
         document.get("v2CookieSession"), "SDK gate proof v2 cookie/session proof"
     )
     expected = {
-        "schema": 7,
+        "schema": 10,
         "gate": GATE_NAME,
         "package": f"{PACKAGE_NAME}@{version}",
         "revision": revision,
@@ -1434,6 +1648,76 @@ def self_test() -> None:
                 "fixtureTrace": "inline-svg:4x3|events:0|now:0",
                 "domCompletionEvents": "0",
                 "evidenceProfile": "controlled-web-session-v2",
+                "sharedNavigationBoundary": "controlled_ready",
+                "sharedOutcome": "quiescent",
+                "sharedProducerPending": "0",
+                "sharedProducerTerminal": False,
+                "sharedPendingImages": "0",
+                "sharedRuntimeFailures": "0",
+                "sharedUnsupportedWork": "0",
+                "sharedExternalIo": "0",
+                "sharedFixtureTrace": "shared-inline-svg:12|now:0",
+                "sharedEvidenceProfile": "controlled-web-session-v2",
+                "sameControlledSession": True,
+                "exactBinaryLaunch": True,
+                "closeResponseAndEof": True,
+            },
+            "v2SettlementUrl": {
+                "profile": "controlled-web-session-v2",
+                "navigationBoundary": "controlled_ready",
+                "controlledOpenUrl": (
+                    "https://packed-sdk-message-channel-v2.example.test/"
+                ),
+                "initialOutcome": "quiescent",
+                "initialUrl": (
+                    "https://packed-sdk-settlement-url-v2.example.test/"
+                    "settlement-url/replaced?proof=initial#attested"
+                ),
+                "historyOutcome": "quiescent",
+                "historyUrl": (
+                    "https://packed-sdk-settlement-url-v2.example.test/"
+                    "settlement-url/pushed?proof=history#attested"
+                ),
+                "replacementOutcome": "quiescent",
+                "replacementUrl": (
+                    "https://packed-sdk-settlement-url-v2.example.test/"
+                    "settlement-url/final?proof=replacement#attested"
+                ),
+                "replacementTrace": "replaced",
+                "sessionUrlStayedAtControlledOpen": True,
+                "sessionEvidenceExcludesUrl": True,
+                "standaloneEvidenceExcludesUrl": True,
+                "unsupportedOutcome": "unsupported_work",
+                "unsupportedFailureCode": "unsupported_clock_surface",
+                "unsupportedUrl": (
+                    "https://packed-sdk-automation-event-timestamps-v2.example.test/"
+                ),
+                "exactBinaryLaunch": True,
+                "closeResponseAndEof": True,
+            },
+            "v2PersistentIntervalProgression": {
+                "profile": "controlled-web-session-v2",
+                "navigationBoundary": "controlled_ready",
+                "implicitVirtualTimeNs": "12000000000",
+                "implicitPersistentTimers": "1",
+                "implicitFutureFinite": "0",
+                "implicitTrace": "interval:1@5000|interval:2@10000|finite@12000",
+                "strictOutcome": "blocked_on_open_ended_work",
+                "strictVirtualTimeNs": "12000000000",
+                "strictTrace": "interval:1@5000|interval:2@10000|finite@12000",
+                "reportOutcome": "quiescent_with_persistent_work",
+                "reportVirtualTimeNs": "12000000000",
+                "reportTrace": "interval:1@5000|interval:2@10000|finite@12000",
+                "persistentTimers": "1",
+                "futureFinite": "0",
+                "persistentKind": "timer",
+                "persistentReason": "interval",
+                "persistentCount": "1",
+                "requestedPeriodNs": "5000000000",
+                "runtimeFailures": "0",
+                "unsupportedWork": "0",
+                "externalIo": "0",
+                "evidenceProfile": "controlled-web-session-v2",
                 "sameControlledSession": True,
                 "exactBinaryLaunch": True,
                 "closeResponseAndEof": True,
@@ -1498,6 +1782,22 @@ def self_test() -> None:
                 "producerPending": "0",
                 "producerTerminal": False,
                 "processedRenderingOpportunities": "3",
+                "postReflowOutcome": "quiescent",
+                "postReflowVirtualTimeNs": "70000000",
+                "postReflowTrace": (
+                    "armed:5|animationstart:trusted:50:50>"
+                    "animationcancel:trusted:70:70"
+                ),
+                "postReflowEventCount": "2",
+                "postReflowEventKinds": "animationcancel,animationstart",
+                "postReflowRuntimeFailures": "0",
+                "postReflowUnsupportedWork": "0",
+                "postReflowExternalIo": "0",
+                "postReflowPendingAnimationEvents": "0",
+                "postReflowNextOpportunityNs": "none",
+                "postReflowProcessedRenderingOpportunities": "4",
+                "postReflowStateTokenPreserved": True,
+                "postReflowOwnedQueueDrain": True,
                 "scriptCreatedConstructorCount": "2",
                 "scriptCreatedTrace": "script:0,0",
                 "rejectedOutcome": "unsupported_work",
@@ -1559,11 +1859,16 @@ def self_test() -> None:
             run_id="123",
             run_attempt="1",
         )
-        assert document["schema"] == 7
+        assert document["schema"] == 10
         assert document["tarball"] == gate_record["tarball"]
         assert document["v2MessageChannel"] == gate_record["v2MessageChannel"]
         assert document["v2DirectDataSvg"] == gate_record["v2DirectDataSvg"]
         assert document["v2InlineSvgRendering"] == gate_record["v2InlineSvgRendering"]
+        assert document["v2SettlementUrl"] == gate_record["v2SettlementUrl"]
+        assert (
+            document["v2PersistentIntervalProgression"]
+            == gate_record["v2PersistentIntervalProgression"]
+        )
         assert document["v2InputMethodFocus"] == gate_record["v2InputMethodFocus"]
         assert (
             document["v2AutomationEventTimestamps"]
@@ -1947,9 +2252,209 @@ def self_test() -> None:
                         "evidenceProfile",
                         "controlled-webapp-v1",
                     ),
+                    (
+                        "wrong shared-pending inline SVG navigation boundary",
+                        "sharedNavigationBoundary",
+                        "unsupported",
+                    ),
+                    (
+                        "nonquiescent shared-pending inline SVG outcome",
+                        "sharedOutcome",
+                        "unsupported_work",
+                    ),
+                    (
+                        "pending shared-pending inline SVG producer",
+                        "sharedProducerPending",
+                        "1",
+                    ),
+                    (
+                        "numeric shared-pending inline SVG producer count",
+                        "sharedProducerPending",
+                        0,
+                    ),
+                    (
+                        "terminal shared-pending inline SVG producer",
+                        "sharedProducerTerminal",
+                        True,
+                    ),
+                    (
+                        "numeric shared-pending inline SVG producer terminal",
+                        "sharedProducerTerminal",
+                        0,
+                    ),
+                    (
+                        "pending shared-pending inline SVG rendering image",
+                        "sharedPendingImages",
+                        "1",
+                    ),
+                    (
+                        "shared-pending inline SVG runtime failure",
+                        "sharedRuntimeFailures",
+                        "1",
+                    ),
+                    (
+                        "shared-pending inline SVG unsupported work",
+                        "sharedUnsupportedWork",
+                        "1",
+                    ),
+                    (
+                        "shared-pending inline SVG external I/O",
+                        "sharedExternalIo",
+                        "1",
+                    ),
+                    (
+                        "wrong shared-pending inline SVG fixture trace",
+                        "sharedFixtureTrace",
+                        "shared-inline-svg:11|now:0",
+                    ),
+                    (
+                        "wrong shared-pending inline SVG evidence profile",
+                        "sharedEvidenceProfile",
+                        "controlled-webapp-v1",
+                    ),
                     ("inline SVG not in same session", "sameControlledSession", False),
                     ("inline SVG not exact binary", "exactBinaryLaunch", False),
                     ("inline SVG missing close proof", "closeResponseAndEof", False),
+                )
+            ],
+        ]
+
+        base_v2_settlement_url = gate_record["v2SettlementUrl"]
+        assert isinstance(base_v2_settlement_url, dict)
+        v2_settlement_url_record_mutations = [
+            (
+                "missing settlement URL field",
+                {
+                    key: value
+                    for key, value in base_v2_settlement_url.items()
+                    if key != "unsupportedUrl"
+                },
+            ),
+            (
+                "extra settlement URL field",
+                {**base_v2_settlement_url, "evidenceUrl": "redacted"},
+            ),
+            *[
+                (label, {**base_v2_settlement_url, field: value})
+                for label, field, value in (
+                    ("wrong settlement URL profile", "profile", "controlled-web-session-v1"),
+                    (
+                        "wrong settlement URL navigation boundary",
+                        "navigationBoundary",
+                        "unsupported",
+                    ),
+                    (
+                        "wrong controlled-open URL",
+                        "controlledOpenUrl",
+                        "https://other.example.test/",
+                    ),
+                    ("nonquiescent initial URL outcome", "initialOutcome", "pending"),
+                    (
+                        "wrong initial settlement URL",
+                        "initialUrl",
+                        "https://packed-sdk-settlement-url-v2.example.test/settlement-url/start",
+                    ),
+                    ("nonquiescent history URL outcome", "historyOutcome", "pending"),
+                    (
+                        "wrong history settlement URL",
+                        "historyUrl",
+                        "https://packed-sdk-settlement-url-v2.example.test/settlement-url/pushed",
+                    ),
+                    (
+                        "nonquiescent replacement URL outcome",
+                        "replacementOutcome",
+                        "pending",
+                    ),
+                    (
+                        "wrong replacement settlement URL",
+                        "replacementUrl",
+                        "https://packed-sdk-settlement-url-v2.example.test/settlement-url/final",
+                    ),
+                    ("wrong replacement trace", "replacementTrace", "pushed"),
+                    (
+                        "Session.url mutated with current history",
+                        "sessionUrlStayedAtControlledOpen",
+                        False,
+                    ),
+                    (
+                        "session evidence exposed URL",
+                        "sessionEvidenceExcludesUrl",
+                        False,
+                    ),
+                    (
+                        "standalone evidence exposed URL",
+                        "standaloneEvidenceExcludesUrl",
+                        False,
+                    ),
+                    (
+                        "wrong unsupported URL outcome",
+                        "unsupportedOutcome",
+                        "quiescent",
+                    ),
+                    (
+                        "wrong unsupported URL failure",
+                        "unsupportedFailureCode",
+                        "unsupported_work",
+                    ),
+                    (
+                        "wrong unsupported terminal URL",
+                        "unsupportedUrl",
+                        "https://packed-sdk-message-channel-v2.example.test/",
+                    ),
+                    ("settlement URL not exact binary", "exactBinaryLaunch", False),
+                    (
+                        "settlement URL missing close proof",
+                        "closeResponseAndEof",
+                        False,
+                    ),
+                )
+            ],
+        ]
+
+        base_v2_persistent_interval = gate_record["v2PersistentIntervalProgression"]
+        assert isinstance(base_v2_persistent_interval, dict)
+        v2_persistent_interval_record_mutations = [
+            (
+                "missing persistent interval progression field",
+                {
+                    key: value
+                    for key, value in base_v2_persistent_interval.items()
+                    if key != "requestedPeriodNs"
+                },
+            ),
+            (
+                "extra persistent interval progression field",
+                {**base_v2_persistent_interval, "advancedAfterFinite": True},
+            ),
+            *[
+                (label, {**base_v2_persistent_interval, field: value})
+                for label, field, value in (
+                    ("wrong interval profile", "profile", "controlled-web-session-v1"),
+                    ("wrong interval navigation boundary", "navigationBoundary", "unsupported"),
+                    ("wrong implicit interval time", "implicitVirtualTimeNs", "10000000000"),
+                    ("missing implicit persistent timer", "implicitPersistentTimers", "0"),
+                    ("implicit finite timer remained", "implicitFutureFinite", "1"),
+                    ("wrong implicit interval trace", "implicitTrace", "interval:1@5000"),
+                    ("wrong strict interval outcome", "strictOutcome", "quiescent"),
+                    ("wrong strict interval time", "strictVirtualTimeNs", "10000000000"),
+                    ("numeric strict interval time", "strictVirtualTimeNs", 12000000000),
+                    ("wrong strict interval trace", "strictTrace", "interval:1@5000"),
+                    ("wrong report interval outcome", "reportOutcome", "quiescent"),
+                    ("wrong report interval time", "reportVirtualTimeNs", "15000000000"),
+                    ("wrong report interval trace", "reportTrace", "interval:3@15000"),
+                    ("missing persistent timer", "persistentTimers", "0"),
+                    ("finite timer remained", "futureFinite", "1"),
+                    ("wrong persistent kind", "persistentKind", "animation"),
+                    ("wrong persistent reason", "persistentReason", "timeout"),
+                    ("wrong persistent count", "persistentCount", "2"),
+                    ("wrong interval period", "requestedPeriodNs", "4000000000"),
+                    ("interval runtime failure", "runtimeFailures", "1"),
+                    ("interval unsupported work", "unsupportedWork", "1"),
+                    ("interval external I/O", "externalIo", "1"),
+                    ("wrong interval evidence profile", "evidenceProfile", "controlled-web-session-v1"),
+                    ("interval not in same session", "sameControlledSession", False),
+                    ("interval not exact binary", "exactBinaryLaunch", False),
+                    ("interval missing close proof", "closeResponseAndEof", False),
                 )
             ],
         ]
@@ -2267,6 +2772,48 @@ def self_test() -> None:
                         "processedRenderingOpportunities",
                         3,
                     ),
+                    ("post-reflow CSS work did not settle", "postReflowOutcome", "pending"),
+                    ("wrong post-reflow CSS time", "postReflowVirtualTimeNs", "50000000"),
+                    (
+                        "wrong post-reflow CSS trace",
+                        "postReflowTrace",
+                        "armed:5|animationstart:trusted:50:50",
+                    ),
+                    ("wrong post-reflow CSS event count", "postReflowEventCount", "1"),
+                    (
+                        "wrong post-reflow CSS event kinds",
+                        "postReflowEventKinds",
+                        "animationstart",
+                    ),
+                    ("post-reflow CSS runtime failure", "postReflowRuntimeFailures", "1"),
+                    ("post-reflow CSS unsupported work", "postReflowUnsupportedWork", "1"),
+                    ("post-reflow CSS external I/O", "postReflowExternalIo", "1"),
+                    (
+                        "post-reflow CSS queue did not drain",
+                        "postReflowPendingAnimationEvents",
+                        "1",
+                    ),
+                    (
+                        "post-reflow CSS retained another opportunity",
+                        "postReflowNextOpportunityNs",
+                        "90000000",
+                    ),
+                    (
+                        "zero post-reflow rendering opportunities",
+                        "postReflowProcessedRenderingOpportunities",
+                        "0",
+                    ),
+                    (
+                        "noncanonical post-reflow rendering opportunities",
+                        "postReflowProcessedRenderingOpportunities",
+                        "02",
+                    ),
+                    (
+                        "post-reflow pending changed authority",
+                        "postReflowStateTokenPreserved",
+                        False,
+                    ),
+                    ("post-reflow queue drain not owned", "postReflowOwnedQueueDrain", False),
                     ("wrong CSS constructor count", "scriptCreatedConstructorCount", "1"),
                     ("controlled script CSS constructors", "scriptCreatedTrace", "script:5,5"),
                     ("script CSS events falsely settle", "rejectedOutcome", "quiescent"),
@@ -2373,6 +2920,30 @@ def self_test() -> None:
             *[
                 (label, {**gate_record, "v2InlineSvgRendering": mutation})
                 for label, mutation in v2_inline_svg_rendering_record_mutations
+            ],
+            (
+                "missing v2 settlement URL proof",
+                {
+                    key: value
+                    for key, value in gate_record.items()
+                    if key != "v2SettlementUrl"
+                },
+            ),
+            *[
+                (label, {**gate_record, "v2SettlementUrl": mutation})
+                for label, mutation in v2_settlement_url_record_mutations
+            ],
+            (
+                "missing v2 persistent interval progression proof",
+                {
+                    key: value
+                    for key, value in gate_record.items()
+                    if key != "v2PersistentIntervalProgression"
+                },
+            ),
+            *[
+                (label, {**gate_record, "v2PersistentIntervalProgression": mutation})
+                for label, mutation in v2_persistent_interval_record_mutations
             ],
             (
                 "missing v2 InputMethod focus proof",
@@ -2495,6 +3066,33 @@ def self_test() -> None:
                 for label, mutation in v2_inline_svg_rendering_record_mutations
             ],
             (
+                "missing durable v2 settlement URL proof",
+                {
+                    key: value
+                    for key, value in proof_document.items()
+                    if key != "v2SettlementUrl"
+                },
+            ),
+            *[
+                (label, {**proof_document, "v2SettlementUrl": mutation})
+                for label, mutation in v2_settlement_url_record_mutations
+            ],
+            (
+                "missing durable v2 persistent interval progression proof",
+                {
+                    key: value
+                    for key, value in proof_document.items()
+                    if key != "v2PersistentIntervalProgression"
+                },
+            ),
+            *[
+                (
+                    label,
+                    {**proof_document, "v2PersistentIntervalProgression": mutation},
+                )
+                for label, mutation in v2_persistent_interval_record_mutations
+            ],
+            (
                 "missing durable v2 InputMethod focus proof",
                 {
                     key: value
@@ -2567,7 +3165,7 @@ def self_test() -> None:
             )
         proof.write_text(proof_text, encoding="utf-8")
 
-        proof.write_text('{"schema":7,' + proof_text.lstrip()[1:], encoding="utf-8")
+        proof.write_text('{"schema":8,' + proof_text.lstrip()[1:], encoding="utf-8")
         expect_error(
             "duplicate proof key",
             lambda: verify_proof(
@@ -2580,7 +3178,7 @@ def self_test() -> None:
             ),
         )
         proof.write_text(
-            proof_text.replace('"schema": 7', '"schema": 1e400'), encoding="utf-8"
+            proof_text.replace('"schema": 10', '"schema": 1e400'), encoding="utf-8"
         )
         expect_error(
             "non-finite proof number",
@@ -2594,7 +3192,7 @@ def self_test() -> None:
             ),
         )
         proof.write_text(
-            proof_text.replace('"schema": 7', '"schema": 7.0'), encoding="utf-8"
+            proof_text.replace('"schema": 10', '"schema": 10.0'), encoding="utf-8"
         )
         expect_error(
             "floating-point proof schema",

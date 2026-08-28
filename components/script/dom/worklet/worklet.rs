@@ -753,6 +753,7 @@ impl WorkletThread {
             policy_container,
             origin: Origin::Origin(origin),
             is_nested_browsing_context: global.is_nested_browsing_context(),
+            controlled_cookie_site_for_cookies: None,
             insecure_requests_policy: global.insecure_requests_policy(),
             has_trustworthy_ancestor_origin: global.has_trustworthy_ancestor_origin(),
         };

@@ -339,6 +339,9 @@ const { values } = parseArgs({
     "session-v2-image-fixture": { type: "string" },
     "session-v2-http-image-fixture": { type: "string" },
     "session-v2-inline-svg-fixture": { type: "string" },
+    "session-v2-inline-svg-shared-pending-fixture": { type: "string" },
+    "session-v2-settlement-url-fixture": { type: "string" },
+    "session-v2-interval-before-finite-fixture": { type: "string" },
     "session-v2-focus-fixture": { type: "string" },
     "session-v2-automation-event-fixture": { type: "string" },
     "session-v2-css-animation-event-fixture": { type: "string" },
@@ -358,6 +361,9 @@ for (const field of [
   "session-v2-image-fixture",
   "session-v2-http-image-fixture",
   "session-v2-inline-svg-fixture",
+  "session-v2-inline-svg-shared-pending-fixture",
+  "session-v2-settlement-url-fixture",
+  "session-v2-interval-before-finite-fixture",
   "session-v2-focus-fixture",
   "session-v2-automation-event-fixture",
   "session-v2-css-animation-event-fixture",
@@ -375,6 +381,13 @@ const sessionV2Fixture = resolve(values["session-v2-fixture"]);
 const sessionV2ImageFixture = resolve(values["session-v2-image-fixture"]);
 const sessionV2HttpImageFixture = resolve(values["session-v2-http-image-fixture"]);
 const sessionV2InlineSvgFixture = resolve(values["session-v2-inline-svg-fixture"]);
+const sessionV2InlineSvgSharedPendingFixture = resolve(
+  values["session-v2-inline-svg-shared-pending-fixture"],
+);
+const sessionV2SettlementUrlFixture = resolve(values["session-v2-settlement-url-fixture"]);
+const sessionV2IntervalBeforeFiniteFixture = resolve(
+  values["session-v2-interval-before-finite-fixture"],
+);
 const sessionV2FocusFixture = resolve(values["session-v2-focus-fixture"]);
 const sessionV2AutomationEventFixture = resolve(values["session-v2-automation-event-fixture"]);
 const sessionV2CssAnimationEventFixture = resolve(
@@ -399,6 +412,18 @@ assert.ok(
 assert.ok(
   isAbsolute(sessionV2InlineSvgFixture),
   "--session-v2-inline-svg-fixture must resolve to an absolute path before launch",
+);
+assert.ok(
+  isAbsolute(sessionV2InlineSvgSharedPendingFixture),
+  "--session-v2-inline-svg-shared-pending-fixture must resolve to an absolute path before launch",
+);
+assert.ok(
+  isAbsolute(sessionV2SettlementUrlFixture),
+  "--session-v2-settlement-url-fixture must resolve to an absolute path before launch",
+);
+assert.ok(
+  isAbsolute(sessionV2IntervalBeforeFiniteFixture),
+  "--session-v2-interval-before-finite-fixture must resolve to an absolute path before launch",
 );
 assert.ok(
   isAbsolute(sessionV2FocusFixture),
@@ -523,6 +548,40 @@ assert.ok(
   "--session-v2-inline-svg-fixture must be a regular file",
 );
 const sessionV2InlineSvgFixtureBody = await readFile(sessionV2InlineSvgFixture, "utf8");
+const sessionV2InlineSvgSharedPendingFixtureStatus = await lstat(
+  sessionV2InlineSvgSharedPendingFixture,
+);
+assert.ok(
+  sessionV2InlineSvgSharedPendingFixtureStatus.isFile() &&
+    !sessionV2InlineSvgSharedPendingFixtureStatus.isSymbolicLink(),
+  "--session-v2-inline-svg-shared-pending-fixture must be a regular file",
+);
+const sessionV2InlineSvgSharedPendingFixtureBody = await readFile(
+  sessionV2InlineSvgSharedPendingFixture,
+  "utf8",
+);
+const sessionV2SettlementUrlFixtureStatus = await lstat(sessionV2SettlementUrlFixture);
+assert.ok(
+  sessionV2SettlementUrlFixtureStatus.isFile() &&
+    !sessionV2SettlementUrlFixtureStatus.isSymbolicLink(),
+  "--session-v2-settlement-url-fixture must be a regular file",
+);
+const sessionV2SettlementUrlFixtureBody = await readFile(
+  sessionV2SettlementUrlFixture,
+  "utf8",
+);
+const sessionV2IntervalBeforeFiniteFixtureStatus = await lstat(
+  sessionV2IntervalBeforeFiniteFixture,
+);
+assert.ok(
+  sessionV2IntervalBeforeFiniteFixtureStatus.isFile() &&
+    !sessionV2IntervalBeforeFiniteFixtureStatus.isSymbolicLink(),
+  "--session-v2-interval-before-finite-fixture must be a regular file",
+);
+const sessionV2IntervalBeforeFiniteFixtureBody = await readFile(
+  sessionV2IntervalBeforeFiniteFixture,
+  "utf8",
+);
 const sessionV2FocusFixtureStatus = await lstat(sessionV2FocusFixture);
 assert.ok(
   sessionV2FocusFixtureStatus.isFile() && !sessionV2FocusFixtureStatus.isSymbolicLink(),
@@ -698,6 +757,8 @@ let v2ClosedCleanly = false;
 let v2MessageChannel;
 let v2DirectDataSvg;
 let v2InlineSvgRendering;
+let v2SettlementUrl;
+let v2PersistentIntervalProgression;
 let v2InputMethodFocus;
 let v2AutomationEventTimestamps;
 let v2CssAnimationEventTimestamps;
@@ -996,6 +1057,18 @@ try {
   const v2HttpImageSvgBody =
     '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="green"/></svg>';
   const v2InlineSvgFixtureUrl = "https://packed-sdk-inline-svg-v2.example.test/";
+  const v2InlineSvgSharedPendingFixtureUrl =
+    "https://packed-sdk-inline-svg-shared-pending-v2.example.test/";
+  const v2SettlementUrlFixtureUrl =
+    "https://packed-sdk-settlement-url-v2.example.test/settlement-url/start?proof=open";
+  const v2SettlementInitialUrl =
+    "https://packed-sdk-settlement-url-v2.example.test/settlement-url/replaced?proof=initial#attested";
+  const v2SettlementHistoryUrl =
+    "https://packed-sdk-settlement-url-v2.example.test/settlement-url/pushed?proof=history#attested";
+  const v2SettlementReplacementUrl =
+    "https://packed-sdk-settlement-url-v2.example.test/settlement-url/final?proof=replacement#attested";
+  const v2IntervalBeforeFiniteFixtureUrl =
+    "https://packed-sdk-interval-before-finite-v2.example.test/";
   const v2FocusFixtureUrl = "https://packed-sdk-input-method-focus-v2.example.test/";
   const v2AutomationEventFixtureUrl =
     "https://packed-sdk-automation-event-timestamps-v2.example.test/";
@@ -1055,6 +1128,33 @@ try {
             status: 200,
             headers: [["content-type", "text/html; charset=utf-8"]],
             body: { utf8: sessionV2InlineSvgFixtureBody },
+          },
+        },
+        {
+          match: {
+            method: "GET",
+            url: { exact: v2InlineSvgSharedPendingFixtureUrl },
+          },
+          fulfill: {
+            status: 200,
+            headers: [["content-type", "text/html; charset=utf-8"]],
+            body: { utf8: sessionV2InlineSvgSharedPendingFixtureBody },
+          },
+        },
+        {
+          match: { method: "GET", url: { exact: v2SettlementUrlFixtureUrl } },
+          fulfill: {
+            status: 200,
+            headers: [["content-type", "text/html; charset=utf-8"]],
+            body: { utf8: sessionV2SettlementUrlFixtureBody },
+          },
+        },
+        {
+          match: { method: "GET", url: { exact: v2IntervalBeforeFiniteFixtureUrl } },
+          fulfill: {
+            status: 200,
+            headers: [["content-type", "text/html; charset=utf-8"]],
+            body: { utf8: sessionV2IntervalBeforeFiniteFixtureBody },
           },
         },
         {
@@ -1219,9 +1319,109 @@ try {
   const v2InlineSvgEvidence = v2Session.settlementEvidence(v2InlineSvgSettled);
   assert.equal(v2InlineSvgEvidence.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
 
+  const v2InlineSvgSharedPendingNavigation = await v2Session.navigate(
+    v2InlineSvgSharedPendingFixtureUrl,
+    v2InlineSvgTraceResult.stateToken,
+    commandDeadline(),
+  );
+  assert.equal(v2InlineSvgSharedPendingNavigation.boundary, "controlled_ready");
+  const v2InlineSvgSharedPendingSettled = await v2Session.settle(
+    v2InlineSvgSharedPendingNavigation.stateToken,
+    {},
+    commandDeadline(),
+  );
+  assert.equal(v2InlineSvgSharedPendingSettled.outcome, "quiescent");
+  assert.deepEqual(v2InlineSvgSharedPendingSettled.unsupportedWork, []);
+  assert.deepEqual(v2InlineSvgSharedPendingSettled.externalIo, []);
+  assert.equal(v2InlineSvgSharedPendingSettled.snapshot.producers.pending, 0n);
+  assert.equal(v2InlineSvgSharedPendingSettled.snapshot.producers.terminal, false);
+  assert.equal(v2InlineSvgSharedPendingSettled.snapshot.rendering.pendingImages, 0n);
+  assert.deepEqual(v2InlineSvgSharedPendingSettled.snapshot.runtimeFailures, []);
+  const v2InlineSvgSharedPendingTraceResult = await v2Session.text(
+    "#result",
+    v2InlineSvgSharedPendingSettled.stateToken,
+    commandDeadline(),
+  );
+  assert.equal(
+    v2InlineSvgSharedPendingTraceResult.value,
+    "shared-inline-svg:12|now:0",
+  );
+  const v2InlineSvgSharedPendingEvidence = v2Session.settlementEvidence(
+    v2InlineSvgSharedPendingSettled,
+  );
+  assert.equal(
+    v2InlineSvgSharedPendingEvidence.profile,
+    CONTROLLED_WEB_SESSION_V2_PROFILE,
+  );
+
+  const v2SettlementUrlNavigation = await v2Session.navigate(
+    v2SettlementUrlFixtureUrl,
+    v2InlineSvgSharedPendingTraceResult.stateToken,
+    commandDeadline(),
+  );
+  assert.equal(v2SettlementUrlNavigation.boundary, "controlled_ready");
+  assert.equal(v2Session.url, v2FixtureUrl, "Session.url mutated after navigation");
+  const v2SettlementInitial = await v2Session.settle(
+    v2SettlementUrlNavigation.stateToken,
+    {},
+    commandDeadline(),
+  );
+  assert.equal(v2SettlementInitial.outcome, "quiescent");
+  assert.equal(v2SettlementInitial.url, v2SettlementInitialUrl);
+  assert.equal(v2Session.url, v2FixtureUrl, "Session.url mutated after settlement");
+  const v2SettlementInitialSessionEvidence =
+    v2Session.settlementEvidence(v2SettlementInitial);
+  const v2SettlementInitialStandaloneEvidence = sdk.settlementEvidence(
+    v2SettlementInitial,
+  );
+  assert.equal(Object.hasOwn(v2SettlementInitialSessionEvidence, "url"), false);
+  assert.equal(Object.hasOwn(v2SettlementInitialStandaloneEvidence, "url"), false);
+
+  const v2SettlementHistoryAction = await v2Session.activate(
+    "#push",
+    v2SettlementInitial.stateToken,
+    commandDeadline(),
+  );
+  const v2SettlementHistory = await v2Session.settle(
+    v2SettlementHistoryAction.stateToken,
+    {},
+    commandDeadline(),
+  );
+  assert.equal(v2SettlementHistory.outcome, "quiescent");
+  assert.equal(v2SettlementHistory.url, v2SettlementHistoryUrl);
+  assert.equal(v2Session.url, v2FixtureUrl, "Session.url mutated after pushState");
+  assert.equal(
+    Object.hasOwn(v2Session.settlementEvidence(v2SettlementHistory), "url"),
+    false,
+  );
+
+  const v2SettlementReplacementAction = await v2Session.activate(
+    "#replace",
+    v2SettlementHistory.stateToken,
+    commandDeadline(),
+  );
+  const v2SettlementReplacement = await v2Session.settle(
+    v2SettlementReplacementAction.stateToken,
+    {},
+    commandDeadline(),
+  );
+  assert.equal(v2SettlementReplacement.outcome, "quiescent");
+  assert.equal(v2SettlementReplacement.url, v2SettlementReplacementUrl);
+  assert.equal(v2Session.url, v2FixtureUrl, "Session.url mutated after replaceState");
+  const v2SettlementReplacementEvidence = v2Session.settlementEvidence(
+    v2SettlementReplacement,
+  );
+  assert.equal(Object.hasOwn(v2SettlementReplacementEvidence, "url"), false);
+  const v2SettlementTraceResult = await v2Session.text(
+    "#result",
+    v2SettlementReplacement.stateToken,
+    commandDeadline(),
+  );
+  assert.equal(v2SettlementTraceResult.value, "replaced");
+
   const v2FocusNavigation = await v2Session.navigate(
     v2FocusFixtureUrl,
-    v2InlineSvgTraceResult.stateToken,
+    v2SettlementTraceResult.stateToken,
     commandDeadline(),
   );
   assert.equal(v2FocusNavigation.boundary, "controlled_ready");
@@ -1248,9 +1448,87 @@ try {
   const v2FocusEvidence = v2Session.settlementEvidence(v2FocusSettled);
   assert.equal(v2FocusEvidence.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
 
+  const v2PersistentIntervalNavigation = await v2Session.navigate(
+    v2IntervalBeforeFiniteFixtureUrl,
+    v2FocusTraceResult.stateToken,
+    commandDeadline(),
+  );
+  assert.equal(v2PersistentIntervalNavigation.boundary, "controlled_ready");
+  const v2PersistentIntervalImplicitPending = await v2Session.pending(commandDeadline());
+  assert.equal(v2PersistentIntervalImplicitPending.virtualTimeNs, 12_000_000_000n);
+  assert.equal(v2PersistentIntervalImplicitPending.timers.persistent, 1n);
+  assert.equal(v2PersistentIntervalImplicitPending.timers.futureFinite, 0n);
+  assert.deepEqual(v2PersistentIntervalImplicitPending.runtimeFailures, []);
+  const v2PersistentIntervalImplicitTrace = await v2Session.text(
+    "#trace",
+    v2PersistentIntervalImplicitPending.stateToken,
+    commandDeadline(),
+  );
+  assert.equal(
+    v2PersistentIntervalImplicitTrace.value,
+    "interval:1@5000|interval:2@10000|finite@12000",
+  );
+  const v2PersistentIntervalStrict = await v2Session.settle(
+    v2PersistentIntervalImplicitTrace.stateToken,
+    { persistentWork: "strict" },
+    commandDeadline(),
+  );
+  assert.equal(v2PersistentIntervalStrict.outcome, "blocked_on_open_ended_work");
+  assert.equal(v2PersistentIntervalStrict.virtualTimeNs, 12_000_000_000n);
+  assert.equal(v2PersistentIntervalStrict.snapshot.timers.persistent, 1n);
+  assert.equal(v2PersistentIntervalStrict.snapshot.timers.futureFinite, 0n);
+  assert.deepEqual(v2PersistentIntervalStrict.snapshot.runtimeFailures, []);
+  assert.deepEqual(v2PersistentIntervalStrict.unsupportedWork, []);
+  assert.deepEqual(v2PersistentIntervalStrict.externalIo, []);
+  const v2PersistentIntervalStrictTrace = await v2Session.text(
+    "#trace",
+    v2PersistentIntervalStrict.stateToken,
+    commandDeadline(),
+  );
+  assert.equal(
+    v2PersistentIntervalStrictTrace.value,
+    v2PersistentIntervalImplicitTrace.value,
+    "strict classification executed another interval callback",
+  );
+  const v2PersistentIntervalReported = await v2Session.settle(
+    v2PersistentIntervalStrictTrace.stateToken,
+    { persistentWork: "report" },
+    commandDeadline(),
+  );
+  assert.equal(v2PersistentIntervalReported.outcome, "quiescent_with_persistent_work");
+  assert.equal(v2PersistentIntervalReported.virtualTimeNs, 12_000_000_000n);
+  assert.equal(v2PersistentIntervalReported.snapshot.timers.persistent, 1n);
+  assert.equal(v2PersistentIntervalReported.snapshot.timers.futureFinite, 0n);
+  assert.deepEqual(v2PersistentIntervalReported.snapshot.runtimeFailures, []);
+  assert.deepEqual(v2PersistentIntervalReported.unsupportedWork, []);
+  assert.deepEqual(v2PersistentIntervalReported.externalIo, []);
+  assert.equal(v2PersistentIntervalReported.persistentWork.length, 1);
+  const [v2PersistentIntervalWork] = v2PersistentIntervalReported.persistentWork;
+  assert.equal(v2PersistentIntervalWork.kind, "timer");
+  assert.equal(v2PersistentIntervalWork.reason, "interval");
+  assert.equal(v2PersistentIntervalWork.count, 1n);
+  assert.equal(v2PersistentIntervalWork.requestedPeriodNs, 5_000_000_000n);
+  const v2PersistentIntervalReportTrace = await v2Session.text(
+    "#trace",
+    v2PersistentIntervalReported.stateToken,
+    commandDeadline(),
+  );
+  assert.equal(
+    v2PersistentIntervalReportTrace.value,
+    v2PersistentIntervalStrictTrace.value,
+    "report-mode checkpoint executed another interval callback",
+  );
+  const v2PersistentIntervalEvidence = v2Session.settlementEvidence(
+    v2PersistentIntervalReported,
+  );
+  assert.equal(
+    v2PersistentIntervalEvidence.profile,
+    CONTROLLED_WEB_SESSION_V2_PROFILE,
+  );
+
   const v2AutomationNavigation = await v2Session.navigate(
     v2AutomationEventFixtureUrl,
-    v2FocusTraceResult.stateToken,
+    v2PersistentIntervalReportTrace.stateToken,
     commandDeadline(),
   );
   assert.equal(v2AutomationNavigation.boundary, "controlled_ready");
@@ -1419,8 +1697,19 @@ try {
   assert.equal(v2AutomationUnsupported.count, 1n);
   assert.equal(v2AutomationUnsupported.reason, "time_surface");
   assert.equal(v2AutomationUnsupported.timeSurface, "host_timestamp");
+  assert.equal(v2AutomationRejected.url, v2AutomationEventFixtureUrl);
+  assert.equal(
+    v2Session.url,
+    v2FixtureUrl,
+    "Session.url mutated after an unsupported terminal settlement",
+  );
   const v2AutomationEvidence = v2Session.settlementEvidence(v2AutomationRejected);
   assert.equal(v2AutomationEvidence.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
+  assert.equal(Object.hasOwn(v2AutomationEvidence, "url"), false);
+  assert.equal(
+    Object.hasOwn(sdk.settlementEvidence(v2AutomationRejected), "url"),
+    false,
+  );
 
   await v2Session.close(commandDeadline());
   await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
@@ -1497,6 +1786,74 @@ try {
     fixtureTrace: v2InlineSvgTraceResult.value,
     domCompletionEvents: v2InlineSvgDomCompletionEvents,
     evidenceProfile: v2InlineSvgEvidence.profile,
+    sharedNavigationBoundary: v2InlineSvgSharedPendingNavigation.boundary,
+    sharedOutcome: v2InlineSvgSharedPendingSettled.outcome,
+    sharedProducerPending: String(
+      v2InlineSvgSharedPendingSettled.snapshot.producers.pending,
+    ),
+    sharedProducerTerminal: v2InlineSvgSharedPendingSettled.snapshot.producers.terminal,
+    sharedPendingImages: String(
+      v2InlineSvgSharedPendingSettled.snapshot.rendering.pendingImages,
+    ),
+    sharedRuntimeFailures: String(
+      v2InlineSvgSharedPendingSettled.snapshot.runtimeFailures.length,
+    ),
+    sharedUnsupportedWork: String(v2InlineSvgSharedPendingSettled.unsupportedWork.length),
+    sharedExternalIo: String(v2InlineSvgSharedPendingSettled.externalIo.length),
+    sharedFixtureTrace: v2InlineSvgSharedPendingTraceResult.value,
+    sharedEvidenceProfile: v2InlineSvgSharedPendingEvidence.profile,
+    sameControlledSession: true,
+    exactBinaryLaunch: true,
+    closeResponseAndEof: true,
+  };
+  v2SettlementUrl = {
+    profile: v2Session.profile,
+    navigationBoundary: v2SettlementUrlNavigation.boundary,
+    controlledOpenUrl: v2Session.url,
+    initialOutcome: v2SettlementInitial.outcome,
+    initialUrl: v2SettlementInitial.url,
+    historyOutcome: v2SettlementHistory.outcome,
+    historyUrl: v2SettlementHistory.url,
+    replacementOutcome: v2SettlementReplacement.outcome,
+    replacementUrl: v2SettlementReplacement.url,
+    replacementTrace: v2SettlementTraceResult.value,
+    sessionUrlStayedAtControlledOpen: v2Session.url === v2FixtureUrl,
+    sessionEvidenceExcludesUrl:
+      !Object.hasOwn(v2SettlementInitialSessionEvidence, "url") &&
+      !Object.hasOwn(v2SettlementReplacementEvidence, "url") &&
+      !Object.hasOwn(v2AutomationEvidence, "url"),
+    standaloneEvidenceExcludesUrl:
+      !Object.hasOwn(v2SettlementInitialStandaloneEvidence, "url") &&
+      !Object.hasOwn(sdk.settlementEvidence(v2AutomationRejected), "url"),
+    unsupportedOutcome: v2AutomationRejected.outcome,
+    unsupportedFailureCode: v2AutomationRejected.failure?.code,
+    unsupportedUrl: v2AutomationRejected.url,
+    exactBinaryLaunch: true,
+    closeResponseAndEof: true,
+  };
+  v2PersistentIntervalProgression = {
+    profile: v2Session.profile,
+    navigationBoundary: v2PersistentIntervalNavigation.boundary,
+    implicitVirtualTimeNs: String(v2PersistentIntervalImplicitPending.virtualTimeNs),
+    implicitPersistentTimers: String(v2PersistentIntervalImplicitPending.timers.persistent),
+    implicitFutureFinite: String(v2PersistentIntervalImplicitPending.timers.futureFinite),
+    implicitTrace: v2PersistentIntervalImplicitTrace.value,
+    strictOutcome: v2PersistentIntervalStrict.outcome,
+    strictVirtualTimeNs: String(v2PersistentIntervalStrict.virtualTimeNs),
+    strictTrace: v2PersistentIntervalStrictTrace.value,
+    reportOutcome: v2PersistentIntervalReported.outcome,
+    reportVirtualTimeNs: String(v2PersistentIntervalReported.virtualTimeNs),
+    reportTrace: v2PersistentIntervalReportTrace.value,
+    persistentTimers: String(v2PersistentIntervalReported.snapshot.timers.persistent),
+    futureFinite: String(v2PersistentIntervalReported.snapshot.timers.futureFinite),
+    persistentKind: v2PersistentIntervalWork.kind,
+    persistentReason: v2PersistentIntervalWork.reason,
+    persistentCount: String(v2PersistentIntervalWork.count),
+    requestedPeriodNs: String(v2PersistentIntervalWork.requestedPeriodNs),
+    runtimeFailures: String(v2PersistentIntervalReported.snapshot.runtimeFailures.length),
+    unsupportedWork: String(v2PersistentIntervalReported.unsupportedWork.length),
+    externalIo: String(v2PersistentIntervalReported.externalIo.length),
+    evidenceProfile: v2PersistentIntervalEvidence.profile,
     sameControlledSession: true,
     exactBinaryLaunch: true,
     closeResponseAndEof: true,
@@ -1695,9 +2052,59 @@ try {
   const v2CssEvidence = v2CssSession.settlementEvidence(v2CssSettled);
   assert.equal(v2CssEvidence.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
 
+  const v2CssPostReflowStarted = await v2CssSession.activate(
+    "#post-reflow",
+    v2CssControlledTraceResult.stateToken,
+    commandDeadline(),
+  );
+  const v2CssPostReflowSettled = await v2CssSession.settle(
+    v2CssPostReflowStarted.stateToken,
+    {},
+    commandDeadline(),
+  );
+  assert.equal(v2CssPostReflowSettled.outcome, "quiescent");
+  assert.equal(v2CssPostReflowSettled.virtualTimeNs, 70_000_000n);
+  assert.deepEqual(v2CssPostReflowSettled.unsupportedWork, []);
+  assert.deepEqual(v2CssPostReflowSettled.externalIo, []);
+  assert.deepEqual(v2CssPostReflowSettled.snapshot.runtimeFailures, []);
+  assert.equal(v2CssPostReflowSettled.snapshot.rendering.pendingAnimationEvents, 0n);
+  assert.equal(v2CssPostReflowSettled.snapshot.rendering.nextOpportunityNs, null);
+  assert.ok(v2CssPostReflowSettled.processed.renderingOpportunities > 0n);
+  const v2CssPostReflowPending = await v2CssSession.pending(commandDeadline());
+  assert.equal(v2CssPostReflowPending.virtualTimeNs, 70_000_000n);
+  assert.equal(v2CssPostReflowPending.rendering.pendingAnimationEvents, 0n);
+  assert.equal(v2CssPostReflowPending.rendering.nextOpportunityNs, null);
+  assert.deepEqual(v2CssPostReflowPending.runtimeFailures, []);
+  assert.equal(
+    v2CssPostReflowPending.stateToken,
+    v2CssPostReflowSettled.stateToken,
+    "passive pending observation changed the drained post-reflow CSS authority",
+  );
+  const v2CssPostReflowTraceResult = await v2CssSession.text(
+    "#post-reflow-result",
+    v2CssPostReflowSettled.stateToken,
+    commandDeadline(),
+  );
+  assert.equal(
+    v2CssPostReflowTraceResult.value,
+    "armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70",
+  );
+  const v2CssPostReflowEvents =
+    v2CssPostReflowTraceResult.value.split("|")[1]?.split(">") ?? [];
+  assert.equal(v2CssPostReflowEvents.length, 2);
+  const v2CssPostReflowKinds = [];
+  for (const entry of v2CssPostReflowEvents) {
+    const match = /^(animationcancel|animationstart):trusted:([^:]+):([^:]+)$/u.exec(entry);
+    assert.ok(match, `post-reflow CSS event escaped the exact owned shape: ${entry}`);
+    assert.equal(match[2], match[3], `post-reflow CSS event escaped document time: ${entry}`);
+    v2CssPostReflowKinds.push(match[1]);
+  }
+  v2CssPostReflowKinds.sort();
+  assert.deepEqual(v2CssPostReflowKinds, ["animationcancel", "animationstart"]);
+
   const v2CssScriptCreated = await v2CssSession.activate(
     "#script-created",
-    v2CssControlledTraceResult.stateToken,
+    v2CssPostReflowTraceResult.stateToken,
     commandDeadline(),
   );
   const v2CssScriptTraceResult = await v2CssSession.text(
@@ -1765,6 +2172,27 @@ try {
     producerPending: String(v2CssSettled.snapshot.producers.pending),
     producerTerminal: v2CssSettled.snapshot.producers.terminal,
     processedRenderingOpportunities: String(v2CssSettled.processed.renderingOpportunities),
+    postReflowOutcome: v2CssPostReflowSettled.outcome,
+    postReflowVirtualTimeNs: String(v2CssPostReflowSettled.virtualTimeNs),
+    postReflowTrace: v2CssPostReflowTraceResult.value,
+    postReflowEventCount: String(v2CssPostReflowEvents.length),
+    postReflowEventKinds: v2CssPostReflowKinds.join(","),
+    postReflowRuntimeFailures: String(v2CssPostReflowSettled.snapshot.runtimeFailures.length),
+    postReflowUnsupportedWork: String(v2CssPostReflowSettled.unsupportedWork.length),
+    postReflowExternalIo: String(v2CssPostReflowSettled.externalIo.length),
+    postReflowPendingAnimationEvents: String(
+      v2CssPostReflowPending.rendering.pendingAnimationEvents,
+    ),
+    postReflowNextOpportunityNs:
+      v2CssPostReflowPending.rendering.nextOpportunityNs === null
+        ? "none"
+        : String(v2CssPostReflowPending.rendering.nextOpportunityNs),
+    postReflowProcessedRenderingOpportunities: String(
+      v2CssPostReflowSettled.processed.renderingOpportunities,
+    ),
+    postReflowStateTokenPreserved:
+      v2CssPostReflowPending.stateToken === v2CssPostReflowSettled.stateToken,
+    postReflowOwnedQueueDrain: true,
     scriptCreatedConstructorCount: "2",
     scriptCreatedTrace: v2CssScriptEntries.at(-1),
     rejectedOutcome: v2CssRejected.outcome,
@@ -2399,6 +2827,8 @@ try {
       v2MessageChannel,
       v2DirectDataSvg,
       v2InlineSvgRendering,
+      v2SettlementUrl,
+      v2PersistentIntervalProgression,
       v2InputMethodFocus,
       v2AutomationEventTimestamps,
       v2CssAnimationEventTimestamps,

@@ -418,6 +418,7 @@ impl SharedWorkerGlobalScope {
                     policy_container: policy_container.clone(),
                     origin: Origin::Origin(origin.clone()),
                     is_nested_browsing_context,
+                    controlled_cookie_site_for_cookies: None,
                     insecure_requests_policy,
                     has_trustworthy_ancestor_origin: current_global_ancestor_trustworthy,
                 };

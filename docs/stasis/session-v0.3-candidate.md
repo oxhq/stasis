@@ -6,11 +6,13 @@
 > `Runtime.openSession()` continues to default to `controlled-web-session-v1`; v2 must be selected
 > explicitly and the native runtime must advertise it.
 
-`controlled-web-session-v2` preserves the complete v1 session contract and adds seven
+`controlled-web-session-v2` preserves the complete v1 session contract and adds nine
 benchmark-driven compatibility slices: controlled-local messaging, bounded direct image
 completion, inline-SVG rendering completion, single-line text-focus presentation and focus-event
 time, synchronous public-automation event time, internal CSS animation-event time, and controlled
-persistent-cookie expiry plus SameSite request selection. The owned
+persistent-cookie expiry plus SameSite request selection, plus an owner-attested current URL on
+every returned v2 settle result, plus bounded progression through owned persistent interval heads
+when finite work remains. The owned
 source added by this profile is a constructor-created
 `MessageChannel` whose two ports remain in the active controlled top-level document global, and a
 bounded direct `HTMLImageElement.src` completion path for canonical data SVG and direct HTTP(S)
@@ -19,9 +21,9 @@ controlled top-level, single-line `InputMethodType::Text` focus with `multiline 
 virtual keyboard requested. Engine-generated focus transitions and admitted image completion
 events receive document-clock event timestamps. A separate synchronous automation scope gives the
 browser-created form events emitted by one admitted public mutating action one shared document-clock
-sample. Engine-generated CSS `AnimationEvent` objects on the bounded instant finite-animation path
-drain from an already-owned pending-event batch in the exact public non-auxiliary controlled
-top-level WebView and receive one shared document-clock sample. These additions
+sample. Engine-generated CSS `AnimationEvent` objects on the bounded finite-animation and
+post-reflow queue-drain paths drain from an already-owned pending-event batch in the exact public
+non-auxiliary controlled top-level WebView and receive one shared document-clock sample. These additions
 preserve DOM behavior without admitting a general cross-realm messaging, image-source,
 host-timestamp, event-constructor, animation, or embedder-control system.
 
@@ -83,12 +85,14 @@ internal animation and transition event seam.
 
 The existing rendering authority already retains each document's CSS animation and transition
 states, pending animation-event count, finite/infinite/unsupported classification, and the 10,000
-rendering-opportunity execution limit. A scheduled opportunity with pending animation events is
-finite rendering demand and must use guarded `AdvanceTo` at the exact retained scheduler head,
-including when that deadline equals `now`; only an event batch with no live scheduled opportunity is
-`Drive`-ready. `Drive` cannot detach a controlled scheduler entry, so treating a scheduled batch as
-ready would spin checkpoint turns instead of reaching the callback. This is a settlement-liveness
-correction, not a new producer, task source, or execution limit.
+rendering-opportunity execution limit. A nonempty document-owned pending CSS animation-event queue
+is finite rendering demand and retains one later owned rendering opportunity until dispatch drains
+the queue; an empty queue leaves no rendering opportunity. A scheduled opportunity with pending
+animation events must use guarded `AdvanceTo` at the exact retained scheduler head, including when
+that deadline equals `now`; only an event batch with no live scheduled opportunity is `Drive`-ready.
+`Drive` cannot detach a controlled scheduler entry, so treating a scheduled batch as ready would
+spin checkpoint turns instead of reaching the callback. This is a settlement-liveness correction,
+not a new producer, task source, or execution limit.
 
 V2 adds one timestamp adapter at the owning `Animations::send_pending_events` seam. For a nonempty pending-event
 dispatch batch, `ScriptThread::current_controlled_top_level_target_matches(window)` must
@@ -110,7 +114,9 @@ Every eligible event in one batch therefore exposes the same document-relative `
 A stale or mismatched record is not promoted by this adapter.
 
 The executable compatibility proof is deliberately narrower than the adapter mapping: it exercises
-one already-complete finite animation and observes owned `animationstart` and `animationend` events.
+one already-complete finite animation and observes owned `animationstart` and `animationend` events,
+then proves that post-reflow `animationstart` and `animationcancel` work retains a later opportunity,
+drains the pending-event queue, and leaves no further opportunity.
 The `TransitionEvent` mapping applies only if the existing rendering pipeline has already produced
 an owned transition record that reaches this pending dispatch queue. V0.3 does not claim general
 CSS transition execution or settlement compatibility.
@@ -222,9 +228,10 @@ controlled callback delivery can invoke the retained unsupported callback. This 
 limited to an admitted v2 direct HTTP(S) request. Baseline and v1 multipart behavior is unchanged.
 
 At most 512 controlled image ownership records may be retained by one Window. Each pending
-controlled callback, each exact `(cache ID, DOM owner)` identity, and each controlled
-vector-rasterization key owns one non-cloneable capacity reservation. Multiple DOM owners sharing a
-cache ID therefore consume distinct records. Rejection of record 513 latches a bounded
+controlled callback, each retained layout owner, each exact `(cache ID, DOM owner)` identity, each
+controlled vector-rasterization key, and each retained raster owner owns one non-cloneable capacity
+reservation. Multiple DOM owners sharing a cache ID or raster key therefore consume distinct
+records. Rejection of record 513 latches a bounded
 Image-producer admission terminal, and there is no baseline fallback. On the HTML decode
 `ReadyForRequest` path, callback and identity reservations succeed before the cache request is
 issued. On the post-reflow raster path, record 513 can be observed after layout initiated the task;
@@ -238,8 +245,8 @@ Pending observation treats the union of callback and per-owner layout `PendingIm
 logical image identities and treats each `(PendingImageId, requested size)` raster key as separate
 work. An image ID is controlled only when every retained callback for that ID is controlled and no
 retained callback or layout owner is baseline or explicitly unsupported. Live record count must
-equal retained controlled callbacks plus
-exact `(cache ID, DOM owner)` identities plus controlled raster keys, and, absent a producer
+equal retained controlled callbacks plus controlled layout owners plus exact `(cache ID, DOM
+owner)` identities plus controlled raster keys plus controlled raster owners and, absent a producer
 terminal, the Image producer's pending count must be at least the number of controlled logical work
 items. Controlled items are represented by the producer fence and are removed from the generic
 pending-rendering image count; baseline, missing, mixed, or otherwise unowned items
@@ -282,14 +289,31 @@ serialized URL for that same DOM owner. The serialized URL is admitted only when
 65,536 bytes and the canonical `DataUrl` parser reports exactly `image/svg+xml`. An arbitrary
 script-, CSS-, layout-, or embedder-supplied data URL cannot impersonate this authority.
 
-The inline owner must join the exact `PendingImageId`/DOM-owner cache identity. Finite decode and
+The inline owner must successfully establish or retain its exact current
+`PendingImageId`/DOM-owner cache identity during admission. Finite decode and
 vector-raster completion then use the same bounded retained-record inventory, Image producer
 fence, guarded ScriptThread handoff, mixed-owner downgrade, and exact raster-key reconciliation as
-the direct image slice. A missing identity, mismatched cached URL, non-internal request, capacity
-failure, provenance mismatch, abandoned callback, or guarded transport failure never falls back to
+the direct image slice. An identity-reservation failure, mismatched cached URL, non-internal request,
+capacity failure, provenance mismatch, abandoned callback, or guarded transport failure never falls back to
 the baseline sender. A delivery-time provenance mismatch remains retained typed unsupported work;
 it is not converted into producer abandonment. Controlled work is represented by the Image producer
 fence rather than hidden in generic pending rendering.
+
+An identical current inline root may reach post-reflow while an earlier exact owner still retains
+the shared image-cache producer. The layout snapshot can report either `PendingResponse` or a
+stale/reentrant `Unrequested`; neither cache-state label is authority by itself. In both cases, the
+candidate's exact cache-key URL and `PendingImageId` must match an existing same-ID
+`ControlledV2Fenced` layout record. The existing callback set must be nonempty, uniformly fenced,
+and every callback must retain the exact producer URL key equal to the candidate URL. That key is
+owned by the live producer callback: it can survive an earlier DOM owner's unbind, but terminal
+callback removal revokes it. No preexisting live DOM identity is required or trusted. There must be
+no baseline retained callback, layout owner, or raster work for the ID. A new current candidate
+owner is retained once, while an already-retained candidate is idempotent. The join reuses the
+existing listener and producer; it adds no listener, producer, or fetch. Each controlled callback,
+layout owner, DOM identity, raster key, and raster owner consumes the shared 512-record Window
+capacity until its exact terminal or unbind lifetime ends. A missing layout anchor or producer key,
+stale candidate, URL/ID mismatch, mixed provenance, or capacity terminal fails closed and cannot
+promote baseline work.
 
 This is a rendering-completion claim, not an event-surface expansion. The internal inline-SVG
 completion creates no DOM `load`, `error`, or `loadend` event and therefore makes no new timestamp
@@ -397,9 +421,9 @@ TypeScript SDK as `bigint | null`. Session cookies retain `null`.
 Cookie authority is bounded by that same u64 Unix-nanosecond domain even though the general
 controlled clock accepts u128 values. When a post-open request observes controlled Unix time above
 `18446744073709551615`, it fails nonfatally as `unsupported_cookie_time_range` with partial request
-state effect before network start or Cookie header construction. During initial controlled open,
-the shell hardens that same code to a fatal fail-stop because no usable session can be returned. A
-persistent expiry that has no u64 headroom uses the same typed boundary. Page-authored cookie APIs
+state effect. During initial controlled open, the shell hardens that same code to a fatal fail-stop
+because no usable session can be returned. A persistent expiry that has no u64 headroom uses the
+same typed boundary. Page-authored cookie APIs
 surface the equivalent `NotSupportedError`; they do not truncate or wrap time.
 
 SameSite selection uses the schemeful site-for-cookies captured from the request client, the
@@ -408,17 +432,71 @@ are selected only same-site. `Lax` and unspecified cookies are also eligible on 
 top-level `GET`, `HEAD`, `OPTIONS`, or `TRACE`; `None` requires `Secure` and may be selected
 cross-site. Ineligible cookies are filtered before Cookie header construction without creating a
 settlement terminal. An unknown or opaque request context still fails closed as
-`unsupported_cookie_same_site_context` before network start.
+`unsupported_cookie_same_site_context`. Both post-open typed rejections may retain bounded
+`request_started` and `request_failed` evidence, but they occur before `route_decided` or route
+selection, fixture or live external I/O, and Cookie header construction.
 
-Response-cookie storage uses the same captured schemeful context. A same-site response or any
-top-level-navigation response may store every otherwise valid unpartitioned cookie. For a
-cross-site subresource response, only a valid Secure `SameSite=None` cookie is eligible; Strict,
-Lax, and unspecified cookies are ignored without a terminal. The redirect-hop method is not an
-input to this response-storage admission rule.
+Response-cookie storage uses the same captured schemeful context. Controlled parsing,
+normalization, and time-range validation happen before SameSite eligibility. A same-site response
+or any top-level-navigation response may store every otherwise valid unpartitioned cookie. For a
+cross-site subresource response, after successful controlled parsing only a valid Secure
+`SameSite=None` cookie is eligible; otherwise valid Strict, Lax, and unspecified cookies are
+ignored without a terminal. Parse, normalization, and time-range failures retain their existing
+typed outcomes and are not covered by that ignore rule. The redirect-hop method is not an input to
+this response-storage admission rule.
 
 Partitioned cookies remain `unsupported_partitioned_cookie`. `cookieStore.get()`, `getAll()`, and
 `delete()` retain `controlled_cookie_store_read_delete_unsupported`; this slice does not create a
 general Cookie Store API or durable browser profile.
+
+## Owner-attested settlement URL
+
+Every returned `runtime.settle` result for an explicitly selected v2 session includes a required
+`url` string. Stasis projects that URL only after the existing passive N1, document-pending D, and
+passive N2 settlement bracket agrees on the exact active top-level navigation authority. It comes
+from the same final authority used to derive the returned `stateToken`, and names the active
+top-level document URL at that terminal snapshot. The field is present for every returned outcome;
+its presence does not mean that the outcome is quiescent.
+
+This is a result projection, not a new poll or mutable session property. `Session.url` remains the
+URL observed when the session opened; callers that need the current owner-verified URL after
+same-document history changes or document replacement use `settled.url`. Action and navigation
+result shapes retain their existing contracts. Frozen v1 settle-result bytes and TypeScript types
+remain unchanged.
+
+URLs can contain sensitive application data. Neither `settlementEvidence(result)` nor
+`session.settlementEvidence(result)` copies the v2 `url`; the existing bounded redacted evidence
+contract continues to exclude URLs, query values, credentials, fragments, headers, bodies,
+cookies, and Web Storage.
+
+## Persistent intervals before finite work
+
+The forcing unchanged-corpus case is the Cypress Real World App at
+`28ca4d03e4c68d366ccdbb25d43e1f37b3c67a4d`: its installed MUI 5.16.12
+`Unstable_TrapFocus` keeps a 50 ms focus-enforcement interval alive while the onboarding dialog is
+open, with finite animation work scheduled behind that interval. The contract below is generic
+scheduler authority; there is no MUI, React, or benchmark-name branch in the runtime.
+
+An open interval is persistent work, not a finite blocker and not an external subscription. In v2,
+when `persistentWork` is `report`, finite owned work may still be reached when an eligible
+JavaScript interval owns the scheduler head in front of it. The coordinator advances exactly that
+one head with the ordinary single-use `DocumentAdvanceToken`, revalidates it against the complete
+fresh pending snapshot, dispatches its callback as one ordinary task, completes its microtask
+checkpoint, and reobserves before deciding again. Every observed finite timer and animated-image
+deadline must be strictly later than the interval head. One scheduled finite rendering opportunity
+may share the head timestamp only when it is a distinct exact owner on the same scheduler and its
+`TimerId` sequence follows the interval head. The coordinator dispatches the interval head and
+reobserves before advancing that exact rendering entry or any further work. Same-entry,
+lower-or-equal-order, foreign-scheduler, bare/unowned, equal finite-timer, and equal animated-image
+collisions remain `blocked_on_open_ended_work`.
+
+This is bounded progression, not an interval drain. Ordinary-task, microtask, rendering, mutation,
+control-turn, and virtual-time limits all remain in force, so a recursive or zero-delay interval
+terminates through the existing typed budget results. As soon as finite work drains, the next
+interval-only head is not advanced: two fresh stable checkpoints return
+`quiescent_with_persistent_work` and report the interval. `persistentWork: "strict"`,
+`controlled-webapp-v1`, and `controlled-web-session-v1` retain the previous
+`blocked_on_open_ended_work` behavior and execute no interval callback for this case.
 
 ## Identity and compatibility
 
@@ -433,6 +511,7 @@ V2 pins its predecessor profile by SHA-256
 re-hashes that frozen `controlled-web-session-v1` file independently; naming the predecessor is not
 accepted as evidence that its bytes stayed unchanged.
 
-V2 expands only the declared execution, headless-presentation, and controlled cookie-state
-surfaces. Web Storage retains its predecessor behavior inside a profile-matched v2 artifact.
-Import and export preserve that exact v2 identity and there is no implicit state migration.
+V2 expands only the declared execution, headless-presentation, controlled cookie-state,
+owner-attested settlement-result URL, and bounded persistent-interval progression surfaces. Web Storage retains its predecessor behavior inside
+a profile-matched v2 artifact. Import and export preserve that exact v2 identity and there is no
+implicit state migration.

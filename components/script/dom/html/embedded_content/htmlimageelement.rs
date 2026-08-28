@@ -651,25 +651,44 @@ impl HTMLImageElement {
                     ImageCallbackDelivery::Baseline,
                     cx,
                 );
-                let _ = self.register_image_cache_callback(id, ChangeType::Element, provenance);
+                let _ = self.register_image_cache_callback(
+                    id,
+                    ChangeType::Element,
+                    provenance,
+                    img_url,
+                );
             },
             ImageCacheResult::Pending(id) => {
-                let _ = self.register_image_cache_callback(id, ChangeType::Element, provenance);
+                let _ = self.register_image_cache_callback(
+                    id,
+                    ChangeType::Element,
+                    provenance,
+                    img_url,
+                );
             },
             ImageCacheResult::ReadyForRequest(id) => {
                 match provenance {
                     ImageRequestProvenance::Baseline => {
                         // Preserve the predecessor ordering for every unowned image path.
                         self.fetch_request(img_url, id, provenance);
-                        let _ =
-                            self.register_image_cache_callback(id, ChangeType::Element, provenance);
+                        let _ = self.register_image_cache_callback(
+                            id,
+                            ChangeType::Element,
+                            provenance,
+                            img_url,
+                        );
                     },
                     ImageRequestProvenance::ControlledV2DirectDataSvg |
                     ImageRequestProvenance::ControlledV2DirectHttpImage => {
                         // Controlled work must have a retained owner before it starts. If
                         // capacity or producer-fence admission fails, Window latches the typed
                         // terminal and this request is never issued.
-                        if self.register_image_cache_callback(id, ChangeType::Element, provenance) {
+                        if self.register_image_cache_callback(
+                            id,
+                            ChangeType::Element,
+                            provenance,
+                            img_url,
+                        ) {
                             self.fetch_request(img_url, id, provenance);
                         }
                     },
@@ -734,6 +753,7 @@ impl HTMLImageElement {
         id: PendingImageId,
         change_type: ChangeType,
         provenance: ImageRequestProvenance,
+        producer_key: &ServoUrl,
     ) -> bool {
         let trusted_node = Trusted::new(self);
         let generation = self.generation_id();
@@ -755,6 +775,7 @@ impl HTMLImageElement {
                 let Ok(callback) = window.register_controlled_v2_image_cache_listener(
                     id,
                     self.upcast::<Node>(),
+                    producer_key.clone(),
                     move |response, delivery, _| {
                         Self::queue_image_cache_response(
                             trusted_node.clone(),
@@ -1558,6 +1579,7 @@ impl HTMLImageElement {
                     id,
                     change_type,
                     ImageRequestProvenance::Baseline,
+                    &image_url,
                 );
             },
             ImageCacheResult::FailedToLoadOrDecode => {
@@ -1575,6 +1597,7 @@ impl HTMLImageElement {
                     id,
                     change_type,
                     ImageRequestProvenance::Baseline,
+                    &image_url,
                 );
             },
             ImageCacheResult::Pending(id) => {
@@ -1582,6 +1605,7 @@ impl HTMLImageElement {
                     id,
                     change_type,
                     ImageRequestProvenance::Baseline,
+                    &image_url,
                 );
             },
         }

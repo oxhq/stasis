@@ -1372,6 +1372,8 @@ impl RuntimeSettleParams {
                     .ok_or(SettleParamsError::DurationOutOfRange("wallIoTimeoutNs"))?,
                 None => defaults.wall_io_timeout,
             },
+            advance_interval_head_before_finite_work: defaults
+                .advance_interval_head_before_finite_work,
         };
         Ok(ResolvedSettlePolicy {
             persistent_work: self.persistent_work,
@@ -4383,6 +4385,17 @@ mod tests {
         assert_eq!(advance, RuntimeAdvanceToNextParams {});
         let defaults: RuntimeSettleParams = serde_json::from_value(json!({})).unwrap();
         assert_eq!(defaults, RuntimeSettleParams::default());
+        let mut engine_defaults = EngineSettlePolicy::default();
+        engine_defaults.advance_interval_head_before_finite_work = true;
+        assert!(
+            defaults
+                .clone()
+                .resolve(engine_defaults)
+                .unwrap()
+                .engine
+                .advance_interval_head_before_finite_work,
+            "wire overrides must preserve internal profile-bound engine policy",
+        );
         assert!(serde_json::from_value::<RuntimePendingParams>(json!({"surprise": true})).is_err());
         assert!(serde_json::from_value::<RuntimePendingParams>(json!([])).is_err());
         assert!(
@@ -4943,7 +4956,7 @@ mod tests {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>(),
-            "d9855ee01844e0fae796a9925c87a936281d47fc480b9d047da74d4a3afcd989",
+            "1351eec7fb3ec307907aaa26ea6776d364ccf686310a62b42a55b91b9ad7e4c4",
             "the stable profile test must be closed over every advertised field",
         );
         let profile: Value = serde_json::from_slice(profile_bytes)
@@ -4961,7 +4974,41 @@ mod tests {
         assert_eq!(profile["compatibility"]["predecessorContractUnchanged"], true);
         assert_eq!(
             profile["compatibility"]["profileExpansion"],
-            "execution_headless_presentation_and_controlled_cookie_state_surfaces"
+            "execution_headless_presentation_controlled_cookie_state_owner_attested_settlement_url_and_bounded_persistent_interval_progression_surfaces"
+        );
+        assert_eq!(
+            profile["sessionSettlementResult"],
+            json!({
+                "profile": "controlled-web-session-v2_only",
+                "field": "url",
+                "presence": "every_returned_runtime_settle_outcome",
+                "source": "final_passive_N1_document_pending_D_passive_N2_owner_navigation_authority",
+                "binding": "same_exact_navigation_authority_as_stateToken",
+                "meaning": "active_top_level_document_url_at_terminal_snapshot",
+                "doesNotImply": "quiescence",
+                "settlementEvidence": "excluded",
+            })
+        );
+        assert_eq!(
+            profile["execution"]["persistentIntervalFiniteProgression"],
+            json!({
+                "profile": "controlled-web-session-v2_only",
+                "policy": "persistentWork_report_only",
+                "precondition": "finite_owned_work_remains_and_the_exact_eligible_JavaScriptInterval_is_the_authoritative_scheduler_head",
+                "deadlineRelation": "every_observed_finite_timer_and_animated_image_deadline_is_strictly_later_an_equal_timestamp_finite_rendering_opportunity_is_allowed_only_when_its_exact_distinct_scheduler_entry_is_ordered_after_the_interval_head_same_entry_unowned_and_equal_finite_timer_or_animated_image_collisions_remain_blocked_on_open_ended_work",
+                "authority": "single_use_DocumentAdvanceToken_revalidated_against_the_complete_fresh_pending_snapshot",
+                "ordering": "advance_and_dispatch_one_exact_interval_head_then_reobserve_before_advancing_the_exact_distinct_rendering_entry_or_any_further_work",
+                "callbackAccounting": "ordinary_task_and_microtask_rendering_mutation_control_turn_and_virtual_time_limits_unchanged",
+                "terminal": "after_finite_work_drains_two_stable_checkpoints_return_quiescent_with_persistent_work_without_advancing_an_interval_only_head",
+                "strictPolicy": "blocked_on_open_ended_work_without_interval_progression",
+                "predecessorProfiles": "unchanged_blocked_on_open_ended_work_when_interval_owns_the_head_ahead_of_finite_work",
+                "notClaimed": [
+                    "ignoring_or_clearing_intervals",
+                    "wall_clock_polling_or_sleep",
+                    "unbounded_interval_drain",
+                    "external_or_cross_event_loop_timer_authority",
+                ],
+            })
         );
         assert_eq!(
             profile["execution"]["messageChannel"]["construction"]["interface"],
@@ -5086,13 +5133,15 @@ mod tests {
                 "samplingFailure": "latch_controlled_clock_terminal_and_leave_batch_undispatched_without_host_fallback",
                 "pendingAuthority": "existing_pending_event_and_finite_infinite_unsupported_animation_rendering_facts_unchanged",
                 "settlementScheduling": {
+                    "nonemptyDocumentOwnedQueue": "finite_rendering_demand_that_retains_one_later_owned_rendering_opportunity_until_dispatch_drains_the_queue",
+                    "emptyDocumentOwnedQueue": "no_pending_CSS_animation_events_leaves_no_rendering_opportunity",
                     "scheduledPendingEventBatch": "finite_rendering_demand_advanced_to_exact_retained_scheduler_head_including_deadline_equal_to_now",
                     "driveReadiness": "pending_animation_events_are_Drive_ready_only_without_a_live_scheduled_opportunity",
                     "reason": "Drive_cannot_detach_a_controlled_scheduler_entry",
                     "surfaceEffect": "liveness_correction_only_no_new_producer_task_source_or_execution_limit",
                 },
                 "executionLimit": "existing_10000_rendering_opportunity_limit",
-                "representativeExecutableProof": "instant_finite_animationstart_and_animationend_only",
+                "representativeExecutableProof": "instant_finite_animationstart_and_animationend_plus_post_reflow_animationstart_and_animationcancel_queue_drain",
                 "transitionSettlementCompatibility": "not_claimed_timestamp_adapter_applies_only_if_an_existing_owned_transition_record_reaches_pending_dispatch",
                 "scriptCreatedConstructors": "AnimationEvent_and_TransitionEvent_remain_host_timestamp",
                 "auxiliaryStaleMismatchedNestedAndRealtime": "host_timestamp_predecessor_behavior",
@@ -5124,10 +5173,12 @@ mod tests {
                     "maximumRetainedControlledOwnershipRecordsPerWindow": 512,
                     "recordKinds": [
                         "pending_callback",
+                        "layout_owner",
                         "exact_cache_id_DOM_owner_identity",
                         "vector_rasterization_key",
+                        "vector_rasterization_owner",
                     ],
-                    "reservationUnit": "one_record_per_controlled_pending_callback_exact_cache_id_DOM_owner_identity_or_vector_rasterization_key",
+                    "reservationUnit": "one_record_per_controlled_pending_callback_layout_owner_exact_cache_id_DOM_owner_identity_vector_rasterization_key_or_vector_rasterization_owner",
                     "overflow": "sticky_Image_producer_admission_limit_terminal_without_baseline_fallback",
                     "decodeRequestAdmission": "ReadyForRequest_callback_and_identity_reservations_succeed_before_cache_request_issue",
                     "teardown": "callback_identity_layout_and_raster_collections_cleared_together_releasing_all_records",
@@ -5165,7 +5216,7 @@ mod tests {
                     "mixedLayoutOwnership": "baseline_layout_owner_globally_downgrades_cache_id_and_live_raster_keys_and_delivery_mismatch_rejects_before_any_callback_while_retained_as_unsupported_rendering",
                     "mixedMissingOrBaseline": "missing_baseline_or_explicit_Unsupported_is_unsupported_pending_rendering_image_load",
                     "controlledProjection": "Image_producer_fence_not_pending_rendering_image_load",
-                    "reservationReconciliation": "live_controlled_records_equal_retained_controlled_callbacks_plus_exact_cache_id_DOM_owner_identities_plus_controlled_rasterization_keys",
+                    "reservationReconciliation": "live_controlled_records_equal_retained_controlled_callbacks_plus_controlled_layout_owners_plus_exact_cache_id_DOM_owner_identities_plus_controlled_rasterization_keys_plus_controlled_rasterization_owners",
                     "unsupportedReservationReconciliation": "explicit_Unsupported_records_retain_exact_logical_ID_without_controlled_capacity_reservations",
                     "producerReconciliation": "pending_Image_producers_greater_than_or_equal_to_controlled_logical_work_absent_terminal",
                 },
@@ -5212,8 +5263,18 @@ mod tests {
                     "executionDomain": "same_ScriptThread_and_ImageCache",
                 },
                 "ownership": {
-                    "cacheIdJoin": "exact_PendingImageId_DOM_owner_identity_required",
-                    "retentionBudget": "shared_512_record_controlled_image_ownership_limit",
+                    "cacheIdJoin": "exact_PendingImageId_current_candidate_identity_retained_on_admission",
+                    "retainedProducerJoinAdmission": {
+                        "cacheStates": "PendingResponse_or_stale_reentrant_Unrequested_each_carries_exact_cache_key_URL",
+                        "candidate": "current_inline_SVG_exact_PendingImageId_and_exact_current_cached_URL_new_owner_retained_once_existing_owner_idempotent",
+                        "anchor": "existing_same_PendingImageId_ControlledV2Fenced_layout_record_plus_live_producer_callback_keys_no_preexisting_DOM_identity_required",
+                        "provenance": "nonempty_callback_set_uniformly_ControlledV2Fenced_each_exact_producer_key_equals_candidate_URL_and_no_baseline_retained_work",
+                        "producerReuse": "reuse_existing_uniformly_fenced_listener_and_producer_set_join_adds_no_listener_producer_or_fetch",
+                        "producerKeyLifetime": "owned_by_live_callback_until_terminal_callback_removal_independent_of_prior_DOM_owner_unbind",
+                        "failure": "missing_layout_anchor_missing_or_wrong_producer_key_stale_candidate_mismatched_ID_or_mixed_provenance_fails_closed_without_baseline_promotion",
+                        "excluded": "baseline_v1_external_nested_iframe_worker_worklet_and_cross_loop_unchanged",
+                    },
+                    "retentionBudget": "shared_512_record_limit_counts_each_controlled_callback_layout_owner_DOM_identity_raster_key_and_raster_owner_until_its_exact_terminal_or_unbind_lifetime_ends",
                     "mixedOwnership": "baseline_owner_globally_downgrades_shared_cache_id_and_live_raster_keys",
                     "hostFallback": "forbidden_for_admitted_work",
                 },
@@ -5335,6 +5396,28 @@ mod tests {
             cookie_response_product_surfaces,
             ["bounded_schemeful_SameSite_response_cookie_storage"]
         );
+        let settlement_url_product_surfaces: Vec<_> = profile["supportedProductSurface"]
+            .as_array()
+            .expect("supportedProductSurface must be an array")
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|surface| surface.contains("owner_attested_current_top_level_url"))
+            .collect();
+        assert_eq!(
+            settlement_url_product_surfaces,
+            ["owner_attested_current_top_level_url_on_every_v2_settle_result"]
+        );
+        let interval_progression_product_surfaces: Vec<_> = profile["supportedProductSurface"]
+            .as_array()
+            .expect("supportedProductSurface must be an array")
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|surface| surface.contains("report_policy_interval_progression"))
+            .collect();
+        assert_eq!(
+            interval_progression_product_surfaces,
+            ["bounded_report_policy_interval_progression_before_strictly_later_finite_work_or_exact_distinct_same_deadline_rendering"]
+        );
         assert_eq!(
             profile["unsupportedClasses"]["hostTimestamp"],
             json!({
@@ -5395,7 +5478,7 @@ mod tests {
                 "maximumControlledUnixTimeNsInclusive": "18446744073709551615",
                 "postOpenNetworkRequestAboveMaximum": {
                     "code": "unsupported_cookie_time_range",
-                    "boundary": "before_network_start_and_cookie_header_construction",
+                    "boundary": "may_retain_bounded_request_started_and_request_failed_evidence_but_rejects_before_route_decided_route_selection_fixture_or_live_external_io_and_cookie_header_construction",
                     "fatal": false,
                     "stateEffect": "partial",
                     "processEffect": "continue",
@@ -5417,7 +5500,7 @@ mod tests {
                     "topLevelNavigation": "captured_request_boolean",
                     "unknownOrOpaque": {
                         "code": "unsupported_cookie_same_site_context",
-                        "boundary": "before_network_start_and_cookie_header_construction",
+                        "boundary": "may_retain_bounded_request_started_and_request_failed_evidence_but_rejects_before_route_decided_route_selection_fixture_or_live_external_io_and_cookie_header_construction",
                     },
                 },
                 "none": "requires_secure",
@@ -5433,7 +5516,7 @@ mod tests {
                     "sameSiteOrTopLevelNavigation":
                         "all_valid_unpartitioned_response_cookies_eligible",
                     "crossSiteSubresource":
-                        "only_secure_SameSite_None_eligible_Strict_Lax_and_unspecified_ignored_without_terminal",
+                        "after_successful_controlled_parsing_only_secure_SameSite_None_is_eligible_otherwise_valid_Strict_Lax_and_unspecified_are_ignored_without_terminal_parse_normalization_and_time_range_failures_retain_existing_typed_outcomes",
                     "requestMethod": "not_an_admission_input",
                 },
             })

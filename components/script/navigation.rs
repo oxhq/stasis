@@ -241,6 +241,10 @@ impl InProgressLoad {
             policy_container: self.load_data.policy_container.clone().unwrap_or_default(),
             origin: Origin::Origin(client_origin),
             is_nested_browsing_context: self.parent_info.is_some(),
+            controlled_cookie_site_for_cookies: self
+                .load_data
+                .controlled_cookie_site_for_cookies
+                .clone(),
             insecure_requests_policy,
             has_trustworthy_ancestor_origin: self.load_data.has_trustworthy_ancestor_origin,
         };
@@ -317,6 +321,42 @@ pub(crate) fn determine_the_origin(
     MutableOrigin::new(url.origin())
 }
 
+#[cfg(test)]
+mod controlled_cookie_origin_tests {
+    use content_security_policy::{CspList, PolicyDisposition, PolicySource};
+
+    use super::*;
+    use crate::dom::window::controlled_cookie_site_for_document_origin;
+
+    #[test]
+    fn csp_sandboxed_top_level_https_document_has_no_controlled_cookie_site() {
+        let url = ServoUrl::parse("https://example.test/sandboxed").unwrap();
+        let csp = CspList::parse(
+            "sandbox allow-scripts",
+            PolicySource::Header,
+            PolicyDisposition::Enforce,
+        );
+        let flags = csp.get_sandboxing_flag_set_for_document().unwrap();
+        assert!(flags.contains(SandboxingFlagSet::SANDBOXED_ORIGIN_BROWSING_CONTEXT_FLAG));
+        assert!(!flags.contains(SandboxingFlagSet::SANDBOXED_SCRIPTS_BROWSING_CONTEXT_FLAG));
+
+        let origin = determine_the_origin(Some(&url), flags, None);
+
+        assert!(!origin.is_tuple());
+        assert!(url.origin().is_tuple());
+        assert_eq!(
+            controlled_cookie_site_for_document_origin(true, &origin),
+            None
+        );
+
+        let ordinary_origin = determine_the_origin(Some(&url), SandboxingFlagSet::empty(), None);
+        assert_eq!(
+            controlled_cookie_site_for_document_origin(true, &ordinary_origin),
+            Some(ServoUrl::parse("https://example.test/").unwrap())
+        );
+    }
+}
+
 /// <https://html.spec.whatwg.org/multipage/#navigate-fragid>
 fn navigate_to_fragment(
     cx: &mut JSContext,
@@ -383,6 +423,9 @@ pub(crate) fn navigate(
     mut load_data: LoadData,
 ) {
     let doc = window.Document();
+    // Capture request-client cookie provenance before this navigation is queued through
+    // Constellation. Later same-document history changes must not reattribute the request.
+    load_data.controlled_cookie_site_for_cookies = window.controlled_cookie_site_for_document(&doc);
 
     // <https://html.spec.whatwg.org/multipage/#process-a-navigate-fetch>
     if force_reload {

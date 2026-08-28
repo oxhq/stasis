@@ -131,6 +131,11 @@ pub struct LoadData {
     pub load_origin: LoadOrigin,
     /// The URL.
     pub url: ServoUrl,
+    /// Servo-internal site-for-cookies provenance captured when this navigation was requested.
+    /// Manual redirect replays retain this value rather than consulting the subsequently active
+    /// document URL.
+    #[serde(default)]
+    pub controlled_cookie_site_for_cookies: Option<ServoUrl>,
     /// <https://html.spec.whatwg.org/multipage/#concept-document-about-base-url>
     pub about_base_url: Option<ServoUrl>,
     /// The creator pipeline id if this is an about:blank load.
@@ -205,6 +210,7 @@ impl LoadData {
         Self {
             load_origin,
             url,
+            controlled_cookie_site_for_cookies: None,
             about_base_url,
             creator_pipeline_id,
             method: Method::GET,
@@ -231,9 +237,9 @@ impl LoadData {
     /// Create a new [`LoadData`] for a completely new top-level `WebView` that isn't created
     /// via APIs like `window.open`. This is for `WebView`s completely unrelated to others.
     pub fn new_for_new_unrelated_webview(url: ServoUrl) -> Self {
-        Self::new(
+        let mut load_data = Self::new(
             LoadOrigin::Constellation,
-            url,
+            url.clone(),
             None,
             None,
             Referrer::NoReferrer,
@@ -242,7 +248,11 @@ impl LoadData {
             None,
             false,
             SandboxingFlagSet::empty(),
-        )
+        );
+        // A completely new top-level WebView has no predecessor client. Its builder URL is the
+        // only request-creation authority available for the initial navigation.
+        load_data.controlled_cookie_site_for_cookies = Some(url);
+        load_data
     }
 }
 
@@ -808,10 +818,19 @@ pub enum ScriptToConstellationMessage {
     /// Script has opened a new auxiliary browsing context.
     CreateAuxiliaryWebView(AuxiliaryWebViewCreationRequest),
     /// Mark a new document as active, optionally correlating the first controlled
-    /// response-headers turn with its exact in-flight `DriveOneTurn` command.
-    ActivateDocument(Option<InitialPipelineActivationCorrelation>),
+    /// response-headers turn with its exact in-flight `DriveOneTurn` command. The second field is
+    /// the Script-attested site-for-cookies of the actual active top-level Document; opaque and
+    /// nested documents send `None` even when their URL itself has an HTTP(S) tuple origin.
+    ActivateDocument(
+        Option<InitialPipelineActivationCorrelation>,
+        Option<ServoUrl>,
+    ),
     /// Update the pipeline Url, which can change after redirections.
     SetFinalUrl(ServoUrl),
+    /// Replace the active Document's Script-attested site-for-cookies after a post-activation
+    /// origin transition. In particular, synthesized inline documents send `None` when their
+    /// formerly tuple origin becomes opaque.
+    SetControlledCookieSiteForCookies(Option<ServoUrl>),
     /// A log entry, with the top-level browsing context id and thread name
     LogEntry(Option<ScriptEventLoopId>, Option<String>, LogEntry),
     /// Discard the document.
@@ -952,10 +971,29 @@ mod document_control_tests {
 
         assert_eq!(correlation.request_id(), request_id);
         assert_eq!(correlation.cancellation_id(), cancellation_id);
+        let site = ServoUrl::parse("https://example.test/document").unwrap();
         assert!(matches!(
-            ScriptToConstellationMessage::ActivateDocument(Some(correlation)),
-            ScriptToConstellationMessage::ActivateDocument(Some(observed))
-                if observed == correlation
+            ScriptToConstellationMessage::ActivateDocument(
+                Some(correlation),
+                Some(site.clone()),
+            ),
+            ScriptToConstellationMessage::ActivateDocument(
+                Some(observed),
+                Some(observed_site),
+            ) if observed == correlation && observed_site == site
+        ));
+        assert!(matches!(
+            ScriptToConstellationMessage::ActivateDocument(None, None),
+            ScriptToConstellationMessage::ActivateDocument(None, None)
+        ));
+        assert!(matches!(
+            ScriptToConstellationMessage::SetControlledCookieSiteForCookies(Some(site.clone())),
+            ScriptToConstellationMessage::SetControlledCookieSiteForCookies(Some(observed))
+                if observed == site
+        ));
+        assert!(matches!(
+            ScriptToConstellationMessage::SetControlledCookieSiteForCookies(None),
+            ScriptToConstellationMessage::SetControlledCookieSiteForCookies(None)
         ));
     }
 }

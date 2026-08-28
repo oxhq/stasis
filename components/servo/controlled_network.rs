@@ -19,6 +19,7 @@ pub(crate) fn handle_request(
     session: &ControlledNetworkSession,
     mut load: WebResourceLoad,
     site_for_cookies: Option<url::Url>,
+    top_level_navigation: bool,
 ) {
     let request = load.request();
     let header_names = request
@@ -28,16 +29,18 @@ pub(crate) fn handle_request(
         .map(HeaderName::as_str)
         .collect::<Vec<_>>();
     let resource_kind = EvidenceResourceKind::from(request.controlled_resource_kind);
-    let top_level_navigation = request.is_for_main_frame;
-    let (action, policy) = session.begin_with_cookie_policy(ControlledNetworkRequest {
-        load_id: request.controlled_load_id,
-        method: request.method.as_str(),
-        url: &request.url,
-        resource_kind,
-        main_frame: request.is_for_main_frame,
-        header_names: &header_names,
-        body_bytes: request.controlled_body_bytes,
-    });
+    let (action, policy) = session.begin_with_cookie_policy(
+        ControlledNetworkRequest {
+            load_id: request.controlled_load_id,
+            method: request.method.as_str(),
+            url: &request.url,
+            resource_kind,
+            main_frame: request.is_for_main_frame,
+            header_names: &header_names,
+            body_bytes: request.controlled_body_bytes,
+        },
+        site_for_cookies.as_ref(),
+    );
     load.mark_controlled_session(ControlledCookieContext {
         policy,
         site_for_cookies,

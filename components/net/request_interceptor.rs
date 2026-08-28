@@ -39,26 +39,7 @@ impl RequestInterceptor {
         context: &FetchContext,
     ) -> InterceptedRequest {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let is_for_main_frame = matches!(request.destination, Destination::Document);
-        let web_resource_request = WebResourceRequest {
-            method: request.method.clone(),
-            // Redirect recursion appends to the Fetch request URL list. Evidence and fixture
-            // matching belong to this hop, not the original URL at the head of that list.
-            url: request.current_url().into_url(),
-            headers: request.headers.clone(),
-            destination: request.destination,
-            referrer_url: request.referrer.to_url().map(|url| url.as_url().clone()),
-            is_for_main_frame,
-            is_redirect: request.redirect_count > 0,
-            controlled_load_id: controlled_load_id(request),
-            controlled_body_bytes: request.body.as_ref().map_or(Some(0), |body| {
-                body.len().and_then(|length| u64::try_from(length).ok())
-            }),
-            controlled_resource_kind: controlled_resource_kind(
-                request.destination,
-                request.originating_api,
-            ),
-        };
+        let web_resource_request = web_resource_request(request);
 
         let controlled_load_id = web_resource_request.controlled_load_id;
 
@@ -204,6 +185,34 @@ impl RequestInterceptor {
     }
 }
 
+fn web_resource_request(request: &Request) -> WebResourceRequest {
+    WebResourceRequest {
+        method: request.method.clone(),
+        // Redirect recursion appends to the Fetch request URL list. Evidence and fixture matching
+        // belong to this hop, not the original URL at the head of that list.
+        url: request.current_url().into_url(),
+        headers: request.headers.clone(),
+        destination: request.destination,
+        referrer_url: request.referrer.to_url().map(|url| url.as_url().clone()),
+        is_for_main_frame: matches!(request.destination, Destination::Document),
+        is_redirect: request.redirect_count > 0,
+        controlled_cookie_site_for_cookies: request
+            .client
+            .as_ref()
+            .and_then(|client| client.controlled_cookie_site_for_cookies.clone())
+            .map(servo_url::ServoUrl::into_url),
+        controlled_cookie_top_level_navigation: request.controlled_cookie_top_level_navigation,
+        controlled_load_id: controlled_load_id(request),
+        controlled_body_bytes: request.body.as_ref().map_or(Some(0), |body| {
+            body.len().and_then(|length| u64::try_from(length).ok())
+        }),
+        controlled_resource_kind: controlled_resource_kind(
+            request.destination,
+            request.originating_api,
+        ),
+    }
+}
+
 fn controlled_load_id(request: &Request) -> WebResourceLoadId {
     WebResourceLoadId::new(
         controlled_request_identity(request),
@@ -262,12 +271,31 @@ fn controlled_resource_kind(
 
 #[cfg(test)]
 mod tests {
+    use http::Method;
     use net_traits::blob_url_store::UrlWithBlobClaim;
-    use net_traits::request::{Referrer, RequestBuilder, RequestId};
+    use net_traits::policy_container::PolicyContainer;
+    use net_traits::request::{
+        InsecureRequestsPolicy, Origin, PreloadedResources, Referrer, RequestBuilder,
+        RequestClient, RequestId,
+    };
     use servo_base::id::TEST_PIPELINE_ID;
+    use servo_url::{ImmutableOrigin, ServoUrl};
     use uuid::Uuid;
 
     use super::*;
+
+    fn captured_client(site_for_cookies: Option<&str>) -> RequestClient {
+        RequestClient {
+            preloaded_resources: PreloadedResources::default(),
+            policy_container: PolicyContainer::default(),
+            origin: Origin::Origin(ImmutableOrigin::new_opaque()),
+            is_nested_browsing_context: false,
+            controlled_cookie_site_for_cookies: site_for_cookies
+                .map(|url| ServoUrl::parse(url).unwrap()),
+            insecure_requests_policy: InsecureRequestsPolicy::DoNotUpgrade,
+            has_trustworthy_ancestor_origin: false,
+        }
+    }
 
     fn navigation_request(urls: &[&str]) -> Request {
         let urls = urls
@@ -279,7 +307,9 @@ mod tests {
             UrlWithBlobClaim::from_url_without_having_claimed_blob(urls[0].clone()),
             Referrer::NoReferrer,
         )
+        .destination(Destination::Document)
         .mode(RequestMode::Navigate)
+        .client(captured_client(Some("https://source.example/account")))
         .pipeline_id(Some(TEST_PIPELINE_ID))
         .url_list(urls)
         .build()
@@ -312,6 +342,60 @@ mod tests {
         assert_eq!(controlled_redirect_index(&successor), 1);
         assert_eq!(controlled_redirect_index(&later_successor), 2);
         assert_eq!(controlled_request_identity(&first)[6] >> 4, 0);
+        let successor = web_resource_request(&successor);
+        assert_eq!(
+            successor.controlled_cookie_site_for_cookies.as_ref(),
+            Some(&url::Url::parse("https://source.example/account").unwrap())
+        );
+        assert!(successor.controlled_cookie_top_level_navigation);
+    }
+
+    #[test]
+    fn request_owned_cookie_provenance_survives_interleaved_history_and_redirect_method_change() {
+        let mut request = RequestBuilder::new(
+            None,
+            UrlWithBlobClaim::from_url_without_having_claimed_blob(
+                ServoUrl::parse("https://resource.example/start").unwrap(),
+            ),
+            Referrer::NoReferrer,
+        )
+        .method(Method::POST)
+        .mode(RequestMode::CorsMode)
+        .client(captured_client(Some("https://a.example/document")))
+        .build();
+
+        let created = web_resource_request(&request);
+        let active_top_level_after_creation =
+            url::Url::parse("https://b.example/history-entry").unwrap();
+        assert_eq!(
+            created.controlled_cookie_site_for_cookies.as_ref(),
+            Some(&url::Url::parse("https://a.example/document").unwrap())
+        );
+        assert_ne!(
+            created.controlled_cookie_site_for_cookies.as_ref(),
+            Some(&active_top_level_after_creation)
+        );
+
+        // Fetch redirect processing changes the live method and current URL on this same Request.
+        request.method = Method::GET;
+        request
+            .url_list
+            .push(UrlWithBlobClaim::from_url_without_having_claimed_blob(
+                ServoUrl::parse("https://resource.example/redirected").unwrap(),
+            ));
+        request.redirect_count = 1;
+        let redirected = web_resource_request(&request);
+
+        assert_eq!(redirected.method, Method::GET);
+        assert!(redirected.is_redirect);
+        assert_eq!(
+            redirected.controlled_cookie_site_for_cookies,
+            created.controlled_cookie_site_for_cookies
+        );
+        assert_eq!(
+            redirected.controlled_cookie_top_level_navigation,
+            created.controlled_cookie_top_level_navigation
+        );
     }
 
     #[test]

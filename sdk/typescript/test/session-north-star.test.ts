@@ -11,10 +11,12 @@ import test from "node:test";
 
 import {
   CONTROLLED_WEB_SESSION_V1_PROFILE,
+  CONTROLLED_WEB_SESSION_V2_PROFILE,
   StasisProtocolError,
   launch,
   type DocumentStateToken,
   type Runtime,
+  type SelectableSessionProfile,
   type Session,
   type SessionEvidenceRecord,
   type SessionNetworkOptions,
@@ -257,6 +259,27 @@ test(
         false,
         "the deterministic /api/profile fixture unexpectedly reached the live server",
       );
+    } finally {
+      await server.close();
+    }
+  },
+);
+
+test(
+  "real native v0.3 settlement projects final owner-attested same-document URL authority",
+  {
+    skip:
+      NATIVE_BINARY === undefined
+        ? "set STASIS_SESSION_NORTH_STAR_BINARY to the v0.3 stasis executable"
+        : false,
+    timeout: 120_000,
+  },
+  async () => {
+    assert.ok(NATIVE_BINARY, "STASIS_SESSION_NORTH_STAR_BINARY must be non-empty");
+    const server = await startSessionNorthStarServer();
+    try {
+      await proveV2SettlementProjectsCurrentUrl(server, NATIVE_BINARY);
+      if (server.errors.length > 0) throw server.errors[0];
     } finally {
       await server.close();
     }
@@ -649,6 +672,52 @@ async function proveSynchronousHistoryActionCarriesAuthority(
     assert.ok(
       evidence.records.some(record => record.kind === "same_document_history_changed"),
       "synchronous history action omitted its bounded history evidence",
+    );
+
+    await closeSessionAndAssertProcessExit(runtime, session);
+    closed = true;
+  } finally {
+    if (!closed) await runtime.close();
+  }
+}
+
+async function proveV2SettlementProjectsCurrentUrl(
+  server: SessionNorthStarServer,
+  executablePath: string,
+): Promise<void> {
+  const runtime = await launch({ executablePath });
+  let closed = false;
+  try {
+    const sourceUrl = server.url("/sync-history-source");
+    const session = await runtime.openSession(sourceUrl, {
+      profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+      network: { mode: "live", routes: [] },
+    });
+    assert.equal(session.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
+    assert.equal(session.url, sourceUrl);
+
+    const initial = await session.settle(session.stateToken, SETTLE_POLICY);
+    assert.equal(initial.outcome, "quiescent");
+    assert.equal(initial.url, sourceUrl);
+
+    const activated = await session.activate("#sync-history-action", initial.stateToken);
+    assert.deepEqual(
+      Object.keys(activated).sort(),
+      ["stateGeneration", "stateToken"],
+      "the v2 URL observation must not widen action result shapes",
+    );
+    const terminal = await session.settle(activated.stateToken, SETTLE_POLICY);
+    assert.equal(terminal.outcome, "quiescent");
+    assert.equal(new URL(terminal.url).pathname, "/sync-history-two");
+    assert.equal(
+      session.url,
+      sourceUrl,
+      "Session.url remains the controlled-open URL rather than mutable live state",
+    );
+    assert.equal(
+      Object.hasOwn(session.settlementEvidence(terminal), "url"),
+      false,
+      "bounded settlement evidence must not copy the page URL",
     );
 
     await closeSessionAndAssertProcessExit(runtime, session);
@@ -1809,9 +1878,9 @@ function assertAuditRedaction(
   }
 }
 
-async function closeSessionAndAssertProcessExit(
+async function closeSessionAndAssertProcessExit<Profile extends SelectableSessionProfile>(
   runtime: Runtime,
-  session: Session,
+  session: Session<Profile>,
 ): Promise<void> {
   const pid = runtime.pid;
   assert.ok(pid !== undefined, "native runtime PID is unavailable");

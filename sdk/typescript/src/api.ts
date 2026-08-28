@@ -791,7 +791,7 @@ export class Session<Profile extends SelectableSessionProfile = SessionSupportPr
       METHOD.settle,
       encodeSessionSettleParams(expectedStateToken, policy),
       this.#requestOptions(options, "indeterminate"),
-      decodeSessionSettle,
+      (value) => decodeSessionSettle(value, this.profile),
     );
     return bindSessionSettleResultProfile(result, this.profile);
   }

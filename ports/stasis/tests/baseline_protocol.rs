@@ -91,8 +91,14 @@ const CONTROLLED_V2_INVALID_HTTP_IMAGE: &[u8] = b"not an image";
 const CONTROLLED_V2_MULTIPART_HTTP_IMAGE: &[u8] = b"--stasis-image\r\nContent-Type: image/svg+xml\r\n\r\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\"/>\r\n--stasis-image--\r\n";
 const CONTROLLED_V2_INLINE_SVG_FIXTURE: &[u8] =
     include_bytes!("fixtures/controlled_v2_inline_svg.html");
+const CONTROLLED_V2_INLINE_SVG_SHARED_PENDING_FIXTURE: &[u8] =
+    include_bytes!("fixtures/controlled_v2_inline_svg_shared_pending.html");
+const CONTROLLED_V2_INLINE_SVG_INCREMENTAL_FIXTURE: &[u8] =
+    include_bytes!("fixtures/controlled_v2_inline_svg_incremental_same_task.html");
 const CONTROLLED_V2_INLINE_SVG_ADVANCED_FIXTURE: &[u8] =
     include_bytes!("fixtures/controlled_v2_inline_svg_advanced.html");
+const CONTROLLED_V2_INTERVAL_BEFORE_FINITE_FIXTURE: &[u8] =
+    include_bytes!("fixtures/controlled_v2_interval_before_finite.html");
 const CONTROLLED_COOKIE_FIXTURE: &[u8] = br#"<!doctype html>
 <meta charset="utf-8">
 <script>
@@ -151,6 +157,21 @@ const CONTROLLED_V2_COOKIE_EXPIRY_FIXTURE: &[u8] = br##"<!doctype html>
 <script>
 document.querySelector("#start").addEventListener("click", () => {
   setTimeout(() => { document.querySelector("#result").textContent = "fired"; }, 5);
+});
+</script>"##;
+const CONTROLLED_V2_COOKIE_REQUEST_CONTEXT_FIXTURE: &[u8] = br##"<!doctype html>
+<meta charset="utf-8">
+<button id="probe">probe</button>
+<output id="result">idle</output>
+<script>
+document.querySelector("#probe").addEventListener("click", () => {
+  document.querySelector("#result").textContent = "scheduled";
+  setTimeout(() => {
+    fetch("/probe")
+      .then((response) => response.text())
+      .then((text) => { document.querySelector("#result").textContent = text; })
+      .catch(() => { document.querySelector("#result").textContent = "fetch-rejected"; });
+  }, 1);
 });
 </script>"##;
 
@@ -642,6 +663,243 @@ fn controlled_session_v2_expiry_rotates_session_state_authority() {
 }
 
 #[test]
+fn controlled_v2_csp_opaque_request_context_fails_before_fixture_route_decision() {
+    exercise_controlled_v2_cookie_request_context(false);
+    exercise_controlled_v2_cookie_request_context(true);
+}
+
+fn exercise_controlled_v2_cookie_request_context(csp_sandboxed: bool) {
+    let case_id = if csp_sandboxed { "csp-opaque" } else { "ordinary" };
+    let url = format!("https://cookie-request-context-{case_id}.example.test/");
+    let probe_url = format!("{url}probe");
+    let mut document_headers = vec![json!(["content-type", "text/html; charset=utf-8"])];
+    if csp_sandboxed {
+        document_headers.push(json!([
+            "content-security-policy",
+            "sandbox allow-scripts"
+        ]));
+    }
+    let mut routes = vec![json!({
+        "match": {"method": "GET", "url": {"exact": url.as_str()}},
+        "fulfill": {
+            "status": 200,
+            "headers": document_headers,
+            "body": {
+                "utf8": std::str::from_utf8(
+                    CONTROLLED_V2_COOKIE_REQUEST_CONTEXT_FIXTURE,
+                )
+                .unwrap(),
+            },
+        },
+    })];
+    if !csp_sandboxed {
+        routes.push(json!({
+            "match": {"method": "GET", "url": {"exact": probe_url.as_str()}},
+            "fulfill": {
+                "status": 200,
+                "headers": [["content-type", "text/plain; charset=utf-8"]],
+                "body": {"utf8": "probe-ok"},
+            },
+        }));
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_stasis"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn stasis");
+    let mut input = child.stdin.take().expect("missing child stdin");
+    let responses = spawn_response_reader(child.stdout.take().expect("missing child stdout"));
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": format!("init-cookie-request-context-{case_id}"),
+            "method": "protocol.initialize",
+            "params": {"client": {"name": "integration-test", "version": "0.0.0"}},
+        }),
+    );
+    assert_eq!(
+        receive(&responses)["id"],
+        format!("init-cookie-request-context-{case_id}"),
+    );
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": format!("open-cookie-request-context-{case_id}"),
+            "method": "session.open",
+            "params": {
+                "url": url.as_str(),
+                "clockMode": "controlled",
+                "profile": "controlled-web-session-v2",
+                "network": {
+                    "mode": "fixtures_only",
+                    "routes": routes,
+                },
+            },
+        }),
+    );
+    let opened = receive(&responses);
+    assert_eq!(
+        opened["id"],
+        format!("open-cookie-request-context-{case_id}"),
+        "{opened:#}",
+    );
+    assert_eq!(opened["sessionId"], "s-1", "{opened:#}");
+    let (_, activated_token) = call_controlled_action(
+        &mut input,
+        &responses,
+        &format!("activate-cookie-request-context-{case_id}"),
+        "action.activate",
+        json!({"selector": "#probe"}),
+        &state_token(&opened, "cookie request-context open"),
+    );
+    let pending = call_session(
+        &mut input,
+        &responses,
+        &format!("pending-cookie-request-context-{case_id}"),
+        "runtime.pending",
+        json!({}),
+    );
+    assert_eq!(
+        pending["result"]["network"]["active"],
+        json!([]),
+        "activation must only schedule the controlled timer, not start /probe: {pending:#}",
+    );
+    assert_eq!(
+        pending["result"]["timers"]["futureFinite"], "1",
+        "the fetch must remain behind one controlled finite timer: {pending:#}",
+    );
+    assert_eq!(
+        pending["result"]["stateToken"], activated_token,
+        "passive pending observation must preserve the activated document authority: {pending:#}",
+    );
+
+    let settled = call_session(
+        &mut input,
+        &responses,
+        &format!("settle-cookie-request-context-{case_id}"),
+        "runtime.settle",
+        json!({
+            "expectedStateToken": state_token(&pending, "cookie request-context pending"),
+        }),
+    );
+    if csp_sandboxed {
+        assert_eq!(
+            settled["error"]["code"], "unsupported_cookie_same_site_context",
+            "the CSP sandbox must fail closed on its opaque request client: {settled:#}",
+        );
+        assert_eq!(settled["error"]["fatal"], false, "{settled:#}");
+        assert_eq!(settled["error"]["stateEffect"], "partial", "{settled:#}");
+        // There is deliberately no /probe route in this fixtures-only case. Reaching fixture
+        // selection would therefore publish `network_fixture_miss`; the exact SameSite-context
+        // terminal proves the opaque request client is rejected first. Post-terminal audit is
+        // intentionally unavailable while that sticky failure remains authoritative.
+    } else {
+        assert_eq!(settled["result"]["outcome"], "quiescent", "{settled:#}");
+        assert_eq!(
+            settled["result"]["snapshot"]["network"]["active"],
+            json!([]),
+            "the ordinary request must leave no active network operation: {settled:#}",
+        );
+        let text = call_session(
+            &mut input,
+            &responses,
+            &format!("text-cookie-request-context-{case_id}"),
+            "dom.text",
+            json!({
+                "selector": "#result",
+                "expectedStateToken": state_token(&settled, "ordinary cookie request settle"),
+            }),
+        );
+        assert_eq!(
+            text["result"]["value"], "probe-ok",
+            "the no-CSP twin must execute the same fetch to completion: {text:#}",
+        );
+    }
+
+    if !csp_sandboxed {
+        let requests = call_session(
+            &mut input,
+            &responses,
+            &format!("requests-cookie-request-context-{case_id}"),
+            "session.requests",
+            json!({"limit": 32}),
+        );
+        let probe_requests = requests["result"]["records"]
+            .as_array()
+            .expect("request audit must carry records")
+            .iter()
+            .filter(|record| record["url"]["path"] == "/probe")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            probe_requests.len(), 1,
+            "the fixture must retain exactly one redacted /probe request: {requests:#}",
+        );
+        let probe_request = probe_requests[0];
+        assert_eq!(probe_request["method"], "GET", "{requests:#}");
+        assert_eq!(probe_request["resourceKind"], "fetch", "{requests:#}");
+        assert_eq!(probe_request["mainFrame"], false, "{requests:#}");
+        let probe_request_id = probe_request["requestId"]
+            .as_str()
+            .expect("probe request audit must carry requestId");
+
+        let evidence = call_session(
+            &mut input,
+            &responses,
+            &format!("evidence-cookie-request-context-{case_id}"),
+            "session.evidence",
+            json!({"limit": 32}),
+        );
+        let records = evidence["result"]["records"]
+            .as_array()
+            .expect("evidence audit must carry records");
+        assert!(
+            records.iter().any(|record| {
+                record["kind"] == "request_started" && record["requestId"] == probe_request_id
+            }),
+            "the ordinary twin must retain the attempted request's bounded metadata: {evidence:#}",
+        );
+        assert!(
+            records.iter().any(|record| {
+                record["kind"] == "route_decided"
+                    && record["requestId"] == probe_request_id
+                    && record["decision"] == "fixture_fulfill"
+            }),
+            "the ordinary twin must prove that the /probe fixture route was selected: {evidence:#}",
+        );
+        assert!(
+            records.iter().any(|record| {
+                record["kind"] == "request_completed" && record["requestId"] == probe_request_id
+            }),
+            "the ordinary twin must prove that the /probe request completed: {evidence:#}",
+        );
+    }
+
+    let closed = call_session(
+        &mut input,
+        &responses,
+        &format!("close-cookie-request-context-{case_id}"),
+        "session.close",
+        json!({}),
+    );
+    assert_eq!(closed["result"]["state"], "closed", "{closed:#}");
+    drop(input);
+    let status = child
+        .wait()
+        .expect("failed to wait for cookie request-context process");
+    assert!(
+        status.success(),
+        "cookie request-context process exited with {status}",
+    );
+}
+
+#[test]
 fn controlled_local_message_channel_is_additive_to_session_v2() {
     exercise_message_channel_profile("controlled-web-session-v1", false);
     exercise_message_channel_profile("controlled-web-session-v2", true);
@@ -786,6 +1044,44 @@ fn controlled_session_v2_inline_svg_rendering_is_owned_without_v1_promotion() {
 }
 
 #[test]
+fn controlled_session_v2_coalesces_exact_pending_inline_svg_owners_without_v1_promotion() {
+    exercise_controlled_data_svg_profile(
+        "controlled-web-session-v2",
+        "inline-svg-shared-pending-v2",
+        CONTROLLED_V2_INLINE_SVG_SHARED_PENDING_FIXTURE,
+        ControlledImageProfileExpectation::Owned("shared-inline-svg:12|now:0"),
+    );
+    exercise_controlled_data_svg_profile(
+        "controlled-web-session-v1",
+        "inline-svg-shared-pending-v1",
+        CONTROLLED_V2_INLINE_SVG_SHARED_PENDING_FIXTURE,
+        ControlledImageProfileExpectation::PredecessorMayQuiesce(
+            "shared-inline-svg:12|now:0",
+        ),
+    );
+}
+
+#[test]
+fn controlled_session_v2_handles_incremental_same_task_inline_svg_clone() {
+    exercise_controlled_data_svg_profile(
+        "controlled-web-session-v2",
+        "inline-svg-incremental-same-task-v2",
+        CONTROLLED_V2_INLINE_SVG_INCREMENTAL_FIXTURE,
+        ControlledImageProfileExpectation::Owned(
+            "incremental-inline-svg:2|first:4x3|second:4x3|now:0",
+        ),
+    );
+    exercise_controlled_data_svg_profile(
+        "controlled-web-session-v1",
+        "inline-svg-incremental-same-task-v1",
+        CONTROLLED_V2_INLINE_SVG_INCREMENTAL_FIXTURE,
+        ControlledImageProfileExpectation::PredecessorMayQuiesce(
+            "incremental-inline-svg:2|first:4x3|second:4x3|now:0",
+        ),
+    );
+}
+
+#[test]
 fn controlled_session_v2_data_svg_cache_hit_keeps_exact_generation_time() {
     exercise_controlled_data_svg_profile(
         "controlled-web-session-v2",
@@ -812,6 +1108,264 @@ fn controlled_session_v2_reuses_image_identity_capacity_across_520_requests() {
         "identity-reuse-v2",
         CONTROLLED_V2_IMAGE_IDENTITY_REUSE_FIXTURE,
         ControlledImageProfileExpectation::Owned("completed:520|exact-time:true"),
+    );
+}
+
+#[test]
+fn controlled_session_v2_implicit_report_advances_intervals_only_until_finite_work_drains() {
+    let url = "https://controlled-interval-before-finite.example.test/";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_stasis"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn stasis");
+    let mut input = child.stdin.take().expect("missing child stdin");
+    let responses = spawn_response_reader(child.stdout.take().expect("missing child stdout"));
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "init-controlled-interval-before-finite",
+            "method": "protocol.initialize",
+            "params": {"client": {"name": "integration-test", "version": "0.0.0"}},
+        }),
+    );
+    assert_eq!(
+        receive(&responses)["id"],
+        "init-controlled-interval-before-finite"
+    );
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "open-controlled-interval-before-finite",
+            "method": "session.open",
+            "params": {
+                "url": url,
+                "clockMode": "controlled",
+                "profile": "controlled-web-session-v2",
+                "network": {
+                    "mode": "fixtures_only",
+                    "routes": [{
+                        "match": {"method": "GET", "url": {"exact": url}},
+                        "fulfill": {
+                            "status": 200,
+                            "headers": [["content-type", "text/html; charset=utf-8"]],
+                            "body": {
+                                "utf8": std::str::from_utf8(
+                                    CONTROLLED_V2_INTERVAL_BEFORE_FINITE_FIXTURE,
+                                )
+                                .unwrap(),
+                            },
+                        },
+                    }],
+                },
+            },
+        }),
+    );
+    let opened = receive(&responses);
+    assert_eq!(
+        opened["id"], "open-controlled-interval-before-finite",
+        "{opened:#}"
+    );
+    assert_eq!(
+        opened["result"]["profile"], "controlled-web-session-v2",
+        "{opened:#}"
+    );
+    let pending = call_session(
+        &mut input,
+        &responses,
+        "pending-after-open-controlled-interval-before-finite",
+        "runtime.pending",
+        json!({}),
+    );
+    assert_eq!(
+        pending["result"]["virtualTimeNs"], "12000000000",
+        "passive observation must prove implicit v2 report settlement reached the finite timer during session.open: {pending:#}",
+    );
+    assert_eq!(
+        pending["result"]["timers"]["persistent"], "1",
+        "the interval must remain live after implicit open settlement: {pending:#}",
+    );
+    assert_eq!(
+        pending["result"]["timers"]["futureFinite"], "0",
+        "the finite timer must be drained by implicit open settlement: {pending:#}",
+    );
+
+    let strict = call_session(
+        &mut input,
+        &responses,
+        "strict-controlled-interval-before-finite",
+        "runtime.settle",
+        json!({
+            "expectedStateToken": state_token(&pending, "pending after controlled interval open"),
+            "persistentWork": "strict",
+        }),
+    );
+    assert_eq!(
+        strict["result"]["outcome"], "blocked_on_open_ended_work",
+        "strict mode must retain the predecessor stop-at-interval behavior: {strict:#}",
+    );
+    assert_eq!(
+        strict["result"]["virtualTimeNs"], "12000000000",
+        "strict checkpoint must not execute the interval after implicit open drained finite work: {strict:#}",
+    );
+
+    let reported = call_session(
+        &mut input,
+        &responses,
+        "report-controlled-interval-before-finite",
+        "runtime.settle",
+        json!({
+            "expectedStateToken": state_token(&strict, "strict persistent result"),
+            "persistentWork": "report",
+        }),
+    );
+    assert_eq!(
+        reported["result"]["outcome"], "quiescent_with_persistent_work",
+        "{reported:#}"
+    );
+    assert_eq!(
+        reported["result"]["virtualTimeNs"], "12000000000",
+        "report mode must checkpoint an interval-only document without another callback: {reported:#}",
+    );
+    assert_eq!(
+        reported["result"]["snapshot"]["timers"]["persistent"], "1",
+        "the live interval must remain in the terminal pending snapshot: {reported:#}",
+    );
+    assert_eq!(
+        reported["result"]["snapshot"]["timers"]["futureFinite"], "0",
+        "the one-shot work must be fully drained before terminal settlement: {reported:#}",
+    );
+    assert!(
+        reported["result"]["persistentWork"]
+            .as_array()
+            .is_some_and(|work| work.iter().any(|entry| {
+                entry["kind"] == "timer"
+                    && entry["reason"] == "interval"
+                    && entry["requestedPeriodNs"] == "5000000000"
+            })),
+        "the exact persistent interval was not reported: {reported:#}",
+    );
+
+    let final_trace = call_session(
+        &mut input,
+        &responses,
+        "trace-after-final-checkpoints-controlled-interval-before-finite",
+        "dom.text",
+        json!({
+            "selector": "#trace",
+            "expectedStateToken": state_token(&reported, "reported persistent result"),
+        }),
+    );
+    assert_eq!(
+        final_trace["result"]["value"], "interval:1@5000|interval:2@10000|finite@12000",
+        "implicit open must execute exactly the interval callbacks needed to reach finite work, and later strict/report checkpoints must not fire another: {final_trace:#}",
+    );
+
+    let closed = call_session(
+        &mut input,
+        &responses,
+        "close-controlled-interval-before-finite",
+        "session.close",
+        json!({}),
+    );
+    assert_eq!(closed["result"]["state"], "closed", "{closed:#}");
+    drop(input);
+    let status = child
+        .wait()
+        .expect("failed to wait for controlled interval process");
+    assert!(
+        status.success(),
+        "controlled interval process exited with {status}"
+    );
+}
+
+#[test]
+fn controlled_session_v1_open_stops_typed_at_interval_head_before_later_finite_work() {
+    let url = "https://controlled-v1-interval-before-finite.example.test/";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_stasis"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn stasis");
+    let mut input = child.stdin.take().expect("missing child stdin");
+    let responses = spawn_response_reader(child.stdout.take().expect("missing child stdout"));
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "init-controlled-v1-interval-before-finite",
+            "method": "protocol.initialize",
+            "params": {"client": {"name": "integration-test", "version": "0.0.0"}},
+        }),
+    );
+    assert_eq!(
+        receive(&responses)["id"],
+        "init-controlled-v1-interval-before-finite"
+    );
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": "open-controlled-v1-interval-before-finite",
+            "method": "session.open",
+            "params": {
+                "url": url,
+                "clockMode": "controlled",
+                "profile": "controlled-web-session-v1",
+                "network": {
+                    "mode": "fixtures_only",
+                    "routes": [{
+                        "match": {"method": "GET", "url": {"exact": url}},
+                        "fulfill": {
+                            "status": 200,
+                            "headers": [["content-type", "text/html; charset=utf-8"]],
+                            "body": {
+                                "utf8": std::str::from_utf8(
+                                    CONTROLLED_V2_INTERVAL_BEFORE_FINITE_FIXTURE,
+                                )
+                                .unwrap(),
+                            },
+                        },
+                    }],
+                },
+            },
+        }),
+    );
+    let opened = receive(&responses);
+    assert_eq!(
+        opened["id"], "open-controlled-v1-interval-before-finite",
+        "{opened:#}",
+    );
+    assert_eq!(
+        opened["error"]["code"], "blocked_on_open_ended_work",
+        "frozen v1 must stop at the interval head instead of reaching later finite work: {opened:#}",
+    );
+    assert_eq!(opened["error"]["fatal"], true, "{opened:#}");
+    assert_eq!(
+        opened["error"]["details"]["persistentWork"], "1",
+        "the typed v1 failure must report the exact persistent blocker count: {opened:#}",
+    );
+
+    drop(input);
+    let status = child
+        .wait()
+        .expect("failed to wait for frozen v1 interval process");
+    assert_eq!(
+        status.code(),
+        Some(70),
+        "fatal v1 interval blocker must use the shell's documented fatal exit code: {status}",
     );
 }
 
@@ -2833,6 +3387,205 @@ fn controlled_session_v2_css_animation_events_use_owned_dispatch_time() {
         exercise_css_animation_event_profile("controlled-web-session-v1", "css-events-v1", false,),
         None,
         "the frozen v1 profile must not inherit v2 CSS event timestamps",
+    );
+}
+
+#[test]
+fn controlled_session_v2_drains_animation_events_queued_after_reflow() {
+    exercise_css_post_reflow_event_profile(
+        "controlled-web-session-v2",
+        "css-post-reflow-events-v2",
+        true,
+    );
+}
+
+#[test]
+fn controlled_session_v1_does_not_inherit_post_reflow_animation_event_rescheduling() {
+    exercise_css_post_reflow_event_profile(
+        "controlled-web-session-v1",
+        "css-post-reflow-events-v1",
+        false,
+    );
+}
+
+fn exercise_css_post_reflow_event_profile(profile: &str, case_id: &str, expect_v2_drain: bool) {
+    let url = format!("https://controlled-{case_id}.example.test/");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_stasis"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn stasis");
+    let mut input = child.stdin.take().expect("missing child stdin");
+    let responses = spawn_response_reader(child.stdout.take().expect("missing child stdout"));
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": format!("init-{case_id}"),
+            "method": "protocol.initialize",
+            "params": {"client": {"name": "integration-test", "version": "0.0.0"}},
+        }),
+    );
+    assert_eq!(receive(&responses)["id"], format!("init-{case_id}"));
+
+    send(
+        &mut input,
+        json!({
+            "v": 1,
+            "type": "request",
+            "id": format!("open-{case_id}"),
+            "method": "session.open",
+            "params": {
+                "url": url.as_str(),
+                "clockMode": "controlled",
+                "profile": profile,
+                "network": {
+                    "mode": "fixtures_only",
+                    "routes": [{
+                        "match": {"method": "GET", "url": {"exact": url.as_str()}},
+                        "fulfill": {
+                            "status": 200,
+                            "headers": [["content-type", "text/html; charset=utf-8"]],
+                            "body": {
+                                "utf8": std::str::from_utf8(
+                                    CONTROLLED_V2_CSS_ANIMATION_EVENT_TIMESTAMP_FIXTURE,
+                                )
+                                .unwrap(),
+                            },
+                        },
+                    }],
+                },
+            },
+        }),
+    );
+    let opened = receive(&responses);
+    assert_eq!(opened["id"], format!("open-{case_id}"), "{opened:#}");
+    assert_eq!(opened["result"]["profile"], profile, "{opened:#}");
+
+    let qualified = call_session(
+        &mut input,
+        &responses,
+        &format!("qualify-{case_id}"),
+        "runtime.settle",
+        json!({
+            "expectedStateToken": state_token(&opened, "post-reflow CSS fixture open"),
+            "maxVirtualTimeNs": "0",
+        }),
+    );
+    assert_eq!(qualified["result"]["outcome"], "quiescent", "{qualified:#}");
+    assert_eq!(
+        qualified["result"]["virtualTimeNs"], "5000000",
+        "the exact fixture timer must establish the starting clock: {qualified:#}",
+    );
+
+    let (_, action_token) = call_controlled_action(
+        &mut input,
+        &responses,
+        &format!("start-{case_id}"),
+        "action.activate",
+        json!({"selector": "#post-reflow"}),
+        &state_token(&qualified, "settled post-reflow fixture timer"),
+    );
+    let settled = call_session(
+        &mut input,
+        &responses,
+        &format!("settle-{case_id}"),
+        "runtime.settle",
+        json!({"expectedStateToken": action_token}),
+    );
+    let pending = call_session(
+        &mut input,
+        &responses,
+        &format!("pending-{case_id}"),
+        "runtime.pending",
+        json!({}),
+    );
+    if expect_v2_drain {
+        assert_eq!(settled["result"]["outcome"], "quiescent", "{settled:#}");
+        assert_eq!(
+            pending["result"]["virtualTimeNs"], "70000000",
+            "the post-layout animationcancel batch needs exactly one later 20 ms opportunity: {pending:#}",
+        );
+        assert_eq!(
+            pending["result"]["rendering"]["pendingAnimationEvents"], "0",
+            "the document-owned post-layout event queue must drain: {pending:#}",
+        );
+        assert!(
+            pending["result"]["rendering"]["nextOpportunityNs"].is_null(),
+            "draining the final event batch must not retain another opportunity: {pending:#}",
+        );
+        assert_eq!(
+            state_token(&pending, "post-reflow CSS pending observation"),
+            state_token(&settled, "settled post-reflow CSS event queue"),
+            "passive pending observation must preserve settlement authority",
+        );
+
+        let text = call_session(
+            &mut input,
+            &responses,
+            &format!("text-{case_id}"),
+            "dom.text",
+            json!({
+                "selector": "#post-reflow-result",
+                "expectedStateToken": state_token(&settled, "settled post-reflow CSS event queue"),
+            }),
+        );
+        assert_eq!(
+            text["result"]["value"],
+            "armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70",
+            "the event queued by the second opportunity's reflow must dispatch in one exact later batch: {text:#}",
+        );
+    } else {
+        assert_eq!(
+            settled["result"]["outcome"], "unsupported_work",
+            "the frozen v1 profile must retain its host-timestamp terminal: {settled:#}",
+        );
+        assert_eq!(
+            settled["result"]["failure"]["code"], "unsupported_clock_surface",
+            "{settled:#}",
+        );
+        assert_eq!(
+            settled["result"]["unsupportedWork"],
+            json!([{
+                "kind": "other",
+                "count": "1",
+                "reason": "time_surface",
+                "timeSurface": "host_timestamp",
+            }]),
+            "v1 post-reflow events must retain predecessor timestamp authority: {settled:#}",
+        );
+        assert_eq!(
+            pending["result"]["virtualTimeNs"], "50000000",
+            "v1 must stop at its predecessor host-timestamp terminal: {pending:#}",
+        );
+        assert_eq!(
+            pending["result"]["rendering"]["pendingAnimationEvents"], "1",
+            "v1 must not inherit the v2-only later queue-drain opportunity: {pending:#}",
+        );
+        assert!(
+            pending["result"]["rendering"]["nextOpportunityNs"].is_null(),
+            "v1 must not retain the v2-only post-reflow rendering opportunity: {pending:#}",
+        );
+    }
+
+    let closed = call_session(
+        &mut input,
+        &responses,
+        &format!("close-{case_id}"),
+        "session.close",
+        json!({}),
+    );
+    assert_eq!(closed["result"]["state"], "closed", "{closed:#}");
+    drop(input);
+    let status = child
+        .wait()
+        .expect("failed to wait for post-reflow CSS event process");
+    assert!(
+        status.success(),
+        "post-reflow CSS event process exited with {status}"
     );
 }
 

@@ -42,6 +42,11 @@ pub struct SettlePolicy {
     pub max_control_turns: u64,
     /// Cumulative wall time which may be spent waiting for foreground external I/O.
     pub wall_io_timeout: Duration,
+    /// Whether one exact JavaScript interval scheduler head may be advanced when all remaining
+    /// finite work is strictly later, except for a distinct same-deadline rendering entry ordered
+    /// behind it. Product profiles must opt in explicitly; the default keeps the frozen v1
+    /// behavior which reports the interval as an open-ended blocker.
+    pub advance_interval_head_before_finite_work: bool,
 }
 
 impl Default for SettlePolicy {
@@ -50,6 +55,7 @@ impl Default for SettlePolicy {
             max_virtual_time: Duration::from_secs(30),
             max_control_turns: 1_000_000,
             wall_io_timeout: Duration::from_secs(10),
+            advance_interval_head_before_finite_work: false,
         }
     }
 }
@@ -971,6 +977,13 @@ impl SettleCoordinator {
                     .complete_runtime(pending, SettleRuntimeFailure::MissingFiniteSchedulerHead);
             };
             let logical_head = logical_timer_owning_head(&pending, head);
+            let interval_head_progression_authorized = logical_head.is_some_and(|timer| {
+                matches!(
+                    timer.kind,
+                    PendingLogicalTimerKind::JavaScriptInterval { .. }
+                ) && self.policy.advance_interval_head_before_finite_work
+                    && all_finite_work_is_ordered_after_interval_head(&pending, head)
+            });
             if let Some(timer) = logical_head {
                 if !timer.eligible_in_controlled_turn {
                     return self.complete_runtime(
@@ -981,7 +994,8 @@ impl SettleCoordinator {
                 if matches!(
                     timer.kind,
                     PendingLogicalTimerKind::JavaScriptInterval { .. }
-                ) {
+                ) && !interval_head_progression_authorized
+                {
                     return self.complete(SettleCompletion::BlockedOnOpenEndedWork {
                         pending,
                         persistent: classification.persistent,
@@ -996,12 +1010,11 @@ impl SettleCoordinator {
                     control_turns: self.control_turns,
                 });
             }
-            let exact_logical_timer_head = logical_head.is_some_and(|timer| {
-                !matches!(
-                    timer.kind,
-                    PendingLogicalTimerKind::JavaScriptInterval { .. }
-                        | PendingLogicalTimerKind::EventSourceReconnect
-                )
+            let exact_logical_timer_head = logical_head.is_some_and(|timer| match timer.kind {
+                PendingLogicalTimerKind::JavaScriptInterval { .. } =>
+                    interval_head_progression_authorized,
+                PendingLogicalTimerKind::EventSourceReconnect => false,
+                _ => true,
             });
             if !exact_logical_timer_head && !finite.exact_rendering_head {
                 return self
@@ -1417,6 +1430,71 @@ fn finite_work(pending: &RawPendingSnapshot, classification: &SourceClassificati
         exact_rendering_head: exact_rendering_deadline,
         persistent_rendering_owns_head,
     }
+}
+
+/// Require finite timer and animated-image deadlines to be strictly later than an exact
+/// interval-owned scheduler head. One finite rendering opportunity may share its timestamp only
+/// when its complete scheduler snapshot proves a distinct entry ordered after that head. Bare
+/// deadlines and same-entry collisions remain fail-closed.
+fn all_finite_work_is_ordered_after_interval_head(
+    pending: &RawPendingSnapshot,
+    head: timers::TimerDeadlineSnapshot,
+) -> bool {
+    let mut saw_finite_work = false;
+
+    for source in pending.sources.sources() {
+        if let PendingSourceDisposition::FiniteDeadline(deadline) = source.disposition {
+            saw_finite_work = true;
+            if deadline <= head.deadline {
+                return false;
+            }
+        }
+    }
+
+    let finite_rendering_source =
+        pending.sources.sources().iter().any(|source| {
+            source.disposition == PendingSourceDisposition::FiniteRenderingOpportunity
+        });
+    if let Some(deadline) = pending.rendering.scheduled_opportunity
+        && (finite_rendering_source
+            || pending
+                .rendering
+                .pipelines()
+                .iter()
+                .any(has_finite_rendering_demand))
+    {
+        saw_finite_work = true;
+        if !exact_rendering_entry_is_ordered_after_interval_head(deadline, head) {
+            return false;
+        }
+    }
+
+    for rendering in pending.rendering.pipelines() {
+        if rendering.activity == PendingRenderingPipelineActivity::FullyActive
+            && rendering.animated_images.finite_images != 0
+        {
+            let Some(deadline) = rendering.animated_images.scheduled_timer else {
+                return false;
+            };
+            saw_finite_work = true;
+            if deadline.deadline <= head.deadline {
+                return false;
+            }
+        }
+    }
+
+    saw_finite_work
+}
+
+fn exact_rendering_entry_is_ordered_after_interval_head(
+    candidate: timers::TimerDeadlineSnapshot,
+    head: timers::TimerDeadlineSnapshot,
+) -> bool {
+    candidate.scheduler_id == head.scheduler_id
+        && candidate.id != head.id
+        && (candidate.deadline > head.deadline
+            || (candidate.deadline == head.deadline
+                && candidate.id.sequence() > head.id.sequence()))
 }
 
 fn quiet_snapshots_match(first: &RawPendingSnapshot, second: &RawPendingSnapshot) -> bool {
@@ -2293,7 +2371,7 @@ mod tests {
     }
 
     #[test]
-    fn interval_is_persistent_and_is_never_advanced() {
+    fn interval_only_document_is_checkpointed_without_advance_even_when_progression_is_enabled() {
         let mut fixture = Fixture::new();
         fixture.schedule(Duration::from_secs(5));
         let mut first = fixture.snapshot(2, 1);
@@ -2321,7 +2399,10 @@ mod tests {
         second.logical_timers = first.logical_timers.clone();
         second.validate().unwrap();
 
-        let mut coordinator = SettleCoordinator::new(SettlePolicy::default());
+        let mut coordinator = SettleCoordinator::new(SettlePolicy {
+            advance_interval_head_before_finite_work: true,
+            ..SettlePolicy::default()
+        });
         assert_observe(coordinator.start().unwrap());
         assert!(matches!(
             observe(&mut coordinator, first, None).unwrap(),
@@ -2504,6 +2585,308 @@ mod tests {
     }
 
     #[test]
+    fn strict_policy_blocks_while_opted_in_report_advances_only_with_the_exact_token() {
+        let mut fixture = Fixture::new();
+        fixture.schedule(Duration::from_nanos(10));
+        let finite_id = fixture.schedule(Duration::from_nanos(20));
+        let finite_deadline = joined_deadline(&fixture.scheduler, finite_id).deadline;
+        let mut pending = fixture.snapshot(2, 1);
+        let head = pending.scheduler.next_deadline.unwrap();
+        set_timer_sources(
+            &mut pending,
+            vec![
+                timer_source(
+                    1,
+                    PendingSourceDisposition::OpenEnded(PendingOpenEndedSourceReason::Interval {
+                        requested_period: Duration::from_nanos(10),
+                    }),
+                ),
+                timer_source(2, PendingSourceDisposition::FiniteDeadline(finite_deadline)),
+            ],
+            vec![
+                logical_timer(
+                    1,
+                    1,
+                    PendingLogicalTimerKind::JavaScriptInterval {
+                        requested_period: Duration::from_nanos(10),
+                    },
+                    head.deadline,
+                    Some(head),
+                ),
+                logical_timer(
+                    2,
+                    2,
+                    PendingLogicalTimerKind::JavaScriptOneShot,
+                    finite_deadline,
+                    None,
+                ),
+            ],
+        );
+        let advance_token = token(&pending);
+        let policy = SettlePolicy {
+            advance_interval_head_before_finite_work: true,
+            ..SettlePolicy::default()
+        };
+
+        let mut strict = SettleCoordinator::new(SettlePolicy::default());
+        assert_observe(strict.start().unwrap());
+        assert!(matches!(
+            observe(&mut strict, pending.clone(), Some(advance_token.clone()),).unwrap(),
+            SettleProgress::Complete(SettleCompletion::BlockedOnOpenEndedWork { .. })
+        ));
+
+        let mut missing = SettleCoordinator::new(policy);
+        assert_observe(missing.start().unwrap());
+        assert!(matches!(
+            observe(&mut missing, pending.clone(), None).unwrap(),
+            SettleProgress::Complete(SettleCompletion::RuntimeError {
+                failure: SettleRuntimeFailure::MissingAdvanceAuthority,
+                ..
+            })
+        ));
+
+        let mut exact = SettleCoordinator::new(policy);
+        assert_observe(exact.start().unwrap());
+        assert!(matches!(
+            observe(&mut exact, pending, Some(advance_token.clone())).unwrap(),
+            SettleProgress::Command(DocumentControlCommand::AdvanceTo(observed))
+                if *observed == advance_token && observed.deadline() == head
+        ));
+    }
+
+    #[test]
+    fn interval_advance_token_aba_rejection_requires_a_fresh_observation_and_token() {
+        let mut fixture = Fixture::new();
+        fixture.schedule(Duration::from_nanos(10));
+        let finite_id = fixture.schedule(Duration::from_nanos(20));
+        let finite_deadline = joined_deadline(&fixture.scheduler, finite_id).deadline;
+        let mut pending = fixture.snapshot(2, 1);
+        let head = pending.scheduler.next_deadline.unwrap();
+        set_timer_sources(
+            &mut pending,
+            vec![
+                timer_source(
+                    1,
+                    PendingSourceDisposition::OpenEnded(PendingOpenEndedSourceReason::Interval {
+                        requested_period: Duration::from_nanos(10),
+                    }),
+                ),
+                timer_source(2, PendingSourceDisposition::FiniteDeadline(finite_deadline)),
+            ],
+            vec![
+                logical_timer(
+                    1,
+                    1,
+                    PendingLogicalTimerKind::JavaScriptInterval {
+                        requested_period: Duration::from_nanos(10),
+                    },
+                    head.deadline,
+                    Some(head),
+                ),
+                logical_timer(
+                    2,
+                    2,
+                    PendingLogicalTimerKind::JavaScriptOneShot,
+                    finite_deadline,
+                    None,
+                ),
+            ],
+        );
+        let stale =
+            DocumentAdvanceToken::new_internal(DocumentAdvanceTokenId::new(17), &pending).unwrap();
+        let fresh =
+            DocumentAdvanceToken::new_internal(DocumentAdvanceTokenId::new(18), &pending).unwrap();
+        let policy = SettlePolicy {
+            advance_interval_head_before_finite_work: true,
+            ..SettlePolicy::default()
+        };
+        let mut coordinator = SettleCoordinator::new(policy);
+        assert_observe(coordinator.start().unwrap());
+        assert!(matches!(
+            observe(&mut coordinator, pending.clone(), Some(stale.clone())).unwrap(),
+            SettleProgress::Command(DocumentControlCommand::AdvanceTo(observed))
+                if *observed == stale
+        ));
+        assert_observe(
+            coordinator
+                .consume_receive_outcome(
+                    DocumentControlReceiveOutcome::CommandOutcome(
+                        DocumentControlOutcome::Rejected(DocumentControlError::StaleAdvanceToken {
+                            expected: fresh.id(),
+                            observed: stale.id(),
+                        }),
+                    ),
+                    Duration::ZERO,
+                )
+                .unwrap(),
+        );
+        assert!(matches!(
+            observe(&mut coordinator, pending, Some(fresh.clone())).unwrap(),
+            SettleProgress::Command(DocumentControlCommand::AdvanceTo(observed))
+                if *observed == fresh
+        ));
+    }
+
+    #[test]
+    fn interval_callback_progression_remains_bounded_by_the_ordinary_task_budget() {
+        let mut fixture = Fixture::new();
+        fixture.schedule(Duration::from_nanos(10));
+        let finite_id = fixture.schedule(Duration::from_nanos(20));
+        let finite_deadline = joined_deadline(&fixture.scheduler, finite_id).deadline;
+        let mut initial = fixture.snapshot(2, 1);
+        let first_interval_head = initial.scheduler.next_deadline.unwrap();
+        set_timer_sources(
+            &mut initial,
+            vec![
+                timer_source(
+                    1,
+                    PendingSourceDisposition::OpenEnded(PendingOpenEndedSourceReason::Interval {
+                        requested_period: Duration::from_nanos(5),
+                    }),
+                ),
+                timer_source(2, PendingSourceDisposition::FiniteDeadline(finite_deadline)),
+            ],
+            vec![
+                logical_timer(
+                    1,
+                    1,
+                    PendingLogicalTimerKind::JavaScriptInterval {
+                        requested_period: Duration::from_nanos(5),
+                    },
+                    first_interval_head.deadline,
+                    Some(first_interval_head),
+                ),
+                logical_timer(
+                    2,
+                    2,
+                    PendingLogicalTimerKind::JavaScriptOneShot,
+                    finite_deadline,
+                    None,
+                ),
+            ],
+        );
+        let first_token = token(&initial);
+        let policy = SettlePolicy {
+            advance_interval_head_before_finite_work: true,
+            ..SettlePolicy::default()
+        };
+        let mut coordinator = SettleCoordinator::new(policy);
+        assert_observe(coordinator.start().unwrap());
+        assert!(matches!(
+            observe(&mut coordinator, initial, Some(first_token)).unwrap(),
+            SettleProgress::Command(DocumentControlCommand::AdvanceTo(_))
+        ));
+
+        fixture
+            .scheduler
+            .advance_to_and_activate(first_interval_head)
+            .unwrap();
+        let mut activated = fixture.snapshot(3, 2);
+        let mut ready_interval = logical_timer(
+            1,
+            1,
+            PendingLogicalTimerKind::JavaScriptInterval {
+                requested_period: Duration::from_nanos(5),
+            },
+            first_interval_head.deadline,
+            None,
+        );
+        ready_interval.is_ordering_head = true;
+        ready_interval.delivery_ready = true;
+        set_timer_sources(
+            &mut activated,
+            vec![
+                timer_source(1, PendingSourceDisposition::Ready),
+                timer_source(2, PendingSourceDisposition::FiniteDeadline(finite_deadline)),
+            ],
+            vec![
+                ready_interval,
+                logical_timer(
+                    2,
+                    2,
+                    PendingLogicalTimerKind::JavaScriptOneShot,
+                    finite_deadline,
+                    None,
+                ),
+            ],
+        );
+        assert!(matches!(
+            coordinator
+                .consume_receive_outcome(
+                    received(
+                        DocumentControlAction::TimerActivated(first_interval_head),
+                        activated,
+                        None,
+                    ),
+                    Duration::ZERO,
+                )
+                .unwrap(),
+            SettleProgress::Command(DocumentControlCommand::DriveOneTurn)
+        ));
+
+        let repeated_interval_id = fixture.schedule(Duration::from_nanos(5));
+        let repeated_interval_head = joined_deadline(&fixture.scheduler, repeated_interval_id);
+        let mut limited = fixture.snapshot(4, 3);
+        set_timer_sources(
+            &mut limited,
+            vec![
+                timer_source(
+                    1,
+                    PendingSourceDisposition::OpenEnded(PendingOpenEndedSourceReason::Interval {
+                        requested_period: Duration::from_nanos(5),
+                    }),
+                ),
+                timer_source(2, PendingSourceDisposition::FiniteDeadline(finite_deadline)),
+            ],
+            vec![
+                logical_timer(
+                    1,
+                    1,
+                    PendingLogicalTimerKind::JavaScriptInterval {
+                        requested_period: Duration::from_nanos(5),
+                    },
+                    repeated_interval_head.deadline,
+                    Some(repeated_interval_head),
+                ),
+                logical_timer(
+                    2,
+                    2,
+                    PendingLogicalTimerKind::JavaScriptOneShot,
+                    finite_deadline,
+                    None,
+                ),
+            ],
+        );
+        limited.execution = Some(execution_limit_observation(
+            fixture.clock.id(),
+            DocumentExecutionBudget::OrdinaryTasks,
+            3,
+        ));
+        limited.validate().unwrap();
+        assert!(matches!(
+            coordinator
+                .consume_receive_outcome(
+                    received(
+                        DocumentControlAction::TurnProcessed {
+                            microtask_checkpoint_advanced: true,
+                        },
+                        limited,
+                        None,
+                    ),
+                    Duration::ZERO,
+                )
+                .unwrap(),
+            SettleProgress::Complete(SettleCompletion::ExecutionLimitExceeded {
+                budget: DocumentExecutionBudget::OrdinaryTasks,
+                limit: 3,
+                observed: 4,
+                control_turns: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn finite_debounce_advances_before_later_interval_heartbeat() {
         let mut fixture = Fixture::new();
         fixture.schedule(Duration::from_nanos(10));
@@ -2552,7 +2935,295 @@ mod tests {
     }
 
     #[test]
-    fn interval_collision_at_finite_deadline_fails_closed() {
+    fn exact_distinct_equal_deadline_rendering_entry_follows_the_interval_head() {
+        let mut fixture = Fixture::new();
+        fixture.schedule(Duration::from_nanos(10));
+        let rendering_id = fixture.schedule(Duration::from_nanos(10));
+        let finite_id = fixture.schedule(Duration::from_nanos(40));
+        let rendering_wake = joined_deadline(&fixture.scheduler, rendering_id);
+        let finite_wake = joined_deadline(&fixture.scheduler, finite_id);
+        let mut pending = fixture.snapshot(2, 1);
+        let interval_head = pending.scheduler.next_deadline.unwrap();
+        assert_eq!(rendering_wake.deadline, interval_head.deadline);
+        assert!(rendering_wake.id.sequence() > interval_head.id.sequence());
+
+        let mut rendering = pending.rendering.pipelines()[0];
+        rendering.finite_animations = 2;
+        pending.rendering =
+            PendingRenderingObservation::new(Some(rendering_wake), false, vec![rendering])
+                .unwrap();
+        let finite_timer = logical_timer(
+            2,
+            2,
+            PendingLogicalTimerKind::JavaScriptOneShot,
+            finite_wake.deadline,
+            None,
+        );
+        set_timer_sources(
+            &mut pending,
+            vec![
+                timer_source(
+                    1,
+                    PendingSourceDisposition::OpenEnded(PendingOpenEndedSourceReason::Interval {
+                        requested_period: Duration::from_nanos(10),
+                    }),
+                ),
+                timer_source(
+                    2,
+                    PendingSourceDisposition::FiniteDeadline(finite_wake.deadline),
+                ),
+            ],
+            vec![
+                logical_timer(
+                    1,
+                    1,
+                    PendingLogicalTimerKind::JavaScriptInterval {
+                        requested_period: Duration::from_nanos(10),
+                    },
+                    interval_head.deadline,
+                    Some(interval_head),
+                ),
+                finite_timer,
+            ],
+        );
+        let interval_token = token(&pending);
+        let policy = SettlePolicy {
+            advance_interval_head_before_finite_work: true,
+            ..SettlePolicy::default()
+        };
+        let mut coordinator = SettleCoordinator::new(policy);
+        assert_observe(coordinator.start().unwrap());
+        assert!(matches!(
+            observe(&mut coordinator, pending, Some(interval_token.clone())).unwrap(),
+            SettleProgress::Command(DocumentControlCommand::AdvanceTo(observed))
+                if *observed == interval_token && observed.deadline() == interval_head
+        ));
+
+        fixture
+            .scheduler
+            .advance_to_and_activate(interval_head)
+            .unwrap();
+        let mut activated = fixture.snapshot(3, 2);
+        assert_eq!(activated.scheduler.next_deadline, Some(rendering_wake));
+        let mut ready_interval = logical_timer(
+            1,
+            1,
+            PendingLogicalTimerKind::JavaScriptInterval {
+                requested_period: Duration::from_nanos(10),
+            },
+            interval_head.deadline,
+            None,
+        );
+        ready_interval.is_ordering_head = true;
+        ready_interval.delivery_ready = true;
+        activated.rendering =
+            PendingRenderingObservation::new(Some(rendering_wake), false, vec![rendering])
+                .unwrap();
+        let finite_timer = logical_timer(
+            2,
+            2,
+            PendingLogicalTimerKind::JavaScriptOneShot,
+            finite_wake.deadline,
+            None,
+        );
+        set_timer_sources(
+            &mut activated,
+            vec![
+                timer_source(1, PendingSourceDisposition::Ready),
+                timer_source(
+                    2,
+                    PendingSourceDisposition::FiniteDeadline(finite_wake.deadline),
+                ),
+            ],
+            vec![
+                ready_interval,
+                finite_timer,
+            ],
+        );
+        assert!(matches!(
+            coordinator
+                .consume_receive_outcome(
+                    received(
+                        DocumentControlAction::TimerActivated(interval_head),
+                        activated,
+                        None,
+                    ),
+                    Duration::ZERO,
+                )
+                .unwrap(),
+            SettleProgress::Command(DocumentControlCommand::DriveOneTurn)
+        ));
+
+        let next_interval_id = fixture.schedule(Duration::from_nanos(10));
+        let next_interval_wake = joined_deadline(&fixture.scheduler, next_interval_id);
+        let mut after_interval = fixture.snapshot(4, 3);
+        assert_eq!(after_interval.scheduler.next_deadline, Some(rendering_wake));
+        after_interval.rendering =
+            PendingRenderingObservation::new(Some(rendering_wake), false, vec![rendering])
+                .unwrap();
+        let finite_timer = logical_timer(
+            2,
+            2,
+            PendingLogicalTimerKind::JavaScriptOneShot,
+            finite_wake.deadline,
+            None,
+        );
+        set_timer_sources(
+            &mut after_interval,
+            vec![
+                timer_source(
+                    1,
+                    PendingSourceDisposition::OpenEnded(PendingOpenEndedSourceReason::Interval {
+                        requested_period: Duration::from_nanos(10),
+                    }),
+                ),
+                timer_source(
+                    2,
+                    PendingSourceDisposition::FiniteDeadline(finite_wake.deadline),
+                ),
+            ],
+            vec![
+                logical_timer(
+                    1,
+                    1,
+                    PendingLogicalTimerKind::JavaScriptInterval {
+                        requested_period: Duration::from_nanos(10),
+                    },
+                    next_interval_wake.deadline,
+                    Some(next_interval_wake),
+                ),
+                finite_timer,
+            ],
+        );
+        let rendering_token = token(&after_interval);
+        assert!(matches!(
+            coordinator
+                .consume_receive_outcome(
+                    received(
+                        DocumentControlAction::TurnProcessed {
+                            microtask_checkpoint_advanced: true,
+                        },
+                        after_interval,
+                        Some(rendering_token.clone()),
+                    ),
+                    Duration::ZERO,
+                )
+                .unwrap(),
+            SettleProgress::Command(DocumentControlCommand::AdvanceTo(observed))
+                if *observed == rendering_token && observed.deadline() == rendering_wake
+        ));
+    }
+
+    #[test]
+    fn same_entry_interval_and_rendering_collision_is_rejected_before_coordination() {
+        let mut fixture = Fixture::new();
+        fixture.schedule(Duration::from_nanos(10));
+        let finite_id = fixture.schedule(Duration::from_nanos(40));
+        let finite_wake = joined_deadline(&fixture.scheduler, finite_id);
+        let mut pending = fixture.snapshot(2, 1);
+        let head = pending.scheduler.next_deadline.unwrap();
+        let mut rendering = pending.rendering.pipelines()[0];
+        rendering.finite_animations = 1;
+        pending.rendering =
+            PendingRenderingObservation::new(Some(head), false, vec![rendering]).unwrap();
+        pending.sources = PendingSourceSnapshot::new(
+            PendingSourceEpoch::new(1),
+            vec![
+                timer_source(
+                    1,
+                    PendingSourceDisposition::OpenEnded(PendingOpenEndedSourceReason::Interval {
+                        requested_period: Duration::from_nanos(10),
+                    }),
+                ),
+                timer_source(
+                    2,
+                    PendingSourceDisposition::FiniteDeadline(finite_wake.deadline),
+                ),
+            ],
+        )
+        .unwrap();
+        let finite_timer = logical_timer(
+            2,
+            2,
+            PendingLogicalTimerKind::JavaScriptOneShot,
+            finite_wake.deadline,
+            None,
+        );
+        pending.logical_timers = PendingLogicalTimerSnapshot::new(vec![
+            logical_timer(
+                1,
+                1,
+                PendingLogicalTimerKind::JavaScriptInterval {
+                    requested_period: Duration::from_nanos(10),
+                },
+                head.deadline,
+                Some(head),
+            ),
+            finite_timer,
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            pending.validate(),
+            Err(
+                embedder_traits::document_pending::PendingSnapshotInvariantError::SchedulerEntryOwnerConflict(
+                    claimed,
+                )
+            ) if claimed == head
+        ));
+    }
+
+    #[test]
+    fn distinct_equal_deadline_animated_image_remains_blocked() {
+        let mut fixture = Fixture::new();
+        fixture.schedule(Duration::from_nanos(10));
+        let image_id = fixture.schedule(Duration::from_nanos(10));
+        let image_wake = joined_deadline(&fixture.scheduler, image_id);
+        let mut pending = fixture.snapshot(2, 1);
+        let interval_head = pending.scheduler.next_deadline.unwrap();
+        assert_eq!(image_wake.deadline, interval_head.deadline);
+        assert!(image_wake.id.sequence() > interval_head.id.sequence());
+
+        let mut rendering = pending.rendering.pipelines()[0];
+        rendering.animated_images = PendingAnimatedImageObservation {
+            retained_images: 1,
+            finite_images: 1,
+            scheduled_timer: Some(image_wake),
+            ..PendingAnimatedImageObservation::default()
+        };
+        pending.rendering = PendingRenderingObservation::new(None, false, vec![rendering]).unwrap();
+        set_timer_sources(
+            &mut pending,
+            vec![timer_source(
+                1,
+                PendingSourceDisposition::OpenEnded(PendingOpenEndedSourceReason::Interval {
+                    requested_period: Duration::from_nanos(10),
+                }),
+            )],
+            vec![logical_timer(
+                1,
+                1,
+                PendingLogicalTimerKind::JavaScriptInterval {
+                    requested_period: Duration::from_nanos(10),
+                },
+                interval_head.deadline,
+                Some(interval_head),
+            )],
+        );
+        let advance_token = token(&pending);
+        let mut coordinator = SettleCoordinator::new(SettlePolicy {
+            advance_interval_head_before_finite_work: true,
+            ..SettlePolicy::default()
+        });
+        assert_observe(coordinator.start().unwrap());
+        assert!(matches!(
+            observe(&mut coordinator, pending, Some(advance_token)).unwrap(),
+            SettleProgress::Complete(SettleCompletion::BlockedOnOpenEndedWork { .. })
+        ));
+    }
+
+    #[test]
+    fn unowned_equal_finite_timer_collision_fails_closed_when_progression_is_enabled() {
         let mut fixture = Fixture::new();
         fixture.schedule(Duration::from_nanos(10));
         let mut pending = fixture.snapshot(2, 1);
@@ -2590,7 +3261,10 @@ mod tests {
         );
         let advance_token = token(&pending);
 
-        let mut coordinator = SettleCoordinator::new(SettlePolicy::default());
+        let mut coordinator = SettleCoordinator::new(SettlePolicy {
+            advance_interval_head_before_finite_work: true,
+            ..SettlePolicy::default()
+        });
         assert_observe(coordinator.start().unwrap());
         assert!(matches!(
             observe(&mut coordinator, pending, Some(advance_token)).unwrap(),

@@ -16,6 +16,9 @@ These pages are served only from the loopback integration-test server in
 - `interval.html` leaves a repeating timer ahead of a later one-shot timer so
   settlement must report the open-ended head, preserve the one-shot as deferred
   finite work, and execute neither callback.
+- `controlled_v2_interval_before_finite.html` proves the v2/report-only expansion:
+  two exact interval heads may run to reach a later finite one-shot, after which
+  settlement reports the still-live interval without executing another cycle.
 - `application_navigation.html` proves that an application-initiated top-level
   document replacement is rejected with typed unsupported-work evidence, even
   when a same-origin navigation could otherwise reuse the controlled event loop.

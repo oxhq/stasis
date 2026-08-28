@@ -26,6 +26,7 @@ import {
   type SessionStateV2,
   type SessionSupportProfile,
   type SettlementEvidenceV2,
+  type UnsupportedReason,
 } from "../src/index.js";
 
 const fixture = fileURLToPath(new URL("./fixtures/fake-shell.mjs", import.meta.url));
@@ -103,6 +104,12 @@ if (false) {
     typeof CONTROLLED_WEB_SESSION_V2_PROFILE
   >;
   const stableResult = null as unknown as SessionSettleResult;
+  const renderBlockingReason: UnsupportedReason = "render_blocking_element";
+  // @ts-expect-error Unsupported reasons are a closed native/SDK vocabulary.
+  const inventedRenderBlockingReason: UnsupportedReason = "invented_render_blocker";
+  const candidateSettleUrl: string = candidateResult.url;
+  // @ts-expect-error Frozen v1 settlement results do not acquire the v2 URL field.
+  stableResult.url;
   const copiedCandidateResult = { ...candidateResult };
   const copiedCandidateEvidence: SettlementEvidenceV2<
     typeof CONTROLLED_WEB_SESSION_V1_PROFILE
@@ -214,6 +221,9 @@ if (false) {
   void inferredCandidateEvidence;
   void candidateResult;
   void stableResult;
+  void renderBlockingReason;
+  void inventedRenderBlockingReason;
+  void candidateSettleUrl;
   void copiedCandidateEvidence;
   void falselyBoundCopy;
   void stablePool;
@@ -273,8 +283,18 @@ test("explicit v2 selection binds capability, response, state, and evidence iden
 
   const settled = await session.settle(session.stateToken);
   assert.equal(
-    session.settlementEvidence(settled).profile,
+    settled.url,
+    "https://example.test/current?source=owner#terminal",
+  );
+  const sessionEvidence = session.settlementEvidence(settled);
+  assert.equal(
+    sessionEvidence.profile,
     CONTROLLED_WEB_SESSION_V2_PROFILE,
+  );
+  assert.equal(
+    Object.hasOwn(sessionEvidence, "url"),
+    false,
+    "settlement evidence must not copy the potentially sensitive page URL",
   );
   assert.equal(
     settlementEvidence(settled, CONTROLLED_WEB_SESSION_V2_PROFILE).profile,
@@ -330,6 +350,74 @@ test("explicit v2 selection binds capability, response, state, and evidence iden
   assert.notEqual(mutation.sessionStateToken, cookies.sessionStateToken);
   assert.equal(replaced.cookies[0]?.expiresUnixTimeNs, replacementExpiry);
   await session.close();
+});
+
+test("settlement URL decoding is required only for the explicitly selected v2 profile", async (context) => {
+  for (const testCase of [
+    {
+      scenario: "session-v2-settle-missing-url",
+      profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+      message: /runtime\.settle result\.url must be a string/u,
+    },
+    {
+      scenario: "session-v2-settle-invalid-url",
+      profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+      message: /runtime\.settle result\.url must be a string/u,
+    },
+    {
+      scenario: "session-v1-unexpected-settle-url",
+      profile: CONTROLLED_WEB_SESSION_V1_PROFILE,
+      message: /unexpected field/u,
+    },
+  ] as const) {
+    const runtime = await fakeRuntime(context, testCase.scenario);
+    const session =
+      testCase.profile === CONTROLLED_WEB_SESSION_V2_PROFILE
+        ? await runtime.openSession("https://example.test/", {
+            profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+          })
+        : await runtime.openSession("https://example.test/");
+
+    await assert.rejects(session.settle(session.stateToken), (error) => {
+      assert.ok(error instanceof StasisTransportError);
+      assert.equal(error.code, "invalid_result");
+      assert.match(error.message, testCase.message);
+      return true;
+    });
+  }
+});
+
+test("render-blocking settlement work is typed while unknown reasons remain rejected", async (context) => {
+  const acceptedRuntime = await fakeRuntime(context, "session-render-blocking-unsupported");
+  const acceptedSession = await acceptedRuntime.openSession("https://example.test/", {
+    profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+  });
+  const accepted = await acceptedSession.settle(acceptedSession.stateToken);
+  assert.equal(accepted.outcome, "unsupported_work");
+  assert.deepEqual(accepted.unsupportedWork, [
+    {
+      kind: "rendering_update",
+      count: 2n,
+      reason: "render_blocking_element",
+    },
+  ]);
+  assert.deepEqual(acceptedSession.settlementEvidence(accepted).reason, {
+    kind: "unsupported_work",
+    code: "unsupported_source",
+    items: accepted.unsupportedWork,
+    omitted: 0,
+  });
+
+  const rejectedRuntime = await fakeRuntime(context, "session-unknown-unsupported-reason");
+  const rejectedSession = await rejectedRuntime.openSession("https://example.test/", {
+    profile: CONTROLLED_WEB_SESSION_V2_PROFILE,
+  });
+  await assert.rejects(rejectedSession.settle(rejectedSession.stateToken), (error) => {
+    assert.ok(error instanceof StasisTransportError);
+    assert.equal(error.code, "invalid_result");
+    assert.match(error.message, /unsupportedWork\.reason has unknown value invented_render_blocker/u);
+    return true;
+  });
 });
 
 test("explicit v2 selection fails before open when the runtime does not advertise it", async (context) => {

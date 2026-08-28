@@ -4551,6 +4551,7 @@ impl GlobalScope {
             policy_container: self.policy_container(),
             origin: RequestOrigin::Origin(self.origin().immutable().clone()),
             is_nested_browsing_context: false,
+            controlled_cookie_site_for_cookies: None,
             insecure_requests_policy: self.insecure_requests_policy(),
             has_trustworthy_ancestor_origin: false,
         }

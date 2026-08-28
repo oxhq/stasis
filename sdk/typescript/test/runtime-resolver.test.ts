@@ -16,7 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 
 import { StasisAbortError } from "../src/errors.js";
 import {
@@ -35,6 +35,19 @@ const VERSION = "0.1.0-test.0";
 const PLATFORM_KEY = "darwin-arm64";
 const ROOT = `stasis-${VERSION}-macos-aarch64`;
 const BINARY = Buffer.from("#!/bin/sh\nprintf 'fixture runtime\\n'\n", "utf8");
+const MANAGED_RUNTIME_CACHE_TEST_OPTIONS = {
+  skip:
+    process.platform === "win32"
+      ? "Windows supports only explicit executablePath; managed-runtime cache installation is unsupported"
+      : false,
+};
+
+function managedRuntimeCacheTest(
+  title: string,
+  body: (context: TestContext) => void | Promise<void>,
+): Promise<void> {
+  return test(title, MANAGED_RUNTIME_CACHE_TEST_OPTIONS, body);
+}
 
 interface TarFixtureMember {
   name: string;
@@ -106,7 +119,7 @@ async function createResolverFixture(
   return { root, cache, archive, manifest, dependencies, downloads };
 }
 
-test("resolver installs exact bytes atomically, reuses cache, and repairs corruption", async (context) => {
+managedRuntimeCacheTest("resolver installs exact bytes atomically, reuses cache, and repairs corruption", async (context) => {
   const fixture = await createResolverFixture(context);
   const executable = await resolveRuntimeExecutable(
     VERSION,
@@ -140,7 +153,7 @@ test("resolver installs exact bytes atomically, reuses cache, and repairs corrup
   assert.equal(fixture.downloads.count, 2);
 });
 
-test("concurrent resolvers share one exclusive cache installation", async (context) => {
+managedRuntimeCacheTest("concurrent resolvers share one exclusive cache installation", async (context) => {
   const fixture = await createResolverFixture(context);
   const originalDownload = fixture.dependencies.downloadArchive!;
   fixture.dependencies.downloadArchive = async (...arguments_) => {
@@ -161,7 +174,7 @@ test("concurrent resolvers share one exclusive cache installation", async (conte
   assert.deepEqual(await readFile(executables[0]!), BINARY);
 });
 
-test("primary cache lock is published only after complete owner metadata", async (context) => {
+managedRuntimeCacheTest("primary cache lock is published only after complete owner metadata", async (context) => {
   const fixture = await createResolverFixture(context);
   let candidateOwner: unknown;
   let lockFilename = "";
@@ -199,7 +212,7 @@ test("primary cache lock is published only after complete owner metadata", async
 
 test(
   "cache FIFOs fail closed without blocking marker or executable validation",
-  { skip: process.platform === "win32", timeout: 5_000 },
+  { ...MANAGED_RUNTIME_CACHE_TEST_OPTIONS, timeout: 5_000 },
   async (context) => {
     const fixture = await createResolverFixture(context);
     let executable = await resolveRuntimeExecutable(
@@ -233,7 +246,7 @@ test(
   },
 );
 
-test("absolute archive deadline aborts the transfer and leaves no cache entry", async (context) => {
+managedRuntimeCacheTest("absolute archive deadline aborts the transfer and leaves no cache entry", async (context) => {
   const fixture = await createResolverFixture(context);
   let observedAbort = false;
   await assert.rejects(
@@ -269,7 +282,7 @@ test("absolute archive deadline aborts the transfer and leaves no cache entry", 
   await assert.rejects(access(cacheEntry));
 });
 
-test("resolver safely reclaims a stale cache lock owned by a dead process", async (context) => {
+managedRuntimeCacheTest("resolver safely reclaims a stale cache lock owned by a dead process", async (context) => {
   const fixture = await createResolverFixture(context);
   const artifact = fixture.manifest.artifacts[PLATFORM_KEY]!;
   const lockDirectory = join(fixture.cache, "runtime-v1", ".locks");
@@ -301,7 +314,7 @@ test("resolver safely reclaims a stale cache lock owned by a dead process", asyn
   await assert.rejects(access(lockFilename));
 });
 
-test("resolver safely reclaims an orphaned stale reclaim lock", async (context) => {
+managedRuntimeCacheTest("resolver safely reclaims an orphaned stale reclaim lock", async (context) => {
   const fixture = await createResolverFixture(context);
   const artifact = fixture.manifest.artifacts[PLATFORM_KEY]!;
   const lockDirectory = join(fixture.cache, "runtime-v1", ".locks");
@@ -332,7 +345,7 @@ test("resolver safely reclaims an orphaned stale reclaim lock", async (context) 
   await assert.rejects(access(`${lockFilename}.reclaim`));
 });
 
-test("resolver rejects archive and executable digest mismatches", async (context) => {
+managedRuntimeCacheTest("resolver rejects archive and executable digest mismatches", async (context) => {
   const archiveMismatch = await createResolverFixture(context);
   const artifact = archiveMismatch.manifest.artifacts[PLATFORM_KEY]!;
   const badArchiveManifest: RuntimeDistributionManifest = {
@@ -368,7 +381,7 @@ test("resolver rejects archive and executable digest mismatches", async (context
   );
 });
 
-test("resolver rejects traversal and link entries before they escape extraction", async (context) => {
+managedRuntimeCacheTest("resolver rejects traversal and link entries before they escape extraction", async (context) => {
   const traversal = await createResolverFixture(context, [
     { name: ROOT, type: "directory" },
     { name: `${ROOT}/../escape`, content: Buffer.from("escape", "utf8") },
@@ -394,7 +407,7 @@ test("resolver rejects traversal and link entries before they escape extraction"
   );
 });
 
-test("resolver enforces bounded decompression and member counts", async (context) => {
+managedRuntimeCacheTest("resolver enforces bounded decompression and member counts", async (context) => {
   const fixture = await createResolverFixture(context);
   await assert.rejects(
     resolveRuntimeExecutable(
@@ -415,6 +428,29 @@ test("resolver enforces bounded decompression and member counts", async (context
     /member-count limit/u,
   );
 });
+
+test(
+  "Windows managed acquisition stays typed unsupported and names the explicit override",
+  async (context) => {
+    const fixture = await createResolverFixture(context);
+    await assert.rejects(
+      resolveRuntimeExecutable(
+        VERSION,
+        { cacheDirectory: fixture.cache },
+        { ...fixture.dependencies, platform: "win32", architecture: "x64" },
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof RuntimeResolutionError);
+        assert.equal(
+          error.message,
+          `@oxhq/stasis@${VERSION} has no native runtime for win32-x64; pass executablePath to use an explicit compatible runtime`,
+        );
+        return true;
+      },
+    );
+    assert.equal(fixture.downloads.count, 0);
+  },
+);
 
 test("resolver fails closed on manifest, platform, URL, and abort mismatches", async (context) => {
   const fixture = await createResolverFixture(context);

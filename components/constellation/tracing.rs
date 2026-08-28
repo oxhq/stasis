@@ -191,6 +191,9 @@ mod from_script {
                 Self::CreateAuxiliaryWebView(..) => target!("ScriptNewAuxiliary"),
                 Self::ActivateDocument(..) => target!("ActivateDocument"),
                 Self::SetFinalUrl(..) => target!("SetFinalUrl"),
+                Self::SetControlledCookieSiteForCookies(..) => {
+                    target!("SetControlledCookieSiteForCookies")
+                },
                 Self::LogEntry(..) => target!("LogEntry"),
                 Self::DiscardDocument => target!("DiscardDocument"),
                 Self::DiscardTopLevelBrowsingContext => target!("DiscardTopLevelBrowsingContext"),

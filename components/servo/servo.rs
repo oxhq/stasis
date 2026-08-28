@@ -409,21 +409,17 @@ impl ServoInner {
                     if matches!(web_resource_load.request().url.scheme(), "http" | "https")
                         && let Some(session) = webview.controlled_network_session()
                     {
-                        // A main-frame navigation establishes its target as the new cookie
-                        // context. Subresources and fetches remain bound to the active document's
-                        // top-level URL. This distinction is part of controlled-web-session-v1:
-                        // without it, a supported cross-origin document replacement cannot send
-                        // cookies belonging to its target origin.
-                        let site_for_cookies = controlled_cookie_context_url_for_policy(
-                            &web_resource_load.request().url,
-                            web_resource_load.request().is_for_main_frame,
-                            webview.controlled_cookie_top_level_url(),
-                            session.cookie_policy(),
-                        );
+                        let (site_for_cookies, top_level_navigation) =
+                            controlled_cookie_context_for_policy(
+                                web_resource_load.request(),
+                                session.cookie_policy(),
+                                || webview.controlled_cookie_top_level_url(),
+                            );
                         crate::controlled_network::handle_request(
                             &session,
                             web_resource_load,
                             site_for_cookies,
+                            top_level_navigation,
                         );
                     } else {
                         webview
@@ -893,38 +889,72 @@ fn controlled_cookie_context_url(
     is_for_main_frame: bool,
     active_top_level_url: Option<url::Url>,
 ) -> url::Url {
-    controlled_cookie_context_url_for_policy(
-        request_url,
-        is_for_main_frame,
-        active_top_level_url,
-        ControlledCookiePolicy::SessionV1,
-    )
-    .expect("the frozen v1 cookie context always has a site")
+    if is_for_main_frame {
+        request_url.clone()
+    } else {
+        active_top_level_url.unwrap_or_else(|| request_url.clone())
+    }
 }
 
-fn controlled_cookie_context_url_for_policy(
-    request_url: &url::Url,
-    is_for_main_frame: bool,
-    active_top_level_url: Option<url::Url>,
+fn controlled_cookie_context_from_request(
+    request: &WebResourceRequest,
+) -> (Option<url::Url>, bool) {
+    (
+        request.controlled_cookie_site_for_cookies.clone(),
+        request.controlled_cookie_top_level_navigation,
+    )
+}
+
+fn controlled_cookie_context_for_policy(
+    request: &WebResourceRequest,
     policy: ControlledCookiePolicy,
-) -> Option<url::Url> {
+    active_top_level_url: impl FnOnce() -> Option<url::Url>,
+) -> (Option<url::Url>, bool) {
     match policy {
-        ControlledCookiePolicy::SessionV1 if is_for_main_frame => Some(request_url.clone()),
-        ControlledCookiePolicy::SessionV1 => {
-            Some(active_top_level_url.unwrap_or_else(|| request_url.clone()))
-        },
-        // V2 captures the pre-navigation client site for both navigation and subresource hops.
-        // The builder URL is installed before the first navigation; `None` therefore represents
-        // genuinely unproven provenance and must stay explicit.
-        ControlledCookiePolicy::SessionV2 { .. } => active_top_level_url,
+        // Frozen v1 keeps its legacy interception-time behavior: a main-frame navigation uses its
+        // target, while subresources use the mutable active top-level projection with the existing
+        // request-URL fallback.
+        ControlledCookiePolicy::SessionV1 => (
+            Some(controlled_cookie_context_url(
+                &request.url,
+                request.is_for_main_frame,
+                active_top_level_url(),
+            )),
+            request.is_for_main_frame,
+        ),
+        // V2 must not invoke the mutable WebView projection supplied above.
+        ControlledCookiePolicy::SessionV2 { .. } => controlled_cookie_context_from_request(request),
     }
 }
 
 #[cfg(test)]
 mod controlled_cookie_context_tests {
-    use embedder_traits::ControlledCookiePolicy;
+    use std::cell::Cell;
 
-    use super::{controlled_cookie_context_url, controlled_cookie_context_url_for_policy};
+    use content_security_policy::Destination;
+    use embedder_traits::{
+        ControlledCookiePolicy, WebResourceKind, WebResourceLoadId, WebResourceRequest,
+    };
+    use http::{HeaderMap, Method};
+
+    use super::{controlled_cookie_context_for_policy, controlled_cookie_context_url};
+
+    fn v2_request(site_for_cookies: Option<url::Url>) -> WebResourceRequest {
+        WebResourceRequest {
+            method: Method::GET,
+            headers: HeaderMap::new(),
+            url: url::Url::parse("https://resource.example/data").unwrap(),
+            destination: Destination::None,
+            referrer_url: None,
+            is_for_main_frame: false,
+            is_redirect: false,
+            controlled_cookie_site_for_cookies: site_for_cookies,
+            controlled_cookie_top_level_navigation: false,
+            controlled_load_id: WebResourceLoadId::new([7; 16], 0),
+            controlled_body_bytes: Some(0),
+            controlled_resource_kind: WebResourceKind::Fetch,
+        }
+    }
 
     #[test]
     fn main_frame_cross_origin_navigation_uses_the_target_context() {
@@ -956,27 +986,43 @@ mod controlled_cookie_context_tests {
     }
 
     #[test]
-    fn v2_preserves_the_pre_navigation_site_for_every_request_kind() {
-        let active = url::Url::parse("https://source.example/account").unwrap();
-        let target = url::Url::parse("https://target.example/dashboard").unwrap();
-        let policy = ControlledCookiePolicy::SessionV2 { unix_time_ns: 7 };
+    fn v2_delayed_request_keeps_a_after_top_level_history_advances_to_b() {
+        let site_a = url::Url::parse("https://a.example/account").unwrap();
+        let request_created_under_a = v2_request(Some(site_a.clone()));
 
-        assert_eq!(
-            controlled_cookie_context_url_for_policy(&target, true, Some(active.clone()), policy,),
-            Some(active.clone()),
+        // Model a delayed Net interception after a same-document or replacement transition has
+        // advanced the WebView projection. V2 has no input through which B can reattribute A's
+        // already-created request.
+        let active_top_level_after_creation =
+            url::Url::parse("https://b.example/history-entry").unwrap();
+        let mutable_context_reads = Cell::new(0);
+        let (site_for_cookies, top_level_navigation) = controlled_cookie_context_for_policy(
+            &request_created_under_a,
+            ControlledCookiePolicy::SessionV2 { unix_time_ns: 7 },
+            || {
+                mutable_context_reads.set(mutable_context_reads.get() + 1);
+                Some(active_top_level_after_creation.clone())
+            },
         );
-        assert_eq!(
-            controlled_cookie_context_url_for_policy(&target, false, Some(active.clone()), policy,),
-            Some(active),
+
+        assert_eq!(mutable_context_reads.get(), 0);
+        assert_eq!(site_for_cookies, Some(site_a));
+        assert_ne!(
+            site_for_cookies.as_ref(),
+            Some(&active_top_level_after_creation)
         );
-        assert_eq!(
-            controlled_cookie_context_url_for_policy(&target, true, None, policy),
-            None,
+        assert!(!top_level_navigation);
+    }
+
+    #[test]
+    fn v2_unknown_request_context_stays_explicit() {
+        let (site_for_cookies, _) = controlled_cookie_context_for_policy(
+            &v2_request(None),
+            ControlledCookiePolicy::SessionV2 { unix_time_ns: 7 },
+            || panic!("v2 must not consult mutable top-level state"),
         );
-        assert_eq!(
-            controlled_cookie_context_url_for_policy(&target, false, None, policy),
-            None,
-        );
+
+        assert_eq!(site_for_cookies, None);
     }
 }
 

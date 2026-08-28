@@ -730,8 +730,26 @@ async function handle(request) {
     const outcome =
       scenario === "settle-outcomes"
         ? settleOutcomes[settleOrdinal++ % settleOutcomes.length]
-        : "quiescent";
+        : scenario === "session-render-blocking-unsupported" ||
+            scenario === "session-unknown-unsupported-reason"
+          ? "unsupported_work"
+          : "quiescent";
     const result = settleResult(outcome);
+    if (
+      scenario === "session-render-blocking-unsupported" ||
+      scenario === "session-unknown-unsupported-reason"
+    ) {
+      result.unsupportedWork = [
+        {
+          kind: "rendering_update",
+          count: "2",
+          reason:
+            scenario === "session-render-blocking-unsupported"
+              ? "render_blocking_element"
+              : "invented_render_blocker",
+        },
+      ];
+    }
     if (scenario === "invalid-settle") {
       result.outcome = "virtual_time_limit_exceeded";
       delete result.limit;
@@ -743,6 +761,16 @@ async function handle(request) {
       }
       result.stateToken = rotateDocumentToken();
       result.snapshot.stateToken = result.stateToken;
+      if (openParams.profile === sessionV2Profile) {
+        if (scenario !== "session-v2-settle-missing-url") {
+          result.url =
+            scenario === "session-v2-settle-invalid-url"
+              ? 42
+              : "https://example.test/current?source=owner#terminal";
+        }
+      } else if (scenario === "session-v1-unexpected-settle-url") {
+        result.url = "https://example.test/unexpected";
+      }
     }
     await send(request, result);
     return;

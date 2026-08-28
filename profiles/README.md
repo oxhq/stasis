@@ -41,7 +41,18 @@ abandon the stream and stay
 terminal. Completion and abandonment are accepted only for the exact live fence/sequence and
 registered Image producer class. The inline path additionally requires an internal request,
 the same canonical MIME/URL bound, an exact cache-ID owner join, and fenced decode/raster
-completion; it creates no DOM load event. Excluded URLs and image consumers receive no new owned
+completion. An identical current inline root may join an exact retained producer whether layout
+reports `PendingResponse` or a stale/reentrant `Unrequested`, when its exact cache-key URL and
+`PendingImageId` match an existing same-ID fenced layout record and every live callback retains
+the exact same producer URL key. That callback-owned key may survive an earlier DOM owner's unbind,
+but terminal callback removal revokes it; the old DOM identity is neither required nor trusted.
+The callback set must be nonempty and uniformly fenced, with no baseline retained work. A new
+current owner is retained once and an already-retained owner is idempotent. The join reuses the
+existing listener and producer; it adds no listener, producer, or fetch. Controlled callbacks,
+layout owners, DOM identities, raster keys, and raster owners all consume the shared 512-record
+capacity through their exact lifetimes. A missing anchor/key, stale candidate, mismatch, mixed
+provenance, or capacity terminal fails closed and cannot promote baseline work. The inline path creates no DOM
+load event. Excluded URLs and image consumers receive no new owned
 authority; retained baseline work and observed host timestamps keep their existing typed rejection
 paths. Data URLs require the canonical parser and exact `image/svg+xml`; HTTP(S) is admitted by the
 initially selected scheme before response format is known, with resource I/O separately owned and
@@ -77,10 +88,32 @@ externally routed ports remain typed `external_subscription` or worker boundarie
 non-SVG data, CSS/background/generated-content, favicon, video-poster, animated,
 general or nested/external SVG resources, iframe/worker/worklet, and transferred image paths are
 not promoted by the image slice. Web Animations API semantics, event ordering/cardinality,
-`elapsedTime`, and CSS animation limits are unchanged. Scheduled pending animation-event batches
-are finite rendering demand owned by guarded `AdvanceTo` at the exact retained scheduler head;
-only an unscheduled batch is `Drive`-ready. This prevents a checkpoint spin without adding a task
-source or limit. Baseline and v1 profile contracts are unchanged.
+`elapsedTime`, and CSS animation limits are unchanged. A nonempty document-owned pending CSS
+animation-event queue is finite rendering demand and retains one later owned rendering opportunity
+until dispatch drains it; an empty queue leaves no opportunity. A live scheduled batch uses guarded
+`AdvanceTo` at the exact retained scheduler head, and only an unscheduled batch is `Drive`-ready.
+This prevents a checkpoint spin without adding a task source or limit. Baseline and v1 profile
+contracts are unchanged.
+
+Every returned v2 `runtime.settle` result also carries a required owner-attested `url`. The shell
+projects it from the exact final active top-level navigation authority after the passive
+N1/document-pending-D/passive-N2 bracket succeeds, and that same authority binds the returned
+`stateToken`. The field is present for every returned outcome and does not itself claim quiescence.
+It does not turn the open-time `Session.url` into mutable state, add a polling operation, or change
+action, navigation, or frozen v1 result shapes. Settlement evidence continues to omit URLs and
+other sensitive application values.
+
+V2 also resolves the scheduler-head case in which an owned persistent JavaScript interval sits
+before eligible finite work. Only `persistentWork: "report"` may advance that exact eligible head, using the
+same single-use complete-snapshot token as every finite advance. Each interval callback remains an
+ordinary task under all existing execution and virtual-time limits. When finite work is gone, two
+stable checkpoints return `quiescent_with_persistent_work` without advancing the interval again.
+Finite timer and animated-image deadlines must remain strictly later. One finite rendering
+opportunity may share the timestamp only as a distinct exact same-scheduler owner whose `TimerId`
+sequence follows the interval head; same-entry, lower-or-equal-order, foreign-scheduler,
+bare/unowned, equal finite-timer, and equal animated-image collisions remain blocked.
+`strict`, `controlled-webapp-v1`, and `controlled-web-session-v1` retain the former
+`blocked_on_open_ended_work` behavior.
 
 V2 persistent cookies are memory-owned by the controlled session and use its Unix-nanosecond
 clock with origin zero. `Max-Age` precedes `Expires`, lifetime is clamped to 400 days, expiry at or
@@ -88,12 +121,16 @@ before controlled now deletes, and lazy purge runs before observation, request s
 export. SameSite uses captured schemeful site-for-cookies, the current redirect-hop method, and
 the top-level-navigation bit: Strict is same-site only; Lax and unspecified also admit cross-site
 top-level safe methods; Secure None cookies may cross site. Unknown or opaque context remains typed
-unsupported before network start. Cross-site subresource responses store only valid Secure
-SameSite=None cookies; Strict, Lax, and unspecified response cookies are ignored, while top-level
-navigation responses admit all otherwise valid unpartitioned cookies. A post-open request at
-controlled Unix time above u64 fails nonfatally as `unsupported_cookie_time_range` before network
-start rather than wrapping; initial controlled open hardens the same code to fatal fail-stop.
-Partitioned cookies and CookieStore read/getAll/delete remain unsupported. The schema remains 1,
+unsupported. After successful controlled parsing, cross-site subresource
+responses store only valid Secure SameSite=None cookies; otherwise valid Strict, Lax, and
+unspecified response cookies are ignored. Parse, normalization, and time-range failures retain
+their existing typed outcomes. Top-level navigation responses admit all otherwise valid
+unpartitioned cookies. A post-open request at controlled Unix time above u64 fails nonfatally as
+`unsupported_cookie_time_range` rather than wrapping; initial controlled open hardens the same code
+to fatal fail-stop. Either post-open typed rejection may retain bounded `request_started` and
+`request_failed` evidence, but it occurs before `route_decided` or route selection, fixture or live
+external I/O, and Cookie header construction. Partitioned cookies and CookieStore read/getAll/delete
+remain unsupported. The schema remains 1,
 but V2 exports and imports only a literal
 `controlled-web-session-v2` state artifact; it never silently migrates v1 state or persists a host
 cookie jar to disk. See

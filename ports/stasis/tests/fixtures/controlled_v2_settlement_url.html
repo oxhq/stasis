@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled v2 settlement URL authority</title>
+<button id="push" type="button">Push history</button>
+<button id="replace" type="button">Replace history</button>
+<output id="result">initial</output>
+<script>
+  history.replaceState(
+    { phase: "initial" },
+    "",
+    "/settlement-url/replaced?proof=initial#attested",
+  );
+
+  document.querySelector("#push").addEventListener("click", () => {
+    history.pushState(
+      { phase: "pushed" },
+      "",
+      "/settlement-url/pushed?proof=history#attested",
+    );
+    document.querySelector("#result").textContent = "pushed";
+  });
+
+  document.querySelector("#replace").addEventListener("click", () => {
+    history.replaceState(
+      { phase: "final" },
+      "",
+      "/settlement-url/final?proof=replacement#attested",
+    );
+    document.querySelector("#result").textContent = "replaced";
+  });
+</script>

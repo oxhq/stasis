@@ -377,6 +377,12 @@ impl Animations {
             .sum()
     }
 
+    /// Whether the document owns animation events which must be dispatched by a later
+    /// update-the-rendering opportunity.
+    pub(crate) fn has_pending_events(&self) -> bool {
+        !self.pending_events.borrow().is_empty()
+    }
+
     /// Copy the retained CSS animation facts without advancing the timeline,
     /// dispatching events, or holding either collection borrow after this call.
     pub(crate) fn pending_observation(&self) -> CssAnimationPendingObservation {

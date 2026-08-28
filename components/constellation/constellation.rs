@@ -243,6 +243,22 @@ enum DeferredReplacementExit {
     Replacement,
 }
 
+fn controlled_session_navigation_load_data(
+    target_url: ServoUrl,
+    captured_site_for_cookies: Option<ServoUrl>,
+) -> LoadData {
+    let mut load_data = LoadData::new_for_new_unrelated_webview(target_url);
+    load_data.controlled_cookie_site_for_cookies = captured_site_for_cookies;
+    load_data
+}
+
+fn store_active_controlled_cookie_site(
+    slot: &mut Option<ServoUrl>,
+    script_attested_site: Option<ServoUrl>,
+) {
+    *slot = script_attested_site;
+}
+
 impl DeferredReplacementActivation {
     fn classify_exit(self, pipeline_id: PipelineId) -> Option<DeferredReplacementExit> {
         if pipeline_id == self.source_pipeline_id {
@@ -284,6 +300,46 @@ mod deferred_replacement_activation_tests {
             Some(DeferredReplacementExit::Replacement)
         );
         assert_eq!(activation.classify_exit(pipeline_id(3)), None);
+    }
+}
+
+#[cfg(test)]
+mod controlled_session_navigation_load_data_tests {
+    use servo_url::ServoUrl;
+
+    use super::{controlled_session_navigation_load_data, store_active_controlled_cookie_site};
+
+    #[test]
+    fn replacement_keeps_captured_source_site_instead_of_constructor_target() {
+        let source_a = ServoUrl::parse("https://a.example/document").unwrap();
+        let target_b = ServoUrl::parse("https://b.example/replacement").unwrap();
+
+        let load_data =
+            controlled_session_navigation_load_data(target_b.clone(), Some(source_a.clone()));
+
+        assert_eq!(load_data.url, target_b);
+        assert_eq!(load_data.controlled_cookie_site_for_cookies, Some(source_a));
+    }
+
+    #[test]
+    fn replacement_preserves_an_opaque_source_instead_of_using_the_target() {
+        let target = ServoUrl::parse("https://target.example/replacement").unwrap();
+
+        let load_data = controlled_session_navigation_load_data(target.clone(), None);
+
+        assert_eq!(load_data.url, target);
+        assert_eq!(load_data.controlled_cookie_site_for_cookies, None);
+    }
+
+    #[test]
+    fn activation_stores_the_exact_script_attested_site_including_none() {
+        let site = ServoUrl::parse("https://source.example/document").unwrap();
+        let mut slot = None;
+        store_active_controlled_cookie_site(&mut slot, Some(site.clone()));
+        assert_eq!(slot, Some(site));
+
+        store_active_controlled_cookie_site(&mut slot, None);
+        assert_eq!(slot, None);
     }
 }
 
@@ -1747,6 +1803,13 @@ where
                         return warn!("{}: LoadUrl for unknown browsing context", webview_id);
                     },
                 };
+                // This embedder message is the navigation request-creation boundary. Capture the
+                // Script-attested active Document site now; the pipeline URL alone cannot reveal
+                // a CSP-sandboxed opaque origin.
+                load_data.controlled_cookie_site_for_cookies = self
+                    .pipelines
+                    .get(&pipeline_id)
+                    .and_then(|pipeline| pipeline.controlled_cookie_site_for_cookies.clone());
                 // Since this is a top-level load, initiated by the embedder, go straight to load_url,
                 // bypassing schedule_navigation.
                 self.load_url(
@@ -2282,6 +2345,13 @@ where
             let _ = response.send(Err(SessionNavigationError::SourceInactive));
             return;
         }
+        // Capture the exact source authority before replacement admission mutates session state.
+        // `LoadData::new_for_new_unrelated_webview` necessarily uses the target for a truly new
+        // WebView, so controlled replacement must explicitly override that initial-site default.
+        let controlled_cookie_site_for_cookies = self
+            .pipelines
+            .get(&source_id)
+            .and_then(|pipeline| pipeline.controlled_cookie_site_for_cookies.clone());
         let admission = self
             .webviews
             .get_mut(&webview_id)
@@ -2297,7 +2367,8 @@ where
             let _ = response.send(Err(error));
             return;
         }
-        let load_data = LoadData::new_for_new_unrelated_webview(url);
+        let load_data =
+            controlled_session_navigation_load_data(url, controlled_cookie_site_for_cookies);
         if self
             .load_url_with_session_admission(
                 webview_id,
@@ -3243,7 +3314,16 @@ where
                 self.handle_joint_session_history_length(webview_id, response_sender);
             },
             // Notification that the new document is ready to become active
-            ScriptToConstellationMessage::ActivateDocument(correlation) => {
+            ScriptToConstellationMessage::ActivateDocument(
+                correlation,
+                controlled_cookie_site_for_cookies,
+            ) => {
+                if let Some(pipeline) = self.pipelines.get_mut(&source_pipeline_id) {
+                    store_active_controlled_cookie_site(
+                        &mut pipeline.controlled_cookie_site_for_cookies,
+                        controlled_cookie_site_for_cookies,
+                    );
+                }
                 self.handle_correlated_pipeline_activation(
                     webview_id,
                     source_pipeline_id,
@@ -3257,6 +3337,18 @@ where
                     pipeline.url = final_url;
                 } else {
                     warn!("constellation got set final url message for dead pipeline");
+                }
+            },
+            ScriptToConstellationMessage::SetControlledCookieSiteForCookies(
+                controlled_cookie_site_for_cookies,
+            ) => {
+                if let Some(pipeline) = self.pipelines.get_mut(&source_pipeline_id) {
+                    store_active_controlled_cookie_site(
+                        &mut pipeline.controlled_cookie_site_for_cookies,
+                        controlled_cookie_site_for_cookies,
+                    );
+                } else {
+                    warn!("constellation got cookie-site update for dead pipeline");
                 }
             },
             ScriptToConstellationMessage::PostMessage {
@@ -7786,6 +7878,10 @@ where
         self.pipelines.get(&pipeline_id).map(|pipeline| {
             let mut load_data = pipeline.load_data.clone();
             load_data.url = pipeline.url.clone();
+            // The active Script-attested Document origin is newer authority than the
+            // request-creation provenance retained by the original LoadData.
+            load_data.controlled_cookie_site_for_cookies =
+                pipeline.controlled_cookie_site_for_cookies.clone();
             load_data
         })
     }

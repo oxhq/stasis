@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled v2 shared pending inline SVG rendering</title>
+<main id="icons">
+  <svg class="shared" width="4" height="3" viewBox="0 0 4 3" xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>
+  <svg class="shared" width="4" height="3" viewBox="0 0 4 3" xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>
+  <svg class="shared" width="4" height="3" viewBox="0 0 4 3" xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>
+  <svg class="shared" width="4" height="3" viewBox="0 0 4 3" xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>
+  <svg class="shared" width="4" height="3" viewBox="0 0 4 3" xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>
+  <svg class="shared" width="4" height="3" viewBox="0 0 4 3" xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>
+  <svg class="shared" width="4" height="3" viewBox="0 0 4 3" xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>
+  <svg class="shared" width="4" height="3" viewBox="0 0 4 3" xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>
+  <svg class="shared" width="4" height="3" viewBox="0 0 4 3" xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>
+  <svg class="shared" width="4" height="3" viewBox="0 0 4 3" xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>
+  <svg class="shared" width="4" height="3" viewBox="0 0 4 3" xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>
+  <svg class="shared" width="4" height="3" viewBox="0 0 4 3" xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>
+</main>
+<output id="result">waiting</output>
+<script>
+  const icons = [...document.querySelectorAll("svg.shared")];
+  for (const icon of icons) icon.getBoundingClientRect();
+  document.querySelector("#result").textContent =
+    `shared-inline-svg:${icons.length}|now:${performance.now()}`;
+</script>

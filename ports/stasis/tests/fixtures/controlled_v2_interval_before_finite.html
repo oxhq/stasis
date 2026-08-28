@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Stasis controlled v2 interval before finite work</title>
+  </head>
+  <body>
+    <output id="trace">starting</output>
+
+    <script>
+      const trace = [];
+      let intervalCount = 0;
+
+      window.__stasisPersistentInterval = setInterval(() => {
+        intervalCount += 1;
+        trace.push(`interval:${intervalCount}@${performance.now()}`);
+        document.querySelector("#trace").textContent = trace.join("|");
+      }, 5_000);
+
+      setTimeout(() => {
+        trace.push(`finite@${performance.now()}`);
+        document.querySelector("#trace").textContent = trace.join("|");
+      }, 12_000);
+    </script>
+  </body>
+</html>

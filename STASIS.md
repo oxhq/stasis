@@ -62,7 +62,19 @@ Release identity and immutable boundaries:
   `HTMLImageElement.src` completion for canonical `data:image/svg+xml` or an initially selected
   canonical HTTP(S) URL no larger than 65,536 bytes; a distinct bounded inline
   `<svg>` path whose internal serialized data-SVG request must exactly match that element's cached
-  URL and join its exact cache-ID owner; and narrow exact public non-auxiliary controlled top-level, single-line
+  URL and join its exact cache-ID owner. An identical current inline root may join an exact
+  retained producer whether layout reports `PendingResponse` or a stale/reentrant `Unrequested`:
+  its exact cache-key URL and `PendingImageId` must match an existing same-ID fenced layout record,
+  while every live callback must be fenced and retain that exact producer URL key. The producer
+  key outlives an earlier DOM owner's unbind only until terminal callback removal; no earlier live
+  DOM identity is required or trusted. No baseline work may be retained. A new current owner is
+  retained once and an already-retained owner is idempotent. The join reuses the existing listener
+  and producer; it adds no listener, producer, or fetch. Every controlled callback, layout owner,
+  DOM identity, raster key, and raster owner consumes the shared 512-record capacity until its
+  exact lifetime ends. A missing anchor/key, stale candidate, mismatch, mixed provenance, or
+  capacity terminal fails closed and cannot promote baseline work. Baseline, v1, external,
+  nested-SVG, iframe, worker, worklet, and cross-loop authority remains unchanged. V2 also adds the
+  narrow exact public non-auxiliary controlled top-level, single-line
   `InputMethodType::Text` presentation suppression only when `multiline = false` and no virtual
   keyboard is requested. Admitted HTML image completion events and engine-generated focus
   transitions expose document-clock `Event.timeStamp` values. Every browser-created event
@@ -93,9 +105,11 @@ Release identity and immutable boundaries:
   sample, shared only by internal `AnimationEvent` or `TransitionEvent` records in the exact public non-auxiliary
   controlled top-level WebView/document. The implemented `TransitionEvent` adapter is conditional
   on an existing owned transition record reaching that queue; general transition settlement is not
-  claimed. A scheduled pending animation-event batch is finite demand for guarded `AdvanceTo` at
-  the exact retained scheduler head, while only an unscheduled batch is `Drive`-ready; this closes a
-  checkpoint-spin liveness bug without adding a task source or limit. Auxiliary WebViews remain host-stamped. Inline SVG gains no DOM completion-event claim,
+  claimed. A nonempty document-owned pending CSS animation-event queue is finite demand and
+  retains one later owned rendering opportunity until dispatch drains it; an empty queue leaves no
+  rendering opportunity. A live scheduled batch uses guarded `AdvanceTo` at the exact retained
+  scheduler head, while only an unscheduled batch is `Drive`-ready. This closes a checkpoint-spin
+  liveness bug without adding a task source or limit. Auxiliary WebViews remain host-stamped. Inline SVG gains no DOM completion-event claim,
   and script-created animation/transition constructors, excluded
   image, animated/decode-timeline, decoder-resource-budget, general SVG/resource, and other
   unlisted host-stamped paths remain unsupported or retain
@@ -103,12 +117,33 @@ Release identity and immutable boundaries:
   Unix time, with Max-Age precedence, a 400-day clamp, lazy expiry purge, and exact v2
   export/import identity. SameSite request selection uses captured schemeful site-for-cookies, the
   current redirect-hop method, and the top-level-navigation bit; ineligible cookies are filtered,
-  while unknown or opaque context stays typed unsupported before network start. Cross-site
-  subresource responses retain only valid Secure SameSite=None cookies; top-level responses admit
-  every otherwise valid unpartitioned cookie. Controlled Unix time above u64 is a nonfatal
-  `unsupported_cookie_time_range` boundary for a post-open request before network start, never a
-  truncation; initial controlled open hardens the same code to fatal fail-stop. Partitioned
+  while unknown or opaque context stays typed unsupported. Cross-site
+  subresource responses, after successful controlled parsing, retain only valid Secure
+  SameSite=None cookies; otherwise valid Strict/Lax/unspecified values are ignored. Parse,
+  normalization, and time-range failures retain their existing typed outcomes. Top-level
+  responses admit every otherwise valid unpartitioned cookie. Controlled Unix time above u64 is a
+  nonfatal `unsupported_cookie_time_range` boundary for a post-open request, never a truncation;
+  initial controlled open hardens the same code to fatal fail-stop. Either post-open typed
+  rejection may retain bounded `request_started` and `request_failed` evidence, but it occurs before
+  `route_decided` or route selection, fixture or live external I/O, and Cookie header construction.
+  Partitioned
   cookies and the deferred CookieStore read/getAll/delete methods receive no new authority.
+  Every returned v2 settle result additionally includes the active top-level document `url` from
+  the same final passive-N1/document-pending-D/passive-N2 owner authority that binds its
+  `stateToken`. The field is required on every returned outcome and does not imply quiescence.
+  `Session.url` remains the open-time value; this projection adds no poll or mutable session
+  property, leaves action/navigation and frozen v1 result shapes unchanged, and remains excluded
+  from bounded redacted settlement evidence.
+  With `persistentWork: "report"`, v2 may also advance an eligible exact JavaScript interval only
+  while every observed finite timer and animated-image deadline is strictly later. One finite
+  rendering opportunity may share its timestamp only as a distinct exact same-scheduler owner
+  whose `TimerId` sequence follows the interval head; Stasis dispatches the interval and reobserves
+  before that rendering entry. Same-entry, lower-or-equal-order, foreign-scheduler, bare/unowned,
+  equal finite-timer, and equal animated-image collisions remain blocked. Each activation uses the ordinary
+  single-use advance token and its callback consumes the existing task/microtask/rendering,
+  mutation, control-turn, and virtual-time budgets. Once finite work drains, an interval-only
+  document is checkpointed and returned as `quiescent_with_persistent_work` without another
+  interval cycle. `strict` and both predecessor profiles retain their stop-at-interval behavior.
   It is explicit-only,
   leaves the v1 session default and v1 behavior unchanged, and is not a public release claim
   until exact v0.3 artifacts pass the hosted promotion and public-consumer gates.

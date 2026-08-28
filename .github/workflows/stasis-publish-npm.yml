@@ -715,6 +715,9 @@ jobs:
             --session-v2-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_data_svg.html \
             --session-v2-http-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_http.html \
             --session-v2-inline-svg-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg.html \
+            --session-v2-inline-svg-shared-pending-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg_shared_pending.html \
+            --session-v2-settlement-url-fixture ports/stasis/tests/fixtures/controlled_v2_settlement_url.html \
+            --session-v2-interval-before-finite-fixture ports/stasis/tests/fixtures/controlled_v2_interval_before_finite.html \
             --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
             --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
             --session-v2-css-animation-event-fixture ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html \
@@ -983,6 +986,76 @@ jobs:
                       "fixtureTrace": "inline-svg:4x3|events:0|now:0",
                       "domCompletionEvents": "0",
                       "evidenceProfile": "controlled-web-session-v2",
+                      "sharedNavigationBoundary": "controlled_ready",
+                      "sharedOutcome": "quiescent",
+                      "sharedProducerPending": "0",
+                      "sharedProducerTerminal": False,
+                      "sharedPendingImages": "0",
+                      "sharedRuntimeFailures": "0",
+                      "sharedUnsupportedWork": "0",
+                      "sharedExternalIo": "0",
+                      "sharedFixtureTrace": "shared-inline-svg:12|now:0",
+                      "sharedEvidenceProfile": "controlled-web-session-v2",
+                      "sameControlledSession": True,
+                      "exactBinaryLaunch": True,
+                      "closeResponseAndEof": True,
+                  },
+                  "v2SettlementUrl": {
+                      "profile": "controlled-web-session-v2",
+                      "navigationBoundary": "controlled_ready",
+                      "controlledOpenUrl": (
+                          "https://packed-sdk-message-channel-v2.example.test/"
+                      ),
+                      "initialOutcome": "quiescent",
+                      "initialUrl": (
+                          "https://packed-sdk-settlement-url-v2.example.test/"
+                          "settlement-url/replaced?proof=initial#attested"
+                      ),
+                      "historyOutcome": "quiescent",
+                      "historyUrl": (
+                          "https://packed-sdk-settlement-url-v2.example.test/"
+                          "settlement-url/pushed?proof=history#attested"
+                      ),
+                      "replacementOutcome": "quiescent",
+                      "replacementUrl": (
+                          "https://packed-sdk-settlement-url-v2.example.test/"
+                          "settlement-url/final?proof=replacement#attested"
+                      ),
+                      "replacementTrace": "replaced",
+                      "sessionUrlStayedAtControlledOpen": True,
+                      "sessionEvidenceExcludesUrl": True,
+                      "standaloneEvidenceExcludesUrl": True,
+                      "unsupportedOutcome": "unsupported_work",
+                      "unsupportedFailureCode": "unsupported_clock_surface",
+                      "unsupportedUrl": (
+                          "https://packed-sdk-automation-event-timestamps-v2.example.test/"
+                      ),
+                      "exactBinaryLaunch": True,
+                      "closeResponseAndEof": True,
+                  },
+                  "v2PersistentIntervalProgression": {
+                      "profile": "controlled-web-session-v2",
+                      "navigationBoundary": "controlled_ready",
+                      "implicitVirtualTimeNs": "12000000000",
+                      "implicitPersistentTimers": "1",
+                      "implicitFutureFinite": "0",
+                      "implicitTrace": "interval:1@5000|interval:2@10000|finite@12000",
+                      "strictOutcome": "blocked_on_open_ended_work",
+                      "strictVirtualTimeNs": "12000000000",
+                      "strictTrace": "interval:1@5000|interval:2@10000|finite@12000",
+                      "reportOutcome": "quiescent_with_persistent_work",
+                      "reportVirtualTimeNs": "12000000000",
+                      "reportTrace": "interval:1@5000|interval:2@10000|finite@12000",
+                      "persistentTimers": "1",
+                      "futureFinite": "0",
+                      "persistentKind": "timer",
+                      "persistentReason": "interval",
+                      "persistentCount": "1",
+                      "requestedPeriodNs": "5000000000",
+                      "runtimeFailures": "0",
+                      "unsupportedWork": "0",
+                      "externalIo": "0",
+                      "evidenceProfile": "controlled-web-session-v2",
                       "sameControlledSession": True,
                       "exactBinaryLaunch": True,
                       "closeResponseAndEof": True,
@@ -1184,6 +1257,18 @@ jobs:
                   "unsupportedAnimations": "0",
                   "producerPending": "0",
                   "producerTerminal": False,
+                  "postReflowOutcome": "quiescent",
+                  "postReflowVirtualTimeNs": "70000000",
+                  "postReflowTrace": "armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70",
+                  "postReflowEventCount": "2",
+                  "postReflowEventKinds": "animationcancel,animationstart",
+                  "postReflowRuntimeFailures": "0",
+                  "postReflowUnsupportedWork": "0",
+                  "postReflowExternalIo": "0",
+                  "postReflowPendingAnimationEvents": "0",
+                  "postReflowNextOpportunityNs": "none",
+                  "postReflowStateTokenPreserved": True,
+                  "postReflowOwnedQueueDrain": True,
                   "scriptCreatedConstructorCount": "2",
                   "scriptCreatedTrace": "script:0,0",
                   "rejectedOutcome": "unsupported_work",
@@ -1204,6 +1289,7 @@ jobs:
                   "controlledEventCount", "controlledEventKinds",
                   "controlledOwnedEventCount", "controlledDispatchTimeCount",
                   "processedRenderingOpportunities",
+                  "postReflowProcessedRenderingOpportunities",
               }
               event_count = (
                   css_record.get("controlledEventCount", "")
@@ -1234,6 +1320,11 @@ jobs:
                   if type(css_record) is dict
                   else ""
               )
+              post_reflow_rendering_opportunities = (
+                  css_record.get("postReflowProcessedRenderingOpportunities", "")
+                  if type(css_record) is dict
+                  else ""
+              )
               if (
                   type(css_record) is not dict
                   or set(css_record) != css_expected_fields
@@ -1257,6 +1348,8 @@ jobs:
                   or int(dispatch_times) > int(event_count)
                   or not isinstance(rendering_opportunities, str)
                   or re.fullmatch(r"[1-9][0-9]*", rendering_opportunities) is None
+                  or not isinstance(post_reflow_rendering_opportunities, str)
+                  or re.fullmatch(r"[1-9][0-9]*", post_reflow_rendering_opportunities) is None
               ):
                   raise SystemExit(
                       f"{context} lost exact v2CssAnimationEventTimestamps evidence"
@@ -1548,7 +1641,7 @@ jobs:
               raise SystemExit("SDK gate proof size is outside the release limit")
           proof = strict_json_loads(proof_file.read_text(encoding="utf-8"), "SDK gate proof")
           expected_proof = {
-              "schema": 7,
+              "schema": 10,
               "gate": "sdk-act-settle-inspect",
               "package": f"@oxhq/stasis@{version}",
               "revision": revision,
@@ -1571,7 +1664,8 @@ jobs:
               or set(proof)
                   != set(expected_proof) | {
                       "gateLogSha256", "v2MessageChannel", "v2DirectDataSvg",
-                      "v2InlineSvgRendering", "v2InputMethodFocus",
+                      "v2InlineSvgRendering", "v2SettlementUrl",
+                      "v2PersistentIntervalProgression", "v2InputMethodFocus",
                       "v2AutomationEventTimestamps",
                       "v2CssAnimationEventTimestamps",
                       "v2CookieSession",
@@ -1672,7 +1766,8 @@ jobs:
               or set(prepublish_proof)
                   != set(expected_prepublish_proof) | {
                       "gateLogSha256", "v2MessageChannel", "v2DirectDataSvg",
-                      "v2InlineSvgRendering", "v2InputMethodFocus",
+                      "v2InlineSvgRendering", "v2SettlementUrl",
+                      "v2PersistentIntervalProgression", "v2InputMethodFocus",
                       "v2AutomationEventTimestamps",
                       "v2CssAnimationEventTimestamps",
                       "v2CookieSession",
@@ -1882,6 +1977,7 @@ jobs:
               "gate", "package", "revision", "source", "tarball", "binary",
               "binarySha256", "virtualElapsedNs", "wallElapsedMs", "closeResponseAndEof",
               "v2MessageChannel", "v2DirectDataSvg", "v2InlineSvgRendering",
+              "v2SettlementUrl", "v2PersistentIntervalProgression",
               "v2InputMethodFocus", "v2AutomationEventTimestamps",
               "v2CssAnimationEventTimestamps",
               "v2CookieSession",
@@ -1949,7 +2045,9 @@ jobs:
           if prepublish_v2_message_channel != v2_message_channel:
               raise SystemExit("prepublish SDK proof v2 evidence differs from its raw gate log")
           for field in (
-              "v2DirectDataSvg", "v2InlineSvgRendering", "v2InputMethodFocus",
+              "v2DirectDataSvg", "v2InlineSvgRendering", "v2SettlementUrl",
+              "v2PersistentIntervalProgression",
+              "v2InputMethodFocus",
               "v2AutomationEventTimestamps",
               "v2CssAnimationEventTimestamps",
               "v2CookieSession",
@@ -3199,6 +3297,9 @@ jobs:
             --session-v2-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_data_svg.html \
             --session-v2-http-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_http.html \
             --session-v2-inline-svg-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg.html \
+            --session-v2-inline-svg-shared-pending-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg_shared_pending.html \
+            --session-v2-settlement-url-fixture ports/stasis/tests/fixtures/controlled_v2_settlement_url.html \
+            --session-v2-interval-before-finite-fixture ports/stasis/tests/fixtures/controlled_v2_interval_before_finite.html \
             --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
             --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
             --session-v2-css-animation-event-fixture ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html \

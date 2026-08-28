@@ -25,7 +25,18 @@ baseline delivery fallback; an endless response remains blocked on that external
 replacement while HTTP image resource I/O is active retains fatal `blocked_on_external_io`; this
 slice does not claim cross-document replacement through in-flight external I/O. The inline slice additionally requires an internal request and exact
 cached-URL/cache-ID join, fences decode and raster completion, and emits no new DOM load event;
-excluded image paths receive no new authority. Cache-owned callback retirement and a dequeued
+an identical current inline root may join an exact retained producer whether layout reports
+`PendingResponse` or a stale/reentrant `Unrequested`, with its exact cache-key URL and ID anchored
+by an existing same-ID fenced layout record and a nonempty uniformly fenced callback set whose
+callback-owned producer keys all equal that URL. The key may survive an earlier DOM owner's unbind
+only until terminal callback removal; the earlier DOM identity is not authority. A new current
+owner is retained once and an already-retained owner is idempotent. The join reuses the existing
+listener and producer; it adds no listener, producer, or fetch. Every controlled callback, layout
+owner, DOM identity, raster key, and raster owner is charged to the shared 512-record capacity. A
+missing anchor/key, stale candidate, mismatch, mixed provenance, or capacity terminal fails closed
+and cannot promote baseline work.
+Excluded image paths receive no new authority.
+Cache-owned callback retirement and a dequeued
 response whose closed-pipeline tombstone proves that navigation retired its Window complete
 normally as owned cancellation. A normal live handler rejection retains the pending owner or key,
 completes the scoped message guard, and settles as typed `unsupported_rendering`; admission,
@@ -44,8 +55,10 @@ structured cloning. A nonempty owned CSS animation pending-event dispatch batch 
 Performance clock once and shares it only with internal `AnimationEvent` or `TransitionEvent`
 records owned by the exact public non-auxiliary controlled top-level WebView/document. The `TransitionEvent` adapter is
 conditional on an existing owned transition record reaching that queue; general transition
-settlement is not claimed. Scheduled pending animation-event work uses guarded `AdvanceTo` at the
-exact retained scheduler head, including an exact-`now` deadline; only an unscheduled batch is
+settlement is not claimed. A nonempty document-owned pending CSS animation-event queue is finite
+rendering demand and retains one later owned rendering opportunity until dispatch drains it; an
+empty queue leaves no opportunity. Live scheduled work uses guarded `AdvanceTo` at the exact
+retained scheduler head, including an exact-`now` deadline; only an unscheduled batch is
 `Drive`-ready. This corrects liveness without adding a task source or limit. Auxiliary top-level WebViews remain host-stamped. Script-created events,
 including the WebIDL animation
 and transition event constructors, excluded image sources, general SVG/resource, and other
@@ -65,13 +78,36 @@ controlled Unix nanoseconds with origin zero, valid `Max-Age` takes precedence o
 lifetime is clamped to 400 days, and lazy purge precedes observation, request selection, and
 export. SameSite selection uses captured schemeful site-for-cookies, the current redirect-hop
 method, and the top-level-navigation bit; ineligible cookies are filtered, while unknown or opaque
-context remains typed unsupported before network start. V2 state retains schema 1 but carries the
+context remains typed unsupported. V2 state retains schema 1 but carries the
 literal v2 profile and is portable only through explicit v2 export and initial import. V1 state is
-not migrated. Cross-site subresource responses retain only valid Secure SameSite=None cookies;
-top-level-navigation responses admit all otherwise valid unpartitioned cookies. A post-open
-request above u64 is nonfatal `unsupported_cookie_time_range` before network start; initial open
-hardens the same code to fatal fail-stop. Partitioned cookies and
+not migrated. After successful controlled parsing, cross-site subresource responses retain only
+valid Secure SameSite=None cookies; otherwise valid Strict/Lax/unspecified values are ignored,
+while parse, normalization, and time-range failures retain their existing typed outcomes.
+Top-level-navigation responses admit all otherwise valid unpartitioned cookies. A post-open
+request above u64 is nonfatal `unsupported_cookie_time_range`; initial open hardens the same code
+to fatal fail-stop. Either post-open typed rejection may retain bounded `request_started` and
+`request_failed` evidence, but it occurs before `route_decided` or route selection, fixture or live
+external I/O, and Cookie header construction. Partitioned cookies and
 CookieStore read/getAll/delete remain unsupported.
+
+The eighth slice adds a required owner-attested `url` to every returned v2 settle outcome. It is
+projected from the exact final active top-level navigation authority after the passive
+N1/document-pending-D/passive-N2 bracket succeeds, and the same authority binds the returned
+`stateToken`. Its presence does not imply quiescence. `Session.url` remains the open-time value;
+there is no new poll or mutable session property, frozen v1 result shapes remain byte-compatible,
+and bounded redacted settlement evidence does not include the URL.
+
+The ninth slice admits bounded progress through an eligible JavaScript interval scheduler head
+only for v2 settlement with `persistentWork: "report"`. Every observed finite timer and
+animated-image deadline must be strictly later. One finite rendering opportunity may share the
+timestamp only as a distinct exact same-scheduler owner whose `TimerId` sequence follows the
+interval head; same-entry, lower-or-equal-order, foreign-scheduler, bare/unowned, equal
+finite-timer, and equal animated-image collisions remain blocked.
+Every exact head uses the existing single-use advance token; each callback is an ordinary task and
+all task, microtask, rendering, mutation, control-turn, and virtual-time limits remain authoritative.
+After finite work drains, settlement does not fire another interval cycle and returns
+`quiescent_with_persistent_work`. Strict policy and both frozen predecessor profiles still stop at
+the interval head as `blocked_on_open_ended_work`.
 
 The checked-out release and npm workflows accept only exact `v0.3.0` for new
 promotion/publication work. They do not authorize rebuilding or replacing any published `0.2.x`
@@ -214,8 +250,9 @@ without an import and proves neither an ambient request cookie nor cookie state 
 process opens at u64 max, advances beyond it, and proves a post-open request fails as
 `unsupported_cookie_time_range` before reaching the server. Every exact-binary child receives an
 explicit runtime-only environment
-allowlist rather than workflow or registry credentials. Its schema-7 proof binds all seven v2
-slices to the same package, native
+allowlist rather than workflow or registry credentials. Every returned v2 settle in that gate must
+also carry the owner-attested active top-level URL from the same authority as its state token, while
+its settlement evidence omits the URL. Its schema-10 proof binds all nine v2 slices to the same package, native
 digest, source revision, clean close responses, and protocol EOFs.
 
 For direct HTTP(S) images, the 65,536-byte admission limit applies to the initially selected

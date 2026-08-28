@@ -30,9 +30,9 @@ FROZEN_V1_PROFILE_SHA256 = "6e262edf0f8be11a1cece28f68f00d59fdac68b79b0a670ac891
 FROZEN_V2_PROFILE = Path("profiles/controlled-web-session-v1.json")
 FROZEN_V2_PROFILE_SHA256 = "9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a"
 CANDIDATE_V2_PROFILE = Path("profiles/controlled-web-session-v2.json")
-CANDIDATE_V2_PROFILE_SHA256 = "d9855ee01844e0fae796a9925c87a936281d47fc480b9d047da74d4a3afcd989"
+CANDIDATE_V2_PROFILE_SHA256 = "1351eec7fb3ec307907aaa26ea6776d364ccf686310a62b42a55b91b9ad7e4c4"
 CANDIDATE_V2_CONTRACT = Path("docs/stasis/session-v0.3-candidate.md")
-CANDIDATE_V2_CONTRACT_SHA256 = "47116a08cd3917466ca57f2a51bc74f0b4052688af878f0ee493e9a893929cc2"
+CANDIDATE_V2_CONTRACT_SHA256 = "5d1e336b64f703e3bbfcc8ad5d863e6f39636657a5f834911ccdf24a560fcba5"
 PUBLIC_TOP_LEVEL_README = Path("README.md")
 PUBLIC_STASIS_BOUNDARY = Path("STASIS.md")
 PUBLIC_PROFILE_README = Path("profiles/README.md")
@@ -40,6 +40,7 @@ PUBLIC_TYPESCRIPT_SDK_README = Path("sdk/typescript/README.md")
 PUBLIC_RELEASE_RUNBOOK = Path("docs/stasis/releases.md")
 PUBLIC_RELEASE_WORKFLOW = Path(".github/workflows/stasis-package.yml")
 PUBLIC_NPM_PUBLISH_WORKFLOW = Path(".github/workflows/stasis-publish-npm.yml")
+REGISTRY_SDK_VERIFIER_SOURCE = Path("etc/ci/stasis/verify_registry_sdk.mjs")
 MESSAGE_CHANNEL_LIMITS_SOURCE = Path("components/script/dom/globalscope/globalscope.rs")
 MESSAGE_CHANNEL_BASELINE_TEST_SOURCE = Path("ports/stasis/tests/baseline_protocol.rs")
 MESSAGE_CHANNEL_MULTI_PAIR_FIXTURE = Path("ports/stasis/tests/fixtures/message_channel_multi_pair.html")
@@ -77,8 +78,22 @@ CONTROLLED_PROFILE_WIRE_SOURCE = Path("ports/stasis/src/wire.rs")
 CONTROLLED_HTTP_IMAGE_FIXTURE = Path("ports/stasis/tests/fixtures/controlled_v2_image_http.html")
 CONTROLLED_HTTP_IMAGE_MULTIPART_FIXTURE = Path("ports/stasis/tests/fixtures/controlled_v2_image_http_multipart.html")
 CONTROLLED_INLINE_SVG_SOURCE = Path("components/script/dom/svg/svgsvgelement.rs")
+CONTROLLED_INLINE_SVG_LAYOUT_SOURCE = Path("components/shared/layout/lib.rs")
+CONTROLLED_INLINE_SVG_LAYOUT_CONTEXT_SOURCE = Path("components/layout/context.rs")
 CONTROLLED_INLINE_SVG_FIXTURE = Path("ports/stasis/tests/fixtures/controlled_v2_inline_svg.html")
+CONTROLLED_INLINE_SVG_SHARED_PENDING_FIXTURE = Path(
+    "ports/stasis/tests/fixtures/controlled_v2_inline_svg_shared_pending.html"
+)
+CONTROLLED_INLINE_SVG_INCREMENTAL_SAME_TASK_FIXTURE = Path(
+    "ports/stasis/tests/fixtures/controlled_v2_inline_svg_incremental_same_task.html"
+)
 CONTROLLED_INLINE_SVG_ADVANCED_FIXTURE = Path("ports/stasis/tests/fixtures/controlled_v2_inline_svg_advanced.html")
+CONTROLLED_SETTLEMENT_URL_FIXTURE = Path(
+    "ports/stasis/tests/fixtures/controlled_v2_settlement_url.html"
+)
+CONTROLLED_INTERVAL_BEFORE_FINITE_FIXTURE = Path(
+    "ports/stasis/tests/fixtures/controlled_v2_interval_before_finite.html"
+)
 EXECUTION_LIMITS_SOURCE = Path("components/timers/lib.rs")
 CONTROLLED_INPUT_METHOD_EMBEDDER_SUMMARY = (
     "controlledTopLevelSingleLineTextInputMethodPresentationWithoutVirtualKeyboard"
@@ -105,6 +120,11 @@ CONTROLLED_COOKIE_EXPIRY_PRODUCT_SURFACE = (
 )
 CONTROLLED_COOKIE_SAME_SITE_PRODUCT_SURFACE = "bounded_schemeful_SameSite_request_cookie_selection"
 CONTROLLED_COOKIE_SAME_SITE_RESPONSE_PRODUCT_SURFACE = "bounded_schemeful_SameSite_response_cookie_storage"
+CONTROLLED_SETTLEMENT_URL_PRODUCT_SURFACE = "owner_attested_current_top_level_url_on_every_v2_settle_result"
+CONTROLLED_INTERVAL_PROGRESSION_PRODUCT_SURFACE = (
+    "bounded_report_policy_interval_progression_before_strictly_later_finite_work_or_"
+    "exact_distinct_same_deadline_rendering"
+)
 
 BINARY_NAME = "stasis"
 THIRD_PARTY_NAME = "THIRD_PARTY_LICENSES.html"
@@ -926,6 +946,43 @@ def verify_controlled_animation_scheduler_liveness_source(source: str) -> None:
         ),
         "scheduled pending animation-event exact-now and future-head proof",
     )
+    interval_order_start = source.find("fn all_finite_work_is_ordered_after_interval_head(")
+    interval_order_end = source.find("fn quiet_snapshots_match(", interval_order_start)
+    if interval_order_start < 0 or interval_order_end < 0:
+        raise ReleaseError("cannot locate exact interval-head finite-work ordering authority")
+    require_source_fragments_in_order(
+        source[interval_order_start:interval_order_end],
+        (
+            "if deadline <= head.deadline",
+            "PendingSourceDisposition::FiniteRenderingOpportunity",
+            "exact_rendering_entry_is_ordered_after_interval_head(deadline, head)",
+            "rendering.animated_images.finite_images != 0",
+            "rendering.animated_images.scheduled_timer",
+            "if deadline.deadline <= head.deadline",
+            "fn exact_rendering_entry_is_ordered_after_interval_head(",
+            "candidate.scheduler_id == head.scheduler_id",
+            "candidate.id != head.id",
+            "candidate.deadline > head.deadline",
+            "candidate.deadline == head.deadline",
+            "candidate.id.sequence() > head.id.sequence()",
+        ),
+        "strict finite deadline and exact distinct same-deadline rendering ordering",
+    )
+    require_source_fragments_in_order(
+        source,
+        (
+            "fn exact_distinct_equal_deadline_rendering_entry_follows_the_interval_head()",
+            "rendering_wake.id.sequence() > interval_head.id.sequence()",
+            "SettleProgress::Command(DocumentControlCommand::AdvanceTo(observed))",
+            "fn same_entry_interval_and_rendering_collision_is_rejected_before_coordination()",
+            "PendingSnapshotInvariantError::SchedulerEntryOwnerConflict",
+            "fn distinct_equal_deadline_animated_image_remains_blocked()",
+            "SettleProgress::Complete(SettleCompletion::BlockedOnOpenEndedWork { .. })",
+            "fn unowned_equal_finite_timer_collision_fails_closed_when_progression_is_enabled()",
+            "SettleProgress::Complete(SettleCompletion::BlockedOnOpenEndedWork { .. })",
+        ),
+        "equal-deadline interval/rendering admission and fail-closed unit proofs",
+    )
 
 
 INPUT_METHOD_REQUEST_INITIALIZER_RE = re.compile(r"\bInputMethodRequest\s*\{")
@@ -1586,6 +1643,32 @@ def verify_controlled_css_animation_event_timestamp_source(
         "retained CSS animation and pending-event observation",
     )
     require_source_fragments_in_order(
+        animations_source,
+        (
+            "/// Whether the document owns animation events which must be dispatched by a later",
+            "pub(crate) fn has_pending_events(&self) -> bool",
+            "!self.pending_events.borrow().is_empty()",
+        ),
+        "document-owned CSS pending-event rendering liveness predicate",
+    )
+    needs_rendering_update_start = document_source.find("pub(crate) fn needs_rendering_update(")
+    needs_rendering_update_end = document_source.find("fn update_the_rendering(", needs_rendering_update_start)
+    if needs_rendering_update_start < 0 or needs_rendering_update_end < 0:
+        raise ReleaseError("cannot isolate document rendering-update liveness authority")
+    require_source_fragments_in_order(
+        document_source[needs_rendering_update_start:needs_rendering_update_end],
+        (
+            "Style/layout can enqueue animation events after this rendering opportunity already ran",
+            "Controlled-web-session-v2 owns the narrow liveness correction",
+            "keep one later opportunity scheduled for its exact public top-level document",
+            "without\n        // changing baseline or frozen-v1 scheduling behavior",
+            "if ScriptThread::current_controlled_top_level_target_matches(&self.window)",
+            "self.animations.has_pending_events()",
+            "return true;",
+        ),
+        "post-reflow CSS pending-event later-opportunity retention",
+    )
+    require_source_fragments_in_order(
         document_source,
         (
             "pub(crate) fn pending_rendering_observation(",
@@ -1657,6 +1740,11 @@ def verify_controlled_css_animation_event_timestamp_source(
             '"armed:5|animationstart:trusted:20:20:owned>animationend:trusted:20:20:owned"',
             'exercise_css_animation_event_profile("controlled-web-session-v1"',
             "None",
+            "fn controlled_session_v2_drains_animation_events_queued_after_reflow()",
+            'pending["result"]["virtualTimeNs"], "70000000"',
+            'pending["result"]["rendering"]["pendingAnimationEvents"], "0"',
+            'pending["result"]["rendering"]["nextOpportunityNs"].is_null()',
+            '"armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70"',
             "fn controlled_session_v2_script_created_animation_and_transition_events_remain_host_stamped()",
             "fn exercise_css_animation_event_profile(",
             '"timeSurface": "host_timestamp"',
@@ -1676,6 +1764,11 @@ def verify_controlled_css_animation_event_timestamp_source(
             '"animationstart"',
             '"animationend"',
             'target.classList.add("running")',
+            '"animationcancel"',
+            'document.querySelector("#post-reflow").addEventListener("click"',
+            'postReflowTarget.classList.add("running")',
+            "requestAnimationFrame(() =>",
+            'requestAnimationFrame(() => postReflowTarget.classList.remove("running"))',
             'new AnimationEvent("animationstart"',
             'new TransitionEvent("transitionrun"',
             "setTimeout(() => {}, 5)",
@@ -1845,7 +1938,12 @@ def verify_controlled_image_element_source(source: str) -> None:
         (
             "ImageRequestProvenance::ControlledV2DirectDataSvg |",
             "ImageRequestProvenance::ControlledV2DirectHttpImage => {",
-            "if self.register_image_cache_callback(id, ChangeType::Element, provenance) {",
+            "if self.register_image_cache_callback(",
+            "id,",
+            "ChangeType::Element,",
+            "provenance,",
+            "img_url,",
+            ") {",
             "self.fetch_request(img_url, id, provenance);",
         ),
         "controlled image registration before request start",
@@ -1858,10 +1956,12 @@ def verify_controlled_image_element_source(source: str) -> None:
     require_source_fragments_in_order(
         source[callback_start:callback_end],
         (
+            "producer_key: &ServoUrl",
             "ImageRequestProvenance::ControlledV2DirectDataSvg |",
             "ImageRequestProvenance::ControlledV2DirectHttpImage => {",
             "window.register_controlled_v2_image_cache_listener(",
             "self.upcast::<Node>()",
+            "producer_key.clone()",
             "Self::queue_image_cache_response(",
             "delivery,",
             "return false;",
@@ -2246,12 +2346,34 @@ def verify_controlled_profile_wire_source(source: str) -> None:
             f'"{CANDIDATE_V2_PROFILE_SHA256}"',
             'assert_eq!(profile["releaseStatus"], "stable_contract");',
             'assert_eq!(profile["targetRelease"], "0.3.0");',
+            'profile["sessionSettlementResult"]',
+            '"presence": "every_returned_runtime_settle_outcome"',
+            '"binding": "same_exact_navigation_authority_as_stateToken"',
+            '"settlementEvidence": "excluded"',
             'profile["execution"]["controlledImageElement"]',
             '"controlled_top_level_direct_data_svg_and_initial_url_retained_ownership_bounded_http_https"',
             '"maximumInitialSelectedCanonicalUrlBytes": 65536',
+            '"recordKinds": [',
+            '"pending_callback"',
+            '"layout_owner"',
+            '"exact_cache_id_DOM_owner_identity"',
+            '"vector_rasterization_key"',
+            '"vector_rasterization_owner"',
+            '"reservationUnit": "one_record_per_controlled_pending_callback_layout_owner_exact_cache_id_DOM_owner_identity_vector_rasterization_key_or_vector_rasterization_owner"',
             '"multipartMixedReplace": "post_metadata_explicit_unsupported_provenance_retires_controlled_Image_producer_and_reports_unsupported_rendering_image_load_after_finite_resource_IO_drains_while_endless_resource_IO_remains_external"',
             '"inflightHttpDocumentReplacement": "fatal_blocked_on_external_io_before_cross_document_successor_authority"',
+            '"reservationReconciliation": "live_controlled_records_equal_retained_controlled_callbacks_plus_controlled_layout_owners_plus_exact_cache_id_DOM_owner_identities_plus_controlled_rasterization_keys_plus_controlled_rasterization_owners"',
             '"unsupportedReservationReconciliation": "explicit_Unsupported_records_retain_exact_logical_ID_without_controlled_capacity_reservations"',
+            'profile["execution"]["controlledInlineSvgRendering"]',
+            '"retainedProducerJoinAdmission"',
+            '"cacheStates": "PendingResponse_or_stale_reentrant_Unrequested_each_carries_exact_cache_key_URL"',
+            '"candidate": "current_inline_SVG_exact_PendingImageId_and_exact_current_cached_URL_new_owner_retained_once_existing_owner_idempotent"',
+            '"anchor": "existing_same_PendingImageId_ControlledV2Fenced_layout_record_plus_live_producer_callback_keys_no_preexisting_DOM_identity_required"',
+            '"provenance": "nonempty_callback_set_uniformly_ControlledV2Fenced_each_exact_producer_key_equals_candidate_URL_and_no_baseline_retained_work"',
+            '"producerReuse": "reuse_existing_uniformly_fenced_listener_and_producer_set_join_adds_no_listener_producer_or_fetch"',
+            '"producerKeyLifetime": "owned_by_live_callback_until_terminal_callback_removal_independent_of_prior_DOM_owner_unbind"',
+            '"failure": "missing_layout_anchor_missing_or_wrong_producer_key_stale_candidate_mismatched_ID_or_mixed_provenance_fails_closed_without_baseline_promotion"',
+            '"retentionBudget": "shared_512_record_limit_counts_each_controlled_callback_layout_owner_DOM_identity_raster_key_and_raster_owner_until_its_exact_terminal_or_unbind_lifetime_ends"',
         ),
         "enabled exact controlled-web-session-v2 wire profile assertion",
     )
@@ -2438,6 +2560,7 @@ def verify_controlled_image_transport_source(
     require_source_fragments_in_order(
         window_source[registration_start:sample_start],
         (
+            "producer_key: ServoUrl",
             "DocumentControlProfile::TopLevelSession",
             "DocumentExecutionProfile::ControlledWebSessionV2",
             "ScriptThread::current_controlled_top_level_target_matches(self)",
@@ -2452,8 +2575,9 @@ def verify_controlled_image_transport_source(
             ".push(PendingImageCallback",
             "_reservation: Some(callback_reservation)",
             "provenance: PendingImageProvenance::ControlledV2Fenced",
+            "controlled_v2_producer_key: Some(producer_key)",
         ),
-        "controlled Window image registration",
+        "controlled Window image registration and exact inline-SVG producer key retention",
     )
     if window_source[registration_start:sample_start].count("_reservation: identity_owner_reservation") != 2:
         raise ReleaseError(
@@ -2624,6 +2748,9 @@ def verify_controlled_image_pending_and_teardown_source(window_source: str, scri
             "let mut callback_provenances",
             "let mut layout_provenances",
             "for (id, provenance) in layout_registrations",
+            "PendingImageProvenance::ControlledV2Fenced => {",
+            "retained_controlled_registrations =",
+            ".checked_add(1)",
             "let layout_image_ids: HashSet<_> = layout_provenances.keys().copied().collect()",
             "let mut unique_image_ids = callback_ids",
             "unique_image_ids.extend(layout_image_ids)",
@@ -2659,8 +2786,9 @@ def verify_controlled_image_pending_and_teardown_source(window_source: str, scri
             "node: Dom<Node>",
             "destination: LayoutImageDestination",
             "provenance: PendingImageProvenance",
+            "_controlled_reservation: Option<ControlledImageReservation>",
         ),
-        "retained layout-owner provenance field",
+        "retained layout-owner provenance and capacity reservation fields",
     )
     require_source_fragments_in_order(
         window_source[layout_observation_start:controlled_registration_start],
@@ -2729,6 +2857,8 @@ def verify_controlled_image_pending_and_teardown_source(window_source: str, scri
             "ControlledImageReservation::try_new(",
             ".push(ControlledImageIdentityOwner",
             "_reservation: reservation",
+            "fn reserve_controlled_v2_layout_owner(",
+            "ControlledImageReservation::try_new(",
             "pub(crate) fn release_controlled_v2_cached_vector_identity(",
             ".retain(|candidate| *candidate.owner != *owner)",
             "pub(crate) fn downgrade_cached_vector_identity_to_baseline(",
@@ -2818,11 +2948,16 @@ def verify_controlled_image_pending_and_teardown_source(window_source: str, scri
             "let provenance = self.retained_image_provenance(id, &node)",
             "if provenance == PendingImageProvenance::Baseline",
             "self.downgrade_cached_vector_identity_to_baseline(id)",
+            "let controlled_layout_reservation = if provenance ==",
+            "PendingImageProvenance::ControlledV2Fenced",
+            "self.reserve_controlled_v2_layout_owner()",
+            "Some(reservation)",
             "if needs_listener",
             "nodes.push(PendingLayoutImageAncillaryData",
             "provenance,",
+            "_controlled_reservation: controlled_layout_reservation",
         ),
-        "post-reflow exact layout-owner provenance retention and downgrade",
+        "post-reflow exact layout-owner provenance, reservation, and downgrade",
     )
 
     delivery_start = window_source.find("pub(crate) fn pending_image_notification(")
@@ -3001,11 +3136,82 @@ def verify_controlled_image_pending_and_teardown_source(window_source: str, scri
 
 def verify_controlled_inline_svg_rendering_source(
     svg_source: str,
+    layout_source: str,
+    layout_context_source: str,
     window_source: str,
     protocol_source: str,
     fixture_source: str,
+    shared_pending_fixture_source: str,
+    incremental_same_task_fixture_source: str,
     advanced_fixture_source: str,
 ) -> None:
+    require_source_fragments_in_order(
+        window_source,
+        (
+            "struct PendingImageRasterizationOwner<T> {",
+            "_controlled_reservation: Option<ControlledImageReservation>",
+            "impl<T> PendingImageRasterizationOwner<T>",
+            "fn new(node: T, controlled_reservation: Option<ControlledImageReservation>)",
+            "_controlled_reservation: controlled_reservation",
+            "fn release_controlled_reservation(&mut self)",
+            "self._controlled_reservation = None",
+            "nodes: Vec<PendingImageRasterizationOwner<Dom<Node>>>",
+            "fn downgrade_to_baseline(&mut self)",
+            "owner.release_controlled_reservation()",
+            "fn mark_unsupported(&mut self)",
+            "owner.release_controlled_reservation()",
+            ".map(|(_, entry)| (entry.provenance, entry.nodes.len()))",
+        ),
+        "controlled inline SVG production raster-owner capacity accounting",
+    )
+    require_source_fragments_in_order(
+        window_source,
+        (
+            "fn reserve_controlled_v2_raster_owner(",
+            "count: Rc<Cell<usize>>",
+            "producer_fence: &timers::DocumentProducerFence",
+            "ControlledImageReservation::try_new(count, producer_fence)",
+        ),
+        "controlled inline SVG shared raster-owner reservation primitive",
+    )
+    if window_source.count("fn reserve_controlled_v2_raster_owner(") != 1:
+        raise ReleaseError("controlled inline SVG must define one raster-owner reservation gate")
+    if window_source.count("owner.release_controlled_reservation()") != 2:
+        raise ReleaseError(
+            "controlled inline SVG must release every raster-owner reservation on both downgrades"
+        )
+    pending_state_start = layout_source.find("pub enum PendingImageState {")
+    pending_state_end = layout_source.find("pub struct PendingImage {", pending_state_start)
+    if pending_state_start < 0 or pending_state_end < 0:
+        raise ReleaseError("cannot locate exact pending-image state surface")
+    require_source_fragments_in_order(
+        layout_source[pending_state_start:pending_state_end],
+        (
+            "Unrequested(ServoUrl)",
+            "exact cache key",
+            "without starting a",
+            "second producer",
+            "PendingResponse(ServoUrl)",
+        ),
+        "pending inline SVG exact cache-key URL retention",
+    )
+    pending_layout_result_start = layout_context_source.find("ImageCacheResult::Pending(id) => {")
+    pending_layout_result_end = layout_context_source.find(
+        "ImageCacheResult::ReadyForRequest",
+        pending_layout_result_start,
+    )
+    if pending_layout_result_start < 0 or pending_layout_result_end < 0:
+        raise ReleaseError("cannot locate pending image layout handoff")
+    require_source_fragments_in_order(
+        layout_context_source[pending_layout_result_start:pending_layout_result_end],
+        (
+            "ImageCacheResult::Pending(id) => {",
+            "PendingImageState::PendingResponse(url)",
+            "is_internal_request",
+        ),
+        "pending inline SVG exact URL layout handoff",
+    )
+
     url_gate_start = svg_source.find("fn is_bounded_data_svg_url(")
     element_start = svg_source.find("#[dom_struct]", url_gate_start)
     if url_gate_start < 0 or element_start < 0:
@@ -3070,6 +3276,50 @@ def verify_controlled_inline_svg_rendering_source(
         "controlled inline SVG generation invalidation",
     )
 
+    retained_join_gate_start = window_source.find("fn controlled_v2_retained_inline_svg_join_is_exact(")
+    retained_join_gate_end = window_source.find(
+        "enum ControlledV2InlineSvgRequestAction",
+        retained_join_gate_start,
+    )
+    action_gate_end = window_source.find("struct ControlledImageReservation", retained_join_gate_end)
+    if min(retained_join_gate_start, retained_join_gate_end, action_gate_end) < 0:
+        raise ReleaseError("cannot locate controlled inline SVG retained-producer join gates")
+    retained_join_gate = window_source[retained_join_gate_start:retained_join_gate_end]
+    require_source_fragments_in_order(
+        retained_join_gate,
+        (
+            "is_internal_request == InternalRequest::Yes",
+            "has_controlled_layout_record",
+            "!has_baseline_retained_work",
+            "!callback_facts.is_empty()",
+            ".all(|(provenance, producer_key)|",
+            "*provenance == PendingImageProvenance::ControlledV2Fenced",
+            "producer_key.is_some_and(|retained_url| retained_url == candidate_url)",
+        ),
+        "controlled inline SVG retained-producer exact key and uniform provenance gate",
+    )
+    action_gate = window_source[retained_join_gate_end:action_gate_end]
+    require_source_fragments_in_order(
+        action_gate,
+        (
+            "enum ControlledV2InlineSvgRequestAction",
+            "StartProducer",
+            "JoinRetainedProducer",
+            "Reject",
+            "fn controlled_v2_inline_svg_request_action(",
+            "is_unrequested: bool",
+            "needs_listener: bool",
+            "initial_request_is_exact: bool",
+            "retained_join_is_exact: bool",
+            "if !needs_listener && retained_join_is_exact",
+            "ControlledV2InlineSvgRequestAction::JoinRetainedProducer",
+            "is_unrequested && needs_listener && initial_request_is_exact",
+            "ControlledV2InlineSvgRequestAction::StartProducer",
+            "ControlledV2InlineSvgRequestAction::Reject",
+        ),
+        "controlled inline SVG retained-producer state-independent action gate",
+    )
+
     admission_start = window_source.find("fn image_id_has_explicitly_unsupported_retained_work(")
     baseline_admission_start = window_source.find("fn image_id_has_baseline_retained_work(", admission_start)
     inline_svg_decode_start = window_source.find("fn admits_controlled_v2_inline_svg_decode(", baseline_admission_start)
@@ -3123,6 +3373,23 @@ def verify_controlled_inline_svg_rendering_source(
             "std::ptr::eq(self, node.owner_document().window())",
             "node.downcast::<SVGSVGElement>()",
             "svg.admits_controlled_v2_serialized_data_url(url, is_internal_request)",
+            "fn admits_controlled_v2_retained_inline_svg_join(",
+            "self.admits_controlled_v2_inline_svg_decode(node, url, is_internal_request)",
+            "pending_image_callbacks",
+            ".get(&id)",
+            "callback.provenance",
+            "callback.controlled_v2_producer_key.as_ref()",
+            ".collect::<Vec<_>>()",
+            "pending_layout_images",
+            "let has_controlled_layout_record = layout_images",
+            ".get(&id)",
+            "owners.iter().any(|owner|",
+            "owner.provenance ==",
+            "PendingImageProvenance::ControlledV2Fenced",
+            "controlled_v2_retained_inline_svg_join_is_exact(",
+            "&callback_facts",
+            "has_controlled_layout_record",
+            "self.image_id_has_baseline_retained_work(id)",
             "fn admits_controlled_v2_inline_svg_raster(",
             "std::ptr::eq(self, node.owner_document().window())",
             "svg.controlled_v2_cached_serialized_data_url()",
@@ -3140,7 +3407,7 @@ def verify_controlled_inline_svg_rendering_source(
     if post_reflow_start < 0 or post_reflow_end < 0:
         raise ReleaseError("cannot locate controlled inline SVG post-reflow ownership")
     post_reflow = window_source[post_reflow_start:post_reflow_end]
-    controlled_decode_start = post_reflow.find("let mut controlled_inline_svg_fetches_started = HashSet::new()")
+    controlled_decode_start = post_reflow.find("for image in pending_images {")
     baseline_decode_start = post_reflow.find(
         "// Preserve the predecessor fetch-before-listener ordering",
         controlled_decode_start,
@@ -3161,28 +3428,52 @@ def verify_controlled_inline_svg_rendering_source(
     require_source_fragments_in_order(
         controlled_decode,
         (
-            "controlled_inline_svg_fetches_started = HashSet::new()",
-            "let controlled_transport_is_exact = if needs_listener",
-            "!self.pending_image_callbacks.borrow().contains_key(&id)",
-            "controlled_inline_svg_fetches_started.contains(&id)",
+            "let is_new_owner = !self",
+            "let needs_listener = !self.pending_layout_images.borrow().contains_key(&id)",
+            "PendingImageState::Unrequested(url) => (url, Some(url))",
+            "PendingImageState::PendingResponse(url) => (url, None)",
+            "let initial_request_is_exact = unrequested_url.is_some_and",
             "self.admits_controlled_v2_inline_svg_decode(",
             "!self.image_id_has_baseline_retained_work(id)",
+            "!self.pending_image_callbacks.borrow().contains_key(&id)",
+            "let retained_join_is_exact = !needs_listener",
+            "self.admits_controlled_v2_retained_inline_svg_join(",
+            "candidate_url",
+            "controlled_v2_inline_svg_request_action(",
+            "unrequested_url.is_some()",
+            "initial_request_is_exact",
+            "retained_join_is_exact",
+            "if controlled_inline_svg_action != ControlledV2InlineSvgRequestAction::Reject",
             "let Some(svg) = node.downcast::<SVGSVGElement>()",
+            "let controlled_layout_reservation = if is_new_owner",
+            "self.reserve_controlled_v2_layout_owner()",
+            "Some(reservation)",
             "self.retained_image_provenance(id, &node)",
             ".retain_controlled_v2_cached_vector_identity(id, &node)",
+            "let sender = match controlled_inline_svg_action",
+            "ControlledV2InlineSvgRequestAction::StartProducer",
             "self.register_controlled_v2_image_cache_listener(",
+            "candidate_url.clone()",
             "self.release_controlled_v2_cached_vector_identity(id, &node)",
+            "ControlledV2InlineSvgRequestAction::JoinRetainedProducer => None",
+            "if is_new_owner {",
             "PendingImageProvenance::ControlledV2Fenced",
+            "_controlled_reservation: controlled_layout_reservation",
             "svg.record_controlled_v2_cached_vector_id(id)",
+            "if let Some(sender) = sender",
+            "let Some(url) = unrequested_url else",
             "image_cache.add_listener(ImageLoadListener::new(sender, pipeline_id, id))",
             "fetch_image_for_layout(",
-            "controlled_inline_svg_fetches_started.insert(id)",
             "continue;",
         ),
-        "controlled inline SVG identity/listener/fetch ordering",
+        "controlled inline SVG retained-producer action and identity/listener/fetch ordering",
     )
     if controlled_decode.count("fetch_image_for_layout(") != 1:
         raise ReleaseError("controlled inline SVG decode must start exactly one fetch after fenced admission")
+    if controlled_decode.count("self.register_controlled_v2_image_cache_listener(") != 1:
+        raise ReleaseError("controlled inline SVG decode must install exactly one fenced listener")
+    if controlled_decode.count("image_cache.add_listener(") != 1:
+        raise ReleaseError("controlled inline SVG decode must attach exactly one fenced cache listener")
     if any(
         event_fragment in controlled_decode for event_fragment in ("Event::new(", "fire_image_event(", 'atom!("load")')
     ):
@@ -3213,13 +3504,31 @@ def verify_controlled_inline_svg_rendering_source(
             "provenance = PendingImageProvenance::ControlledV2Fenced",
             "svg.record_controlled_v2_cached_vector_id(image.id)",
             "self.downgrade_cached_vector_identity_to_baseline(image.id)",
+            "let is_new_raster_owner = !self",
+            "entry.nodes.iter().any(|owner| *owner.node == *node)",
+            "let controlled_raster_owner_reservation = if is_new_raster_owner",
+            'expect("controlled raster image owner requires a producer fence")',
+            "reserve_controlled_v2_raster_owner(",
+            "self.controlled_image_retained_record_count.clone()",
+            "&producer_fence",
+            "svg.release_controlled_v2_cached_vector_id(image.id)",
             "self.new_image_rasterization_entry(provenance)",
             "svg.release_controlled_v2_cached_vector_id(image.id)",
             ".insert(key, entry)",
             "image_cache.add_rasterization_complete_listener(",
+            "if is_new_raster_owner",
+            "entry.nodes.push(PendingImageRasterizationOwner::new(",
+            "Dom::from_ref(&*node)",
+            "controlled_raster_owner_reservation",
         ),
         "controlled inline SVG synchronous cache-hit raster ownership",
     )
+    if raster.count("let is_new_raster_owner =") != 1:
+        raise ReleaseError("controlled inline SVG raster path must classify one new-owner gate")
+    if raster.count("reserve_controlled_v2_raster_owner(") != 1:
+        raise ReleaseError("controlled inline SVG raster path must reserve each new controlled owner")
+    if raster.count("controlled_raster_owner_reservation,") != 1:
+        raise ReleaseError("controlled inline SVG raster path must retain the exact owner reservation")
 
     require_source_fragments_in_order(
         svg_source,
@@ -3234,9 +3543,47 @@ def verify_controlled_inline_svg_rendering_source(
         "controlled inline SVG native rejection unit proof",
     )
     require_source_fragments_in_order(
+        window_source,
+        (
+            "fn retained_inline_svg_producer_key_admits_after_owner_identity_release()",
+            "Some(&candidate)",
+            "controlled_v2_retained_inline_svg_join_is_exact(",
+            "InternalRequest::Yes",
+            "&callbacks",
+            "fn retained_inline_svg_join_rejects_missing_wrong_or_mixed_producer_authority()",
+            "let wrong =",
+            "let missing_key =",
+            "let mixed =",
+            "InternalRequest::No",
+            "&[]",
+            "&missing_key",
+            "&wrong",
+            "&mixed",
+            "fn exact_retained_inline_svg_join_handles_both_cache_states_without_a_second_producer()",
+            "controlled_v2_inline_svg_request_action(true, false, false, true)",
+            "ControlledV2InlineSvgRequestAction::JoinRetainedProducer",
+            "controlled_v2_inline_svg_request_action(false, false, false, true)",
+            "ControlledV2InlineSvgRequestAction::JoinRetainedProducer",
+            "controlled_v2_inline_svg_request_action(true, true, true, false)",
+            "ControlledV2InlineSvgRequestAction::StartProducer",
+            "ControlledV2InlineSvgRequestAction::Reject",
+            "fn coalesced_controlled_layout_owners_are_one_logical_work_item()",
+            "&[(1, PendingImageProvenance::ControlledV2Fenced); 12]",
+            "assert_eq!(observation.retained_callback_ids, 1)",
+            "assert_eq!(observation.retained_layout_image_ids, 1)",
+            "assert_eq!(observation.retained_unique_image_ids, 1)",
+            "assert_eq!(observation.controlled_work_items, Some(1))",
+            "assert_eq!(observation.unsupported_work_items, Some(0))",
+            "assert!(observation.controlled_retained_record_inventory_matches)",
+        ),
+        "controlled inline SVG retained-producer gates and accounting unit proof",
+    )
+    require_source_fragments_in_order(
         protocol_source,
         (
             'include_bytes!("fixtures/controlled_v2_inline_svg.html")',
+            'include_bytes!("fixtures/controlled_v2_inline_svg_shared_pending.html")',
+            'include_bytes!("fixtures/controlled_v2_inline_svg_incremental_same_task.html")',
             'include_bytes!("fixtures/controlled_v2_inline_svg_advanced.html")',
             "fn controlled_session_v2_direct_data_svg_is_owned_without_v1_promotion()",
             '"controlled-web-session-v2"',
@@ -3250,6 +3597,23 @@ def verify_controlled_inline_svg_rendering_source(
             "CONTROLLED_V2_INLINE_SVG_FIXTURE",
             "ControlledImageProfileExpectation::PredecessorMayQuiesce(",
             '"inline-svg:4x3|events:0|now:0"',
+            "fn controlled_session_v2_coalesces_exact_pending_inline_svg_owners_without_v1_promotion()",
+            '"inline-svg-shared-pending-v2"',
+            "CONTROLLED_V2_INLINE_SVG_SHARED_PENDING_FIXTURE",
+            'ControlledImageProfileExpectation::Owned("shared-inline-svg:12|now:0")',
+            '"inline-svg-shared-pending-v1"',
+            "CONTROLLED_V2_INLINE_SVG_SHARED_PENDING_FIXTURE",
+            "ControlledImageProfileExpectation::PredecessorMayQuiesce(",
+            '"shared-inline-svg:12|now:0"',
+            "fn controlled_session_v2_handles_incremental_same_task_inline_svg_clone()",
+            '"inline-svg-incremental-same-task-v2"',
+            "CONTROLLED_V2_INLINE_SVG_INCREMENTAL_FIXTURE",
+            "ControlledImageProfileExpectation::Owned(",
+            '"incremental-inline-svg:2|first:4x3|second:4x3|now:0"',
+            '"inline-svg-incremental-same-task-v1"',
+            "CONTROLLED_V2_INLINE_SVG_INCREMENTAL_FIXTURE",
+            "ControlledImageProfileExpectation::PredecessorMayQuiesce(",
+            '"incremental-inline-svg:2|first:4x3|second:4x3|now:0"',
             "fn controlled_session_v2_inline_svg_raster_completes_after_advanced_document_time()",
             "fn exercise_controlled_inline_svg_advanced()",
             '"5000000"',
@@ -3293,6 +3657,41 @@ def verify_controlled_inline_svg_rendering_source(
         "controlled inline SVG zero-event fixture",
     )
     require_source_fragments_in_order(
+        shared_pending_fixture_source,
+        (
+            '<main id="icons">',
+            'document.querySelectorAll("svg.shared")',
+            "for (const icon of icons) icon.getBoundingClientRect()",
+            "`shared-inline-svg:${icons.length}|now:${performance.now()}`",
+        ),
+        "controlled inline SVG shared-pending fixture",
+    )
+    shared_svg = (
+        '<svg class="shared" width="4" height="3" viewBox="0 0 4 3" '
+        'xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>'
+    )
+    if shared_pending_fixture_source.count(shared_svg) != 12:
+        raise ReleaseError("controlled inline SVG shared-pending fixture must retain exactly twelve identical roots")
+    require_source_fragments_in_order(
+        incremental_same_task_fixture_source,
+        (
+            'const first = icons.firstElementChild',
+            "const firstRect = first.getBoundingClientRect()",
+            "const second = first.cloneNode(true)",
+            "icons.append(second)",
+            "const secondRect = second.getBoundingClientRect()",
+            "`incremental-inline-svg:${icons.children.length}`",
+            "`first:${firstRect.width}x${firstRect.height}`",
+            "`second:${secondRect.width}x${secondRect.height}`",
+            "`now:${performance.now()}`",
+        ),
+        "controlled inline SVG incremental same-task owner fixture",
+    )
+    if incremental_same_task_fixture_source.count("<svg ") != 1:
+        raise ReleaseError(
+            "controlled inline SVG incremental fixture must begin with exactly one SVG root"
+        )
+    require_source_fragments_in_order(
         advanced_fixture_source,
         (
             'document.querySelector("#start").onclick',
@@ -3306,6 +3705,87 @@ def verify_controlled_inline_svg_rendering_source(
         ),
         "controlled inline SVG advanced clock and no-event fixture",
     )
+
+
+def verify_controlled_settlement_url_fixture_source(source: str) -> None:
+    require_source_fragments_in_order(
+        source,
+        (
+            'history.replaceState(',
+            '{ phase: "initial" }',
+            '"/settlement-url/replaced?proof=initial#attested"',
+            'document.querySelector("#push").addEventListener("click"',
+            'history.pushState(',
+            '{ phase: "pushed" }',
+            '"/settlement-url/pushed?proof=history#attested"',
+            'document.querySelector("#result").textContent = "pushed"',
+            'document.querySelector("#replace").addEventListener("click"',
+            'history.replaceState(',
+            '{ phase: "final" }',
+            '"/settlement-url/final?proof=replacement#attested"',
+            'document.querySelector("#result").textContent = "replaced"',
+        ),
+        "controlled settlement URL same-document fixture",
+    )
+    if source.count("history.replaceState(") != 2 or source.count("history.pushState(") != 1:
+        raise ReleaseError(
+            "controlled settlement URL fixture must retain exactly two replacements and one history push"
+        )
+
+
+def verify_controlled_interval_before_finite_source(
+    protocol_source: str,
+    fixture_source: str,
+) -> None:
+    require_source_fragments_in_order(
+        protocol_source,
+        (
+            'include_bytes!("fixtures/controlled_v2_interval_before_finite.html")',
+            "fn controlled_session_v2_implicit_report_advances_intervals_only_until_finite_work_drains()",
+            'pending["result"]["virtualTimeNs"], "12000000000"',
+            'pending["result"]["timers"]["persistent"], "1"',
+            'pending["result"]["timers"]["futureFinite"], "0"',
+            '"persistentWork": "strict"',
+            'strict["result"]["outcome"], "blocked_on_open_ended_work"',
+            'strict["result"]["virtualTimeNs"], "12000000000"',
+            '"persistentWork": "report"',
+            'reported["result"]["outcome"], "quiescent_with_persistent_work"',
+            'reported["result"]["virtualTimeNs"], "12000000000"',
+            'reported["result"]["snapshot"]["timers"]["persistent"], "1"',
+            'reported["result"]["snapshot"]["timers"]["futureFinite"], "0"',
+            'entry["requestedPeriodNs"] == "5000000000"',
+            '"interval:1@5000|interval:2@10000|finite@12000"',
+            "fn controlled_session_v1_open_stops_typed_at_interval_head_before_later_finite_work()",
+            '"profile": "controlled-web-session-v1"',
+            'opened["error"]["code"], "blocked_on_open_ended_work"',
+            'opened["error"]["fatal"], true',
+            'opened["error"]["details"]["persistentWork"], "1"',
+            "status.code()",
+            "Some(70)",
+        ),
+        "controlled v2 implicit-report and frozen-v1 persistent interval protocol proofs",
+    )
+    require_source_fragments_in_order(
+        fixture_source,
+        (
+            "window.__stasisPersistentInterval = setInterval(() => {",
+            "intervalCount += 1",
+            "trace.push(`interval:${intervalCount}@${performance.now()}`)",
+            "}, 5_000)",
+            "setTimeout(() => {",
+            "trace.push(`finite@${performance.now()}`)",
+            "}, 12_000)",
+        ),
+        "controlled v2 interval-before-finite fixture",
+    )
+    if fixture_source.count("setInterval(") != 1 or fixture_source.count("setTimeout(") != 1:
+        raise ReleaseError(
+            "controlled v2 interval-before-finite fixture must retain one interval and one timeout"
+        )
+    if "clearInterval(" in fixture_source:
+        raise ReleaseError(
+            "controlled v2 interval-before-finite fixture must retain its persistent interval"
+        )
 
 
 def rust_usize_constant(source: str, name: str, description: str) -> int:
@@ -3404,6 +3884,241 @@ def credential_free_v2_automation_verifier_block(source: str, description: str) 
     return block
 
 
+def credential_free_v2_css_verifier_block(source: str, description: str) -> str:
+    start = 'css_record = document.get("v2CssAnimationEventTimestamps")'
+    if source.count(start) != 1:
+        raise ReleaseError(f"{description} does not contain one v2 CSS verifier block")
+    start_index = source.index(start)
+    end_index = source.find("\n\n          def ", start_index)
+    if end_index < 0:
+        raise ReleaseError(f"{description} does not terminate its v2 CSS verifier block")
+    block = source[start_index:end_index]
+    require_public_surface_markers(
+        block,
+        description,
+        (
+            '"postReflowOutcome": "quiescent"',
+            '"postReflowVirtualTimeNs": "70000000"',
+            '"postReflowTrace": "armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70"',
+            '"postReflowEventCount": "2"',
+            '"postReflowEventKinds": "animationcancel,animationstart"',
+            '"postReflowRuntimeFailures": "0"',
+            '"postReflowUnsupportedWork": "0"',
+            '"postReflowExternalIo": "0"',
+            '"postReflowPendingAnimationEvents": "0"',
+            '"postReflowNextOpportunityNs": "none"',
+            '"postReflowStateTokenPreserved": True',
+            '"postReflowOwnedQueueDrain": True',
+            '"postReflowProcessedRenderingOpportunities"',
+            're.fullmatch(r"[1-9][0-9]*", post_reflow_rendering_opportunities)',
+        ),
+    )
+    return block
+
+
+def credential_free_v2_fixture_verifier_block(source: str, description: str) -> str:
+    start = "def require_exact_v2_fixture_proofs(document, context):"
+    end = 'automation_record = document.get("v2AutomationEventTimestamps")'
+    if source.count(start) != 1 or source.count(end) != 1:
+        raise ReleaseError(f"{description} does not contain one v2 fixture verifier block")
+    start_index = source.index(start)
+    end_index = source.index(end, start_index)
+    block = source[start_index:end_index]
+    require_public_surface_markers(
+        block,
+        description,
+        (
+            '"sharedNavigationBoundary": "controlled_ready"',
+            '"sharedOutcome": "quiescent"',
+            '"sharedProducerPending": "0"',
+            '"sharedProducerTerminal": False',
+            '"sharedPendingImages": "0"',
+            '"sharedRuntimeFailures": "0"',
+            '"sharedUnsupportedWork": "0"',
+            '"sharedExternalIo": "0"',
+            '"sharedFixtureTrace": "shared-inline-svg:12|now:0"',
+            '"sharedEvidenceProfile": "controlled-web-session-v2"',
+            '"v2SettlementUrl": {',
+            '"initialOutcome": "quiescent"',
+            '"settlement-url/replaced?proof=initial#attested"',
+            '"historyOutcome": "quiescent"',
+            '"settlement-url/pushed?proof=history#attested"',
+            '"replacementOutcome": "quiescent"',
+            '"settlement-url/final?proof=replacement#attested"',
+            '"replacementTrace": "replaced"',
+            '"sessionUrlStayedAtControlledOpen": True',
+            '"sessionEvidenceExcludesUrl": True',
+            '"standaloneEvidenceExcludesUrl": True',
+            '"unsupportedOutcome": "unsupported_work"',
+            '"unsupportedFailureCode": "unsupported_clock_surface"',
+            '"unsupportedUrl": (',
+            '"v2PersistentIntervalProgression": {',
+            '"implicitVirtualTimeNs": "12000000000"',
+            '"implicitPersistentTimers": "1"',
+            '"implicitFutureFinite": "0"',
+            '"implicitTrace": "interval:1@5000|interval:2@10000|finite@12000"',
+            '"strictOutcome": "blocked_on_open_ended_work"',
+            '"strictVirtualTimeNs": "12000000000"',
+            '"strictTrace": "interval:1@5000|interval:2@10000|finite@12000"',
+            '"reportOutcome": "quiescent_with_persistent_work"',
+            '"reportVirtualTimeNs": "12000000000"',
+            '"reportTrace": "interval:1@5000|interval:2@10000|finite@12000"',
+            '"persistentTimers": "1"',
+            '"futureFinite": "0"',
+            '"persistentKind": "timer"',
+            '"persistentReason": "interval"',
+            '"persistentCount": "1"',
+            '"requestedPeriodNs": "5000000000"',
+            '"runtimeFailures": "0"',
+            '"unsupportedWork": "0"',
+            '"externalIo": "0"',
+            '"evidenceProfile": "controlled-web-session-v2"',
+        ),
+    )
+    return block
+
+
+def verify_registry_sdk_durable_v2_fixture_source(source: str) -> None:
+    require_source_fragments_in_order(
+        source,
+        (
+            '"session-v2-inline-svg-shared-pending-fixture": { type: "string" }',
+            'values["session-v2-inline-svg-shared-pending-fixture"]',
+            '"--session-v2-inline-svg-shared-pending-fixture must be a regular file"',
+            '"https://packed-sdk-inline-svg-shared-pending-v2.example.test/"',
+            'body: { utf8: sessionV2InlineSvgSharedPendingFixtureBody }',
+            'const v2InlineSvgSharedPendingNavigation = await v2Session.navigate(',
+            'assert.equal(v2InlineSvgSharedPendingSettled.outcome, "quiescent")',
+            'assert.equal(v2InlineSvgSharedPendingSettled.snapshot.producers.pending, 0n)',
+            'assert.equal(v2InlineSvgSharedPendingSettled.snapshot.rendering.pendingImages, 0n)',
+            '"shared-inline-svg:12|now:0"',
+            'v2InlineSvgSharedPendingEvidence.profile',
+            'sharedFixtureTrace: v2InlineSvgSharedPendingTraceResult.value',
+            'v2InlineSvgRendering,',
+        ),
+        "packed SDK shared-pending inline SVG verifier",
+    )
+    require_source_fragments_in_order(
+        source,
+        (
+            '"session-v2-settlement-url-fixture": { type: "string" }',
+            'values["session-v2-settlement-url-fixture"]',
+            '"--session-v2-settlement-url-fixture must be a regular file"',
+            '"https://packed-sdk-settlement-url-v2.example.test/settlement-url/start?proof=open"',
+            '"https://packed-sdk-settlement-url-v2.example.test/settlement-url/replaced?proof=initial#attested"',
+            '"https://packed-sdk-settlement-url-v2.example.test/settlement-url/pushed?proof=history#attested"',
+            '"https://packed-sdk-settlement-url-v2.example.test/settlement-url/final?proof=replacement#attested"',
+            'body: { utf8: sessionV2SettlementUrlFixtureBody }',
+            'const v2SettlementUrlNavigation = await v2Session.navigate(',
+            'assert.equal(v2SettlementInitial.url, v2SettlementInitialUrl)',
+            'Object.hasOwn(v2SettlementInitialSessionEvidence, "url")',
+            'assert.equal(v2SettlementHistory.url, v2SettlementHistoryUrl)',
+            'Object.hasOwn(v2Session.settlementEvidence(v2SettlementHistory), "url")',
+            'assert.equal(v2SettlementReplacement.url, v2SettlementReplacementUrl)',
+            'Object.hasOwn(v2SettlementReplacementEvidence, "url")',
+            'assert.equal(v2AutomationRejected.outcome, "unsupported_work")',
+            'assert.equal(v2AutomationRejected.url, v2AutomationEventFixtureUrl)',
+            'Object.hasOwn(v2AutomationEvidence, "url")',
+            'v2SettlementUrl = {',
+            'sessionUrlStayedAtControlledOpen: v2Session.url === v2FixtureUrl',
+            'unsupportedUrl: v2AutomationRejected.url',
+            'v2SettlementUrl,',
+        ),
+        "packed SDK settlement URL verifier",
+    )
+    require_source_fragments_in_order(
+        source,
+        (
+            '"session-v2-interval-before-finite-fixture": { type: "string" }',
+            'values["session-v2-interval-before-finite-fixture"]',
+            '"--session-v2-interval-before-finite-fixture must be a regular file"',
+            '"https://packed-sdk-interval-before-finite-v2.example.test/"',
+            'body: { utf8: sessionV2IntervalBeforeFiniteFixtureBody }',
+            'const v2PersistentIntervalNavigation = await v2Session.navigate(',
+            'const v2PersistentIntervalImplicitPending = await v2Session.pending(',
+            'assert.equal(v2PersistentIntervalImplicitPending.virtualTimeNs, 12_000_000_000n)',
+            'assert.equal(v2PersistentIntervalImplicitPending.timers.persistent, 1n)',
+            'assert.equal(v2PersistentIntervalImplicitPending.timers.futureFinite, 0n)',
+            '"interval:1@5000|interval:2@10000|finite@12000"',
+            '{ persistentWork: "strict" }',
+            'assert.equal(v2PersistentIntervalStrict.outcome, "blocked_on_open_ended_work")',
+            'assert.equal(v2PersistentIntervalStrict.virtualTimeNs, 12_000_000_000n)',
+            '"strict classification executed another interval callback"',
+            '{ persistentWork: "report" }',
+            'assert.equal(v2PersistentIntervalReported.outcome, "quiescent_with_persistent_work")',
+            'assert.equal(v2PersistentIntervalReported.snapshot.timers.futureFinite, 0n)',
+            'assert.equal(v2PersistentIntervalWork.requestedPeriodNs, 5_000_000_000n)',
+            '"report-mode checkpoint executed another interval callback"',
+            'v2PersistentIntervalEvidence.profile',
+            'v2PersistentIntervalProgression = {',
+            'implicitTrace: v2PersistentIntervalImplicitTrace.value',
+            'strictTrace: v2PersistentIntervalStrictTrace.value',
+            'reportTrace: v2PersistentIntervalReportTrace.value',
+            'requestedPeriodNs: String(v2PersistentIntervalWork.requestedPeriodNs)',
+            'v2PersistentIntervalProgression,',
+        ),
+        "packed SDK bounded persistent interval verifier",
+    )
+    require_source_fragments_in_order(
+        source,
+        (
+            'const v2CssPostReflowStarted = await v2CssSession.activate(',
+            '"#post-reflow"',
+            "const v2CssPostReflowSettled = await v2CssSession.settle(",
+            'assert.equal(v2CssPostReflowSettled.outcome, "quiescent")',
+            "assert.equal(v2CssPostReflowSettled.virtualTimeNs, 70_000_000n)",
+            "v2CssPostReflowSettled.snapshot.rendering.pendingAnimationEvents, 0n",
+            "v2CssPostReflowSettled.snapshot.rendering.nextOpportunityNs, null",
+            "const v2CssPostReflowPending = await v2CssSession.pending(",
+            "v2CssPostReflowPending.rendering.pendingAnimationEvents, 0n",
+            "v2CssPostReflowPending.rendering.nextOpportunityNs, null",
+            "v2CssPostReflowPending.stateToken",
+            "v2CssPostReflowSettled.stateToken",
+            '"#post-reflow-result"',
+            '"armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70"',
+            'postReflowTrace: v2CssPostReflowTraceResult.value',
+            'postReflowPendingAnimationEvents: String(',
+            'postReflowNextOpportunityNs:',
+            'postReflowProcessedRenderingOpportunities: String(',
+            'postReflowStateTokenPreserved:',
+            'postReflowOwnedQueueDrain: true',
+        ),
+        "packed SDK post-reflow CSS animation-event queue-drain verifier",
+    )
+
+
+def verify_registry_sdk_durable_v2_fixture_invocations(
+    source: str,
+    description: str,
+    expected_count: int,
+) -> None:
+    invocation_pattern = re.compile(
+        r'(?m)^[ \t]+(?:"\$\{gate_runner\[@\]\}" )?'
+        r'node etc/ci/stasis/verify_registry_sdk\.mjs \\\r?\n'
+        r'(?P<arguments>(?:[ \t]+--[^\r\n]*(?:\r?\n|$))+)',
+    )
+    argument_blocks = [match.group("arguments") for match in invocation_pattern.finditer(source)]
+    if len(argument_blocks) != expected_count:
+        raise ReleaseError(
+            f"{description} must contain exactly {expected_count} packed SDK verifier invocations"
+        )
+    required_arguments = (
+        "--session-v2-inline-svg-shared-pending-fixture "
+        "ports/stasis/tests/fixtures/controlled_v2_inline_svg_shared_pending.html",
+        "--session-v2-settlement-url-fixture "
+        "ports/stasis/tests/fixtures/controlled_v2_settlement_url.html",
+        "--session-v2-interval-before-finite-fixture "
+        "ports/stasis/tests/fixtures/controlled_v2_interval_before_finite.html",
+    )
+    for index, argument_block in enumerate(argument_blocks, start=1):
+        for argument in required_arguments:
+            if argument_block.count(argument) != 1:
+                raise ReleaseError(
+                    f"{description} packed SDK verifier invocation {index} must carry "
+                    f"exactly one {argument!r} argument"
+                )
+
+
 def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     profile_filename = source_root / CANDIDATE_V2_PROFILE
     contract_filename = source_root / CANDIDATE_V2_CONTRACT
@@ -3414,6 +4129,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     public_release_runbook_filename = source_root / PUBLIC_RELEASE_RUNBOOK
     public_release_workflow_filename = source_root / PUBLIC_RELEASE_WORKFLOW
     public_npm_publish_workflow_filename = source_root / PUBLIC_NPM_PUBLISH_WORKFLOW
+    registry_sdk_verifier_filename = source_root / REGISTRY_SDK_VERIFIER_SOURCE
     message_limits_filename = source_root / MESSAGE_CHANNEL_LIMITS_SOURCE
     message_baseline_test_filename = source_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
     message_multi_pair_fixture_filename = source_root / MESSAGE_CHANNEL_MULTI_PAIR_FIXTURE
@@ -3449,8 +4165,18 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     controlled_http_image_fixture_filename = source_root / CONTROLLED_HTTP_IMAGE_FIXTURE
     controlled_http_image_multipart_fixture_filename = source_root / CONTROLLED_HTTP_IMAGE_MULTIPART_FIXTURE
     controlled_inline_svg_filename = source_root / CONTROLLED_INLINE_SVG_SOURCE
+    controlled_inline_svg_layout_filename = source_root / CONTROLLED_INLINE_SVG_LAYOUT_SOURCE
+    controlled_inline_svg_layout_context_filename = source_root / CONTROLLED_INLINE_SVG_LAYOUT_CONTEXT_SOURCE
     controlled_inline_svg_fixture_filename = source_root / CONTROLLED_INLINE_SVG_FIXTURE
+    controlled_inline_svg_shared_pending_fixture_filename = source_root / CONTROLLED_INLINE_SVG_SHARED_PENDING_FIXTURE
+    controlled_inline_svg_incremental_same_task_fixture_filename = (
+        source_root / CONTROLLED_INLINE_SVG_INCREMENTAL_SAME_TASK_FIXTURE
+    )
     controlled_inline_svg_advanced_fixture_filename = source_root / CONTROLLED_INLINE_SVG_ADVANCED_FIXTURE
+    controlled_settlement_url_fixture_filename = source_root / CONTROLLED_SETTLEMENT_URL_FIXTURE
+    controlled_interval_before_finite_fixture_filename = (
+        source_root / CONTROLLED_INTERVAL_BEFORE_FINITE_FIXTURE
+    )
     execution_limits_filename = source_root / EXECUTION_LIMITS_SOURCE
     require_regular_file(profile_filename, "controlled-web-session-v2 candidate profile")
     require_regular_file(contract_filename, "controlled-web-session-v2 candidate contract")
@@ -3461,6 +4187,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     require_regular_file(public_release_runbook_filename, "public release runbook")
     require_regular_file(public_release_workflow_filename, "public release-note workflow")
     require_regular_file(public_npm_publish_workflow_filename, "public npm publish workflow")
+    require_regular_file(registry_sdk_verifier_filename, "packed SDK registry verifier")
     require_regular_file(message_limits_filename, "MessageChannel native limit source")
     require_regular_file(message_baseline_test_filename, "MessageChannel native baseline proof source")
     require_regular_file(message_multi_pair_fixture_filename, "MessageChannel multi-pair fixture")
@@ -3548,12 +4275,36 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     )
     require_regular_file(controlled_inline_svg_filename, "controlled inline SVG source")
     require_regular_file(
+        controlled_inline_svg_layout_filename,
+        "controlled inline SVG pending-state source",
+    )
+    require_regular_file(
+        controlled_inline_svg_layout_context_filename,
+        "controlled inline SVG pending-state handoff source",
+    )
+    require_regular_file(
         controlled_inline_svg_fixture_filename,
         "controlled inline SVG protocol fixture",
     )
     require_regular_file(
+        controlled_inline_svg_shared_pending_fixture_filename,
+        "controlled inline SVG shared-pending protocol fixture",
+    )
+    require_regular_file(
+        controlled_inline_svg_incremental_same_task_fixture_filename,
+        "controlled inline SVG incremental same-task protocol fixture",
+    )
+    require_regular_file(
         controlled_inline_svg_advanced_fixture_filename,
         "controlled inline SVG advanced protocol fixture",
+    )
+    require_regular_file(
+        controlled_settlement_url_fixture_filename,
+        "controlled settlement URL protocol fixture",
+    )
+    require_regular_file(
+        controlled_interval_before_finite_fixture_filename,
+        "controlled interval-before-finite protocol fixture",
     )
     require_regular_file(execution_limits_filename, "controlled execution-limit source")
     if contract_filename.stat().st_size <= 0 or contract_filename.stat().st_size > MAX_TEXT_MEMBER_BYTES:
@@ -3568,6 +4319,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         public_release_runbook = public_release_runbook_filename.read_text(encoding="utf-8")
         public_release_workflow = public_release_workflow_filename.read_text(encoding="utf-8")
         public_npm_publish_workflow = public_npm_publish_workflow_filename.read_text(encoding="utf-8")
+        registry_sdk_verifier_source = registry_sdk_verifier_filename.read_text(encoding="utf-8")
         message_limits_source = message_limits_filename.read_text(encoding="utf-8")
         message_baseline_test_source = message_baseline_test_filename.read_text(encoding="utf-8")
         message_multi_pair_fixture_source = message_multi_pair_fixture_filename.read_text(encoding="utf-8")
@@ -3619,9 +4371,25 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             encoding="utf-8"
         )
         controlled_inline_svg_source = controlled_inline_svg_filename.read_text(encoding="utf-8")
+        controlled_inline_svg_layout_source = controlled_inline_svg_layout_filename.read_text(encoding="utf-8")
+        controlled_inline_svg_layout_context_source = controlled_inline_svg_layout_context_filename.read_text(
+            encoding="utf-8"
+        )
         controlled_inline_svg_fixture_source = controlled_inline_svg_fixture_filename.read_text(encoding="utf-8")
+        controlled_inline_svg_shared_pending_fixture_source = (
+            controlled_inline_svg_shared_pending_fixture_filename.read_text(encoding="utf-8")
+        )
+        controlled_inline_svg_incremental_same_task_fixture_source = (
+            controlled_inline_svg_incremental_same_task_fixture_filename.read_text(encoding="utf-8")
+        )
         controlled_inline_svg_advanced_fixture_source = controlled_inline_svg_advanced_fixture_filename.read_text(
             encoding="utf-8"
+        )
+        controlled_settlement_url_fixture_source = controlled_settlement_url_fixture_filename.read_text(
+            encoding="utf-8"
+        )
+        controlled_interval_before_finite_fixture_source = (
+            controlled_interval_before_finite_fixture_filename.read_text(encoding="utf-8")
         )
         execution_limits_source = execution_limits_filename.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
@@ -3643,6 +4411,10 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "controlled-web-session-v2 candidate profile",
     )
     compatibility = require_json_object(profile.get("compatibility"), "controlled-web-session-v2 compatibility")
+    session_settlement_result = require_json_object(
+        profile.get("sessionSettlementResult"),
+        "controlled-web-session-v2 session settlement result",
+    )
     session_state = require_json_object(profile.get("sessionState"), "controlled-web-session-v2 sessionState")
     session_cookies = require_json_object(session_state.get("cookies"), "controlled-web-session-v2 session cookies")
     cookie_persistence = require_json_object(
@@ -3697,6 +4469,10 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     transfer_preflight = require_json_object(
         execution.get("portBackedStructuredCloneTransferPreflight"),
         "controlled-web-session-v2 port-backed transfer preflight",
+    )
+    controlled_persistent_interval_progression = require_json_object(
+        execution.get("persistentIntervalFiniteProgression"),
+        "controlled-web-session-v2 persistent interval finite progression",
     )
     controlled_input_method = require_json_object(
         execution.get("controlledInputMethodFocus"),
@@ -3762,6 +4538,10 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         controlled_inline_svg.get("ownership"),
         "controlled-web-session-v2 inline SVG ownership",
     )
+    controlled_inline_svg_retained_join = require_json_object(
+        controlled_inline_svg_ownership.get("retainedProducerJoinAdmission"),
+        "controlled-web-session-v2 inline SVG retained-producer join admission",
+    )
     controlled_inline_svg_completion = require_json_object(
         controlled_inline_svg.get("completion"),
         "controlled-web-session-v2 inline SVG completion",
@@ -3817,11 +4597,55 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     if compatibility.get("predecessorContractUnchanged") is not True:
         raise ReleaseError("controlled-web-session-v2 predecessorContractUnchanged must remain true")
     if compatibility.get("profileExpansion") != (
-        "execution_headless_presentation_and_controlled_cookie_state_surfaces"
+        "execution_headless_presentation_controlled_cookie_state_owner_attested_settlement_url_and_bounded_persistent_interval_progression_surfaces"
     ):
         raise ReleaseError("controlled-web-session-v2 profile expansion identity changed")
     if compatibility.get("stateArtifactProfile") != ("selected_controlled_session_profile_exact"):
         raise ReleaseError("controlled-web-session-v2 state artifact selection identity changed")
+    require_exact_fields(
+        session_settlement_result,
+        {
+            "profile": "controlled-web-session-v2_only",
+            "field": "url",
+            "presence": "every_returned_runtime_settle_outcome",
+            "source": "final_passive_N1_document_pending_D_passive_N2_owner_navigation_authority",
+            "binding": "same_exact_navigation_authority_as_stateToken",
+            "meaning": "active_top_level_document_url_at_terminal_snapshot",
+            "doesNotImply": "quiescence",
+            "settlementEvidence": "excluded",
+        },
+        "controlled-web-session-v2 session settlement result",
+    )
+    require_exact_fields(
+        controlled_persistent_interval_progression,
+        {
+            "profile": "controlled-web-session-v2_only",
+            "policy": "persistentWork_report_only",
+            "precondition": "finite_owned_work_remains_and_the_exact_eligible_JavaScriptInterval_is_the_authoritative_scheduler_head",
+            "deadlineRelation": (
+                "every_observed_finite_timer_and_animated_image_deadline_is_strictly_later_an_"
+                "equal_timestamp_finite_rendering_opportunity_is_allowed_only_when_its_exact_"
+                "distinct_scheduler_entry_is_ordered_after_the_interval_head_same_entry_unowned_"
+                "and_equal_finite_timer_or_animated_image_collisions_remain_blocked_on_open_ended_work"
+            ),
+            "authority": "single_use_DocumentAdvanceToken_revalidated_against_the_complete_fresh_pending_snapshot",
+            "ordering": (
+                "advance_and_dispatch_one_exact_interval_head_then_reobserve_before_advancing_"
+                "the_exact_distinct_rendering_entry_or_any_further_work"
+            ),
+            "callbackAccounting": "ordinary_task_and_microtask_rendering_mutation_control_turn_and_virtual_time_limits_unchanged",
+            "terminal": "after_finite_work_drains_two_stable_checkpoints_return_quiescent_with_persistent_work_without_advancing_an_interval_only_head",
+            "strictPolicy": "blocked_on_open_ended_work_without_interval_progression",
+            "predecessorProfiles": "unchanged_blocked_on_open_ended_work_when_interval_owns_the_head_ahead_of_finite_work",
+            "notClaimed": [
+                "ignoring_or_clearing_intervals",
+                "wall_clock_polling_or_sleep",
+                "unbounded_interval_drain",
+                "external_or_cross_event_loop_timer_authority",
+            ],
+        },
+        "controlled-web-session-v2 persistent interval finite progression",
+    )
     require_exact_fields(
         cookie_persistence,
         {
@@ -3842,7 +4666,11 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         cookie_post_open_time_range,
         {
             "code": "unsupported_cookie_time_range",
-            "boundary": "before_network_start_and_cookie_header_construction",
+            "boundary": (
+                "may_retain_bounded_request_started_and_request_failed_evidence_but_rejects_"
+                "before_route_decided_route_selection_fixture_or_live_external_io_and_cookie_"
+                "header_construction"
+            ),
             "fatal": False,
             "stateEffect": "partial",
             "processEffect": "continue",
@@ -3864,7 +4692,11 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         cookie_unknown_or_opaque_context,
         {
             "code": "unsupported_cookie_same_site_context",
-            "boundary": "before_network_start_and_cookie_header_construction",
+            "boundary": (
+                "may_retain_bounded_request_started_and_request_failed_evidence_but_rejects_"
+                "before_route_decided_route_selection_fixture_or_live_external_io_and_cookie_"
+                "header_construction"
+            ),
         },
         "controlled-web-session-v2 opaque SameSite context boundary",
     )
@@ -3884,7 +4716,9 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         {
             "sameSiteOrTopLevelNavigation": ("all_valid_unpartitioned_response_cookies_eligible"),
             "crossSiteSubresource": (
-                "only_secure_SameSite_None_eligible_Strict_Lax_and_unspecified_ignored_without_terminal"
+                "after_successful_controlled_parsing_only_secure_SameSite_None_is_eligible_"
+                "otherwise_valid_Strict_Lax_and_unspecified_are_ignored_without_terminal_parse_"
+                "normalization_and_time_range_failures_retain_existing_typed_outcomes"
             ),
             "requestMethod": "not_an_admission_input",
         },
@@ -4070,7 +4904,10 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             ),
             "settlementScheduling": controlled_css_settlement_scheduling,
             "executionLimit": "existing_10000_rendering_opportunity_limit",
-            "representativeExecutableProof": ("instant_finite_animationstart_and_animationend_only"),
+            "representativeExecutableProof": (
+                "instant_finite_animationstart_and_animationend_plus_post_reflow_"
+                "animationstart_and_animationcancel_queue_drain"
+            ),
             "transitionSettlementCompatibility": (
                 "not_claimed_timestamp_adapter_applies_only_if_an_existing_owned_"
                 "transition_record_reaches_pending_dispatch"
@@ -4087,6 +4924,13 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     require_exact_fields(
         controlled_css_settlement_scheduling,
         {
+            "nonemptyDocumentOwnedQueue": (
+                "finite_rendering_demand_that_retains_one_later_owned_rendering_opportunity_"
+                "until_dispatch_drains_the_queue"
+            ),
+            "emptyDocumentOwnedQueue": (
+                "no_pending_CSS_animation_events_leaves_no_rendering_opportunity"
+            ),
             "scheduledPendingEventBatch": (
                 "finite_rendering_demand_advanced_to_exact_retained_scheduler_head_including_deadline_equal_to_now"
             ),
@@ -4140,12 +4984,14 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "maximumRetainedControlledOwnershipRecordsPerWindow": 512,
             "recordKinds": [
                 "pending_callback",
+                "layout_owner",
                 "exact_cache_id_DOM_owner_identity",
                 "vector_rasterization_key",
+                "vector_rasterization_owner",
             ],
             "reservationUnit": (
-                "one_record_per_controlled_pending_callback_exact_cache_id_DOM_owner_"
-                "identity_or_vector_rasterization_key"
+                "one_record_per_controlled_pending_callback_layout_owner_exact_cache_id_DOM_"
+                "owner_identity_vector_rasterization_key_or_vector_rasterization_owner"
             ),
             "overflow": ("sticky_Image_producer_admission_limit_terminal_without_baseline_fallback"),
             "decodeRequestAdmission": (
@@ -4243,7 +5089,8 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "controlledProjection": ("Image_producer_fence_not_pending_rendering_image_load"),
             "reservationReconciliation": (
                 "live_controlled_records_equal_retained_controlled_callbacks_plus_"
-                "exact_cache_id_DOM_owner_identities_plus_controlled_rasterization_keys"
+                "controlled_layout_owners_plus_exact_cache_id_DOM_owner_identities_plus_"
+                "controlled_rasterization_keys_plus_controlled_rasterization_owners"
             ),
             "unsupportedReservationReconciliation": (
                 "explicit_Unsupported_records_retain_exact_logical_ID_without_controlled_capacity_reservations"
@@ -4323,12 +5170,51 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     require_exact_fields(
         controlled_inline_svg_ownership,
         {
-            "cacheIdJoin": "exact_PendingImageId_DOM_owner_identity_required",
-            "retentionBudget": "shared_512_record_controlled_image_ownership_limit",
+            "cacheIdJoin": "exact_PendingImageId_current_candidate_identity_retained_on_admission",
+            "retainedProducerJoinAdmission": controlled_inline_svg_retained_join,
+            "retentionBudget": (
+                "shared_512_record_limit_counts_each_controlled_callback_layout_owner_"
+                "DOM_identity_raster_key_and_raster_owner_until_its_exact_terminal_or_"
+                "unbind_lifetime_ends"
+            ),
             "mixedOwnership": ("baseline_owner_globally_downgrades_shared_cache_id_and_live_raster_keys"),
             "hostFallback": "forbidden_for_admitted_work",
         },
         "controlled-web-session-v2 inline SVG ownership",
+    )
+    require_exact_fields(
+        controlled_inline_svg_retained_join,
+        {
+            "cacheStates": (
+                "PendingResponse_or_stale_reentrant_Unrequested_each_carries_exact_cache_key_URL"
+            ),
+            "candidate": (
+                "current_inline_SVG_exact_PendingImageId_and_exact_current_cached_URL_"
+                "new_owner_retained_once_existing_owner_idempotent"
+            ),
+            "anchor": (
+                "existing_same_PendingImageId_ControlledV2Fenced_layout_record_plus_live_"
+                "producer_callback_keys_no_preexisting_DOM_identity_required"
+            ),
+            "provenance": (
+                "nonempty_callback_set_uniformly_ControlledV2Fenced_each_exact_producer_"
+                "key_equals_candidate_URL_and_no_baseline_retained_work"
+            ),
+            "producerReuse": (
+                "reuse_existing_uniformly_fenced_listener_and_producer_set_"
+                "join_adds_no_listener_producer_or_fetch"
+            ),
+            "producerKeyLifetime": (
+                "owned_by_live_callback_until_terminal_callback_removal_independent_of_"
+                "prior_DOM_owner_unbind"
+            ),
+            "failure": (
+                "missing_layout_anchor_missing_or_wrong_producer_key_stale_candidate_"
+                "mismatched_ID_or_mixed_provenance_fails_closed_without_baseline_promotion"
+            ),
+            "excluded": ("baseline_v1_external_nested_iframe_worker_worklet_and_cross_loop_unchanged"),
+        },
+        "controlled-web-session-v2 inline SVG retained-producer join admission",
     )
     require_exact_fields(
         controlled_inline_svg_completion,
@@ -4463,6 +5349,22 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         raise ReleaseError(
             "controlled-web-session-v2 supportedProductSurface must contain exactly the "
             "bounded schemeful SameSite response-cookie storage summary"
+        )
+    settlement_url_product_surfaces = [
+        entry for entry in supported_product_surface if "owner_attested_current_top_level_url" in entry.lower()
+    ]
+    if settlement_url_product_surfaces != [CONTROLLED_SETTLEMENT_URL_PRODUCT_SURFACE]:
+        raise ReleaseError(
+            "controlled-web-session-v2 supportedProductSurface must contain exactly the "
+            "owner-attested current top-level settlement URL summary"
+        )
+    interval_progression_product_surfaces = [
+        entry for entry in supported_product_surface if "report_policy_interval_progression" in entry
+    ]
+    if interval_progression_product_surfaces != [CONTROLLED_INTERVAL_PROGRESSION_PRODUCT_SURFACE]:
+        raise ReleaseError(
+            "controlled-web-session-v2 supportedProductSurface must contain exactly the bounded "
+            "report-policy interval progression and exact distinct same-deadline rendering summary"
         )
     require_expected_fields(
         message_channel,
@@ -4639,9 +5541,11 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "`unsupported_clock_surface` settlement outcome",
         "not\ncreated synchronously inside the public action scope",
         "existing rendering authority already retains each document's CSS animation",
-        "scheduled opportunity with pending animation events is\nfinite rendering demand",
-        "including when that deadline equals `now`",
-        "only an event batch with no live scheduled opportunity is\n`Drive`-ready",
+        "nonempty document-owned pending CSS animation-event queue\nis finite rendering demand",
+        "retains one later owned rendering opportunity until dispatch drains\nthe queue",
+        "empty queue leaves no rendering opportunity",
+        "including when\nthat deadline equals `now`",
+        "only an event batch with no live scheduled opportunity is `Drive`-ready",
         "timestamp adapter at the owning `Animations::send_pending_events` seam",
         "`ScriptThread::current_controlled_top_level_target_matches(window)`",
         "conservatively reconstruct the dispatch Window as the sole retained fully-active public",
@@ -4654,6 +5558,8 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "`transitionrun`, `transitionstart`, `transitionend`, and `transitioncancel`",
         "executable compatibility proof is deliberately narrower than the adapter mapping",
         "owned `animationstart` and `animationend` events",
+        "post-reflow `animationstart` and `animationcancel` work retains a later opportunity",
+        "leaves no further opportunity",
         "`TransitionEvent` mapping applies only if the existing rendering pipeline",
         "does not claim general\nCSS transition execution or settlement compatibility",
         "WebIDL `new_with_proto` paths remain unchanged",
@@ -4706,12 +5612,17 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "owner or raster key remains retained",
         "pending observation classifies that work as\n`unsupported_rendering` / `image_load`",
         "At most 512 controlled image ownership records",
-        "Multiple DOM owners sharing a\ncache ID therefore consume distinct records",
+        "Each pending\ncontrolled callback, each retained layout owner",
+        "each\ncontrolled vector-rasterization key, and each retained raster owner owns one non-cloneable capacity",
+        "Multiple DOM owners sharing a cache ID or raster key therefore consume distinct\nrecords",
         "Rejection of record 513 latches",
         "HTML decode\n`ReadyForRequest` path",
         "after layout initiated the task",
         "checks that terminal before even an idempotent success",
+        "callback, identity, layout, and raster maps together",
         "union of callback and per-owner layout `PendingImageId` values",
+        "Live record count must\nequal retained controlled callbacks plus controlled layout owners plus exact",
+        "controlled raster keys plus controlled raster owners",
         "Image producer's pending count must be at least",
         "Controlled items are represented by the producer fence",
         "`load` and\n`loadend`, or `error` and `loadend`",
@@ -4722,9 +5633,25 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "The second image slice is independent of `HTMLImageElement`",
         "request must be marked `InternalRequest::Yes`",
         "request URL must exactly equal the cached\nserialized URL for that same DOM owner",
+        "inline owner must successfully establish or retain its exact current\n`PendingImageId`/DOM-owner cache identity during admission",
+        "An identity-reservation failure, mismatched cached URL, non-internal request",
+        "identical current inline root may reach post-reflow",
+        "either `PendingResponse` or a\nstale/reentrant `Unrequested`",
+        "neither cache-state label is authority by itself",
+        "candidate's exact cache-key URL and `PendingImageId` must match an existing same-ID",
+        "`ControlledV2Fenced` layout record",
+        "callback set must be nonempty, uniformly fenced",
+        "every callback must retain the exact producer URL key equal to the candidate URL",
+        "owned by the live producer callback",
+        "terminal\ncallback removal revokes it",
+        "No preexisting live DOM identity is required or trusted",
+        "new current candidate\nowner is retained once, while an already-retained candidate is idempotent",
+        "join reuses the\nexisting listener and producer",
+        "adds no listener, producer, or fetch",
+        "missing layout anchor or producer key",
+        "fails closed and cannot\npromote baseline work",
         "delivery-time provenance mismatch remains retained typed unsupported work",
         "not converted into producer abandonment",
-        "missing identity, mismatched cached URL, non-internal request, capacity",
         "completion creates no DOM `load`, `error`, or `loadend` event",
         "V2 owns persistent cookies in memory for the lifetime of its single controlled session",
         "Persistence\nacross processes is available only through an explicit `controlled-web-session-v2` state export",
@@ -4736,14 +5663,33 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "current redirect-hop method",
         "cross-site\ntop-level `GET`, `HEAD`, `OPTIONS`, or `TRACE`",
         "Ineligible cookies are filtered before Cookie header construction",
-        "`unsupported_cookie_same_site_context` before network start",
+        "`unsupported_cookie_same_site_context`. Both post-open typed rejections may retain bounded",
         "post-open request observes controlled Unix time above\n`18446744073709551615`",
-        "`unsupported_cookie_time_range` with partial request\nstate effect before network start",
-        "initial controlled open,\nthe shell hardens that same code to a fatal fail-stop",
-        "cross-site subresource response, only a valid Secure `SameSite=None` cookie is eligible",
-        "redirect-hop method is not an\ninput to this response-storage admission rule",
+        "`unsupported_cookie_time_range` with partial request\nstate effect",
+        "`request_started` and `request_failed` evidence, but they occur before `route_decided`",
+        "selection, fixture or live external I/O, and Cookie header construction",
+        "initial controlled open, the shell hardens that same code to a fatal fail-stop",
+        "Controlled parsing,\nnormalization, and time-range validation happen before SameSite eligibility",
+        "after successful controlled parsing only a valid Secure\n`SameSite=None` cookie is eligible",
+        "otherwise valid Strict, Lax, and unspecified cookies are\nignored without a terminal",
+        "Parse, normalization, and time-range failures retain their existing\ntyped outcomes",
+        "redirect-hop method is not an input to\nthis response-storage admission rule",
         "Partitioned cookies remain `unsupported_partitioned_cookie`",
         "`delete()` retain `controlled_cookie_store_read_delete_unsupported`",
+        "## Owner-attested settlement URL",
+        "Every returned `runtime.settle` result for an explicitly selected v2 session",
+        "same final authority used to derive the returned `stateToken`",
+        "does not mean that the outcome is quiescent",
+        "`Session.url` remains the\nURL observed when the session opened",
+        "settlementEvidence(result)` nor\n`session.settlementEvidence(result)` copies the v2 `url`",
+        "## Persistent intervals before finite work",
+        "when `persistentWork` is `report`, finite owned work may still be reached",
+        "Every observed finite timer and animated-image\ndeadline must be strictly later",
+        "distinct exact owner on the same scheduler",
+        "`TimerId` sequence follows the interval head",
+        "Same-entry,\nlower-or-equal-order, foreign-scheduler, bare/unowned, equal finite-timer",
+        "two fresh stable checkpoints return\n`quiescent_with_persistent_work`",
+        "`persistentWork: \"strict\"`,\n`controlled-webapp-v1`, and `controlled-web-session-v1` retain the previous",
         FROZEN_V2_PROFILE_SHA256,
     )
     for marker in contract_markers:
@@ -4783,6 +5729,32 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "an endless response remains blocked on external I/O",
             "Public document replacement while HTTP image Resource I/O is active remains fatal",
             "decoder-resource-budget",
+            "whether layout reports `PendingResponse` or a stale/reentrant `Unrequested`",
+            "exact cache-key URL and `PendingImageId`",
+            "existing same-ID fenced layout record",
+            "every live callback must be fenced and retain that exact producer URL key",
+            "no earlier live\n  DOM identity is required or trusted",
+            "No baseline work may be retained",
+            "new current owner is\n  retained once and an already-retained owner is idempotent",
+            "adds no listener, producer, or fetch",
+            "missing anchor/key, stale candidate, mismatch, mixed provenance, or\n  capacity terminal fails closed",
+            "nested-SVG, iframe, worker, worklet, and cross-loop authority remains unchanged",
+            "nonempty document-owned pending CSS animation-event queue is finite demand",
+            "retains one later owned rendering opportunity until dispatch drains it",
+            "empty queue leaves no\n  rendering opportunity",
+            "after successful controlled parsing, retain only valid Secure",
+            "otherwise valid Strict/Lax/unspecified values are ignored",
+            "normalization, and time-range failures retain their existing typed outcomes",
+            "Every returned v2 settle result additionally includes the active top-level document `url`",
+            "does not imply quiescence",
+            "remains excluded\n  from bounded redacted settlement evidence",
+            'With `persistentWork: "report"`, v2 may also advance an eligible exact JavaScript interval',
+            "every observed finite timer and animated-image deadline is strictly later",
+            "distinct exact same-scheduler owner",
+            "`TimerId` sequence follows the interval head",
+            "Same-entry, lower-or-equal-order, foreign-scheduler, bare/unowned",
+            "returned as `quiescent_with_persistent_work` without another",
+            "`strict` and both predecessor profiles retain their stop-at-interval behavior",
         ),
     )
     for public_readme, description in (
@@ -4812,11 +5784,80 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         ),
     )
     require_public_surface_markers(
+        public_profile_readme,
+        "public profile README retained-producer inline SVG authority",
+        (
+            "whether layout\nreports `PendingResponse` or a stale/reentrant `Unrequested`",
+            "exact cache-key URL and\n`PendingImageId` match an existing same-ID fenced layout record",
+            "every live callback retains\nthe exact same producer URL key",
+            "callback-owned key may survive an earlier DOM owner's unbind",
+            "old DOM identity is neither required nor trusted",
+            "callback set must be nonempty and uniformly fenced",
+            "new\ncurrent owner is retained once and an already-retained owner is idempotent",
+            "join reuses the\nexisting listener and producer; it adds no listener, producer, or fetch",
+            "missing anchor/key, stale candidate, mismatch, mixed\nprovenance, or capacity terminal fails closed and cannot promote baseline work",
+            "general or nested/external SVG resources, iframe/worker/worklet, and transferred image paths are\nnot promoted",
+        ),
+    )
+    require_public_surface_markers(
         public_typescript_sdk_readme,
         "public TypeScript SDK publication and HTTP image authority",
         (
             "is not a publication claim: the native runtime must advertise v2",
             "while HTTP image resource I/O remains active retains fatal `blocked_on_external_io`",
+            "every returned settle outcome has a required `url`",
+            "`session.url` remains the open-time URL",
+            "Settlement evidence deliberately omits\nthe URL",
+            "After successful controlled parsing, cross-site",
+            "otherwise valid\nStrict/Lax/unspecified values are ignored",
+            "normalization, and time-range failures\nretain their existing typed outcomes",
+        ),
+    )
+    require_public_surface_markers(
+        public_typescript_sdk_readme,
+        "public TypeScript SDK shared-pending inline SVG authority",
+        (
+            "exact cache-key URL",
+            "match an existing same-ID fenced layout record",
+            "every live callback is\n fenced with that exact producer URL key",
+            "callback owns this key through terminal removal",
+            "earlier DOM owner may already have unbound and its identity is neither required nor trusted",
+            "peer reuses the existing\n listener and producer without adding a listener, producer, or fetch",
+            "Missing keys or anchors",
+            "does not promote baseline or v1 work, external or nested SVG resources, iframes, workers",
+        ),
+    )
+    require_public_surface_markers(
+        public_profile_readme,
+        "public profile README settlement URL authority",
+        (
+            "Every returned v2 `runtime.settle` result also carries a required owner-attested `url`",
+            "does not itself claim quiescence",
+            "Settlement evidence continues to omit URLs",
+            "A nonempty document-owned pending CSS",
+            "retains one later owned rendering opportunity",
+            "empty queue leaves no opportunity",
+            "Finite timer and animated-image deadlines must remain strictly later",
+            "distinct exact same-scheduler owner",
+            "`TimerId`\nsequence follows the interval head",
+            "After successful controlled parsing, cross-site subresource",
+            "otherwise valid Strict, Lax, and\nunspecified response cookies are ignored",
+            "normalization, and time-range failures retain\ntheir existing typed outcomes",
+        ),
+    )
+    require_public_surface_markers(
+        public_typescript_sdk_readme,
+        "public TypeScript SDK CSS liveness and interval ordering authority",
+        (
+            "A nonempty document-owned pending CSS animation-event queue is finite demand",
+            "retains one later\nowned rendering opportunity",
+            "empty queue leaves no opportunity",
+            "Finite timer and animated-image deadlines must\nbe strictly later",
+            "distinct\nexact same-scheduler owner",
+            "`TimerId` sequence follows the interval head",
+            "After successful controlled parsing, cross-site",
+            "otherwise valid\nStrict/Lax/unspecified values are ignored",
+            "normalization, and time-range failures\nretain their existing typed outcomes",
         ),
     )
     require_public_surface_markers(
@@ -4827,6 +5868,29 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "A final redirect URL is not rechecked against that initial limit",
             "separately owned Resource I/O and the immutable session network policy remains authoritative",
             "Cache\nreuse proof is limited to one pipeline's image-cache store under immutable fixture routes",
+            "whether layout reports\n`PendingResponse` or a stale/reentrant `Unrequested`",
+            "exact cache-key URL and ID anchored\nby an existing same-ID fenced layout record",
+            "nonempty uniformly fenced callback set whose\ncallback-owned producer keys all equal that URL",
+            "key may survive an earlier DOM owner's unbind",
+            "earlier DOM identity is not authority",
+            "new current\nowner is retained once and an already-retained owner is idempotent",
+            "join reuses the existing\nlistener and producer; it adds no listener, producer, or fetch",
+            "missing anchor/key, stale candidate, mismatch, mixed provenance, or capacity terminal fails closed",
+            "nonempty document-owned pending CSS animation-event queue is finite",
+            "retains one later owned rendering opportunity until dispatch drains it",
+            "empty queue leaves no opportunity",
+            "After successful controlled parsing, cross-site subresource responses retain only",
+            "otherwise valid Strict/Lax/unspecified values are ignored",
+            "normalization, and time-range failures retain their existing typed outcomes",
+            "The eighth slice adds a required owner-attested `url`",
+            "does not imply quiescence",
+            "settlement evidence does not include the URL",
+            "The ninth slice admits bounded progress through an eligible JavaScript interval scheduler head",
+            '`persistentWork: "report"`',
+            "Every observed finite timer and\nanimated-image deadline must be strictly later",
+            "distinct exact same-scheduler owner",
+            "`TimerId` sequence follows the\ninterval head",
+            "schema-10 proof binds all nine v2 slices",
         ),
     )
     require_public_surface_markers(
@@ -4840,8 +5904,138 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "one pipeline's image-cache store under immutable fixture routes",
             "Public document replacement while HTTP image resource I/O remains active keeps",
             "the fatal blocked_on_external_io boundary",
+            "producer when its cache-key URL and PendingImageId match an existing same-ID fenced",
+            "every live callback is uniformly fenced with that exact producer URL",
+            "callback owns that key until terminal removal",
+            "earlier DOM owner may",
+            "already have unbound and its identity is neither required nor trusted",
+            "peer reuses the existing listener and producer without adding a listener",
+            "producer, or fetch",
+            "Baseline, v1, external/nested SVG, iframe, worker, worklet, and cross-loop authority",
+            "nonempty document-owned pending CSS animation-event queue retains one later owned",
+            "empty queue leaves no opportunity",
+            "With persistentWork=report, v2 may advance an eligible exact JavaScript interval head",
+            "Finite timer and animated-image deadlines must be strictly",
+            "same-scheduler owner whose TimerId sequence follows the interval head",
+            "lower-or-equal-order, foreign-scheduler, bare/unowned, equal finite-timer",
+            "After successful controlled",
+            "otherwise valid Strict/Lax/unspecified values are ignored",
+            "normalization,\n          and time-range failures retain their existing typed outcomes",
+            "interval-only document checkpoints as quiescent_with_persistent_work without another",
+            "Strict policy and both predecessor profiles retain stop-at-interval behavior",
         ),
     )
+    posix_stasis_lib_gate = (
+        "          cargo test --locked --profile production-stripped -p stasis-shell --lib "
+        "-- --test-threads=1 --show-output\n"
+    )
+    if public_release_workflow.count(posix_stasis_lib_gate) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must run the complete Stasis library invariant suite "
+            "once in the macOS/Linux native matrix"
+        )
+    windows_stasis_lib_gate = (
+        "& cargo test --locked --profile production-stripped -p stasis-shell --lib ' +\n"
+        "            '-- --test-threads=1 --show-output; exit $LASTEXITCODE'\n"
+        "          & .\\mach.ps1 exec -- pwsh -NoProfile -Command $stasisLibTestCommand"
+    )
+    if public_release_workflow.count(windows_stasis_lib_gate) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must run the complete Stasis library invariant suite "
+            "once through mach.ps1 on Windows"
+        )
+    if public_release_workflow.count("-p stasis-shell --lib") != 2:
+        raise ReleaseError(
+            "credential-free package workflow must retain exactly the native-matrix and Windows "
+            "complete Stasis library invariant invocations"
+        )
+    posix_controlled_image_capacity_gate = (
+        "          cargo test --locked --profile production-stripped -p servo-script --lib "
+        "pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output\n"
+    )
+    if public_release_workflow.count(posix_controlled_image_capacity_gate) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must run the controlled image capacity invariants "
+            "once in the macOS/Linux native matrix"
+        )
+    windows_controlled_image_capacity_gate = (
+        "& cargo test --locked --profile production-stripped -p servo-script --lib ' +\n"
+        "            'pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output; ' +\n"
+        "            'exit $LASTEXITCODE'\n"
+        "          & .\\mach.ps1 exec -- pwsh -NoProfile -Command $controlledImageCapacityTestCommand"
+    )
+    if public_release_workflow.count(windows_controlled_image_capacity_gate) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must run the controlled image capacity invariants "
+            "once through mach.ps1 on Windows"
+        )
+    if public_release_workflow.count("pending_nonanimated_image_observation_tests") != 2:
+        raise ReleaseError(
+            "credential-free package workflow must retain exactly the native-matrix and Windows "
+            "controlled image capacity invocations"
+        )
+    packed_sdk_shared_pending_argument = (
+        "--session-v2-inline-svg-shared-pending-fixture "
+        "ports/stasis/tests/fixtures/controlled_v2_inline_svg_shared_pending.html"
+    )
+    if public_release_workflow.count(packed_sdk_shared_pending_argument) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must invoke the shared-pending inline SVG proof once"
+        )
+    if public_npm_publish_workflow.count(packed_sdk_shared_pending_argument) != 2:
+        raise ReleaseError(
+            "npm-publish workflow must invoke the shared-pending inline SVG proof twice"
+        )
+    packed_sdk_settlement_url_argument = (
+        "--session-v2-settlement-url-fixture "
+        "ports/stasis/tests/fixtures/controlled_v2_settlement_url.html"
+    )
+    if public_release_workflow.count(packed_sdk_settlement_url_argument) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must invoke the settlement URL proof once"
+        )
+    if public_npm_publish_workflow.count(packed_sdk_settlement_url_argument) != 2:
+        raise ReleaseError(
+            "npm-publish workflow must invoke the settlement URL proof twice"
+        )
+    packed_sdk_interval_before_finite_argument = (
+        "--session-v2-interval-before-finite-fixture "
+        "ports/stasis/tests/fixtures/controlled_v2_interval_before_finite.html"
+    )
+    if public_release_workflow.count(packed_sdk_interval_before_finite_argument) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must invoke the persistent interval proof once"
+        )
+    if public_npm_publish_workflow.count(packed_sdk_interval_before_finite_argument) != 2:
+        raise ReleaseError(
+            "npm-publish workflow must invoke the persistent interval proof twice"
+        )
+    packed_sdk_schema_marker = '"schema": 10,'
+    if public_release_workflow.count(packed_sdk_schema_marker) != 1:
+        raise ReleaseError("credential-free package workflow must require SDK proof schema 10")
+    if public_npm_publish_workflow.count(packed_sdk_schema_marker) != 1:
+        raise ReleaseError("npm-publish workflow must require SDK proof schema 10")
+    verify_registry_sdk_durable_v2_fixture_invocations(
+        public_release_workflow,
+        "credential-free package workflow",
+        1,
+    )
+    verify_registry_sdk_durable_v2_fixture_invocations(
+        public_npm_publish_workflow,
+        "npm-publish workflow",
+        2,
+    )
+    verify_registry_sdk_durable_v2_fixture_source(registry_sdk_verifier_source)
+    package_v2_fixture_verifier = credential_free_v2_fixture_verifier_block(
+        public_release_workflow,
+        "credential-free package v2 fixture verifier",
+    )
+    publish_v2_fixture_verifier = credential_free_v2_fixture_verifier_block(
+        public_npm_publish_workflow,
+        "credential-free npm-publish v2 fixture verifier",
+    )
+    if package_v2_fixture_verifier != publish_v2_fixture_verifier:
+        raise ReleaseError("credential-free package and npm-publish v2 fixture verifiers diverged")
     package_v2_automation_verifier = credential_free_v2_automation_verifier_block(
         public_release_workflow,
         "credential-free package v2 automation verifier",
@@ -4852,6 +6046,16 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     )
     if package_v2_automation_verifier != publish_v2_automation_verifier:
         raise ReleaseError("credential-free package and npm-publish v2 automation verifiers diverged")
+    package_v2_css_verifier = credential_free_v2_css_verifier_block(
+        public_release_workflow,
+        "credential-free package v2 CSS verifier",
+    )
+    publish_v2_css_verifier = credential_free_v2_css_verifier_block(
+        public_npm_publish_workflow,
+        "credential-free npm-publish v2 CSS verifier",
+    )
+    if package_v2_css_verifier != publish_v2_css_verifier:
+        raise ReleaseError("credential-free package and npm-publish v2 CSS verifiers diverged")
     verify_message_port_router_source(message_limits_source)
     verify_controlled_local_pending_projection_source(message_limits_source)
     verify_controlled_local_fifo_source(message_limits_source)
@@ -4921,10 +6125,19 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     )
     verify_controlled_inline_svg_rendering_source(
         controlled_inline_svg_source,
+        controlled_inline_svg_layout_source,
+        controlled_inline_svg_layout_context_source,
         controlled_image_window_source,
         message_baseline_test_source,
         controlled_inline_svg_fixture_source,
+        controlled_inline_svg_shared_pending_fixture_source,
+        controlled_inline_svg_incremental_same_task_fixture_source,
         controlled_inline_svg_advanced_fixture_source,
+    )
+    verify_controlled_settlement_url_fixture_source(controlled_settlement_url_fixture_source)
+    verify_controlled_interval_before_finite_source(
+        message_baseline_test_source,
+        controlled_interval_before_finite_fixture_source,
     )
     native_bounds = {
         "maximumRetainedNativePortEntriesPerGlobal": rust_usize_constant(
@@ -4998,6 +6211,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "contractSha256": contract_sha256,
         "identity": expected_identity,
         "predecessor": compatibility["predecessor"],
+        "sessionSettlementResult": session_settlement_result,
         "bounds": native_bounds,
         "routerOwnership": construction["routerOwnership"],
         "controlledInputMethodFocus": controlled_input_method,
@@ -5598,6 +6812,7 @@ def self_test() -> None:
             PUBLIC_RELEASE_RUNBOOK,
             PUBLIC_RELEASE_WORKFLOW,
             PUBLIC_NPM_PUBLISH_WORKFLOW,
+            REGISTRY_SDK_VERIFIER_SOURCE,
             MESSAGE_CHANNEL_LIMITS_SOURCE,
             MESSAGE_CHANNEL_BASELINE_TEST_SOURCE,
             MESSAGE_CHANNEL_MULTI_PAIR_FIXTURE,
@@ -5633,8 +6848,14 @@ def self_test() -> None:
             CONTROLLED_HTTP_IMAGE_FIXTURE,
             CONTROLLED_HTTP_IMAGE_MULTIPART_FIXTURE,
             CONTROLLED_INLINE_SVG_SOURCE,
+            CONTROLLED_INLINE_SVG_LAYOUT_SOURCE,
+            CONTROLLED_INLINE_SVG_LAYOUT_CONTEXT_SOURCE,
             CONTROLLED_INLINE_SVG_FIXTURE,
+            CONTROLLED_INLINE_SVG_SHARED_PENDING_FIXTURE,
+            CONTROLLED_INLINE_SVG_INCREMENTAL_SAME_TASK_FIXTURE,
             CONTROLLED_INLINE_SVG_ADVANCED_FIXTURE,
+            CONTROLLED_SETTLEMENT_URL_FIXTURE,
+            CONTROLLED_INTERVAL_BEFORE_FINITE_FIXTURE,
             EXECUTION_LIMITS_SOURCE,
         )
 
@@ -5657,12 +6878,17 @@ def self_test() -> None:
             marker: str,
             replacement: str,
             description: str,
+            *,
+            expected_count: int = 1,
         ) -> None:
             reset_candidate_authority_sources()
             filename = candidate_profile_root / source_name
             source = filename.read_text(encoding="utf-8")
-            if source.count(marker) != 1:
-                raise ReleaseError(f"self-test cannot uniquely locate {description} public marker")
+            if source.count(marker) != expected_count:
+                raise ReleaseError(
+                    f"self-test cannot locate exactly {expected_count} copies of "
+                    f"the {description} public marker"
+                )
             filename.write_text(source.replace(marker, replacement, 1), encoding="utf-8")
             require_candidate_mutation_rejected(description)
 
@@ -5828,6 +7054,60 @@ def self_test() -> None:
             ),
             (
                 PUBLIC_RELEASE_WORKFLOW,
+                '"sharedUnsupportedWork": "0"',
+                '"sharedUnsupportedWork": "1"',
+                "package attestation shared-pending inline SVG settlement evidence",
+            ),
+            (
+                PUBLIC_NPM_PUBLISH_WORKFLOW,
+                '"settlement-url/final?proof=replacement#attested"',
+                '"settlement-url/final?proof=wrong#attested"',
+                "npm-publish owner-attested replacement settlement URL evidence",
+            ),
+            (
+                PUBLIC_RELEASE_WORKFLOW,
+                '"schema": 10,',
+                '"schema": 9,',
+                "package durable SDK proof schema",
+            ),
+            (
+                REGISTRY_SDK_VERIFIER_SOURCE,
+                'postReflowOwnedQueueDrain: true',
+                'postReflowOwnedQueueDrain: false',
+                "packed SDK post-reflow CSS owned queue drain",
+            ),
+            (
+                PUBLIC_RELEASE_WORKFLOW,
+                '"postReflowTrace": "armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70"',
+                '"postReflowTrace": "armed:5|animationstart:trusted:50:50"',
+                "package attestation post-reflow CSS exact trace",
+            ),
+            (
+                PUBLIC_STASIS_BOUNDARY,
+                "distinct exact same-scheduler owner",
+                "same-deadline work without an exact owner",
+                "STASIS exact same-deadline rendering owner boundary",
+            ),
+            (
+                PUBLIC_RELEASE_RUNBOOK,
+                "Every observed finite timer and\nanimated-image deadline must be strictly later",
+                "Every observed finite deadline may be equal",
+                "release-runbook strict timer and animated-image deadline boundary",
+            ),
+            (
+                CANDIDATE_V2_CONTRACT,
+                "after successful controlled parsing only a valid Secure",
+                "before controlled parsing any Secure",
+                "v2 contract response-cookie parse-before-SameSite boundary",
+            ),
+            (
+                PUBLIC_RELEASE_WORKFLOW,
+                "otherwise valid Strict/Lax/unspecified values are ignored",
+                "all raw Strict/Lax/unspecified values are ignored",
+                "release-note otherwise-valid response-cookie ignore boundary",
+            ),
+            (
+                PUBLIC_RELEASE_WORKFLOW,
                 'automation_dynamic_fields = set(automation_time_fields) | {"controlledTrace"}',
                 "automation_dynamic_fields = set(automation_time_fields)",
                 "package attestation dynamic automation timestamp evidence",
@@ -5858,6 +7138,145 @@ def self_test() -> None:
                 replacement,
                 description,
             )
+
+        packed_sdk_shared_pending_argument = (
+            "--session-v2-inline-svg-shared-pending-fixture "
+            "ports/stasis/tests/fixtures/controlled_v2_inline_svg_shared_pending.html"
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            packed_sdk_shared_pending_argument,
+            packed_sdk_shared_pending_argument.replace("shared_pending.html", "shared_pending_broken.html"),
+            "package shared-pending packed-SDK invocation",
+        )
+        packed_sdk_settlement_url_argument = (
+            "--session-v2-settlement-url-fixture "
+            "ports/stasis/tests/fixtures/controlled_v2_settlement_url.html"
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            packed_sdk_settlement_url_argument,
+            packed_sdk_settlement_url_argument.replace("settlement_url.html", "settlement_url_broken.html"),
+            "two npm settlement-URL packed-SDK invocations",
+            expected_count=2,
+        )
+        packed_sdk_interval_before_finite_argument = (
+            "--session-v2-interval-before-finite-fixture "
+            "ports/stasis/tests/fixtures/controlled_v2_interval_before_finite.html"
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            packed_sdk_interval_before_finite_argument,
+            packed_sdk_interval_before_finite_argument.replace(
+                "interval_before_finite.html",
+                "interval_before_finite_broken.html",
+            ),
+            "package persistent-interval packed-SDK invocation",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            packed_sdk_interval_before_finite_argument,
+            packed_sdk_interval_before_finite_argument.replace(
+                "interval_before_finite.html",
+                "interval_before_finite_broken.html",
+            ),
+            "two npm persistent-interval packed-SDK invocations",
+            expected_count=2,
+        )
+        require_public_marker_mutation_rejected(
+            REGISTRY_SDK_VERIFIER_SOURCE,
+            "sharedFixtureTrace: v2InlineSvgSharedPendingTraceResult.value",
+            "sharedFixtureTrace: v2InlineSvgTraceResult.value",
+            "packed SDK shared-pending result linkage",
+        )
+        require_public_marker_mutation_rejected(
+            REGISTRY_SDK_VERIFIER_SOURCE,
+            "assert.equal(v2AutomationRejected.url, v2AutomationEventFixtureUrl);",
+            "assert.equal(v2AutomationRejected.url, v2FixtureUrl);",
+            "packed SDK non-quiescent settlement URL linkage",
+        )
+        require_public_marker_mutation_rejected(
+            REGISTRY_SDK_VERIFIER_SOURCE,
+            "reportTrace: v2PersistentIntervalReportTrace.value",
+            "reportTrace: v2PersistentIntervalStrictTrace.value",
+            "packed SDK persistent-interval report trace linkage",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          cargo test --locked --profile production-stripped -p stasis-shell --lib -- --test-threads=1 --show-output\n",
+            "          cargo test --locked --profile production-stripped -p stasis-shell --lib controlled_network::tests -- --test-threads=1 --show-output\n",
+            "macOS and Linux complete Stasis library invariant gate",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "& cargo test --locked --profile production-stripped -p stasis-shell --lib ' +\n"
+            "            '-- --test-threads=1 --show-output; exit $LASTEXITCODE'",
+            "& cargo test --locked --profile production-stripped -p stasis-shell --lib ' +\n"
+            "            'stdio::platform::tests -- --test-threads=1 --show-output; exit $LASTEXITCODE'",
+            "Windows complete Stasis library invariant gate",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          cargo test --locked --profile production-stripped -p servo-script --lib pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output\n",
+            "          cargo test --locked --profile production-stripped -p servo-script --lib unrelated_tests -- --test-threads=1 --show-output\n",
+            "macOS and Linux controlled image capacity invariant gate",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "& cargo test --locked --profile production-stripped -p servo-script --lib ' +\n"
+            "            'pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output; ' +",
+            "& cargo test --locked --profile production-stripped -p servo-script --lib ' +\n"
+            "            'unrelated_tests -- --test-threads=1 --show-output; ' +",
+            "Windows controlled image capacity invariant gate",
+        )
+        require_public_marker_mutation_rejected(
+            CONTROLLED_PROFILE_WIRE_SOURCE,
+            '"pending_callback",\n                        "layout_owner",',
+            '"pending_callback",',
+            "wire exact controlled image layout-owner record kind",
+        )
+        require_public_marker_mutation_rejected(
+            CONTROLLED_PROFILE_WIRE_SOURCE,
+            '"vector_rasterization_key",\n                        "vector_rasterization_owner",',
+            '"vector_rasterization_key",',
+            "wire exact controlled image raster-owner record kind",
+        )
+        require_public_marker_mutation_rejected(
+            CONTROLLED_PROFILE_WIRE_SOURCE,
+            '"reservationUnit": "one_record_per_controlled_pending_callback_layout_owner_exact_cache_id_DOM_owner_identity_vector_rasterization_key_or_vector_rasterization_owner"',
+            '"reservationUnit": "one_record_per_controlled_pending_callback_exact_cache_id_DOM_owner_identity_or_vector_rasterization_key"',
+            "wire exact controlled image reservation unit",
+        )
+        require_public_marker_mutation_rejected(
+            CONTROLLED_PROFILE_WIRE_SOURCE,
+            '"reservationReconciliation": "live_controlled_records_equal_retained_controlled_callbacks_plus_controlled_layout_owners_plus_exact_cache_id_DOM_owner_identities_plus_controlled_rasterization_keys_plus_controlled_rasterization_owners"',
+            '"reservationReconciliation": "live_controlled_records_equal_retained_controlled_callbacks_plus_exact_cache_id_DOM_owner_identities_plus_controlled_rasterization_keys"',
+            "wire exact controlled image reservation reconciliation",
+        )
+        require_public_marker_mutation_rejected(
+            CONTROLLED_PROFILE_WIRE_SOURCE,
+            '"anchor": "existing_same_PendingImageId_ControlledV2Fenced_layout_record_plus_live_producer_callback_keys_no_preexisting_DOM_identity_required"',
+            '"anchor": "live_current_same_PendingImageId_ControlledV2Fenced_layout_and_identity_SVG_owner_with_exact_cached_URL"',
+            "wire retained inline SVG callback-owned producer-key anchor",
+        )
+        require_public_marker_mutation_rejected(
+            CONTROLLED_IMAGE_WINDOW_SOURCE,
+            "fn reserve_controlled_v2_raster_owner(",
+            "fn reserve_unbounded_raster_owner(",
+            "production controlled raster-owner reservation gate",
+        )
+        require_public_marker_mutation_rejected(
+            CONTROLLED_IMAGE_WINDOW_SOURCE,
+            "let is_new_raster_owner = !self",
+            "let is_new_raster_owner = false && !self",
+            "production controlled raster-owner novelty gate",
+        )
+        require_public_marker_mutation_rejected(
+            CONTROLLED_IMAGE_WINDOW_SOURCE,
+            "controlled_raster_owner_reservation,\n                ));",
+            "None,\n                ));",
+            "production controlled raster-owner retained reservation",
+        )
 
         reset_candidate_authority_sources()
         wire_filename = candidate_profile_root / CONTROLLED_PROFILE_WIRE_SOURCE
@@ -6236,6 +7655,74 @@ def self_test() -> None:
         require_candidate_mutation_rejected("general CSS transition settlement promotion")
 
         reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test exact interval equal-deadline rendering relation",
+        )
+        candidate_profile["execution"]["persistentIntervalFiniteProgression"]["deadlineRelation"] = (
+            "every_observed_finite_deadline_is_strictly_later"
+        )
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("collapsed interval equal-deadline rendering relation")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test interval/rendering reobservation ordering",
+        )
+        candidate_profile["execution"]["persistentIntervalFiniteProgression"]["ordering"] = (
+            "advance_both_same_deadline_entries_without_reobservation"
+        )
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("interval/rendering reobservation ordering bypass")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test interval progression product surface",
+        )
+        interval_surface_index = candidate_profile["supportedProductSurface"].index(
+            CONTROLLED_INTERVAL_PROGRESSION_PRODUCT_SURFACE
+        )
+        candidate_profile["supportedProductSurface"][interval_surface_index] = (
+            "bounded_report_policy_interval_progression_before_any_equal_deadline_work"
+        )
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("broadened interval progression product surface")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test CSS post-reflow pending queue liveness",
+        )
+        candidate_profile["execution"]["controlledCssAnimationEventTimestamps"][
+            "settlementScheduling"
+        ]["nonemptyDocumentOwnedQueue"] = "drive_ready_without_later_opportunity"
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("CSS post-reflow pending queue liveness bypass")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test CSS empty queue opportunity retirement",
+        )
+        candidate_profile["execution"]["controlledCssAnimationEventTimestamps"][
+            "settlementScheduling"
+        ]["emptyDocumentOwnedQueue"] = "retain_an_extra_rendering_opportunity"
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("CSS empty queue opportunity retention")
+
+        reset_candidate_authority_sources()
         settlement_filename = candidate_profile_root / CONTROLLED_RENDERING_SETTLEMENT_SOURCE
         settlement_source = settlement_filename.read_text(encoding="utf-8")
         pending_event_demand = (
@@ -6254,6 +7741,34 @@ def self_test() -> None:
             encoding="utf-8",
         )
         require_candidate_mutation_rejected("scheduled pending animation-event finite demand")
+
+        reset_candidate_authority_sources()
+        document_filename = candidate_profile_root / CONTROLLED_CSS_DOCUMENT_SOURCE
+        document_source = document_filename.read_text(encoding="utf-8")
+        pending_event_rendering_liveness = (
+            "if ScriptThread::current_controlled_top_level_target_matches(&self.window) &&"
+        )
+        if document_source.count(pending_event_rendering_liveness) != 1:
+            raise ReleaseError(
+                "self-test cannot uniquely locate post-reflow CSS pending-event rendering liveness"
+            )
+        document_filename.write_text(
+            document_source.replace(pending_event_rendering_liveness, "if true &&", 1),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("post-reflow CSS pending-event rendering liveness")
+
+        reset_candidate_authority_sources()
+        settlement_filename = candidate_profile_root / CONTROLLED_RENDERING_SETTLEMENT_SOURCE
+        settlement_source = settlement_filename.read_text(encoding="utf-8")
+        exact_rendering_owner_gate = "candidate.id != head.id"
+        if settlement_source.count(exact_rendering_owner_gate) != 1:
+            raise ReleaseError("self-test cannot uniquely locate distinct rendering-owner gate")
+        settlement_filename.write_text(
+            settlement_source.replace(exact_rendering_owner_gate, "candidate.id == head.id", 1),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("same-entry interval/rendering admission")
 
         reset_candidate_authority_sources()
         shell_filename = candidate_profile_root / CONTROLLED_SESSION_SHELL_SOURCE
@@ -6480,6 +7995,51 @@ def self_test() -> None:
             json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
         )
         require_candidate_mutation_rejected("controlled image registration bound")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test controlled image exact retained-record kinds",
+        )
+        candidate_profile["execution"]["controlledImageElement"]["retention"]["recordKinds"] = [
+            "pending_callback",
+            "exact_cache_id_DOM_owner_identity",
+            "vector_rasterization_key",
+        ]
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("incomplete controlled image retained-record kinds")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test controlled image reservation unit",
+        )
+        candidate_profile["execution"]["controlledImageElement"]["retention"]["reservationUnit"] = (
+            "one_record_per_controlled_pending_callback_exact_cache_id_DOM_owner_"
+            "identity_or_vector_rasterization_key"
+        )
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("incomplete controlled image reservation unit")
+
+        reset_candidate_authority_sources()
+        candidate_profile = strict_json_loads(
+            (candidate_profile_root / CANDIDATE_V2_PROFILE).read_text(encoding="utf-8"),
+            "self-test controlled image reservation reconciliation",
+        )
+        candidate_profile["execution"]["controlledImageElement"]["pending"][
+            "reservationReconciliation"
+        ] = (
+            "live_controlled_records_equal_retained_controlled_callbacks_plus_"
+            "exact_cache_id_DOM_owner_identities_plus_controlled_rasterization_keys"
+        )
+        (candidate_profile_root / CANDIDATE_V2_PROFILE).write_text(
+            json.dumps(candidate_profile, allow_nan=False), encoding="utf-8"
+        )
+        require_candidate_mutation_rejected("incomplete controlled image reservation reconciliation")
 
         reset_candidate_authority_sources()
         candidate_profile = strict_json_loads(
@@ -6946,6 +8506,42 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("native CSS animation timestamp proof")
 
         reset_candidate_authority_sources()
+        css_protocol_filename = candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
+        css_protocol_source = css_protocol_filename.read_text(encoding="utf-8")
+        post_reflow_trace = (
+            "armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70"
+        )
+        if css_protocol_source.count(post_reflow_trace) != 1:
+            raise ReleaseError("self-test cannot uniquely locate native post-reflow CSS queue-drain trace")
+        css_protocol_filename.write_text(
+            css_protocol_source.replace(
+                post_reflow_trace,
+                "armed:5|animationstart:trusted:50:50",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("native post-reflow CSS queue-drain proof")
+
+        reset_candidate_authority_sources()
+        css_fixture_filename = candidate_profile_root / CONTROLLED_CSS_ANIMATION_EVENT_FIXTURE
+        css_fixture_source = css_fixture_filename.read_text(encoding="utf-8")
+        nested_post_reflow_removal = (
+            'requestAnimationFrame(() => postReflowTarget.classList.remove("running"))'
+        )
+        if css_fixture_source.count(nested_post_reflow_removal) != 1:
+            raise ReleaseError("self-test cannot uniquely locate nested post-reflow CSS removal")
+        css_fixture_filename.write_text(
+            css_fixture_source.replace(
+                nested_post_reflow_removal,
+                'postReflowTarget.classList.remove("running")',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("post-reflow CSS later-opportunity fixture")
+
+        reset_candidate_authority_sources()
         css_fixture_filename = candidate_profile_root / CONTROLLED_CSS_ANIMATION_EVENT_FIXTURE
         css_fixture_source = css_fixture_filename.read_text(encoding="utf-8")
         script_animation_constructor = 'new AnimationEvent("animationstart"'
@@ -7230,6 +8826,9 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             "fn mark_unsupported(&mut self) {\n"
             "        self.provenance = PendingImageProvenance::Unsupported;\n"
             "        self.reservation = None;\n"
+            "        for owner in &mut self.nodes {\n"
+            "            owner.release_controlled_reservation();\n"
+            "        }\n"
             "    }"
         )
         if image_window_source.count(raster_unsupported_retirement) != 1:
@@ -7263,6 +8862,28 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             encoding="utf-8",
         )
         require_candidate_mutation_rejected("raster Unsupported controlled-reservation release")
+
+        reset_candidate_authority_sources()
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        if image_window_source.count(raster_unsupported_retirement) != 1:
+            raise ReleaseError(
+                "self-test cannot uniquely locate raster Unsupported owner-reservation retirement"
+            )
+        image_window_filename.write_text(
+            image_window_source.replace(
+                raster_unsupported_retirement,
+                raster_unsupported_retirement.replace(
+                    "        for owner in &mut self.nodes {\n"
+                    "            owner.release_controlled_reservation();\n"
+                    "        }\n",
+                    "",
+                    1,
+                ),
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("raster Unsupported owner-reservation release")
 
         reset_candidate_authority_sources()
         image_window_source = image_window_filename.read_text(encoding="utf-8")
@@ -7877,9 +9498,167 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
         require_candidate_mutation_rejected("inline SVG exact cached-URL identity")
 
         reset_candidate_authority_sources()
+        inline_layout_filename = candidate_profile_root / CONTROLLED_INLINE_SVG_LAYOUT_SOURCE
+        inline_layout_source = inline_layout_filename.read_text(encoding="utf-8")
+        pending_response_url_state = "PendingResponse(ServoUrl)"
+        if inline_layout_source.count(pending_response_url_state) != 1:
+            raise ReleaseError("self-test cannot uniquely locate pending-response exact URL state")
+        inline_layout_filename.write_text(
+            inline_layout_source.replace(pending_response_url_state, "PendingResponse", 1),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG pending-response exact URL state")
+
+        reset_candidate_authority_sources()
         image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
         image_window_source = image_window_filename.read_text(encoding="utf-8")
-        inline_controlled_branch = "if controlled_inline_svg {\n"
+        retained_producer_key_capture = "controlled_v2_producer_key: Some(producer_key)"
+        if image_window_source.count(retained_producer_key_capture) != 1:
+            raise ReleaseError(
+                "self-test cannot uniquely locate retained inline SVG producer-key capture"
+            )
+        image_window_filename.write_text(
+            image_window_source.replace(
+                retained_producer_key_capture,
+                "controlled_v2_producer_key: None",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG retained producer exact key capture")
+
+        reset_candidate_authority_sources()
+        image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        exact_retained_join_url = (
+            "producer_key.is_some_and(|retained_url| retained_url == candidate_url)"
+        )
+        if image_window_source.count(exact_retained_join_url) != 1:
+            raise ReleaseError("self-test cannot uniquely locate retained inline SVG exact URL gate")
+        image_window_filename.write_text(
+            image_window_source.replace(
+                exact_retained_join_url,
+                "producer_key.is_some()",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG retained join exact cache-key URL")
+
+        reset_candidate_authority_sources()
+        image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        retained_join_layout_record = "has_controlled_layout_record &&"
+        if image_window_source.count(retained_join_layout_record) != 1:
+            raise ReleaseError(
+                "self-test cannot uniquely locate retained inline SVG layout-record gate"
+            )
+        image_window_filename.write_text(
+            image_window_source.replace(
+                retained_join_layout_record,
+                "true &&",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG retained join requires a controlled layout record")
+
+        reset_candidate_authority_sources()
+        image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        retained_join_callback_presence = "!callback_facts.is_empty() &&"
+        if image_window_source.count(retained_join_callback_presence) != 1:
+            raise ReleaseError("self-test cannot uniquely locate retained inline SVG callback-presence gate")
+        image_window_filename.write_text(
+            image_window_source.replace(retained_join_callback_presence, "true &&", 1),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG retained join missing-callback rejection")
+
+        reset_candidate_authority_sources()
+        image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        uniform_retained_join_provenance = (
+            "*provenance == PendingImageProvenance::ControlledV2Fenced &&"
+        )
+        if image_window_source.count(uniform_retained_join_provenance) != 1:
+            raise ReleaseError("self-test cannot uniquely locate uniform retained inline SVG provenance gate")
+        image_window_filename.write_text(
+            image_window_source.replace(
+                uniform_retained_join_provenance,
+                "true &&",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG retained join uniform fenced provenance")
+
+        reset_candidate_authority_sources()
+        image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        no_baseline_retained_join = "!has_baseline_retained_work &&"
+        if image_window_source.count(no_baseline_retained_join) != 1:
+            raise ReleaseError("self-test cannot uniquely locate retained inline SVG baseline exclusion")
+        image_window_filename.write_text(
+            image_window_source.replace(no_baseline_retained_join, "true &&", 1),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG retained join baseline exclusion")
+
+        reset_candidate_authority_sources()
+        image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        both_cache_states_gate = "if !needs_listener && retained_join_is_exact {"
+        if image_window_source.count(both_cache_states_gate) != 1:
+            raise ReleaseError("self-test cannot uniquely locate state-independent retained SVG join gate")
+        image_window_filename.write_text(
+            image_window_source.replace(
+                both_cache_states_gate,
+                "if !is_unrequested && !needs_listener && retained_join_is_exact {",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG retained join covers stale Unrequested")
+
+        reset_candidate_authority_sources()
+        image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        no_join_listener_gate = "ControlledV2InlineSvgRequestAction::JoinRetainedProducer => None,"
+        if image_window_source.count(no_join_listener_gate) != 1:
+            raise ReleaseError("self-test cannot uniquely locate inline SVG retained-join listener gate")
+        image_window_filename.write_text(
+            image_window_source.replace(
+                no_join_listener_gate,
+                "ControlledV2InlineSvgRequestAction::JoinRetainedProducer => Some(self.baseline_image_cache_transport()),",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG retained join creates no listener or producer")
+
+        reset_candidate_authority_sources()
+        image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        no_second_fetch_url_gate = "let Some(url) = unrequested_url else {"
+        if image_window_source.count(no_second_fetch_url_gate) != 1:
+            raise ReleaseError("self-test cannot uniquely locate inline SVG no-second-fetch gate")
+        image_window_filename.write_text(
+            image_window_source.replace(
+                no_second_fetch_url_gate,
+                "let url = candidate_url; if false {",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG producer start requires exact Unrequested URL")
+
+        reset_candidate_authority_sources()
+        image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        inline_controlled_branch = (
+            "if controlled_inline_svg_action != ControlledV2InlineSvgRequestAction::Reject {\n"
+        )
         if image_window_source.count(inline_controlled_branch) != 1:
             raise ReleaseError("self-test cannot uniquely locate controlled inline SVG decode branch")
         image_window_filename.write_text(
@@ -7891,6 +9670,25 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             encoding="utf-8",
         )
         require_candidate_mutation_rejected("inline SVG fetch before exact owner/listener admission")
+
+        reset_candidate_authority_sources()
+        image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        new_owner_retention_gate = (
+            "                if is_new_owner {\n"
+            "                    self.pending_layout_images"
+        )
+        if image_window_source.count(new_owner_retention_gate) != 1:
+            raise ReleaseError("self-test cannot uniquely locate inline SVG idempotent owner-retention gate")
+        image_window_filename.write_text(
+            image_window_source.replace(
+                new_owner_retention_gate,
+                "                if true {\n                    self.pending_layout_images",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG retained owner remains idempotent")
 
         reset_candidate_authority_sources()
         image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
@@ -7919,6 +9717,162 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             encoding="utf-8",
         )
         require_candidate_mutation_rejected("inline SVG zero-event native proof")
+
+        reset_candidate_authority_sources()
+        shared_inline_fixture_filename = candidate_profile_root / CONTROLLED_INLINE_SVG_SHARED_PENDING_FIXTURE
+        shared_inline_fixture_source = shared_inline_fixture_filename.read_text(encoding="utf-8")
+        shared_inline_root = (
+            '<svg class="shared" width="4" height="3" viewBox="0 0 4 3" '
+            'xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>'
+        )
+        if shared_inline_fixture_source.count(shared_inline_root) != 12:
+            raise ReleaseError("self-test cannot locate twelve identical shared-pending SVG roots")
+        shared_inline_fixture_filename.write_text(
+            shared_inline_fixture_source.replace(shared_inline_root, "", 1),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG twelve-owner shared-pending fixture")
+
+        reset_candidate_authority_sources()
+        incremental_fixture_filename = (
+            candidate_profile_root / CONTROLLED_INLINE_SVG_INCREMENTAL_SAME_TASK_FIXTURE
+        )
+        incremental_fixture_source = incremental_fixture_filename.read_text(encoding="utf-8")
+        incremental_append = "icons.append(second)"
+        if incremental_fixture_source.count(incremental_append) != 1:
+            raise ReleaseError(
+                "self-test cannot uniquely locate incremental inline SVG retained-owner append"
+            )
+        incremental_fixture_filename.write_text(
+            incremental_fixture_source.replace(
+                incremental_append,
+                "icons.replaceChildren(second)",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG incremental retained first owner")
+
+        reset_candidate_authority_sources()
+        settlement_url_fixture_filename = candidate_profile_root / CONTROLLED_SETTLEMENT_URL_FIXTURE
+        settlement_url_fixture_source = settlement_url_fixture_filename.read_text(encoding="utf-8")
+        settlement_url_push = 'history.pushState('
+        if settlement_url_fixture_source.count(settlement_url_push) != 1:
+            raise ReleaseError("self-test cannot uniquely locate settlement URL history push")
+        settlement_url_fixture_filename.write_text(
+            settlement_url_fixture_source.replace(settlement_url_push, "history.replaceState(", 1),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("settlement URL same-document history fixture")
+
+        reset_candidate_authority_sources()
+        interval_fixture_filename = (
+            candidate_profile_root / CONTROLLED_INTERVAL_BEFORE_FINITE_FIXTURE
+        )
+        interval_fixture_source = interval_fixture_filename.read_text(encoding="utf-8")
+        interval_period = "}, 5_000);"
+        if interval_fixture_source.count(interval_period) != 1:
+            raise ReleaseError(
+                "self-test cannot uniquely locate persistent interval fixture period"
+            )
+        interval_fixture_filename.write_text(
+            interval_fixture_source.replace(interval_period, "}, 4_000);", 1),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("persistent interval exact five-second period")
+
+        reset_candidate_authority_sources()
+        image_window_filename = candidate_profile_root / CONTROLLED_IMAGE_WINDOW_SOURCE
+        image_window_source = image_window_filename.read_text(encoding="utf-8")
+        accounting_start = image_window_source.find("fn coalesced_controlled_layout_owners_are_one_logical_work_item()")
+        accounting_end = image_window_source.find("    #[test]", accounting_start + 1)
+        if accounting_start < 0 or accounting_end < 0:
+            raise ReleaseError("self-test cannot bound shared-pending inline SVG accounting proof")
+        accounting_source = image_window_source[accounting_start:accounting_end]
+        one_logical_work_item = "assert_eq!(observation.controlled_work_items, Some(1));"
+        if accounting_source.count(one_logical_work_item) != 1:
+            raise ReleaseError("self-test cannot locate shared-pending one-work-item assertion")
+        image_window_filename.write_text(
+            image_window_source[:accounting_start]
+            + accounting_source.replace(
+                one_logical_work_item,
+                "assert_eq!(observation.controlled_work_items, Some(12));",
+                1,
+            )
+            + image_window_source[accounting_end:],
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG shared-pending exact-ID accounting")
+
+        reset_candidate_authority_sources()
+        inline_protocol_filename = candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
+        inline_protocol_source = inline_protocol_filename.read_text(encoding="utf-8")
+        shared_inline_v2_owned = 'ControlledImageProfileExpectation::Owned("shared-inline-svg:12|now:0")'
+        if inline_protocol_source.count(shared_inline_v2_owned) != 1:
+            raise ReleaseError("self-test cannot uniquely locate shared-pending inline SVG v2 ownership proof")
+        inline_protocol_filename.write_text(
+            inline_protocol_source.replace(
+                shared_inline_v2_owned,
+                "ControlledImageProfileExpectation::Unsupported",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG shared-pending v2 owned protocol proof")
+
+        reset_candidate_authority_sources()
+        inline_protocol_filename = candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
+        inline_protocol_source = inline_protocol_filename.read_text(encoding="utf-8")
+        shared_inline_v1_expectation = (
+            '"inline-svg-shared-pending-v1",\n'
+            "        CONTROLLED_V2_INLINE_SVG_SHARED_PENDING_FIXTURE,\n"
+            "        ControlledImageProfileExpectation::PredecessorMayQuiesce(\n"
+            '            "shared-inline-svg:12|now:0",\n'
+            "        ),"
+        )
+        if inline_protocol_source.count(shared_inline_v1_expectation) != 1:
+            raise ReleaseError("self-test cannot uniquely locate shared-pending inline SVG v1 boundary proof")
+        inline_protocol_filename.write_text(
+            inline_protocol_source.replace(
+                shared_inline_v1_expectation,
+                '"inline-svg-shared-pending-v1",\n'
+                "        CONTROLLED_V2_INLINE_SVG_SHARED_PENDING_FIXTURE,\n"
+                '        ControlledImageProfileExpectation::Owned("shared-inline-svg:12|now:0"),',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG shared-pending v1 non-promotion proof")
+
+        reset_candidate_authority_sources()
+        inline_protocol_filename = candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
+        inline_protocol_source = inline_protocol_filename.read_text(encoding="utf-8")
+        incremental_same_task_v2_trace = (
+            '            "incremental-inline-svg:2|first:4x3|second:4x3|now:0",\n'
+            "        ),\n"
+            "    );\n"
+            "    exercise_controlled_data_svg_profile(\n"
+            '        "controlled-web-session-v1",\n'
+            '        "inline-svg-incremental-same-task-v1",'
+        )
+        if inline_protocol_source.count(incremental_same_task_v2_trace) != 1:
+            raise ReleaseError(
+                "self-test cannot uniquely locate incremental same-task inline SVG v2 owned proof"
+            )
+        inline_protocol_filename.write_text(
+            inline_protocol_source.replace(
+                incremental_same_task_v2_trace,
+                '            "wrong-incremental-same-task-trace",\n'
+                "        ),\n"
+                "    );\n"
+                "    exercise_controlled_data_svg_profile(\n"
+                '        "controlled-web-session-v1",\n'
+                '        "inline-svg-incremental-same-task-v1",',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected("inline SVG incremental same-task v2 owned protocol proof")
 
         reset_candidate_authority_sources()
         inline_protocol_filename = candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE

@@ -10,15 +10,27 @@
     animation: controlled-slide 1ms linear -1ms 1;
   }
 
+  #post-reflow-target.running {
+    animation: controlled-post-reflow 1000ms linear 1;
+  }
+
   @keyframes controlled-slide {
     from { transform: translateX(0); }
     to { transform: translateX(1px); }
   }
+
+  @keyframes controlled-post-reflow {
+    from { transform: translateX(0); }
+    to { transform: translateX(100px); }
+  }
 </style>
 <button id="start" type="button">start owned CSS work</button>
+<button id="post-reflow" type="button">queue an event after animation dispatch</button>
 <button id="script-created" type="button">create script events</button>
 <div id="target">target</div>
+<div id="post-reflow-target">post-reflow target</div>
 <div id="result">pending</div>
+<div id="post-reflow-result">pending</div>
 <script>
   const result = document.querySelector("#result");
   const target = document.querySelector("#target");
@@ -52,6 +64,34 @@
     // dispatch still occurs only through the document's owned update-the-rendering queue.
     target.getBoundingClientRect();
     publish();
+  });
+
+  const postReflowTarget = document.querySelector("#post-reflow-target");
+  const postReflowResult = document.querySelector("#post-reflow-result");
+  const postReflowObserved = [];
+  let postReflowArmedAt = null;
+  const publishPostReflow = () => {
+    postReflowResult.textContent =
+      `armed:${formatTime(postReflowArmedAt ?? -1)}|${postReflowObserved.join(">")}`;
+  };
+  for (const type of ["animationstart", "animationcancel", "animationend"]) {
+    postReflowTarget.addEventListener(type, (event) => {
+      postReflowObserved.push(
+        `${event.type}:${event.isTrusted ? "trusted" : "untrusted"}:${formatTime(event.timeStamp)}:${formatTime(performance.now())}`,
+      );
+      publishPostReflow();
+    });
+  }
+  document.querySelector("#post-reflow").addEventListener("click", () => {
+    postReflowArmedAt = performance.now();
+    postReflowTarget.classList.add("running");
+    // The first rendering opportunity discovers the animation during style/layout, after that
+    // opportunity already dispatched its animation-event batch. The nested rAF removes it in the
+    // next opportunity, causing layout to enqueue animationcancel after that batch as well.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => postReflowTarget.classList.remove("running"));
+    });
+    publishPostReflow();
   });
 
   document.querySelector("#script-created").addEventListener("click", () => {

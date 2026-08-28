@@ -323,6 +323,18 @@ jobs:
           grep -F '"runtimeAcquisition":"explicit-executable-override-cache-bypassed"' \
             "$session_gate_log"
 
+      - name: Gate Stasis library and controlled-source invariants on this native platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --profile production-stripped -p stasis-shell --lib -- --test-threads=1 --show-output
+          cargo test --locked --profile production-stripped -p servo-script --lib pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output
+          cargo test --locked --profile production-stripped -p servo --lib controlled_cookie_context_tests -- --test-threads=1 --show-output
+          cargo test --locked --profile production-stripped -p servo-net --lib request_interceptor::tests -- --test-threads=1 --show-output
+          cargo test --locked --profile production-stripped -p servo-net --test main cookie::controlled_cookie_v2_retrieval_obeys_the_samesite_matrix -- --exact --test-threads=1 --show-output
+          cargo test --locked --profile production-stripped -p servo-net --test main cookie::controlled_cookie_v2_storage_obeys_the_samesite_matrix -- --exact --test-threads=1 --show-output
+          cargo test --locked --profile production-stripped -p servo-constellation --lib controlled_session_navigation_load_data_tests -- --test-threads=1 --show-output
+
       - name: Gate the automation and bounded-settlement fixture matrix
         id: controlled_mvp_gate
         shell: bash
@@ -1073,6 +1085,65 @@ jobs:
             throw 'production-stripped Stasis executable is empty'
           }
 
+      - name: Gate Stasis library and controlled-source invariants on Windows
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stasisLibTestCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell --lib ' +
+            '-- --test-threads=1 --show-output; exit $LASTEXITCODE'
+          & .\mach.ps1 exec -- pwsh -NoProfile -Command $stasisLibTestCommand
+          if ($LASTEXITCODE -ne 0) {
+            throw "the Windows Stasis library-invariant gate failed with exit code $LASTEXITCODE"
+          }
+          $controlledImageCapacityTestCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p servo-script --lib ' +
+            'pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output; ' +
+            'exit $LASTEXITCODE'
+          & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledImageCapacityTestCommand
+          if ($LASTEXITCODE -ne 0) {
+            throw "the Windows controlled-image capacity gate failed with exit code $LASTEXITCODE"
+          }
+          $controlledCookieContextTestCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p servo --lib ' +
+            'controlled_cookie_context_tests -- --test-threads=1 --show-output; ' +
+            'exit $LASTEXITCODE'
+          & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledCookieContextTestCommand
+          if ($LASTEXITCODE -ne 0) {
+            throw "the Windows controlled-cookie context gate failed with exit code $LASTEXITCODE"
+          }
+          $requestInterceptorTestCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p servo-net --lib ' +
+            'request_interceptor::tests -- --test-threads=1 --show-output; ' +
+            'exit $LASTEXITCODE'
+          & .\mach.ps1 exec -- pwsh -NoProfile -Command $requestInterceptorTestCommand
+          if ($LASTEXITCODE -ne 0) {
+            throw "the Windows request-interceptor provenance gate failed with exit code $LASTEXITCODE"
+          }
+          $controlledCookieRetrievalTestCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p servo-net --test main ' +
+            'cookie::controlled_cookie_v2_retrieval_obeys_the_samesite_matrix -- --exact ' +
+            '--test-threads=1 --show-output; exit $LASTEXITCODE'
+          & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledCookieRetrievalTestCommand
+          if ($LASTEXITCODE -ne 0) {
+            throw "the Windows controlled-cookie retrieval gate failed with exit code $LASTEXITCODE"
+          }
+          $controlledCookieStorageTestCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p servo-net --test main ' +
+            'cookie::controlled_cookie_v2_storage_obeys_the_samesite_matrix -- --exact ' +
+            '--test-threads=1 --show-output; exit $LASTEXITCODE'
+          & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledCookieStorageTestCommand
+          if ($LASTEXITCODE -ne 0) {
+            throw "the Windows controlled-cookie storage gate failed with exit code $LASTEXITCODE"
+          }
+          $controlledNavigationLoadDataTestCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p servo-constellation --lib ' +
+            'controlled_session_navigation_load_data_tests -- --test-threads=1 --show-output; ' +
+            'exit $LASTEXITCODE'
+          & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledNavigationLoadDataTestCommand
+          if ($LASTEXITCODE -ne 0) {
+            throw "the Windows controlled-session navigation/load-data gate failed with exit code $LASTEXITCODE"
+          }
+
       - name: Stage the required ANGLE runtime beside Stasis
         run: |
           $ErrorActionPreference = 'Stop'
@@ -1119,6 +1190,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'pnpm install failed' }
           pnpm build
           if ($LASTEXITCODE -ne 0) { throw 'the TypeScript SDK build failed' }
+
+      - name: Gate the platform-honest TypeScript SDK suite on Windows
+        working-directory: sdk/typescript
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm test
+          if ($LASTEXITCODE -ne 0) { throw 'the Windows TypeScript SDK suite failed' }
 
       - name: Gate the controlled-session v1 North Star with the explicit executable
         working-directory: sdk/typescript
@@ -2223,6 +2301,9 @@ jobs:
             --session-v2-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_data_svg.html \
             --session-v2-http-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_http.html \
             --session-v2-inline-svg-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg.html \
+            --session-v2-inline-svg-shared-pending-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg_shared_pending.html \
+            --session-v2-settlement-url-fixture ports/stasis/tests/fixtures/controlled_v2_settlement_url.html \
+            --session-v2-interval-before-finite-fixture ports/stasis/tests/fixtures/controlled_v2_interval_before_finite.html \
             --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
             --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
             --session-v2-css-animation-event-fixture ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html \
@@ -2521,6 +2602,76 @@ jobs:
                       "fixtureTrace": "inline-svg:4x3|events:0|now:0",
                       "domCompletionEvents": "0",
                       "evidenceProfile": "controlled-web-session-v2",
+                      "sharedNavigationBoundary": "controlled_ready",
+                      "sharedOutcome": "quiescent",
+                      "sharedProducerPending": "0",
+                      "sharedProducerTerminal": False,
+                      "sharedPendingImages": "0",
+                      "sharedRuntimeFailures": "0",
+                      "sharedUnsupportedWork": "0",
+                      "sharedExternalIo": "0",
+                      "sharedFixtureTrace": "shared-inline-svg:12|now:0",
+                      "sharedEvidenceProfile": "controlled-web-session-v2",
+                      "sameControlledSession": True,
+                      "exactBinaryLaunch": True,
+                      "closeResponseAndEof": True,
+                  },
+                  "v2SettlementUrl": {
+                      "profile": "controlled-web-session-v2",
+                      "navigationBoundary": "controlled_ready",
+                      "controlledOpenUrl": (
+                          "https://packed-sdk-message-channel-v2.example.test/"
+                      ),
+                      "initialOutcome": "quiescent",
+                      "initialUrl": (
+                          "https://packed-sdk-settlement-url-v2.example.test/"
+                          "settlement-url/replaced?proof=initial#attested"
+                      ),
+                      "historyOutcome": "quiescent",
+                      "historyUrl": (
+                          "https://packed-sdk-settlement-url-v2.example.test/"
+                          "settlement-url/pushed?proof=history#attested"
+                      ),
+                      "replacementOutcome": "quiescent",
+                      "replacementUrl": (
+                          "https://packed-sdk-settlement-url-v2.example.test/"
+                          "settlement-url/final?proof=replacement#attested"
+                      ),
+                      "replacementTrace": "replaced",
+                      "sessionUrlStayedAtControlledOpen": True,
+                      "sessionEvidenceExcludesUrl": True,
+                      "standaloneEvidenceExcludesUrl": True,
+                      "unsupportedOutcome": "unsupported_work",
+                      "unsupportedFailureCode": "unsupported_clock_surface",
+                      "unsupportedUrl": (
+                          "https://packed-sdk-automation-event-timestamps-v2.example.test/"
+                      ),
+                      "exactBinaryLaunch": True,
+                      "closeResponseAndEof": True,
+                  },
+                  "v2PersistentIntervalProgression": {
+                      "profile": "controlled-web-session-v2",
+                      "navigationBoundary": "controlled_ready",
+                      "implicitVirtualTimeNs": "12000000000",
+                      "implicitPersistentTimers": "1",
+                      "implicitFutureFinite": "0",
+                      "implicitTrace": "interval:1@5000|interval:2@10000|finite@12000",
+                      "strictOutcome": "blocked_on_open_ended_work",
+                      "strictVirtualTimeNs": "12000000000",
+                      "strictTrace": "interval:1@5000|interval:2@10000|finite@12000",
+                      "reportOutcome": "quiescent_with_persistent_work",
+                      "reportVirtualTimeNs": "12000000000",
+                      "reportTrace": "interval:1@5000|interval:2@10000|finite@12000",
+                      "persistentTimers": "1",
+                      "futureFinite": "0",
+                      "persistentKind": "timer",
+                      "persistentReason": "interval",
+                      "persistentCount": "1",
+                      "requestedPeriodNs": "5000000000",
+                      "runtimeFailures": "0",
+                      "unsupportedWork": "0",
+                      "externalIo": "0",
+                      "evidenceProfile": "controlled-web-session-v2",
                       "sameControlledSession": True,
                       "exactBinaryLaunch": True,
                       "closeResponseAndEof": True,
@@ -2722,6 +2873,18 @@ jobs:
                   "unsupportedAnimations": "0",
                   "producerPending": "0",
                   "producerTerminal": False,
+                  "postReflowOutcome": "quiescent",
+                  "postReflowVirtualTimeNs": "70000000",
+                  "postReflowTrace": "armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70",
+                  "postReflowEventCount": "2",
+                  "postReflowEventKinds": "animationcancel,animationstart",
+                  "postReflowRuntimeFailures": "0",
+                  "postReflowUnsupportedWork": "0",
+                  "postReflowExternalIo": "0",
+                  "postReflowPendingAnimationEvents": "0",
+                  "postReflowNextOpportunityNs": "none",
+                  "postReflowStateTokenPreserved": True,
+                  "postReflowOwnedQueueDrain": True,
                   "scriptCreatedConstructorCount": "2",
                   "scriptCreatedTrace": "script:0,0",
                   "rejectedOutcome": "unsupported_work",
@@ -2742,6 +2905,7 @@ jobs:
                   "controlledEventCount", "controlledEventKinds",
                   "controlledOwnedEventCount", "controlledDispatchTimeCount",
                   "processedRenderingOpportunities",
+                  "postReflowProcessedRenderingOpportunities",
               }
               event_count = (
                   css_record.get("controlledEventCount", "")
@@ -2772,6 +2936,11 @@ jobs:
                   if type(css_record) is dict
                   else ""
               )
+              post_reflow_rendering_opportunities = (
+                  css_record.get("postReflowProcessedRenderingOpportunities", "")
+                  if type(css_record) is dict
+                  else ""
+              )
               if (
                   type(css_record) is not dict
                   or set(css_record) != css_expected_fields
@@ -2795,6 +2964,8 @@ jobs:
                   or int(dispatch_times) > int(event_count)
                   or not isinstance(rendering_opportunities, str)
                   or re.fullmatch(r"[1-9][0-9]*", rendering_opportunities) is None
+                  or not isinstance(post_reflow_rendering_opportunities, str)
+                  or re.fullmatch(r"[1-9][0-9]*", post_reflow_rendering_opportunities) is None
               ):
                   raise SystemExit(
                       f"{context} lost exact v2CssAnimationEventTimestamps evidence"
@@ -3385,7 +3556,7 @@ jobs:
               sdk_proof_file.read_text(encoding="utf-8"), "SDK gate proof"
           )
           expected_sdk = {
-              "schema": 7,
+              "schema": 10,
               "gate": "sdk-act-settle-inspect",
               "package": f"@oxhq/stasis@{version}",
               "revision": revision,
@@ -3400,7 +3571,8 @@ jobs:
               or set(sdk_proof)
                   != set(expected_sdk) | {
                       "gateLogSha256", "v2MessageChannel", "v2DirectDataSvg",
-                      "v2InlineSvgRendering", "v2InputMethodFocus",
+                      "v2InlineSvgRendering", "v2SettlementUrl",
+                      "v2PersistentIntervalProgression", "v2InputMethodFocus",
                       "v2AutomationEventTimestamps",
                       "v2CssAnimationEventTimestamps",
                       "v2CookieSession",
@@ -4577,7 +4749,16 @@ jobs:
           cache/decode completion path for canonical data SVG and direct HTTP(S) selection; a
           distinct bounded top-level inline SVG
           path for its exact cached internally serialized data-SVG request and cache-ID owner on the
-          same ScriptThread/ImageCache; and
+          same ScriptThread/ImageCache. An identical current inline root may join an exact retained
+          producer when its cache-key URL and PendingImageId match an existing same-ID fenced
+          layout record and every live callback is uniformly fenced with that exact producer URL
+          key. The callback owns that key until terminal removal, so an earlier DOM owner may
+          already have unbound and its identity is neither required nor trusted. The callback set
+          remains nonempty, no baseline work may coexist, and the new current owner is retained
+          once. The peer reuses the existing listener and producer without adding a listener,
+          producer, or fetch.
+          Baseline, v1, external/nested SVG, iframe, worker, worklet, and cross-loop authority
+          remains unchanged. V2 also adds
           an explicit headless InputMethod boundary for controlled top-level, single-line text focus
           without a virtual-keyboard request. Admitted HTML image completion sets and
           engine-generated focus transitions use document-clock timestamps. Every browser-created
@@ -4593,7 +4774,10 @@ jobs:
           over Expires, lifetime is clamped to 400 days, expiry is lazily purged, and an expiry at
           or before controlled now deletes the cookie. SameSite selection uses the captured
           schemeful site-for-cookies, the current redirect-hop method, and the top-level-navigation
-          bit; ineligible cookies are filtered before a request. Persistent cookies remain
+          bit; ineligible cookies are filtered before a request. After successful controlled
+          parsing, cross-site subresource responses retain only valid Secure SameSite=None cookies;
+          otherwise valid Strict/Lax/unspecified values are ignored, while parse, normalization,
+          and time-range failures retain their existing typed outcomes. Persistent cookies remain
           memory-only and become portable only through explicit controlled-web-session-v2 state
           export/import. A v1 artifact is never migrated implicitly, opaque or unknown SameSite
           context is typed unsupported, and partitioned cookies remain outside the profile.
@@ -4618,6 +4802,16 @@ jobs:
           transfer, excluded image sources/consumers, general SVG/resource semantics, cross-global
           messaging, workers, iframes, external ingress, and other undeclared sources receive no
           new controlled authority. Baseline and v1 SVG behavior are unchanged.
+          A nonempty document-owned pending CSS animation-event queue retains one later owned
+          rendering opportunity until dispatch drains it; an empty queue leaves no opportunity.
+          With persistentWork=report, v2 may advance an eligible exact JavaScript interval head
+          while finite work remains. Finite timer and animated-image deadlines must be strictly
+          later. One finite rendering opportunity may share the timestamp only as a distinct exact
+          same-scheduler owner whose TimerId sequence follows the interval head; same-entry,
+          lower-or-equal-order, foreign-scheduler, bare/unowned, equal finite-timer, and equal
+          animated-image collisions remain blocked. Every callback consumes the existing execution budgets, and an
+          interval-only document checkpoints as quiescent_with_persistent_work without another
+          cycle. Strict policy and both predecessor profiles retain stop-at-interval behavior.
 
           Windows x86_64 is compiled, packaged, dependency-closed, and exercised in package CI.
           It remains an unsigned CI-only artifact and is not a managed release asset in this tag.

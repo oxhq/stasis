@@ -574,6 +574,11 @@ test("openSession exposes token authority and the complete bounded session surfa
   assert.equal(settled.outcome, "quiescent");
   assert.equal(settled.snapshot.stateToken, settled.stateToken);
   assert.notEqual(settled.stateToken, extraction.stateToken);
+  assert.equal(
+    Object.hasOwn(settled, "url"),
+    false,
+    "the frozen v1 settlement result shape must not acquire the v2 URL field",
+  );
 
   const navigated = await session.navigate(
     "https://example.test/next",

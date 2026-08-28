@@ -234,6 +234,12 @@ pub struct RequestClient {
     pub origin: Origin,
     /// <https://html.spec.whatwg.org/multipage/#nested-browsing-context>
     pub is_nested_browsing_context: bool,
+    /// Servo-internal site-for-cookies provenance captured with this request client.
+    ///
+    /// `None` deliberately preserves an unknown client context so controlled sessions can fail
+    /// closed instead of consulting mutable browsing-context state later in the request.
+    #[serde(default)]
+    pub controlled_cookie_site_for_cookies: Option<ServoUrl>,
     /// <https://w3c.github.io/webappsec-upgrade-insecure-requests/#insecure-requests-policy>
     pub insecure_requests_policy: InsecureRequestsPolicy,
     /// <https://w3c.github.io/webappsec-secure-contexts/#potentially-trustworthy-origin>
@@ -750,6 +756,12 @@ impl RequestBuilder {
     }
 
     pub fn build(self) -> Request {
+        let controlled_cookie_top_level_navigation = self.mode == RequestMode::Navigate
+            && self.destination == Destination::Document
+            && self
+                .client
+                .as_ref()
+                .is_some_and(|client| !client.is_nested_browsing_context);
         let mut request = Request::new(
             self.id,
             self.url.clone(),
@@ -768,6 +780,7 @@ impl RequestBuilder {
         request.history_navigation = self.history_navigation;
         request.service_workers_mode = self.service_workers_mode;
         request.destination = self.destination;
+        request.controlled_cookie_top_level_navigation = controlled_cookie_top_level_navigation;
         request.originating_api = self.originating_api;
         request.synchronous = self.synchronous;
         request.mode = self.mode;
@@ -844,6 +857,10 @@ pub struct Request {
     pub initiator: Initiator,
     /// <https://fetch.spec.whatwg.org/#concept-request-destination>
     pub destination: Destination,
+    /// Servo-internal top-level-navigation provenance captured when this request is built.
+    /// Redirects mutate the current URL and method on the same request but must not rederive this
+    /// flag from later browsing-context state.
+    pub controlled_cookie_top_level_navigation: bool,
     /// Servo-internal provenance for otherwise ambiguous empty-destination requests.
     pub originating_api: RequestOriginatingApi,
     // TODO: priority object
@@ -913,6 +930,7 @@ impl Request {
             service_workers_mode: ServiceWorkersMode::All,
             initiator: Initiator::None,
             destination: Destination::None,
+            controlled_cookie_top_level_navigation: false,
             originating_api: RequestOriginatingApi::Unclassified,
             origin: origin.unwrap_or(Origin::Client),
             referrer,

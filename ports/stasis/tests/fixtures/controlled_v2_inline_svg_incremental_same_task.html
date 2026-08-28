@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>controlled v2 incremental same-task inline SVG clone</title>
+<main id="icons">
+  <svg width="4" height="3" viewBox="0 0 4 3" xmlns="http://www.w3.org/2000/svg"><rect width="4" height="3" fill="green"></rect></svg>
+</main>
+<output id="result">waiting</output>
+<script>
+  const icons = document.querySelector("#icons");
+  const first = icons.firstElementChild;
+
+  // Complete one geometry read before mounting the duplicate. This deterministically exercises
+  // an incremental same-task DOM/layout mutation, but does not prove that painting has started or
+  // that the first serialized-SVG raster request is still pending.
+  const firstRect = first.getBoundingClientRect();
+
+  // Appending an exact clone preserves the serialized-SVG identity and invalidates layout. The
+  // second read confirms that the dynamically mounted owner participates in the updated layout.
+  // A true cross-turn pending-decode overlap needs an engine-side synchronization hook: yielding
+  // to requestAnimationFrame would make decode completion timing scheduler-dependent.
+  const second = first.cloneNode(true);
+  icons.append(second);
+  const secondRect = second.getBoundingClientRect();
+
+  document.querySelector("#result").textContent = [
+    `incremental-inline-svg:${icons.children.length}`,
+    `first:${firstRect.width}x${firstRect.height}`,
+    `second:${secondRect.width}x${secondRect.height}`,
+    `now:${performance.now()}`,
+  ].join("|");
+</script>

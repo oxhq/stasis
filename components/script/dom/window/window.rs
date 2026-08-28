@@ -220,9 +220,10 @@ use crate::window_named_properties;
 
 /// Maximum retained controlled-v2 image ownership records in one Window.
 ///
-/// Each pending callback, exact `(cache ID, DOM owner)` identity, and vector-raster key consumes
-/// one record. Keeping the categories on one counter makes the boundary both finite and directly
-/// reconcilable from a passive pending snapshot.
+/// Each pending callback, controlled layout owner, exact `(cache ID, DOM owner)` identity,
+/// vector-raster key, and controlled raster owner consumes one record. Keeping the categories on
+/// one counter makes the boundary both finite and directly reconcilable from a passive pending
+/// snapshot.
 const CONTROLLED_V2_IMAGE_RETAINED_RECORD_LIMIT: usize = 512;
 
 /// Provenance retained with one image listener or vector-rasterization owner.
@@ -280,6 +281,61 @@ fn retained_image_provenance_accepts_delivery(
     retained != PendingImageProvenance::Unsupported && retained == delivery
 }
 
+/// Whether one inline-SVG cache owner has enough retained facts to join an existing controlled-v2
+/// producer, regardless of whether layout reports `PendingResponse` or a stale `Unrequested`.
+///
+/// Cache IDs are deliberately insufficient on their own. The candidate must prove its exact
+/// current internally serialized URL, an existing controlled layout record must retain the same
+/// ID, and every live fenced callback must retain that exact producer key. The producer-owned key
+/// survives DOM-owner invalidation only until terminal callback delivery; any absent key or mixed
+/// retained work stays typed unsupported.
+fn controlled_v2_retained_inline_svg_join_is_exact(
+    is_internal_request: InternalRequest,
+    candidate_url: &ServoUrl,
+    callback_facts: &[(PendingImageProvenance, Option<&ServoUrl>)],
+    has_controlled_layout_record: bool,
+    has_baseline_retained_work: bool,
+) -> bool {
+    is_internal_request == InternalRequest::Yes &&
+        has_controlled_layout_record &&
+        !has_baseline_retained_work &&
+        !callback_facts.is_empty() &&
+        callback_facts
+            .iter()
+            .all(|(provenance, producer_key)| {
+                *provenance == PendingImageProvenance::ControlledV2Fenced &&
+                    producer_key.is_some_and(|retained_url| retained_url == candidate_url)
+            })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlledV2InlineSvgRequestAction {
+    StartProducer,
+    JoinRetainedProducer,
+    Reject,
+}
+
+/// Select the only two controlled inline-SVG request paths.
+///
+/// An exact retained producer wins for both cache states. In particular, a stale `Unrequested`
+/// layout item from a later reflow must join the already-fenced producer instead of starting a
+/// duplicate fetch. A new producer remains limited to a genuinely unrequested cache entry with no
+/// retained layout listener.
+fn controlled_v2_inline_svg_request_action(
+    is_unrequested: bool,
+    needs_listener: bool,
+    initial_request_is_exact: bool,
+    retained_join_is_exact: bool,
+) -> ControlledV2InlineSvgRequestAction {
+    if !needs_listener && retained_join_is_exact {
+        ControlledV2InlineSvgRequestAction::JoinRetainedProducer
+    } else if is_unrequested && needs_listener && initial_request_is_exact {
+        ControlledV2InlineSvgRequestAction::StartProducer
+    } else {
+        ControlledV2InlineSvgRequestAction::Reject
+    }
+}
+
 /// One non-cloneable retained-registration slot owned by a Window collection entry.
 struct ControlledImageReservation {
     count: Rc<Cell<usize>>,
@@ -318,6 +374,18 @@ impl Drop for ControlledImageReservation {
     }
 }
 
+/// Reserve one retained controlled raster owner from the same Window-scoped capacity authority as
+/// callbacks, layout owners, identities, and raster keys.
+///
+/// Production insertion and the adversarial stalled-raster test deliberately share this helper so
+/// the cap proof cannot bypass the admission primitive used by the actual node-retention path.
+fn reserve_controlled_v2_raster_owner(
+    count: Rc<Cell<usize>>,
+    producer_fence: &timers::DocumentProducerFence,
+) -> Result<ControlledImageReservation, DocumentProducerFenceError> {
+    ControlledImageReservation::try_new(count, producer_fence)
+}
+
 /// A callback to call when a response comes back from the `ImageCache`.
 ///
 /// This is wrapped in a struct so that we can implement `MallocSizeOf`
@@ -330,6 +398,11 @@ pub struct PendingImageCallback {
     #[ignore_malloc_size_of = "shared capacity accounting owned by this Window"]
     _reservation: Option<ControlledImageReservation>,
     provenance: PendingImageProvenance,
+    /// Exact cache key owned by this live controlled producer. Baseline callbacks retain no key;
+    /// terminal callback removal retires it independently of DOM-owner unbinding. Inline-SVG
+    /// retained joins consume this producer-owned key instead of inferring authority from a DOM
+    /// owner that may already have unbound.
+    controlled_v2_producer_key: Option<ServoUrl>,
 }
 
 /// Current state of the window object
@@ -387,6 +460,63 @@ impl LayoutBlocker {
             self,
             Self::Parsing(instant) if instant + INITIAL_REFLOW_DELAY < host_now()
         )
+    }
+}
+
+pub(crate) fn controlled_cookie_site_for_document_origin(
+    is_top_level: bool,
+    origin: &MutableOrigin,
+) -> Option<ServoUrl> {
+    if !is_top_level || !matches!(origin.scheme(), Some("http" | "https")) {
+        return None;
+    }
+    ServoUrl::parse(origin.immutable().ascii_serialization().as_ref()).ok()
+}
+
+#[cfg(test)]
+mod controlled_cookie_site_for_document_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_top_level_tuple_document_contributes_a_cookie_site() {
+        let url = ServoUrl::parse("https://example.test/document").unwrap();
+        let tuple = MutableOrigin::new(url.origin());
+        let opaque = MutableOrigin::new(ImmutableOrigin::new_opaque());
+        let non_http = MutableOrigin::new(
+            ServoUrl::parse("ftp://files.example.test/archive")
+                .unwrap()
+                .origin(),
+        );
+        let non_default_port = MutableOrigin::new(
+            ServoUrl::parse("https://example.test:8443/path")
+                .unwrap()
+                .origin(),
+        );
+
+        assert_eq!(
+            controlled_cookie_site_for_document_origin(true, &tuple),
+            Some(ServoUrl::parse("https://example.test/").unwrap()),
+            "the site is reconstructed from the actual tuple origin, not the document path"
+        );
+        assert_eq!(
+            controlled_cookie_site_for_document_origin(true, &opaque),
+            None,
+            "a sandboxed HTTPS document keeps its URL but not a schemeful client origin"
+        );
+        assert_eq!(
+            controlled_cookie_site_for_document_origin(true, &non_http),
+            None,
+            "a non-HTTP tuple is outside controlled cookie authority"
+        );
+        assert_eq!(
+            controlled_cookie_site_for_document_origin(true, &non_default_port),
+            Some(ServoUrl::parse("https://example.test:8443/").unwrap())
+        );
+        assert_eq!(
+            controlled_cookie_site_for_document_origin(false, &tuple),
+            None,
+            "nested documents remain outside the single-context authority"
+        );
     }
 }
 
@@ -499,7 +629,7 @@ pub(crate) struct WindowImagePendingObservation {
 fn observe_pending_nonanimated_images(
     callback_registrations: impl IntoIterator<Item = (PendingImageId, PendingImageProvenance)>,
     layout_registrations: impl IntoIterator<Item = (PendingImageId, PendingImageProvenance)>,
-    rasterization_provenances: impl IntoIterator<Item = PendingImageProvenance>,
+    rasterization_registrations: impl IntoIterator<Item = (PendingImageProvenance, usize)>,
     retained_controlled_identity_owners: usize,
     observed_controlled_retained_records: usize,
 ) -> WindowImagePendingObservation {
@@ -526,7 +656,11 @@ fn observe_pending_nonanimated_images(
             PendingImageProvenance::Baseline | PendingImageProvenance::Unsupported => {
                 counts.0 = counts.0.saturating_add(1)
             },
-            PendingImageProvenance::ControlledV2Fenced => counts.1 = counts.1.saturating_add(1),
+            PendingImageProvenance::ControlledV2Fenced => {
+                counts.1 = counts.1.saturating_add(1);
+                retained_controlled_registrations =
+                    retained_controlled_registrations.and_then(|count| count.checked_add(1));
+            },
         }
     }
     let layout_image_ids: HashSet<_> = layout_provenances.keys().copied().collect();
@@ -548,12 +682,14 @@ fn observe_pending_nonanimated_images(
 
     let mut retained_rasterization_keys = 0usize;
     let mut controlled_rasterization_keys = 0usize;
-    for provenance in rasterization_provenances {
+    for (provenance, retained_raster_owners) in rasterization_registrations {
         retained_rasterization_keys = retained_rasterization_keys.saturating_add(1);
         if provenance == PendingImageProvenance::ControlledV2Fenced {
             controlled_rasterization_keys = controlled_rasterization_keys.saturating_add(1);
             retained_controlled_registrations =
-                retained_controlled_registrations.and_then(|count| count.checked_add(1));
+                retained_controlled_registrations
+                    .and_then(|count| count.checked_add(1))
+                    .and_then(|count| count.checked_add(retained_raster_owners));
         }
     }
 
@@ -589,7 +725,7 @@ mod pending_nonanimated_image_observation_tests {
     fn observe(
         callback_registrations: &[(u64, PendingImageProvenance)],
         layout_registrations: &[(u64, PendingImageProvenance)],
-        rasterization_provenances: &[PendingImageProvenance],
+        rasterization_registrations: &[(PendingImageProvenance, usize)],
         retained_controlled_identity_owners: usize,
         observed_controlled_retained_records: usize,
     ) -> WindowImagePendingObservation {
@@ -602,7 +738,7 @@ mod pending_nonanimated_image_observation_tests {
                 .iter()
                 .copied()
                 .map(|(id, provenance)| (PendingImageId(id), provenance)),
-            rasterization_provenances.iter().copied(),
+            rasterization_registrations.iter().copied(),
             retained_controlled_identity_owners,
             observed_controlled_retained_records,
         )
@@ -634,8 +770,8 @@ mod pending_nonanimated_image_observation_tests {
             ],
             &[(3, PendingImageProvenance::Baseline)],
             &[
-                PendingImageProvenance::Baseline,
-                PendingImageProvenance::Baseline,
+                (PendingImageProvenance::Baseline, 0),
+                (PendingImageProvenance::Baseline, 0),
             ],
             0,
             0,
@@ -663,7 +799,7 @@ mod pending_nonanimated_image_observation_tests {
                 (3, PendingImageProvenance::Baseline),
                 (3, PendingImageProvenance::Baseline),
             ],
-            &[PendingImageProvenance::Baseline],
+            &[(PendingImageProvenance::Baseline, 0)],
             0,
             0,
         );
@@ -679,22 +815,22 @@ mod pending_nonanimated_image_observation_tests {
         let id = PendingImageId(7);
         let mut callback_registrations = vec![(id, PendingImageProvenance::Baseline)];
         let mut layout_registrations = vec![(id, PendingImageProvenance::Baseline)];
-        let mut rasterization_provenances = vec![PendingImageProvenance::Baseline];
+        let mut rasterization_registrations = vec![(PendingImageProvenance::Baseline, 0)];
         let before_drop = observe_pending_nonanimated_images(
             callback_registrations.iter().copied(),
             layout_registrations.iter().copied(),
-            rasterization_provenances.iter().copied(),
+            rasterization_registrations.iter().copied(),
             0,
             0,
         );
 
         callback_registrations.clear();
         layout_registrations.clear();
-        rasterization_provenances.clear();
+        rasterization_registrations.clear();
         let after_drop = observe_pending_nonanimated_images(
             callback_registrations.iter().copied(),
             layout_registrations.iter().copied(),
-            rasterization_provenances.iter().copied(),
+            rasterization_registrations.iter().copied(),
             0,
             0,
         );
@@ -730,11 +866,11 @@ mod pending_nonanimated_image_observation_tests {
                 (3, PendingImageProvenance::Baseline),
             ],
             &[
-                PendingImageProvenance::ControlledV2Fenced,
-                PendingImageProvenance::Baseline,
+                (PendingImageProvenance::ControlledV2Fenced, 1),
+                (PendingImageProvenance::Baseline, 0),
             ],
             1,
-            5,
+            8,
         );
 
         assert_eq!(observation.retained_work_items, Some(5));
@@ -763,7 +899,7 @@ mod pending_nonanimated_image_observation_tests {
             ],
             &[],
             1,
-            2,
+            3,
         );
 
         assert_eq!(observation.retained_work_items, Some(1));
@@ -779,12 +915,147 @@ mod pending_nonanimated_image_observation_tests {
             &[(1, PendingImageProvenance::ControlledV2Fenced)],
             &[],
             1,
-            1,
+            2,
         );
 
         assert_eq!(observation.retained_work_items, Some(1));
         assert_eq!(observation.controlled_work_items, Some(0));
         assert_eq!(observation.unsupported_work_items, Some(1));
+        assert!(observation.controlled_retained_record_inventory_matches);
+    }
+
+    #[test]
+    fn retained_inline_svg_producer_key_admits_after_owner_identity_release() {
+        let candidate = ServoUrl::parse("data:image/svg+xml;base64,PHN2Zy8+").unwrap();
+        let callbacks = [(
+            PendingImageProvenance::ControlledV2Fenced,
+            Some(&candidate),
+        )];
+
+        // No DOM identity participates in this predicate: the exact key belongs to the live
+        // callback/producer and the existing controlled layout record retains the cache ID.
+        assert!(controlled_v2_retained_inline_svg_join_is_exact(
+            InternalRequest::Yes,
+            &candidate,
+            &callbacks,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn retained_inline_svg_join_rejects_missing_wrong_or_mixed_producer_authority() {
+        let candidate = ServoUrl::parse("data:image/svg+xml;base64,PHN2Zy8+").unwrap();
+        let other = ServoUrl::parse("data:image/svg+xml;base64,PHN2ZyBpZD0neCcvPg==").unwrap();
+        let exact = [(
+            PendingImageProvenance::ControlledV2Fenced,
+            Some(&candidate),
+        )];
+        let wrong = [(
+            PendingImageProvenance::ControlledV2Fenced,
+            Some(&other),
+        )];
+        let missing_key = [(PendingImageProvenance::ControlledV2Fenced, None)];
+        let mixed = [
+            (
+                PendingImageProvenance::ControlledV2Fenced,
+                Some(&candidate),
+            ),
+            (PendingImageProvenance::Baseline, Some(&candidate)),
+        ];
+
+        assert!(!controlled_v2_retained_inline_svg_join_is_exact(
+            InternalRequest::No,
+            &candidate,
+            &exact,
+            true,
+            false,
+        ));
+        assert!(!controlled_v2_retained_inline_svg_join_is_exact(
+            InternalRequest::Yes,
+            &candidate,
+            &[],
+            true,
+            false,
+        ));
+        assert!(!controlled_v2_retained_inline_svg_join_is_exact(
+            InternalRequest::Yes,
+            &candidate,
+            &missing_key,
+            true,
+            false,
+        ));
+        assert!(!controlled_v2_retained_inline_svg_join_is_exact(
+            InternalRequest::Yes,
+            &candidate,
+            &wrong,
+            true,
+            false,
+        ));
+        assert!(!controlled_v2_retained_inline_svg_join_is_exact(
+            InternalRequest::Yes,
+            &candidate,
+            &mixed,
+            true,
+            false,
+        ));
+        assert!(!controlled_v2_retained_inline_svg_join_is_exact(
+            InternalRequest::Yes,
+            &candidate,
+            &exact,
+            false,
+            false,
+        ));
+        assert!(!controlled_v2_retained_inline_svg_join_is_exact(
+            InternalRequest::Yes,
+            &candidate,
+            &exact,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn exact_retained_inline_svg_join_handles_both_cache_states_without_a_second_producer() {
+        assert_eq!(
+            controlled_v2_inline_svg_request_action(true, false, false, true),
+            ControlledV2InlineSvgRequestAction::JoinRetainedProducer,
+        );
+        assert_eq!(
+            controlled_v2_inline_svg_request_action(false, false, false, true),
+            ControlledV2InlineSvgRequestAction::JoinRetainedProducer,
+        );
+
+        assert_eq!(
+            controlled_v2_inline_svg_request_action(true, true, true, false),
+            ControlledV2InlineSvgRequestAction::StartProducer,
+        );
+        assert_eq!(
+            controlled_v2_inline_svg_request_action(true, false, true, false),
+            ControlledV2InlineSvgRequestAction::Reject,
+        );
+        assert_eq!(
+            controlled_v2_inline_svg_request_action(false, true, true, false),
+            ControlledV2InlineSvgRequestAction::Reject,
+        );
+    }
+
+    #[test]
+    fn coalesced_controlled_layout_owners_are_one_logical_work_item() {
+        let observation = observe(
+            &[(1, PendingImageProvenance::ControlledV2Fenced)],
+            &[(1, PendingImageProvenance::ControlledV2Fenced); 12],
+            &[],
+            12,
+            25,
+        );
+
+        assert_eq!(observation.retained_callback_ids, 1);
+        assert_eq!(observation.retained_layout_image_ids, 1);
+        assert_eq!(observation.retained_unique_image_ids, 1);
+        assert_eq!(observation.controlled_work_items, Some(1));
+        assert_eq!(observation.unsupported_work_items, Some(0));
+        assert!(observation.controlled_retained_record_inventory_matches);
     }
 
     #[test]
@@ -792,9 +1063,9 @@ mod pending_nonanimated_image_observation_tests {
         let observation = observe(
             &[(1, PendingImageProvenance::ControlledV2Fenced)],
             &[(1, PendingImageProvenance::ControlledV2Fenced)],
-            &[PendingImageProvenance::ControlledV2Fenced],
+            &[(PendingImageProvenance::ControlledV2Fenced, 1)],
             3,
-            5,
+            7,
         );
 
         assert_eq!(observation.retained_controlled_identity_owners, 3);
@@ -804,9 +1075,9 @@ mod pending_nonanimated_image_observation_tests {
         let unbounded_owner_inventory = observe(
             &[(1, PendingImageProvenance::ControlledV2Fenced)],
             &[(1, PendingImageProvenance::ControlledV2Fenced)],
-            &[PendingImageProvenance::ControlledV2Fenced],
+            &[(PendingImageProvenance::ControlledV2Fenced, 1)],
             4,
-            5,
+            7,
         );
         assert!(!unbounded_owner_inventory.controlled_retained_record_inventory_matches);
     }
@@ -875,6 +1146,105 @@ mod pending_nonanimated_image_observation_tests {
         reservations.clear();
         assert_eq!(count.get(), 0);
     }
+
+    #[test]
+    fn repeated_join_unbind_before_completion_caps_layout_anchors_at_512() {
+        let count = Rc::new(Cell::new(0));
+        let fence = timers::DocumentProducerFence::default();
+        let callback_reservation =
+            ControlledImageReservation::try_new(count.clone(), &fence).unwrap();
+        let mut layout_anchors = Vec::new();
+
+        // Model 511 exact clone mounts before the shared response completes. Each transient DOM
+        // identity is released by unbind, but its pending-layout anchor remains live until terminal
+        // delivery and therefore must keep consuming bounded Window capacity.
+        for _ in 0..(CONTROLLED_V2_IMAGE_RETAINED_RECORD_LIMIT - 1) {
+            let transient_identity =
+                ControlledImageReservation::try_new(count.clone(), &fence).unwrap();
+            drop(transient_identity);
+            layout_anchors
+                .push(ControlledImageReservation::try_new(count.clone(), &fence).unwrap());
+        }
+        assert_eq!(count.get(), CONTROLLED_V2_IMAGE_RETAINED_RECORD_LIMIT);
+
+        assert!(matches!(
+            ControlledImageReservation::try_new(count.clone(), &fence),
+            Err(DocumentProducerFenceError::AdmissionLimitExceeded {
+                kind: DocumentProducerKind::Image,
+                limit: 512,
+                observed: 513,
+            })
+        ));
+        assert_eq!(count.get(), CONTROLLED_V2_IMAGE_RETAINED_RECORD_LIMIT);
+
+        layout_anchors.clear();
+        drop(callback_reservation);
+        assert_eq!(count.get(), 0);
+    }
+
+    #[test]
+    fn repeated_join_unbind_before_completion_caps_stalled_raster_owners_at_512() {
+        let count = Rc::new(Cell::new(0));
+        let fence = timers::DocumentProducerFence::default();
+        let raster_key_reservation =
+            ControlledImageReservation::try_new(count.clone(), &fence).unwrap();
+        let mut retained_raster_owners: Vec<PendingImageRasterizationOwner<usize>> = Vec::new();
+
+        // One stalled `(image ID, size)` key can retain many exact same-size clone owners. Model
+        // each clone's identity being released on unbind while its raster node anchor stays live
+        // until the shared completion consumes the key.
+        let clone_attempts = CONTROLLED_V2_IMAGE_RETAINED_RECORD_LIMIT + 32;
+        let mut rejected_attempts = 0;
+        for clone_index in 0..clone_attempts {
+            let transient_identity =
+                match ControlledImageReservation::try_new(count.clone(), &fence) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        assert!(matches!(
+                            error,
+                            DocumentProducerFenceError::AdmissionLimitExceeded {
+                                kind: DocumentProducerKind::Image,
+                                limit: 512,
+                                observed: 513,
+                            }
+                        ));
+                        rejected_attempts += 1;
+                        continue;
+                    },
+            };
+            drop(transient_identity);
+            match reserve_controlled_v2_raster_owner(count.clone(), &fence) {
+                Ok(reservation) => retained_raster_owners.push(
+                    PendingImageRasterizationOwner::new(clone_index, Some(reservation)),
+                ),
+                Err(error) => {
+                    assert!(matches!(
+                        error,
+                        DocumentProducerFenceError::AdmissionLimitExceeded {
+                            kind: DocumentProducerKind::Image,
+                            limit: 512,
+                            observed: 513,
+                        }
+                    ));
+                    rejected_attempts += 1;
+                },
+            }
+        }
+        assert_eq!(
+            retained_raster_owners.len(),
+            CONTROLLED_V2_IMAGE_RETAINED_RECORD_LIMIT - 1,
+        );
+        assert_eq!(
+            rejected_attempts,
+            clone_attempts - (CONTROLLED_V2_IMAGE_RETAINED_RECORD_LIMIT - 1),
+        );
+        assert_eq!(count.get(), CONTROLLED_V2_IMAGE_RETAINED_RECORD_LIMIT);
+
+        retained_raster_owners.clear();
+        assert_eq!(count.get(), 1);
+        drop(raster_key_reservation);
+        assert_eq!(count.get(), 0);
+    }
 }
 
 /// Ancillary data of pending image request that was initiated by layout during a reflow.
@@ -888,6 +1258,9 @@ struct PendingLayoutImageAncillaryData {
     destination: LayoutImageDestination,
     #[no_trace]
     provenance: PendingImageProvenance,
+    #[no_trace]
+    #[ignore_malloc_size_of = "shared capacity accounting owned by this Window"]
+    _controlled_reservation: Option<ControlledImageReservation>,
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -910,8 +1283,29 @@ struct PendingImageRasterizationCallback(
 );
 
 #[derive(JSTraceable, MallocSizeOf)]
+struct PendingImageRasterizationOwner<T> {
+    node: T,
+    #[no_trace]
+    #[ignore_malloc_size_of = "shared capacity accounting owned by this Window"]
+    _controlled_reservation: Option<ControlledImageReservation>,
+}
+
+impl<T> PendingImageRasterizationOwner<T> {
+    fn new(node: T, controlled_reservation: Option<ControlledImageReservation>) -> Self {
+        Self {
+            node,
+            _controlled_reservation: controlled_reservation,
+        }
+    }
+
+    fn release_controlled_reservation(&mut self) {
+        self._controlled_reservation = None;
+    }
+}
+
+#[derive(JSTraceable, MallocSizeOf)]
 struct PendingImageRasterizationEntry {
-    nodes: Vec<Dom<Node>>,
+    nodes: Vec<PendingImageRasterizationOwner<Dom<Node>>>,
     #[no_trace]
     #[ignore_malloc_size_of = "callbacks retain their own Trusted roots"]
     callbacks: Vec<PendingImageRasterizationCallback>,
@@ -926,11 +1320,17 @@ impl PendingImageRasterizationEntry {
     fn downgrade_to_baseline(&mut self) {
         self.provenance = PendingImageProvenance::Baseline;
         self.reservation = None;
+        for owner in &mut self.nodes {
+            owner.release_controlled_reservation();
+        }
     }
 
     fn mark_unsupported(&mut self) {
         self.provenance = PendingImageProvenance::Unsupported;
         self.reservation = None;
+        for owner in &mut self.nodes {
+            owner.release_controlled_reservation();
+        }
     }
 }
 
@@ -1428,7 +1828,9 @@ impl Window {
             layout_images
                 .iter()
                 .flat_map(|(id, owners)| owners.iter().map(move |owner| (*id, owner.provenance))),
-            rasterizations.iter().map(|(_, entry)| entry.provenance),
+            rasterizations
+                .iter()
+                .map(|(_, entry)| (entry.provenance, entry.nodes.len())),
             controlled_identities
                 .iter()
                 .map(|(_, identity)| identity.owners.len())
@@ -1454,6 +1856,7 @@ impl Window {
                 callback: Box::new(move |response, _delivery, cx| callback(response, cx)),
                 _reservation: None,
                 provenance: PendingImageProvenance::Baseline,
+                controlled_v2_producer_key: None,
             });
 
         self.baseline_image_cache_transport()
@@ -1469,6 +1872,7 @@ impl Window {
         &self,
         id: PendingImageId,
         owner: &Node,
+        producer_key: ServoUrl,
         callback: impl Fn(PendingImageResponse, ImageCallbackDelivery, &mut JSContext) + 'static,
     ) -> Result<ImageCacheResponseCallback, DocumentProducerFenceError> {
         assert_eq!(
@@ -1545,6 +1949,7 @@ impl Window {
                 callback: Box::new(callback),
                 _reservation: Some(callback_reservation),
                 provenance: PendingImageProvenance::ControlledV2Fenced,
+                controlled_v2_producer_key: Some(producer_key),
             });
         Ok(transport)
     }
@@ -1608,6 +2013,19 @@ impl Window {
         Ok(())
     }
 
+    fn reserve_controlled_v2_layout_owner(
+        &self,
+    ) -> Result<ControlledImageReservation, DocumentProducerFenceError> {
+        let producer_fence = self
+            .script_thread()
+            .document_producer_fence()
+            .expect("controlled layout image owner requires a producer fence");
+        ControlledImageReservation::try_new(
+            self.controlled_image_retained_record_count.clone(),
+            &producer_fence,
+        )
+    }
+
     /// Release one exact cached-vector identity owner. This is intentionally idempotent so stale
     /// queued generations and request replacement can both clean up without coordinating.
     pub(crate) fn release_controlled_v2_cached_vector_identity(
@@ -1659,11 +2077,13 @@ impl Window {
             for callback in callbacks {
                 callback.provenance = PendingImageProvenance::Unsupported;
                 callback._reservation = None;
+                callback.controlled_v2_producer_key = None;
             }
         }
         if let Some(owners) = self.pending_layout_images.borrow_mut().get_mut(&id) {
             for owner in owners {
                 owner.provenance = PendingImageProvenance::Unsupported;
+                owner._controlled_reservation = None;
             }
         }
         for ((candidate_id, _), entry) in self
@@ -1835,6 +2255,50 @@ impl Window {
             })
     }
 
+    fn admits_controlled_v2_retained_inline_svg_join(
+        &self,
+        node: &Node,
+        id: PendingImageId,
+        url: &ServoUrl,
+        is_internal_request: InternalRequest,
+    ) -> bool {
+        if !self.admits_controlled_v2_inline_svg_decode(node, url, is_internal_request) {
+            return false;
+        }
+
+        let callbacks = self.pending_image_callbacks.borrow();
+        let callback_facts = callbacks
+            .get(&id)
+            .map(|callbacks| {
+                callbacks
+                    .iter()
+                    .map(|callback| {
+                        (
+                            callback.provenance,
+                            callback.controlled_v2_producer_key.as_ref(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let layout_images = self.pending_layout_images.borrow();
+        let has_controlled_layout_record = layout_images
+            .get(&id)
+            .is_some_and(|owners| {
+                owners.iter().any(|owner| {
+                    owner.provenance == PendingImageProvenance::ControlledV2Fenced
+                })
+            });
+
+        controlled_v2_retained_inline_svg_join_is_exact(
+            is_internal_request,
+            url,
+            &callback_facts,
+            has_controlled_layout_record,
+            self.image_id_has_baseline_retained_work(id),
+        )
+    }
+
     fn admits_controlled_v2_inline_svg_raster(
         &self,
         node: &Node,
@@ -1984,8 +2448,8 @@ impl Window {
                 .insert(key, entry);
             return Err(());
         }
-        for node in &entry.nodes {
-            node.dirty(cx.no_gc(), NodeDamage::Other);
+        for owner in &entry.nodes {
+            owner.node.dirty(cx.no_gc(), NodeDamage::Other);
         }
         let mut callbacks_complete = true;
         for callback in &entry.callbacks {
@@ -2233,6 +2697,14 @@ impl Window {
         }
     }
 
+    /// Return the canonical HTTP(S) site proven by the actual active top-level Document origin.
+    pub(crate) fn controlled_cookie_site_for_document(
+        &self,
+        document: &Document,
+    ) -> Option<ServoUrl> {
+        controlled_cookie_site_for_document_origin(self.is_top_level(), &document.origin())
+    }
+
     /// Part of <https://fetch.spec.whatwg.org/#populate-request-from-client>
     pub(crate) fn request_client(&self, no_gc: Option<&NoGC>) -> RequestClient {
         // Step 1.2.2. If global is a Window object and global’s navigable is not null,
@@ -2243,6 +2715,7 @@ impl Window {
             has_trustworthy_ancestor_origin,
             policy_container,
             origin,
+            controlled_cookie_site_for_cookies,
         ) = if let Some(no_gc) = no_gc {
             let document = self.document_unrooted(no_gc);
             (
@@ -2251,6 +2724,7 @@ impl Window {
                 document.has_trustworthy_ancestor_or_current_origin(),
                 document.policy_container().clone(),
                 document.origin().clone(),
+                self.controlled_cookie_site_for_document(&document),
             )
         } else {
             let document = self.Document();
@@ -2260,6 +2734,7 @@ impl Window {
                 document.has_trustworthy_ancestor_or_current_origin(),
                 document.policy_container().clone(),
                 document.origin().clone(),
+                self.controlled_cookie_site_for_document(&document),
             )
         };
         RequestClient {
@@ -2267,6 +2742,7 @@ impl Window {
             policy_container,
             origin: Origin::Origin(origin.immutable().clone()),
             is_nested_browsing_context: !self.is_top_level(),
+            controlled_cookie_site_for_cookies,
             insecure_requests_policy,
             has_trustworthy_ancestor_origin,
         }
@@ -4617,7 +5093,7 @@ impl Window {
         } else {
             Some(self.IsSecureContext())
         };
-        LoadData::new(
+        let mut load_data = LoadData::new(
             LoadOrigin::Script(self.origin().snapshot()),
             url,
             source_document.about_base_url(),
@@ -4628,7 +5104,10 @@ impl Window {
             Some(source_document.insecure_requests_policy()),
             source_document.has_trustworthy_ancestor_origin(),
             source_document.creation_sandboxing_flag_set_considering_parent_iframe(),
-        )
+        );
+        load_data.controlled_cookie_site_for_cookies =
+            self.controlled_cookie_site_for_document(&source_document);
+        load_data
     }
 
     /// Handle a potential change to the [`ViewportDetails`] of this [`Window`],
@@ -5090,7 +5569,6 @@ impl Window {
     ) {
         let pipeline_id = self.pipeline_id();
         let image_cache = self.image_cache();
-        let mut controlled_inline_svg_fetches_started = HashSet::new();
         for image in pending_images {
             let id = image.id;
             let node = unsafe { from_untrusted_node_address(image.node) };
@@ -5105,32 +5583,42 @@ impl Window {
                 .get(&id)
                 .is_some_and(|owners| owners.iter().any(|owner| *owner.node == *node));
             let needs_listener = !self.pending_layout_images.borrow().contains_key(&id);
-            let unrequested_url = match &image.state {
-                PendingImageState::Unrequested(url) => Some(url),
-                PendingImageState::PendingResponse => None,
+            let (candidate_url, unrequested_url) = match &image.state {
+                PendingImageState::Unrequested(url) => (url, Some(url)),
+                PendingImageState::PendingResponse(url) => (url, None),
             };
-            let controlled_transport_is_exact = if needs_listener {
-                !self.pending_image_callbacks.borrow().contains_key(&id)
-            } else {
-                // The only listener reuse admitted here is another owner of the same cache ID in
-                // this exact post-reflow batch, after the first owner installed the listener and
-                // started the request. A retained entry from an earlier turn is not enough to
-                // prove that an `Unrequested` item already has a live producer.
-                controlled_inline_svg_fetches_started.contains(&id)
-            };
-            let controlled_inline_svg = unrequested_url.is_some_and(|url| {
+            let initial_request_is_exact = unrequested_url.is_some_and(|url| {
                 self.admits_controlled_v2_inline_svg_decode(&node, url, image.is_internal_request)
             }) && !self.image_id_has_baseline_retained_work(id) &&
-                controlled_transport_is_exact;
+                !self.pending_image_callbacks.borrow().contains_key(&id);
+            let retained_join_is_exact = !needs_listener &&
+                self.admits_controlled_v2_retained_inline_svg_join(
+                    &node,
+                    id,
+                    candidate_url,
+                    image.is_internal_request,
+                );
+            let controlled_inline_svg_action = controlled_v2_inline_svg_request_action(
+                unrequested_url.is_some(),
+                needs_listener,
+                initial_request_is_exact,
+                retained_join_is_exact,
+            );
 
-            if controlled_inline_svg {
-                let Some(url) = unrequested_url else {
-                    // The admission predicate above is deliberately limited to Unrequested URLs.
-                    continue;
-                };
+            if controlled_inline_svg_action != ControlledV2InlineSvgRequestAction::Reject {
                 let Some(svg) = node.downcast::<SVGSVGElement>() else {
                     // Never widen a successful URL check to a different DOM owner type.
                     continue;
+                };
+                let controlled_layout_reservation = if is_new_owner {
+                    let Ok(reservation) = self.reserve_controlled_v2_layout_owner() else {
+                        // The producer fence retains the typed capacity terminal. Do not retain an
+                        // unbounded layout anchor or attach it to the shared producer.
+                        continue;
+                    };
+                    Some(reservation)
+                } else {
+                    None
                 };
                 let identity_was_retained = self.retained_image_provenance(id, &node) ==
                     PendingImageProvenance::ControlledV2Fenced;
@@ -5143,28 +5631,33 @@ impl Window {
                     continue;
                 }
 
-                let sender = if needs_listener {
-                    let trusted_node = Trusted::new(&*node);
-                    let result = self.register_controlled_v2_image_cache_listener(
-                        id,
-                        &node,
-                        move |response, _delivery, cx| {
-                            trusted_node
-                                .root()
-                                .owner_window()
-                                .pending_layout_image_notification(cx.no_gc(), response);
-                        },
-                    );
-                    let Ok(sender) = result else {
-                        if !identity_was_retained {
-                            self.release_controlled_v2_cached_vector_identity(id, &node);
-                        }
-                        // Listener/producer admission is sticky. Do not issue a baseline fetch.
-                        continue;
-                    };
-                    Some(sender)
-                } else {
-                    None
+                let sender = match controlled_inline_svg_action {
+                    ControlledV2InlineSvgRequestAction::StartProducer => {
+                        let trusted_node = Trusted::new(&*node);
+                        let result = self.register_controlled_v2_image_cache_listener(
+                            id,
+                            &node,
+                            candidate_url.clone(),
+                            move |response, _delivery, cx| {
+                                trusted_node
+                                    .root()
+                                    .owner_window()
+                                    .pending_layout_image_notification(cx.no_gc(), response);
+                            },
+                        );
+                        let Ok(sender) = result else {
+                            if !identity_was_retained {
+                                self.release_controlled_v2_cached_vector_identity(id, &node);
+                            }
+                            // Listener/producer admission is sticky. Do not issue a baseline fetch.
+                            continue;
+                        };
+                        Some(sender)
+                    },
+                    ControlledV2InlineSvgRequestAction::JoinRetainedProducer => None,
+                    ControlledV2InlineSvgRequestAction::Reject => {
+                        unreachable!("rejected inline SVG action handled before owner retention")
+                    },
                 };
 
                 if is_new_owner {
@@ -5176,13 +5669,19 @@ impl Window {
                             node: Dom::from_ref(&*node),
                             destination: image.destination,
                             provenance: PendingImageProvenance::ControlledV2Fenced,
+                            _controlled_reservation: controlled_layout_reservation,
                         });
                 }
                 svg.record_controlled_v2_cached_vector_id(id);
 
                 if let Some(sender) = sender {
-                    // Install every retained owner and the sole fenced listener before starting
-                    // the internal data-URL fetch. Image-cache completion may then safely race.
+                    let Some(url) = unrequested_url else {
+                        // `StartProducer` is only selected for an exact `Unrequested` item.
+                        continue;
+                    };
+                    // Install the retained owner and initial fenced listener before starting the
+                    // internal data-URL fetch. Later exact owners join the uniformly fenced
+                    // retained listener set without creating another listener or producer.
                     image_cache.add_listener(ImageLoadListener::new(sender, pipeline_id, id));
                     fetch_image_for_layout(
                         url.clone(),
@@ -5191,7 +5690,6 @@ impl Window {
                         image.is_internal_request,
                         image_cache.clone(),
                     );
-                    controlled_inline_svg_fetches_started.insert(id);
                 }
                 continue;
             }
@@ -5218,9 +5716,21 @@ impl Window {
             let provenance = self.retained_image_provenance(id, &node);
             if provenance == PendingImageProvenance::Baseline {
                 // A baseline owner sharing this cache ID makes all controlled identity/raster joins
-                // ineligible, even when another owner already installed the sole cache listener.
+                // ineligible, even when another owner already installed a controlled listener.
                 self.downgrade_cached_vector_identity_to_baseline(id);
             }
+            let controlled_layout_reservation = if provenance ==
+                PendingImageProvenance::ControlledV2Fenced
+            {
+                let Ok(reservation) = self.reserve_controlled_v2_layout_owner() else {
+                    // A retained controlled identity is insufficient when its new layout anchor
+                    // cannot be bounded by the same Window-level capacity authority.
+                    continue;
+                };
+                Some(reservation)
+            } else {
+                None
+            };
 
             if needs_listener {
                 let trusted_node = Trusted::new(&*node);
@@ -5237,6 +5747,7 @@ impl Window {
                         let result = self.register_controlled_v2_image_cache_listener(
                             id,
                             &node,
+                            candidate_url.clone(),
                             move |response, _delivery, cx| {
                                 trusted_node
                                     .root()
@@ -5268,6 +5779,7 @@ impl Window {
                     node: Dom::from_ref(&*node),
                     destination: image.destination,
                     provenance,
+                    _controlled_reservation: controlled_layout_reservation,
                 });
             }
         }
@@ -5308,6 +5820,37 @@ impl Window {
                 // identity before a baseline key can join it.
                 self.downgrade_cached_vector_identity_to_baseline(image.id);
             }
+            let is_new_raster_owner = !self
+                .pending_images_for_rasterization
+                .borrow()
+                .get(&key)
+                .is_some_and(|entry| {
+                    entry.nodes.iter().any(|owner| *owner.node == *node)
+                });
+            let controlled_raster_owner_reservation = if is_new_raster_owner &&
+                provenance == PendingImageProvenance::ControlledV2Fenced
+            {
+                let producer_fence = self
+                    .script_thread()
+                    .document_producer_fence()
+                    .expect("controlled raster image owner requires a producer fence");
+                let Ok(reservation) = reserve_controlled_v2_raster_owner(
+                    self.controlled_image_retained_record_count.clone(),
+                    &producer_fence,
+                ) else {
+                    if introduced_controlled_identity &&
+                        let Some(svg) = node.downcast::<SVGSVGElement>()
+                    {
+                        svg.release_controlled_v2_cached_vector_id(image.id);
+                    }
+                    // The producer fence retains the typed capacity terminal. Do not leave an
+                    // unbounded node anchor on a stalled shared raster key.
+                    continue;
+                };
+                Some(reservation)
+            } else {
+                None
+            };
             let needs_listener = !self
                 .pending_images_for_rasterization
                 .borrow()
@@ -5341,8 +5884,11 @@ impl Window {
             if provenance == PendingImageProvenance::Baseline {
                 entry.downgrade_to_baseline();
             }
-            if !entry.nodes.iter().any(|n| **n == *node) {
-                entry.nodes.push(Dom::from_ref(&*node));
+            if is_new_raster_owner {
+                entry.nodes.push(PendingImageRasterizationOwner::new(
+                    Dom::from_ref(&*node),
+                    controlled_raster_owner_reservation,
+                ));
             }
         }
 

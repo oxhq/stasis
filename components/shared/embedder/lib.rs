@@ -930,6 +930,13 @@ pub struct WebResourceRequest {
     pub referrer_url: Option<Url>,
     pub is_for_main_frame: bool,
     pub is_redirect: bool,
+    /// Site-for-cookies provenance captured from the request client when the request was created.
+    /// `None` remains an explicit unknown/opaque context for controlled policy enforcement.
+    #[serde(default)]
+    pub controlled_cookie_site_for_cookies: Option<Url>,
+    /// Whether the created request was a top-level navigation. This does not change on redirects.
+    #[serde(default)]
+    pub controlled_cookie_top_level_navigation: bool,
     /// Checked request-hop identity used only by an installed controlled-network session.
     pub controlled_load_id: WebResourceLoadId,
     /// Exact request body length. `None` means an unbounded/streaming body.

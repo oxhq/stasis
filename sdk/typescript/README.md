@@ -109,11 +109,20 @@ const session = await runtime.openSession("https://app.example.test/", {
 });
 try {
   const settled = await session.settle(session.stateToken);
+  console.log(new URL(settled.url).pathname);
   console.log(session.settlementEvidence(settled));
 } finally {
   await session.close();
 }
 ```
+
+For an explicitly selected v2 session, every returned settle outcome has a required `url`. It is
+the active top-level document URL from the same final owner authority that produced
+`settled.stateToken`, after the passive N1/document-pending-D/passive-N2 bracket agrees. Its presence
+does not imply quiescence. `session.url` remains the open-time URL; after same-document history
+changes or document replacement, use `settled.url` instead of polling or treating `session.url` as
+mutable. Frozen v1 settle results do not gain this field. Settlement evidence deliberately omits
+the URL and retains its existing redaction contract.
 
 V2 adds bounded same-global, untransferred `MessageChannel` delivery; a bounded direct
 `HTMLImageElement.src` cache/decode completion path for canonical data SVG and direct HTTP(S)
@@ -125,7 +134,9 @@ exact public non-auxiliary controlled top-level document. It also adds controlle
 persistent-cookie expiry and bounded schemeful SameSite request selection. The image path requires direct `src` selection without
 `srcset`/`picture`/environment changes, an initial serialized URL no larger than 65,536 bytes, the
 same ScriptThread/ImageCache, and room within the
-512-record retained controlled-ownership cap. An admitted synchronous cache hit is owned in the
+ 512-record retained controlled-ownership cap. Controlled callbacks, layout owners, DOM identities,
+ raster keys, and raster owners each consume that shared capacity through their exact lifetimes.
+ An admitted synchronous cache hit is owned in the
 current Script turn and queues its existing ordinary DOM callback without inventing an asynchronous
 `Image` producer lease. Finite asynchronous cache/decode completion is producer-fenced, and one
 document-clock timestamp is shared across the engine-generated image completion events. Cache-owned
@@ -147,6 +158,15 @@ while HTTP image resource I/O remains active retains fatal `blocked_on_external_
 claim cross-document replacement through that state.
 The inline path additionally requires an internal request and the same
 canonical MIME/URL bound; its decode/vector work is fenced, but it creates no DOM load event.
+ An identical current inline root may join an already-pending response when its exact cache-key URL
+ and `PendingImageId` match an existing same-ID fenced layout record and every live callback is
+ fenced with that exact producer URL key. The callback owns this key through terminal removal, so
+ an earlier DOM owner may already have unbound and its identity is neither required nor trusted.
+ The current owner is retained once, no baseline work may coexist, and the peer reuses the existing
+ listener and producer without adding a listener, producer, or fetch. Missing keys or anchors,
+ stale candidates, mixed provenance, and retained-capacity exhaustion fail closed.
+This does not promote baseline or v1 work, external or nested SVG resources, iframes, workers,
+worklets, or cross-loop image work.
 
 Local-channel authority is not borrowed through a same-origin wrapper. Construction requires the
 exact active public top-level target and an incumbent matching the owner global, pipeline, and
@@ -170,19 +190,34 @@ cross-event-loop, worker, BroadcastChannel, and external channels. Blob/file and
 CSS/background/generated-content ownership, animated images, general or nested/external SVG
 resource semantics, and cross-context image work receive no new v2 authority; baseline and v1 SVG
 behavior, CSS animation semantics and limits, and predecessor rejection authorities remain in force.
-When pending animation events still have a live scheduled opportunity, settlement treats them as
-finite demand for guarded `AdvanceTo` at the exact retained scheduler head; only an unscheduled
-batch is `Drive`-ready. This is a liveness correction, not another task source or limit.
+A nonempty document-owned pending CSS animation-event queue is finite demand and retains one later
+owned rendering opportunity until dispatch drains it; an empty queue leaves no opportunity. Live
+scheduled work uses guarded `AdvanceTo` at the exact retained scheduler head, and only an
+unscheduled batch is `Drive`-ready. This is a liveness correction, not another task source or
+limit. With `persistentWork: "report"`, v2 may likewise advance an eligible exact JavaScript
+interval scheduler head while finite work remains. Finite timer and animated-image deadlines must
+be strictly later. One finite rendering opportunity may share the timestamp only as a distinct
+exact same-scheduler owner whose `TimerId` sequence follows the interval head; same-entry,
+lower-or-equal-order, foreign-scheduler, bare/unowned, equal finite-timer, and equal animated-image
+collisions remain blocked. Each activation is bound by the ordinary single-use complete-snapshot
+advance token, and each callback consumes the existing ordinary-task and downstream execution
+budgets. Once finite work drains, settlement checkpoints without firing another interval cycle
+and returns `quiescent_with_persistent_work`. Strict policy and both predecessor profiles retain
+`blocked_on_open_ended_work` at that head.
 V2 cookie expiry uses controlled Unix nanoseconds with origin zero. `Max-Age` precedes `Expires`,
 lifetime is clamped to 400 days, and expired records are lazily purged before observation, request
 selection, and export. SameSite uses the captured schemeful site-for-cookies, current redirect-hop
 method, and top-level-navigation bit. Strict is same-site only; Lax and unspecified also admit
 cross-site top-level safe methods; Secure None cookies may cross site. Unknown or opaque context
-remains typed unsupported before network start. Cross-site subresource responses retain only valid
-Secure SameSite=None cookies; top-level-navigation responses admit all otherwise valid
+remains typed unsupported. After successful controlled parsing, cross-site
+subresource responses retain only valid Secure SameSite=None cookies; otherwise valid
+Strict/Lax/unspecified values are ignored, while parse, normalization, and time-range failures
+retain their existing typed outcomes. Top-level-navigation responses admit all otherwise valid
 unpartitioned cookies. A post-open request at controlled Unix time above u64 fails nonfatally as
-`unsupported_cookie_time_range` before network start instead of truncating; initial controlled
-open hardens the same code to fatal fail-stop. Partitioned cookies
+`unsupported_cookie_time_range` instead of truncating; initial controlled open hardens the same
+code to fatal fail-stop. Either post-open typed rejection may retain bounded `request_started` and
+`request_failed` evidence, but it occurs before `route_decided` or route selection, fixture or live
+external I/O, and Cookie header construction. Partitioned cookies
 plus CookieStore read/getAll/delete remain unsupported.
 
 The SDK keeps `SessionCookie` and `SessionState` as frozen v1-compatible names. Explicit v2 code

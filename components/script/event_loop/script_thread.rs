@@ -7753,12 +7753,23 @@ impl ScriptThread {
                 .flatten()
                 .map(|marker| marker.correlation)
         });
+        let controlled_cookie_site_for_cookies = (self.document_execution_profile
+            == DocumentExecutionProfile::ControlledWebSessionV2)
+            .then(|| {
+                document
+                    .window()
+                    .controlled_cookie_site_for_document(&document)
+            })
+            .flatten();
         self.senders
             .pipeline_to_constellation_sender
             .send((
                 incomplete.webview_id,
                 incomplete.pipeline_id,
-                ScriptToConstellationMessage::ActivateDocument(activation_correlation),
+                ScriptToConstellationMessage::ActivateDocument(
+                    activation_correlation,
+                    controlled_cookie_site_for_cookies,
+                ),
             ))
             .unwrap();
 
@@ -8377,13 +8388,19 @@ impl ScriptThread {
         // The constellation only needs to know the WebView ID for navigation,
         // but actors don't keep track of it. Infer WebView ID from pipeline ID instead.
         if let Some(document) = self.documents.borrow().find_document(pipeline_id) {
+            let mut load_data = LoadData::new_for_new_unrelated_webview(url);
+            if self.document_execution_profile == DocumentExecutionProfile::ControlledWebSessionV2 {
+                load_data.controlled_cookie_site_for_cookies = document
+                    .window()
+                    .controlled_cookie_site_for_document(&document);
+            }
             self.senders
                 .pipeline_to_constellation_sender
                 .send((
                     document.webview_id(),
                     pipeline_id,
                     ScriptToConstellationMessage::LoadUrl(
-                        LoadData::new_for_new_unrelated_webview(url),
+                        load_data,
                         NavigationHistoryBehavior::Push,
                         TargetSnapshotParams::default(),
                     ),

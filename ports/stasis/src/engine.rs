@@ -22,7 +22,7 @@ use servo::{
     ControlledNetworkConfigurationError, ControlledNetworkSession, ControlledNetworkTimeError,
     DocumentClockConfiguration, DocumentClockError, DocumentControlProfileError,
     DocumentExecutionProfileError, GenericReceiver, JSValue, JavaScriptEvaluationError, LoadStatus,
-    Preferences, RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext,
+    Opts, Preferences, RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext,
     UnpublishedWebViewInitializationError, WebView, WebViewBuilder, WebViewDelegate,
 };
 pub use servo::{
@@ -196,6 +196,15 @@ fn preferences_for_clock_mode(
             Some(controlled_preferences(document_control_profile))
         },
     }
+}
+
+fn stasis_servo_options() -> Opts {
+    let mut options = Opts::default();
+    // Stasis session state is owned by the protocol and is portable only through explicit
+    // export/import. Never let an upstream Servo default load or persist cookies (or other site
+    // data) through a host profile directory.
+    options.config_dir = None;
+    options
 }
 
 /// Immutable document-clock selection for one shell WebView.
@@ -509,7 +518,9 @@ impl EngineSession {
             .make_current()
             .map_err(|error| EngineError::Startup(format!("make current: {error:?}")))?;
 
-        let servo_builder = ServoBuilder::default().event_loop_waker(Box::new(waker.clone()));
+        let servo_builder = ServoBuilder::default()
+            .opts(stasis_servo_options())
+            .event_loop_waker(Box::new(waker.clone()));
         let servo_builder = match preferences_for_clock_mode(clock_mode, document_control_profile) {
             Some(preferences) => servo_builder.preferences(preferences),
             None => servo_builder,
@@ -1235,6 +1246,16 @@ mod tests {
         assert_eq!(unix_time_origin_ns.as_nanos(), 0);
         assert!(!mode.paints_frames_automatically());
         assert!(mode.is_controlled());
+    }
+
+    #[test]
+    fn stasis_never_configures_a_host_profile_directory() {
+        let options = stasis_servo_options();
+
+        assert!(
+            options.config_dir.is_none(),
+            "Stasis cookie and site state must remain memory-only unless explicitly exported"
+        );
     }
 
     #[test]

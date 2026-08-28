@@ -1302,6 +1302,19 @@ impl Document {
     /// TODO: Remove this when we create documents after processing headers
     pub(crate) fn mark_as_internal(&self) {
         *self.origin.borrow_mut() = MutableOrigin::new(ImmutableOrigin::new_opaque());
+        if ScriptThread::current_document_execution_profile()
+            != DocumentExecutionProfile::ControlledWebSessionV2
+        {
+            return;
+        }
+        let controlled_cookie_site_for_cookies =
+            self.window().controlled_cookie_site_for_document(self);
+        debug_assert!(controlled_cookie_site_for_cookies.is_none());
+        self.window().send_to_constellation(
+            ScriptToConstellationMessage::SetControlledCookieSiteForCookies(
+                controlled_cookie_site_for_cookies,
+            ),
+        );
     }
 
     pub(crate) fn set_protocol_handler_automation_mode(&self, mode: CustomHandlersAutomationMode) {
@@ -3521,6 +3534,15 @@ impl Document {
             return true;
         }
         if self.window().has_pending_media_query_evaluation() {
+            return true;
+        }
+        // Style/layout can enqueue animation events after this rendering opportunity already ran
+        // `send_pending_events`. Controlled-web-session-v2 owns the narrow liveness correction:
+        // keep one later opportunity scheduled for its exact public top-level document without
+        // changing baseline or frozen-v1 scheduling behavior.
+        if ScriptThread::current_controlled_top_level_target_matches(&self.window) &&
+            self.animations.has_pending_events()
+        {
             return true;
         }
         if self

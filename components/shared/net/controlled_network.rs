@@ -102,6 +102,7 @@ pub enum ControlledNetworkAbortReason {
     FixtureMiss,
     LimitExceeded,
     UnsupportedRequestMetadata,
+    CookiePolicyRejected,
     InternalEvidenceFailure,
 }
 
@@ -222,18 +223,22 @@ impl ControlledNetworkSession {
 
     pub fn begin(&self, request: ControlledNetworkRequest<'_>) -> ControlledNetworkAction {
         let mut inner = self.0.lock();
-        inner.begin(request)
+        inner.begin(request, None)
     }
 
     /// Admit one request and capture the exact cookie clock from the same owner serialization
-    /// point. The returned policy is safe to carry through Net without consulting later time.
+    /// point. V2 also proves the captured schemeful site and u64 cookie-clock domain before route
+    /// selection. A preflight rejection records one bounded failed request and cannot reach either
+    /// a fixture response or live passthrough. V1 deliberately ignores these added checks.
     pub fn begin_with_cookie_policy(
         &self,
         request: ControlledNetworkRequest<'_>,
+        site_for_cookies: Option<&Url>,
     ) -> (ControlledNetworkAction, ControlledCookiePolicy) {
         let mut inner = self.0.lock();
         let policy = inner.cookie_policy();
-        (inner.begin(request), policy)
+        let preflight_failure = controlled_cookie_preflight_failure(policy, site_for_cookies);
+        (inner.begin(request, preflight_failure), policy)
     }
 
     /// Return the current policy for a synchronous privileged state boundary.
@@ -283,23 +288,7 @@ impl ControlledNetworkSession {
                 if active.redirect_successor_claimed {
                     inner.latch(ControlledNetworkFailure::LifecycleInvariant);
                 }
-                inner.latch(match failure {
-                    ControlledNetworkCookieFailure::SameSiteContextUnsupported => {
-                        ControlledNetworkFailure::CookieSameSiteContextUnsupported
-                    },
-                    ControlledNetworkCookieFailure::PersistentCookieUnsupported => {
-                        ControlledNetworkFailure::PersistentCookieUnsupported
-                    },
-                    ControlledNetworkCookieFailure::PartitionedCookieUnsupported => {
-                        ControlledNetworkFailure::PartitionedCookieUnsupported
-                    },
-                    ControlledNetworkCookieFailure::TimeRangeUnsupported => {
-                        ControlledNetworkFailure::CookieTimeRangeUnsupported
-                    },
-                    ControlledNetworkCookieFailure::InvalidCookie => {
-                        ControlledNetworkFailure::InvalidCookie
-                    },
-                });
+                inner.latch(controlled_network_failure_for_cookie(failure));
             },
         }
     }
@@ -389,7 +378,11 @@ impl ControlledNetworkInner {
         }
     }
 
-    fn begin(&mut self, request: ControlledNetworkRequest<'_>) -> ControlledNetworkAction {
+    fn begin(
+        &mut self,
+        request: ControlledNetworkRequest<'_>,
+        cookie_preflight_failure: Option<ControlledNetworkCookieFailure>,
+    ) -> ControlledNetworkAction {
         if self.sticky_failure.is_some() {
             return ControlledNetworkAction::Abort {
                 handle: None,
@@ -477,6 +470,17 @@ impl ControlledNetworkInner {
             load_id: request.load_id,
             request_id,
         };
+        if let Some(failure) = cookie_preflight_failure {
+            self.record(NetworkEvidenceEvent::RequestFailed {
+                request_id,
+                reason: NetworkFailureReason::NetworkError,
+            });
+            self.latch(controlled_network_failure_for_cookie(failure));
+            return ControlledNetworkAction::Abort {
+                handle: Some(handle),
+                reason: ControlledNetworkAbortReason::CookiePolicyRejected,
+            };
+        }
         let decision = match self.fixtures.decide(request.method, request.url) {
             Ok(decision) => decision,
             Err(_) => {
@@ -608,6 +612,46 @@ impl ControlledNetworkInner {
 
 const fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+const fn controlled_network_failure_for_cookie(
+    failure: ControlledNetworkCookieFailure,
+) -> ControlledNetworkFailure {
+    match failure {
+        ControlledNetworkCookieFailure::SameSiteContextUnsupported => {
+            ControlledNetworkFailure::CookieSameSiteContextUnsupported
+        },
+        ControlledNetworkCookieFailure::PersistentCookieUnsupported => {
+            ControlledNetworkFailure::PersistentCookieUnsupported
+        },
+        ControlledNetworkCookieFailure::PartitionedCookieUnsupported => {
+            ControlledNetworkFailure::PartitionedCookieUnsupported
+        },
+        ControlledNetworkCookieFailure::TimeRangeUnsupported => {
+            ControlledNetworkFailure::CookieTimeRangeUnsupported
+        },
+        ControlledNetworkCookieFailure::InvalidCookie => ControlledNetworkFailure::InvalidCookie,
+    }
+}
+
+fn controlled_cookie_preflight_failure(
+    policy: ControlledCookiePolicy,
+    site_for_cookies: Option<&Url>,
+) -> Option<ControlledNetworkCookieFailure> {
+    let ControlledCookiePolicy::SessionV2 { unix_time_ns } = policy else {
+        return None;
+    };
+    // Preserve the cookie-selection validation order: an unprovable schemeful context wins over
+    // a simultaneous clock-range failure. Both checks still happen before fixture route choice.
+    if site_for_cookies
+        .is_none_or(|site| !matches!(site.scheme(), "http" | "https") || !site.origin().is_tuple())
+    {
+        return Some(ControlledNetworkCookieFailure::SameSiteContextUnsupported);
+    }
+    if u64::try_from(unix_time_ns).is_err() {
+        return Some(ControlledNetworkCookieFailure::TimeRangeUnsupported);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1042,7 +1086,8 @@ mod tests {
         let url = Url::parse("https://example.test/data").unwrap();
 
         let v1 = fixture_session("live", json!([]));
-        let (v1_action, v1_policy) = v1.begin_with_cookie_policy(request(31, 0, &url, Some(0)));
+        let (v1_action, v1_policy) =
+            v1.begin_with_cookie_policy(request(31, 0, &url, Some(0)), None);
         assert_eq!(v1_policy, ControlledCookiePolicy::SessionV1);
         let v1_handle = match v1_action {
             ControlledNetworkAction::Passthrough { handle } => handle,
@@ -1060,7 +1105,8 @@ mod tests {
             v2.cookie_policy(),
             ControlledCookiePolicy::SessionV2 { unix_time_ns: 7 },
         );
-        let (v2_action, captured) = v2.begin_with_cookie_policy(request(32, 0, &url, Some(0)));
+        let (v2_action, captured) =
+            v2.begin_with_cookie_policy(request(32, 0, &url, Some(0)), Some(&url));
         let v2_handle = match v2_action {
             ControlledNetworkAction::Passthrough { handle } => handle,
             _ => panic!("expected v2 passthrough"),
@@ -1075,6 +1121,318 @@ mod tests {
             ControlledCookiePolicy::SessionV2 { unix_time_ns: 11 },
         );
         v2.live_terminal(v2_handle.load_id(), ControlledNetworkTerminal::Failed);
+    }
+
+    #[test]
+    fn v2_unknown_cookie_site_fails_before_fixture_selection() {
+        let request_url = Url::parse("https://example.test/data").unwrap();
+        let session = ControlledNetworkSession::from_json_with_execution_profile(
+            json!({
+                "mode": "fixtures_only",
+                "routes": [{
+                    "match": {
+                        "method": "GET",
+                        "url": {"exact": "https://example.test/data"}
+                    },
+                    "fulfill": {"status": 200, "body": {"utf8": "must-not-start"}}
+                }]
+            }),
+            7,
+            DocumentExecutionProfile::ControlledWebSessionV2,
+        )
+        .unwrap();
+
+        let (action, policy) =
+            session.begin_with_cookie_policy(request(33, 0, &request_url, Some(0)), None);
+        assert_eq!(
+            policy,
+            ControlledCookiePolicy::SessionV2 { unix_time_ns: 7 }
+        );
+        assert!(matches!(
+            action,
+            ControlledNetworkAction::Abort {
+                handle: Some(_),
+                reason: ControlledNetworkAbortReason::CookiePolicyRejected,
+            }
+        ));
+        assert_eq!(session.snapshot().active_operations, 0);
+        assert_eq!(
+            session.snapshot().sticky_failure,
+            Some(ControlledNetworkFailure::CookieSameSiteContextUnsupported)
+        );
+
+        let requests = serde_json::to_value(session.requests_page(None, 16).unwrap()).unwrap();
+        assert_eq!(requests["records"].as_array().unwrap().len(), 1);
+        let evidence = serde_json::to_value(session.evidence_page(None, 16).unwrap()).unwrap();
+        let records = evidence["records"].as_array().unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record["kind"] == "request_started")
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record["kind"] == "request_failed")
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record["kind"] == "route_decided")
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record["kind"] == "request_completed")
+        );
+
+        let evidence_before_retry = evidence.clone();
+        let requests_before_retry = requests.clone();
+        assert!(matches!(
+            session
+                .begin_with_cookie_policy(
+                    request(41, 0, &request_url, Some(0)),
+                    Some(&request_url),
+                )
+                .0,
+            ControlledNetworkAction::Abort {
+                handle: None,
+                reason: ControlledNetworkAbortReason::InternalEvidenceFailure,
+            }
+        ));
+        assert_eq!(session.snapshot().active_operations, 0);
+        assert_eq!(
+            serde_json::to_value(session.evidence_page(None, 16).unwrap()).unwrap(),
+            evidence_before_retry,
+            "a sticky preflight failure must reject retries before allocating evidence"
+        );
+        assert_eq!(
+            serde_json::to_value(session.requests_page(None, 16).unwrap()).unwrap(),
+            requests_before_retry,
+            "a sticky preflight failure must reject retries before allocating a request"
+        );
+    }
+
+    #[test]
+    fn v2_opaque_and_non_http_cookie_sites_fail_before_live_passthrough() {
+        let request_url = Url::parse("https://example.test/live").unwrap();
+        for (identity, site) in [
+            (34, Url::parse("data:text/plain,opaque").unwrap()),
+            (35, Url::parse("ftp://site.example/file").unwrap()),
+        ] {
+            let session = ControlledNetworkSession::from_json_with_execution_profile(
+                json!({"mode": "live", "routes": []}),
+                7,
+                DocumentExecutionProfile::ControlledWebSessionV2,
+            )
+            .unwrap();
+
+            let (action, _) = session
+                .begin_with_cookie_policy(request(identity, 0, &request_url, Some(0)), Some(&site));
+            assert!(matches!(
+                action,
+                ControlledNetworkAction::Abort {
+                    handle: Some(_),
+                    reason: ControlledNetworkAbortReason::CookiePolicyRejected,
+                }
+            ));
+            assert_eq!(session.snapshot().active_operations, 0);
+            assert_eq!(
+                session.snapshot().sticky_failure,
+                Some(ControlledNetworkFailure::CookieSameSiteContextUnsupported)
+            );
+            let evidence = serde_json::to_value(session.evidence_page(None, 16).unwrap()).unwrap();
+            assert!(
+                !evidence["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|record| record["kind"] == "route_decided")
+            );
+        }
+    }
+
+    #[test]
+    fn v2_cookie_time_range_preflight_is_credentials_independent_with_explicit_precedence() {
+        let request_url = Url::parse("https://example.test/live").unwrap();
+        let valid_site = Url::parse("https://example.test/page").unwrap();
+        let overflow = u128::from(u64::MAX) + 1;
+
+        // Credentials are intentionally absent from this serialized admission seam. Therefore the
+        // rejection is structural and applies equally to Include, SameOrigin, and Omit before Net
+        // can make a Cookie-header or response-storage decision.
+        for (identity, fixture_value) in [
+            (36, json!({"mode": "live", "routes": []})),
+            (
+                39,
+                json!({
+                    "mode": "fixtures_only",
+                    "routes": [{
+                        "match": {
+                            "method": "GET",
+                            "url": {"exact": "https://example.test/live"}
+                        },
+                        "fulfill": {"status": 200, "body": {"utf8": "must-not-start"}}
+                    }]
+                }),
+            ),
+        ] {
+            let overflow_session = ControlledNetworkSession::from_json_with_execution_profile(
+                fixture_value,
+                overflow,
+                DocumentExecutionProfile::ControlledWebSessionV2,
+            )
+            .unwrap();
+            let (action, _) = overflow_session.begin_with_cookie_policy(
+                request(identity, 0, &request_url, Some(0)),
+                Some(&valid_site),
+            );
+            assert!(matches!(
+                action,
+                ControlledNetworkAction::Abort {
+                    handle: Some(_),
+                    reason: ControlledNetworkAbortReason::CookiePolicyRejected,
+                }
+            ));
+            assert_eq!(overflow_session.snapshot().active_operations, 0);
+            assert_eq!(
+                overflow_session.snapshot().sticky_failure,
+                Some(ControlledNetworkFailure::CookieTimeRangeUnsupported)
+            );
+            let evidence =
+                serde_json::to_value(overflow_session.evidence_page(None, 16).unwrap()).unwrap();
+            assert!(
+                !evidence["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|record| record["kind"] == "route_decided")
+            );
+        }
+
+        let maximum = ControlledNetworkSession::from_json_with_execution_profile(
+            json!({"mode": "live", "routes": []}),
+            u128::from(u64::MAX),
+            DocumentExecutionProfile::ControlledWebSessionV2,
+        )
+        .unwrap();
+        assert!(matches!(
+            maximum
+                .begin_with_cookie_policy(request(40, 0, &request_url, Some(0)), Some(&valid_site),)
+                .0,
+            ControlledNetworkAction::Passthrough { .. }
+        ));
+        assert_eq!(maximum.snapshot().sticky_failure, None);
+
+        let both_invalid = ControlledNetworkSession::from_json_with_execution_profile(
+            json!({"mode": "live", "routes": []}),
+            overflow,
+            DocumentExecutionProfile::ControlledWebSessionV2,
+        )
+        .unwrap();
+        assert!(matches!(
+            both_invalid
+                .begin_with_cookie_policy(request(37, 0, &request_url, Some(0)), None,)
+                .0,
+            ControlledNetworkAction::Abort {
+                reason: ControlledNetworkAbortReason::CookiePolicyRejected,
+                ..
+            }
+        ));
+        assert_eq!(
+            both_invalid.snapshot().sticky_failure,
+            Some(ControlledNetworkFailure::CookieSameSiteContextUnsupported),
+            "schemeful-context rejection preserves the existing selection precedence"
+        );
+
+        let v1 = ControlledNetworkSession::from_json_with_execution_profile(
+            json!({"mode": "live", "routes": []}),
+            overflow,
+            DocumentExecutionProfile::Baseline,
+        )
+        .unwrap();
+        assert!(matches!(
+            v1.begin_with_cookie_policy(request(38, 0, &request_url, Some(0)), None)
+                .0,
+            ControlledNetworkAction::Passthrough { .. }
+        ));
+        assert_eq!(v1.snapshot().sticky_failure, None);
+    }
+
+    #[test]
+    fn rejected_v2_redirect_successor_keeps_lineage_and_leaks_no_operation() {
+        let first_url = Url::parse("https://example.test/start").unwrap();
+        let next_url = Url::parse("https://example.test/next").unwrap();
+        let site = Url::parse("https://example.test/page").unwrap();
+        let session = ControlledNetworkSession::from_json_with_execution_profile(
+            json!({"mode": "live", "routes": []}),
+            7,
+            DocumentExecutionProfile::ControlledWebSessionV2,
+        )
+        .unwrap();
+
+        let first = match session
+            .begin_with_cookie_policy(request(42, 0, &first_url, Some(0)), Some(&site))
+            .0
+        {
+            ControlledNetworkAction::Passthrough { handle } => handle,
+            _ => panic!("expected admitted predecessor"),
+        };
+        let successor = ControlledNetworkRequest {
+            load_id: WebResourceLoadId::new([42; 16], 1),
+            method: "POST",
+            url: &next_url,
+            resource_kind: EvidenceResourceKind::Fetch,
+            main_frame: true,
+            header_names: &[],
+            body_bytes: Some(0),
+        };
+        assert!(matches!(
+            session.begin_with_cookie_policy(successor, None).0,
+            ControlledNetworkAction::Abort {
+                handle: Some(_),
+                reason: ControlledNetworkAbortReason::CookiePolicyRejected,
+            }
+        ));
+        assert_eq!(session.snapshot().active_operations, 1);
+
+        let requests = serde_json::to_value(session.requests_page(None, 16).unwrap()).unwrap();
+        assert_eq!(requests["records"][1]["redirectParentId"], "1");
+        assert_eq!(requests["records"][1]["method"], "POST");
+        let evidence = serde_json::to_value(session.evidence_page(None, 32).unwrap()).unwrap();
+        let records = evidence["records"].as_array().unwrap();
+        assert!(records.iter().any(|record| {
+            record["kind"] == "redirect"
+                && record["requestId"] == "1"
+                && record["nextRequestId"] == "2"
+        }));
+        assert!(
+            records
+                .iter()
+                .any(|record| { record["kind"] == "request_failed" && record["requestId"] == "2" })
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| { record["kind"] == "route_decided" && record["requestId"] == "2" })
+        );
+        assert!(
+            !records.iter().any(|record| {
+                record["kind"] == "request_completed" && record["requestId"] == "2"
+            })
+        );
+
+        session.live_terminal(
+            first.load_id(),
+            ControlledNetworkTerminal::Completed {
+                status: 302,
+                response_bytes: 0,
+            },
+        );
+        assert_eq!(session.snapshot().active_operations, 0);
+        let inner = session.0.lock();
+        assert!(inner.retired_redirect_predecessors.is_empty());
+        assert!(inner.retired_redirect_order.is_empty());
     }
 
     #[test]

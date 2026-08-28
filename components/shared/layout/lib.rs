@@ -201,7 +201,11 @@ unsafe impl Send for TrustedNodeAddress {}
 #[derive(Debug)]
 pub enum PendingImageState {
     Unrequested(ServoUrl),
-    PendingResponse,
+    /// The exact cache key whose already-started response is still pending.
+    ///
+    /// Retaining the URL lets script revalidate coalesced same-document owners without starting a
+    /// second producer or trusting the cache ID by itself.
+    PendingResponse(ServoUrl),
 }
 
 /// The destination in layout where an image is needed.
