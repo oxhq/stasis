@@ -225,9 +225,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # setup-python exports its private pkg-config directory. Do not let that shadow
+          # the Ubuntu 22.04 compatibility-floor metadata used by native dependencies.
+          unset PKG_CONFIG_PATH
+          echo 'PKG_CONFIG_PATH=' >> "$GITHUB_ENV"
           sudo apt-get update
           sudo apt-get install --yes xvfb
           ./mach bootstrap --yes --skip-lints --skip-nextest
+          freetype_pc_dir=$(pkg-config --variable=pcfiledir freetype2)
+          test -n "$freetype_pc_dir"
+          if [[ "$freetype_pc_dir" == /opt/hostedtoolcache/* ]]; then
+            echo "Linux native pkg-config still resolves FreeType from setup-python: $freetype_pc_dir" >&2
+            exit 1
+          fi
 
       - name: Prepare Linux native-test diagnostics
         if: matrix.release_platform == 'linux-x86_64'
@@ -328,12 +338,14 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked --profile production-stripped -p stasis-shell --lib -- --test-threads=1 --show-output
-          cargo test --locked --profile production-stripped -p servo-script --lib pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output
-          cargo test --locked --profile production-stripped -p servo --lib controlled_cookie_context_tests -- --test-threads=1 --show-output
-          cargo test --locked --profile production-stripped -p servo-net --lib request_interceptor::tests -- --test-threads=1 --show-output
-          cargo test --locked --profile production-stripped -p servo-net --test main cookie::controlled_cookie_v2_retrieval_obeys_the_samesite_matrix -- --exact --test-threads=1 --show-output
-          cargo test --locked --profile production-stripped -p servo-net --test main cookie::controlled_cookie_v2_storage_obeys_the_samesite_matrix -- --exact --test-threads=1 --show-output
-          cargo test --locked --profile production-stripped -p servo-constellation --lib controlled_session_navigation_load_data_tests -- --test-threads=1 --show-output
+          # Keep standalone component tests in the release binary's bundled-FreeType feature
+          # graph; Ubuntu 22.04 intentionally does not provide freetype2 >= 24.3.18.
+          cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output
+          cargo test --locked --profile production-stripped -p stasis-shell -p servo --lib controlled_cookie_context_tests -- --test-threads=1 --show-output
+          cargo test --locked --profile production-stripped -p stasis-shell -p servo-net --lib request_interceptor::tests -- --test-threads=1 --show-output
+          cargo test --locked --profile production-stripped -p stasis-shell -p servo-net --test main cookie::controlled_cookie_v2_retrieval_obeys_the_samesite_matrix -- --exact --test-threads=1 --show-output
+          cargo test --locked --profile production-stripped -p stasis-shell -p servo-net --test main cookie::controlled_cookie_v2_storage_obeys_the_samesite_matrix -- --exact --test-threads=1 --show-output
+          cargo test --locked --profile production-stripped -p stasis-shell -p servo-constellation --lib controlled_session_navigation_load_data_tests -- --test-threads=1 --show-output
 
       - name: Gate the automation and bounded-settlement fixture matrix
         id: controlled_mvp_gate

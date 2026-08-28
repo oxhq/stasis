@@ -5925,6 +5925,25 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "Strict policy and both predecessor profiles retain stop-at-interval behavior",
         ),
     )
+    linux_pkg_config_isolation = (
+        "          unset PKG_CONFIG_PATH\n"
+        "          echo 'PKG_CONFIG_PATH=' >> \"$GITHUB_ENV\"\n"
+        "          sudo apt-get update\n"
+        "          sudo apt-get install --yes xvfb\n"
+        "          ./mach bootstrap --yes --skip-lints --skip-nextest\n"
+        "          freetype_pc_dir=$(pkg-config --variable=pcfiledir freetype2)\n"
+        "          test -n \"$freetype_pc_dir\"\n"
+        "          if [[ \"$freetype_pc_dir\" == /opt/hostedtoolcache/* ]]; then\n"
+        "            echo \"Linux native pkg-config still resolves FreeType from setup-python: "
+        "$freetype_pc_dir\" >&2\n"
+        "            exit 1\n"
+        "          fi\n"
+    )
+    if public_release_workflow.count(linux_pkg_config_isolation) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must clear setup-python's pkg-config path and "
+            "reject hosted-toolcache FreeType metadata on the Linux compatibility runner"
+        )
     posix_stasis_lib_gate = (
         "          cargo test --locked --profile production-stripped -p stasis-shell --lib "
         "-- --test-threads=1 --show-output\n"
@@ -5950,7 +5969,8 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "complete Stasis library invariant invocations"
         )
     posix_controlled_image_capacity_gate = (
-        "          cargo test --locked --profile production-stripped -p servo-script --lib "
+        "          cargo test --locked --profile production-stripped -p stasis-shell "
+        "-p servo-script --lib "
         "pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output\n"
     )
     if public_release_workflow.count(posix_controlled_image_capacity_gate) != 1:
@@ -5974,6 +5994,34 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "credential-free package workflow must retain exactly the native-matrix and Windows "
             "controlled image capacity invocations"
         )
+    posix_release_graph_component_gates = (
+        "          cargo test --locked --profile production-stripped -p stasis-shell "
+        "-p servo-script --lib pending_nonanimated_image_observation_tests "
+        "-- --test-threads=1 --show-output\n",
+        "          cargo test --locked --profile production-stripped -p stasis-shell "
+        "-p servo --lib controlled_cookie_context_tests "
+        "-- --test-threads=1 --show-output\n",
+        "          cargo test --locked --profile production-stripped -p stasis-shell "
+        "-p servo-net --lib request_interceptor::tests "
+        "-- --test-threads=1 --show-output\n",
+        "          cargo test --locked --profile production-stripped -p stasis-shell "
+        "-p servo-net --test main "
+        "cookie::controlled_cookie_v2_retrieval_obeys_the_samesite_matrix "
+        "-- --exact --test-threads=1 --show-output\n",
+        "          cargo test --locked --profile production-stripped -p stasis-shell "
+        "-p servo-net --test main "
+        "cookie::controlled_cookie_v2_storage_obeys_the_samesite_matrix "
+        "-- --exact --test-threads=1 --show-output\n",
+        "          cargo test --locked --profile production-stripped -p stasis-shell "
+        "-p servo-constellation --lib controlled_session_navigation_load_data_tests "
+        "-- --test-threads=1 --show-output\n",
+    )
+    for component_gate in posix_release_graph_component_gates:
+        if public_release_workflow.count(component_gate) != 1:
+            raise ReleaseError(
+                "credential-free package workflow must run each focused POSIX component gate "
+                "once in the Stasis release binary's bundled-FreeType feature graph"
+            )
     packed_sdk_shared_pending_argument = (
         "--session-v2-inline-svg-shared-pending-fixture "
         "ports/stasis/tests/fixtures/controlled_v2_inline_svg_shared_pending.html"
@@ -7203,6 +7251,15 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
+            "          unset PKG_CONFIG_PATH\n"
+            "          echo 'PKG_CONFIG_PATH=' >> \"$GITHUB_ENV\"\n",
+            "          unset PKG_CONFIG_PATH\n"
+            "          echo 'PKG_CONFIG_PATH=/opt/hostedtoolcache/Python/lib/pkgconfig' "
+            ">> \"$GITHUB_ENV\"\n",
+            "Linux setup-python pkg-config isolation",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
             "          cargo test --locked --profile production-stripped -p stasis-shell --lib -- --test-threads=1 --show-output\n",
             "          cargo test --locked --profile production-stripped -p stasis-shell --lib controlled_network::tests -- --test-threads=1 --show-output\n",
             "macOS and Linux complete Stasis library invariant gate",
@@ -7217,9 +7274,15 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
-            "          cargo test --locked --profile production-stripped -p servo-script --lib pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output\n",
-            "          cargo test --locked --profile production-stripped -p servo-script --lib unrelated_tests -- --test-threads=1 --show-output\n",
+            "          cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output\n",
+            "          cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib unrelated_tests -- --test-threads=1 --show-output\n",
             "macOS and Linux controlled image capacity invariant gate",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          cargo test --locked --profile production-stripped -p stasis-shell -p servo-net --test main cookie::controlled_cookie_v2_retrieval_obeys_the_samesite_matrix -- --exact --test-threads=1 --show-output\n",
+            "          cargo test --locked --profile production-stripped -p servo-net --test main cookie::controlled_cookie_v2_retrieval_obeys_the_samesite_matrix -- --exact --test-threads=1 --show-output\n",
+            "POSIX controlled-cookie retrieval release feature graph",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
