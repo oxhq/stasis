@@ -2273,6 +2273,17 @@ impl ScriptThread {
                 &fully_active,
             ) {
                 ControlledMessage::Control(message) => self.admit_controlled_command(message),
+                ControlledMessage::DocumentControlClosed => {
+                    // EventLoop::drop queues ExitScriptThread before its document-control sender
+                    // is dropped. If Select observes the disconnect first, take the identical
+                    // lifecycle path instead of panicking or spinning on an always-ready channel.
+                    let continued = self.process_one_controlled_event(
+                        cx,
+                        MixedMessage::FromConstellation(ScriptThreadMessage::ExitScriptThread),
+                    );
+                    debug_assert!(!continued);
+                    break;
+                },
                 ControlledMessage::Ordinary(event) => self.admit_controlled_input(event),
             }
         }

@@ -5994,9 +5994,41 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "credential-free package workflow must retain exactly the native-matrix and Windows "
             "controlled image capacity invocations"
         )
+    posix_document_control_disconnect_gate = (
+        "          cargo test --locked --profile production-stripped -p stasis-shell "
+        "-p servo-script --lib controlled_document_control_disconnect_tests "
+        "-- --test-threads=1 --show-output\n"
+    )
+    if public_release_workflow.count(posix_document_control_disconnect_gate) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must run the controlled document-control "
+            "disconnect regression once in the macOS/Linux native matrix"
+        )
+    windows_document_control_disconnect_gate = (
+        "& cargo test --locked --profile production-stripped -p stasis-shell -p servo-script "
+        "--lib ' +\n"
+        "            'controlled_document_control_disconnect_tests -- --test-threads=1 "
+        "--show-output; ' +\n"
+        "            'exit $LASTEXITCODE'\n"
+        "          & .\\mach.ps1 exec -- pwsh -NoProfile -Command "
+        "$controlledDocumentControlDisconnectTestCommand"
+    )
+    if public_release_workflow.count(windows_document_control_disconnect_gate) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must run the controlled document-control "
+            "disconnect regression once through mach.ps1 on Windows"
+        )
+    if public_release_workflow.count("controlled_document_control_disconnect_tests") != 2:
+        raise ReleaseError(
+            "credential-free package workflow must retain exactly the native-matrix and Windows "
+            "controlled document-control disconnect regression invocations"
+        )
     posix_release_graph_component_gates = (
         "          cargo test --locked --profile production-stripped -p stasis-shell "
         "-p servo-script --lib pending_nonanimated_image_observation_tests "
+        "-- --test-threads=1 --show-output\n",
+        "          cargo test --locked --profile production-stripped -p stasis-shell "
+        "-p servo-script --lib controlled_document_control_disconnect_tests "
         "-- --test-threads=1 --show-output\n",
         "          cargo test --locked --profile production-stripped -p stasis-shell "
         "-p servo --lib controlled_cookie_context_tests "
@@ -7280,6 +7312,12 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
+            "          cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib controlled_document_control_disconnect_tests -- --test-threads=1 --show-output\n",
+            "          cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib unrelated_disconnect_tests -- --test-threads=1 --show-output\n",
+            "macOS and Linux controlled document-control disconnect regression gate",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
             "          cargo test --locked --profile production-stripped -p stasis-shell -p servo-net --test main cookie::controlled_cookie_v2_retrieval_obeys_the_samesite_matrix -- --exact --test-threads=1 --show-output\n",
             "          cargo test --locked --profile production-stripped -p servo-net --test main cookie::controlled_cookie_v2_retrieval_obeys_the_samesite_matrix -- --exact --test-threads=1 --show-output\n",
             "POSIX controlled-cookie retrieval release feature graph",
@@ -7291,6 +7329,14 @@ def self_test() -> None:
             "& cargo test --locked --profile production-stripped -p servo-script --lib ' +\n"
             "            'unrelated_tests -- --test-threads=1 --show-output; ' +",
             "Windows controlled image capacity invariant gate",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "& cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib ' +\n"
+            "            'controlled_document_control_disconnect_tests -- --test-threads=1 --show-output; ' +",
+            "& cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib ' +\n"
+            "            'unrelated_disconnect_tests -- --test-threads=1 --show-output; ' +",
+            "Windows controlled document-control disconnect regression gate",
         )
         require_public_marker_mutation_rejected(
             CONTROLLED_PROFILE_WIRE_SOURCE,

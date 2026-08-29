@@ -649,6 +649,7 @@ jobs:
           # Keep standalone component tests in the release binary's bundled-FreeType feature
           # graph; Ubuntu 22.04 intentionally does not provide freetype2 >= 24.3.18.
           cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output
+          cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib controlled_document_control_disconnect_tests -- --test-threads=1 --show-output
           cargo test --locked --profile production-stripped -p stasis-shell -p servo --lib controlled_cookie_context_tests -- --test-threads=1 --show-output
           cargo test --locked --profile production-stripped -p stasis-shell -p servo-net --lib request_interceptor::tests -- --test-threads=1 --show-output
           cargo test --locked --profile production-stripped -p stasis-shell -p servo-net --test main cookie::controlled_cookie_v2_retrieval_obeys_the_samesite_matrix -- --exact --test-threads=1 --show-output
@@ -1312,6 +1313,14 @@ jobs:
           & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledImageCapacityTestCommand
           if ($LASTEXITCODE -ne 0) {
             throw "the Windows controlled-image capacity gate failed with exit code $LASTEXITCODE"
+          }
+          $controlledDocumentControlDisconnectTestCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib ' +
+            'controlled_document_control_disconnect_tests -- --test-threads=1 --show-output; ' +
+            'exit $LASTEXITCODE'
+          & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledDocumentControlDisconnectTestCommand
+          if ($LASTEXITCODE -ne 0) {
+            throw "the Windows controlled document-control disconnect gate failed with exit code $LASTEXITCODE"
           }
           $controlledCookieContextTestCommand = '$ErrorActionPreference = ''Stop''; ' +
             '& cargo test --locked --profile production-stripped -p servo --lib ' +

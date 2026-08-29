@@ -83,6 +83,9 @@ impl ImageCacheMessage {
 #[derive(Debug)]
 pub(crate) enum ControlledMessage {
     Control(ScriptThreadControlMessage),
+    /// The owner control lane closed while this event loop was blocked in its selected receive.
+    /// `EventLoop` owns both this sender and the lifecycle sender, so this is a terminal signal.
+    DocumentControlClosed,
     Ordinary(MixedMessage),
 }
 
@@ -1567,12 +1570,23 @@ impl ScriptThreadReceivers {
         let message_from_operation = |operation: SelectedOperation| {
             let index = operation.index();
             if index == document_control_index {
-                ControlledMessage::Control(
-                    operation
-                        .recv(&self.document_control_receiver)
-                        .unwrap()
-                        .unwrap(),
-                )
+                match operation.recv(&self.document_control_receiver) {
+                    Ok(Ok(message)) => ControlledMessage::Control(message),
+                    Ok(Err(error)) => {
+                        log::warn!(
+                            "ScriptThreadReceivers IPC error on selected document_control_receiver: {:?}",
+                            error
+                        );
+                        ControlledMessage::DocumentControlClosed
+                    },
+                    Err(error) => {
+                        log::warn!(
+                            "ScriptThreadReceivers disconnected selected document_control_receiver: {:?}",
+                            error
+                        );
+                        ControlledMessage::DocumentControlClosed
+                    },
+                }
             } else if index == task_index {
                 let msg = operation.recv(task_recv).unwrap();
                 ControlledMessage::Ordinary(MixedMessage::FromScript(
@@ -1724,5 +1738,37 @@ impl ScriptThreadReceivers {
             return Some(MixedMessage::FromWebGPUServer(message.unwrap()));
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod controlled_document_control_disconnect_tests {
+    use super::*;
+
+    #[test]
+    fn disconnected_selected_control_lane_is_terminal() {
+        let (document_control_sender, document_control_receiver) = crossbeam_channel::unbounded::<
+            Result<ScriptThreadControlMessage, ipc_channel::IpcError>,
+        >();
+        drop(document_control_sender);
+
+        let (task_sender, task_receiver) = crossbeam_channel::unbounded();
+        let task_queue = TaskQueue::new(task_receiver, task_sender);
+        let receivers = ScriptThreadReceivers {
+            document_control_receiver,
+            constellation_receiver: crossbeam_channel::never(),
+            image_cache_receiver: crossbeam_channel::never(),
+            devtools_server_receiver: crossbeam_channel::never(),
+            #[cfg(feature = "webgpu")]
+            webgpu_receiver: RefCell::new(crossbeam_channel::never()),
+        };
+
+        let message = receivers.recv_controlled(
+            &task_queue,
+            &TimerScheduler::default(),
+            &FxHashSet::default(),
+        );
+
+        assert!(matches!(message, ControlledMessage::DocumentControlClosed));
     }
 }
