@@ -155,6 +155,10 @@ fn main() {
                 std::process::exit(70);
             }
             emit_lifecycle_phase(LifecyclePhase::ProtocolReaderJoinEnd);
+            emit_lifecycle_phase(LifecyclePhase::ShellDropBegin);
+            drop(shell);
+            emit_lifecycle_phase(LifecyclePhase::ShellDropEnd);
+            emit_lifecycle_phase(LifecyclePhase::MainBodyEnd);
         },
         Err(error) => {
             eprintln!("stasis shell fatal error: {error}");

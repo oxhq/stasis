@@ -1067,15 +1067,15 @@ impl FetchThread {
 
     /// If the `FetchThread` is running, send the exit message and wait for it to exit.
     pub fn exit() {
+        Self::exit_and_join().expect("Failed to join on the FetchThread join handle.");
+    }
+
+    /// If the `FetchThread` is running, send Exit and return its physical join result.
+    pub fn exit_and_join() -> thread::Result<()> {
         let Some(fetch_thread) = FETCH_THREAD.get() else {
-            return;
+            return Ok(());
         };
-        let _ = fetch_thread.sender.send(ToFetchThreadMessage::Exit);
-        if let Some(join_handle) = fetch_thread.join_handle.write().take() {
-            join_handle
-                .join()
-                .expect("Failed to join on the FetchThread join handle.");
-        }
+        fetch_thread.exit_and_join()
     }
 }
 
@@ -1084,7 +1084,60 @@ struct FetchThreadHandle {
     join_handle: RwLock<Option<JoinHandle<()>>>,
 }
 
+impl FetchThreadHandle {
+    fn exit_and_join(&self) -> thread::Result<()> {
+        let _ = self.sender.send(ToFetchThreadMessage::Exit);
+        match self.join_handle.write().take() {
+            Some(join_handle) => join_handle.join(),
+            None => Ok(()),
+        }
+    }
+}
+
 static FETCH_THREAD: OnceLock<FetchThreadHandle> = OnceLock::new();
+
+#[cfg(test)]
+mod fetch_thread_ownership_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    use crossbeam_channel::unbounded;
+    use parking_lot::RwLock;
+
+    use super::{FetchThreadHandle, ToFetchThreadMessage};
+
+    struct DropSentinel(Arc<AtomicBool>);
+
+    impl Drop for DropSentinel {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn exit_and_join_fences_callback_drop_and_surfaces_post_exit_panic() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let thread_dropped = Arc::clone(&dropped);
+        let (sender, receiver) = unbounded();
+        let join_handle = thread::spawn(move || {
+            let _callback_state = DropSentinel(thread_dropped);
+            assert!(matches!(
+                receiver.recv(),
+                Ok(ToFetchThreadMessage::Exit)
+            ));
+            std::panic::panic_any("deterministic post-Exit FetchThread panic");
+        });
+        let handle = FetchThreadHandle {
+            sender,
+            join_handle: RwLock::new(Some(join_handle)),
+        };
+
+        assert!(handle.exit_and_join().is_err());
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(handle.exit_and_join().is_ok(), "joining is idempotent");
+    }
+}
 
 /// Instruct the fetch thread to start a new asynchronous fetch request.
 pub fn fetch_async(

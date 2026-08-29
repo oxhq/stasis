@@ -97,6 +97,37 @@ pub fn new_resource_threads(
     ignore_certificate_errors: bool,
     protocols: Arc<ProtocolRegistry>,
 ) -> (ResourceThreads, ResourceThreads, Box<dyn AsyncRuntime>) {
+    let (public_threads, private_threads, async_runtime, _owner) =
+        new_resource_threads_with_owner(
+            devtools_sender,
+            time_profiler_chan,
+            mem_profiler_chan,
+            embedder_proxy,
+            config_dir,
+            certificate_path,
+            ignore_certificate_errors,
+            protocols,
+        );
+    (public_threads, private_threads, async_runtime)
+}
+
+/// Returns resource channels, the async runtime, and physical ownership of ResourceManager.
+#[expect(clippy::too_many_arguments)]
+pub fn new_resource_threads_with_owner(
+    devtools_sender: Option<Sender<DevtoolsControlMsg>>,
+    time_profiler_chan: ProfilerChan,
+    mem_profiler_chan: MemProfilerChan,
+    embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    config_dir: Option<PathBuf>,
+    certificate_path: Option<String>,
+    ignore_certificate_errors: bool,
+    protocols: Arc<ProtocolRegistry>,
+) -> (
+    ResourceThreads,
+    ResourceThreads,
+    Box<dyn AsyncRuntime>,
+    ResourceThreadOwner,
+) {
     // Initialize the async runtime, and get a handle to it for use in clean shutdown.
     let async_runtime = init_async_runtime();
 
@@ -108,7 +139,7 @@ pub fn new_resource_threads(
         })
         .unwrap_or_default();
 
-    let (public_core, private_core) = new_core_resource_thread(
+    let (public_core, private_core, resource_thread_owner) = new_core_resource_thread_with_owner(
         devtools_sender,
         time_profiler_chan,
         mem_profiler_chan,
@@ -122,7 +153,29 @@ pub fn new_resource_threads(
         ResourceThreads::new(public_core),
         ResourceThreads::new(private_core),
         async_runtime,
+        resource_thread_owner,
     )
+}
+
+/// Retains physical ownership of the ResourceManager operating-system thread.
+///
+/// [`CoreResourceMsg::Exit`] acknowledges that logical shutdown work has run,
+/// but the thread can still be dropping thread-owned state after that ACK. The
+/// owner must therefore be joined before process-global runtime state is torn
+/// down.
+#[must_use = "dropping the resource thread owner detaches the ResourceManager thread"]
+pub struct ResourceThreadOwner(thread::JoinHandle<()>);
+
+impl ResourceThreadOwner {
+    pub fn join(self) -> thread::Result<()> {
+        self.0.join()
+    }
+
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    pub fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
 }
 
 /// Create a CoreResourceThread
@@ -137,6 +190,88 @@ pub fn new_core_resource_thread(
     ignore_certificate_errors: bool,
     protocols: Arc<ProtocolRegistry>,
 ) -> (CoreResourceThread, CoreResourceThread) {
+    let (public_thread, private_thread, _owner) = new_core_resource_thread_with_owner(
+        devtools_sender,
+        time_profiler_chan,
+        mem_profiler_chan,
+        embedder_proxy,
+        config_dir,
+        ca_certificates,
+        ignore_certificate_errors,
+        protocols,
+    );
+    (public_thread, private_thread)
+}
+
+/// Create a CoreResourceThread and retain physical ownership of its OS thread.
+#[expect(clippy::too_many_arguments)]
+pub fn new_core_resource_thread_with_owner(
+    devtools_sender: Option<Sender<DevtoolsControlMsg>>,
+    time_profiler_chan: ProfilerChan,
+    mem_profiler_chan: MemProfilerChan,
+    embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    config_dir: Option<PathBuf>,
+    ca_certificates: CACertificates<'static>,
+    ignore_certificate_errors: bool,
+    protocols: Arc<ProtocolRegistry>,
+) -> (CoreResourceThread, CoreResourceThread, ResourceThreadOwner) {
+    new_core_resource_thread_with_after_shutdown(
+        devtools_sender,
+        time_profiler_chan,
+        mem_profiler_chan,
+        embedder_proxy,
+        config_dir,
+        ca_certificates,
+        ignore_certificate_errors,
+        protocols,
+        || {},
+    )
+}
+
+/// Create an owned CoreResourceThread with a deterministic pre-termination
+/// hook. The hook runs after the Exit ACK and before thread-owned state drops.
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+#[expect(clippy::too_many_arguments)]
+pub fn new_core_resource_thread_with_owner_and_after_shutdown_for_testing(
+    devtools_sender: Option<Sender<DevtoolsControlMsg>>,
+    time_profiler_chan: ProfilerChan,
+    mem_profiler_chan: MemProfilerChan,
+    embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    config_dir: Option<PathBuf>,
+    ca_certificates: CACertificates<'static>,
+    ignore_certificate_errors: bool,
+    protocols: Arc<ProtocolRegistry>,
+    after_shutdown: impl FnOnce() + Send + 'static,
+) -> (CoreResourceThread, CoreResourceThread, ResourceThreadOwner) {
+    new_core_resource_thread_with_after_shutdown(
+        devtools_sender,
+        time_profiler_chan,
+        mem_profiler_chan,
+        embedder_proxy,
+        config_dir,
+        ca_certificates,
+        ignore_certificate_errors,
+        protocols,
+        after_shutdown,
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+fn new_core_resource_thread_with_after_shutdown<F>(
+    devtools_sender: Option<Sender<DevtoolsControlMsg>>,
+    time_profiler_chan: ProfilerChan,
+    mem_profiler_chan: MemProfilerChan,
+    embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    config_dir: Option<PathBuf>,
+    ca_certificates: CACertificates<'static>,
+    ignore_certificate_errors: bool,
+    protocols: Arc<ProtocolRegistry>,
+    after_shutdown: F,
+) -> (CoreResourceThread, CoreResourceThread, ResourceThreadOwner)
+where
+    F: FnOnce() + Send + 'static,
+{
     let (public_setup_chan, public_setup_port) = generic_channel::channel().unwrap();
     let (private_setup_chan, private_setup_port) = generic_channel::channel().unwrap();
     let (report_chan, report_port) = generic_channel::channel().unwrap();
@@ -147,7 +282,7 @@ pub fn new_core_resource_thread(
         revoke_sender,
         refresh_token_sender: refresh_sender,
     }));
-    thread::Builder::new()
+    let thread = thread::Builder::new()
         .name("ResourceManager".to_owned())
         .spawn(move || {
             let resource_manager = CoreResourceManager::new(
@@ -184,9 +319,14 @@ pub fn new_core_resource_thread(
                 report_chan,
                 CoreResourceMsg::CollectMemoryReport,
             );
+            after_shutdown();
         })
         .expect("Thread spawning failed");
-    (public_setup_chan, private_setup_chan)
+    (
+        public_setup_chan,
+        private_setup_chan,
+        ResourceThreadOwner(thread),
+    )
 }
 
 struct ResourceChannelManager {

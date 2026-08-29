@@ -84,6 +84,7 @@
 //!
 //! See <https://github.com/servo/servo/issues/14704>
 
+use std::any::Any;
 use std::borrow::ToOwned;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::hash_map::Entry;
@@ -94,6 +95,8 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::{process, thread};
+
+type ShutdownFailure = Box<dyn Any + Send + 'static>;
 
 use background_hang_monitor_api::{
     BackgroundHangMonitorControlMsg, BackgroundHangMonitorRegister, HangAlert,
@@ -131,7 +134,7 @@ use embedder_traits::{
 };
 use euclid::Size2D;
 use euclid::default::Size2D as UntypedSize2D;
-use fonts::SystemFontServiceProxy;
+use fonts::{SystemFontServiceProxy, SystemFontServiceThreadOwner};
 use ipc_channel::IpcError;
 use ipc_channel::router::ROUTER;
 use keyboard_types::{Key, KeyState, Modifiers, NamedKey};
@@ -139,6 +142,7 @@ use layout_api::{LayoutFactory, ScriptThreadFactory};
 use log::{debug, error, info, trace, warn};
 use media::WindowGLContext;
 use net::image_cache::ImageCacheFactoryImpl;
+use net::resource_thread::ResourceThreadOwner;
 use net_traits::pub_domains::registered_domain_name;
 use net_traits::{self, AsyncRuntime, FetchThread, ResourceThreads};
 use paint_api::{
@@ -168,10 +172,11 @@ use servo_base::id::{
 };
 use servo_base::lifecycle_trace::{LifecyclePhase, emit_lifecycle_phase};
 use servo_base::threadboost::{BoostAffinity, ThreadPriority};
+use servo_base::threadpool::ThreadPool;
 use servo_base::{Epoch, generic_channel};
 #[cfg(feature = "bluetooth")]
 use servo_bluetooth_traits::BluetoothRequest;
-use servo_canvas::canvas_paint_thread::CanvasPaintThread;
+use servo_canvas::canvas_paint_thread::{CanvasPaintThread, CanvasPaintThreadOwner};
 use servo_canvas_traits::ConstellationCanvasMsg;
 use servo_canvas_traits::canvas::{CanvasId, CanvasMsg};
 use servo_config::{opts, pref};
@@ -187,6 +192,7 @@ use servo_constellation_traits::{
     WindowSizeType, WorkerAnimationFrameTick,
 };
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
+use storage::StorageThreadOwner;
 use storage_traits::StorageThreads;
 use storage_traits::cache_storage::CacheStorageThreadMessage;
 use storage_traits::client_storage::ClientStorageThreadMessage;
@@ -278,20 +284,24 @@ impl DeferredReplacementActivation {
 /// `JoinHandle::is_finished()` can become true immediately before the OS thread has fully stopped.
 /// Dropping such a handle would detach the thread and lose the synchronization boundary needed
 /// before process-wide JavaScript-engine teardown.
-fn join_finished_event_loop_threads(join_handles: &mut Vec<JoinHandle<()>>) -> usize {
+fn join_finished_event_loop_threads(
+    join_handles: &mut Vec<JoinHandle<()>>,
+) -> Option<ShutdownFailure> {
     let mut unfinished = Vec::with_capacity(join_handles.len());
-    let mut join_failures = 0;
+    let mut first_join_failure = None;
     for join_handle in join_handles.drain(..) {
         if join_handle.is_finished() {
-            if join_handle.join().is_err() {
-                join_failures += 1;
+            if let Err(payload) = join_handle.join()
+                && first_join_failure.is_none()
+            {
+                first_join_failure = Some(payload);
             }
         } else {
             unfinished.push(join_handle);
         }
     }
     *join_handles = unfinished;
-    join_failures
+    first_join_failure
 }
 
 #[cfg(test)]
@@ -309,7 +319,7 @@ mod finished_event_loop_cleanup_tests {
         }
 
         let mut join_handles = vec![finished];
-        assert_eq!(join_finished_event_loop_threads(&mut join_handles), 0);
+        assert!(join_finished_event_loop_threads(&mut join_handles).is_none());
         assert!(join_handles.is_empty());
     }
 
@@ -325,7 +335,7 @@ mod finished_event_loop_cleanup_tests {
         assert!(!running.is_finished());
 
         let mut join_handles = vec![finished, running];
-        assert_eq!(join_finished_event_loop_threads(&mut join_handles), 1);
+        assert!(join_finished_event_loop_threads(&mut join_handles).is_some());
         assert_eq!(join_handles.len(), 1);
 
         release_sender.send(()).unwrap();
@@ -689,6 +699,9 @@ pub struct Constellation<STF, SWF> {
     /// browsing.
     pub(crate) private_resource_threads: ResourceThreads,
 
+    /// Physical ownership of the shared ResourceManager thread.
+    resource_manager_thread: Option<ResourceThreadOwner>,
+
     /// Channels for the constellation to send messages to the public
     /// storage-related threads. There are two groups of storage threads: one
     /// for public browsing, and one for private browsing.
@@ -700,9 +713,18 @@ pub struct Constellation<STF, SWF> {
     /// browsing.
     pub(crate) private_storage_threads: StorageThreads,
 
+    /// Physical ownership of all public and private storage manager threads.
+    storage_threads_owner: Option<StorageThreadOwner>,
+
     /// A channel for the constellation to send messages to the font
     /// cache thread.
     pub(crate) system_font_service: Arc<SystemFontServiceProxy>,
+
+    /// Physical ownership of the SystemFontService thread.
+    system_font_service_thread: Option<SystemFontServiceThreadOwner>,
+
+    /// Whether this Constellation was started through the physically owned production path.
+    physical_thread_owners_required: bool,
 
     /// A channel for the constellation to send messages to the
     /// devtools thread.
@@ -790,7 +812,11 @@ pub struct Constellation<STF, SWF> {
     pub(crate) webxr_registry: Option<webxr_api::Registry>,
 
     /// Lazily initialized channels for canvas paint thread.
-    canvas: OnceCell<(Sender<ConstellationCanvasMsg>, GenericSender<CanvasMsg>)>,
+    canvas: OnceCell<(
+        Sender<ConstellationCanvasMsg>,
+        GenericSender<CanvasMsg>,
+        CanvasPaintThreadOwner,
+    )>,
 
     /// Navigation requests from script awaiting approval from the embedder.
     pending_approval_navigations: PendingApprovalNavigations,
@@ -829,6 +855,10 @@ pub struct Constellation<STF, SWF> {
     /// A vector of [`JoinHandle`]s used to ensure full termination of threaded [`EventLoop`]s
     /// which are runnning in the same process.
     event_loop_join_handles: Vec<JoinHandle<()>>,
+
+    /// First Script event-loop panic observed during ordinary finished-thread cleanup. Retained
+    /// until terminal shutdown so a physically joined ScriptThread failure cannot exit green.
+    finished_event_loop_failure: Option<ShutdownFailure>,
 
     /// A list of URLs that can access privileged internal APIs.
     pub(crate) privileged_urls: Vec<ServoUrl>,
@@ -918,6 +948,28 @@ pub struct InitialConstellationState {
     pub wake_lock_provider: Box<dyn WakeLockDelegate>,
 }
 
+/// Physical ownership of helper threads whose shutdown protocols acknowledge before their final
+/// thread-owned state has dropped.
+pub struct ConstellationThreadOwners {
+    system_font_service: SystemFontServiceThreadOwner,
+    resource_manager: ResourceThreadOwner,
+    storage_threads: StorageThreadOwner,
+}
+
+impl ConstellationThreadOwners {
+    pub fn new(
+        system_font_service: SystemFontServiceThreadOwner,
+        resource_manager: ResourceThreadOwner,
+        storage_threads: StorageThreadOwner,
+    ) -> Self {
+        Self {
+            system_font_service,
+            resource_manager,
+            storage_threads,
+        }
+    }
+}
+
 /// When we are exiting a pipeline, we can either force exiting or not. A normal exit
 /// waits for `Paint` to update its state before exiting, and delegates layout exit to
 /// script. A forced exit does not notify `Paint`, and exits layout without involving
@@ -964,6 +1016,7 @@ where
             random_pipeline_closure_probability,
             random_pipeline_closure_seed,
             hard_fail,
+            None,
             ShutdownCompleteDelivery::WakeEmbedder,
         ));
     }
@@ -984,6 +1037,29 @@ where
             random_pipeline_closure_probability,
             random_pipeline_closure_seed,
             hard_fail,
+            None,
+            ShutdownCompleteDelivery::PollingOwner,
+        )
+    }
+
+    /// Create a joinable Constellation while retaining every production helper thread owner.
+    pub fn start_joinable_with_thread_owners(
+        embedder_to_constellation_receiver: Receiver<EmbedderToConstellationMessage>,
+        state: InitialConstellationState,
+        thread_owners: ConstellationThreadOwners,
+        layout_factory: Arc<dyn LayoutFactory>,
+        random_pipeline_closure_probability: Option<f32>,
+        random_pipeline_closure_seed: Option<usize>,
+        hard_fail: bool,
+    ) -> JoinHandle<()> {
+        Self::start_with_shutdown_delivery(
+            embedder_to_constellation_receiver,
+            state,
+            layout_factory,
+            random_pipeline_closure_probability,
+            random_pipeline_closure_seed,
+            hard_fail,
+            Some(thread_owners),
             ShutdownCompleteDelivery::PollingOwner,
         )
     }
@@ -995,12 +1071,26 @@ where
         random_pipeline_closure_probability: Option<f32>,
         random_pipeline_closure_seed: Option<usize>,
         hard_fail: bool,
+        thread_owners: Option<ConstellationThreadOwners>,
         shutdown_complete_delivery: ShutdownCompleteDelivery,
     ) -> JoinHandle<()> {
         thread::Builder::new()
             .name("Constellation".to_owned())
             .spawn(move || {
                 servo_base::threadboost::boost_thread(ThreadPriority::Elevated, BoostAffinity::Boost);
+                let physical_thread_owners_required = thread_owners.is_some();
+                let (
+                    system_font_service_thread,
+                    resource_manager_thread,
+                    storage_threads_owner,
+                ) = match thread_owners {
+                    Some(owners) => (
+                        Some(owners.system_font_service),
+                        Some(owners.resource_manager),
+                        Some(owners.storage_threads),
+                    ),
+                    None => (None, None, None),
+                };
                 let (script_ipc_sender, script_ipc_receiver) =
                     generic_channel::channel().expect("ipc channel failure");
                 let script_receiver = script_ipc_receiver.route_preserving_errors();
@@ -1075,9 +1165,13 @@ where
                     bluetooth_ipc_sender: state.bluetooth_thread,
                     public_resource_threads: state.public_resource_threads,
                     private_resource_threads: state.private_resource_threads,
+                    resource_manager_thread,
                     public_storage_threads: state.public_storage_threads,
                     private_storage_threads: state.private_storage_threads,
+                    storage_threads_owner,
                     system_font_service: state.system_font_service,
+                    system_font_service_thread,
+                    physical_thread_owners_required,
                     sw_managers: Default::default(),
                     browsing_context_group_set: Default::default(),
                     browsing_context_group_next_id: Default::default(),
@@ -1119,6 +1213,7 @@ where
                     process_manager: ProcessManager::new(state.mem_profiler_chan),
                     async_runtime: state.async_runtime,
                     event_loop_join_handles: Default::default(),
+                    finished_event_loop_failure: None,
                     privileged_urls: state.privileged_urls,
                     image_cache_factory: Arc::new(ImageCacheFactoryImpl::new(
                         broken_image_icon_data,
@@ -1139,7 +1234,7 @@ where
                         .clone(),
                     ),
                 };
-                constellation.run();
+                let shutdown_failure = constellation.run();
                 emit_lifecycle_phase(LifecyclePhase::ConstellationRunEnd);
 
                 // Drop all Constellation-owned state before telling the embedder that shutdown is
@@ -1166,6 +1261,13 @@ where
                         }
                     },
                 }
+
+                // Deliver the terminal embedder boundary before surfacing any joined helper
+                // panic. Servo can then join this thread, finish its remaining owned cleanup, and
+                // still turn the failure into a non-zero process outcome instead of a false green.
+                if let Some(payload) = shutdown_failure {
+                    std::panic::resume_unwind(payload);
+                }
             })
             .expect("Thread spawning failed")
     }
@@ -1186,16 +1288,18 @@ where
     }
 
     fn clean_up_finished_script_event_loops(&mut self) {
-        let join_failures = join_finished_event_loop_threads(&mut self.event_loop_join_handles);
-        if join_failures > 0 {
-            error!("Failed to join {join_failures} finished script-thread(s).");
+        if let Some(payload) = join_finished_event_loop_threads(&mut self.event_loop_join_handles) {
+            error!("Failed to join a finished Script event-loop thread.");
+            if self.finished_event_loop_failure.is_none() {
+                self.finished_event_loop_failure = Some(payload);
+            }
         }
         self.event_loops
             .retain(|event_loop| event_loop.upgrade().is_some());
     }
 
     /// The main event loop for the constellation.
-    fn run(&mut self) {
+    fn run(&mut self) -> Option<ShutdownFailure> {
         while !self.shutting_down || !self.pipelines.is_empty() {
             // Randomly close a pipeline if --random-pipeline-closure-probability is set
             // This is for testing the hardening of the constellation.
@@ -1204,14 +1308,7 @@ where
             self.finish_completed_session_history_traversal_requests();
             self.clean_up_finished_script_event_loops();
         }
-        self.handle_shutdown();
-
-        if !opts::get().multiprocess {
-            StyleThreadPool::shutdown();
-        }
-
-        // Shut down the `FetchThread` if it has been started at any time.
-        FetchThread::exit();
+        self.handle_shutdown()
     }
 
     /// Helper that sends a message to the event loop of a given pipeline, logging the
@@ -4255,7 +4352,9 @@ where
         self.shutting_down = true;
         self.fail_all_document_controls(DocumentControlError::ChannelClosed);
 
-        self.mem_profiler_chan.send(mem::ProfilerMsg::Exit);
+        // The embedding Servo owns the memory-profiler thread. It exits that profiler only after
+        // Constellation and every reporter-owning helper have physically terminated, so reporter
+        // teardown cannot race a detached profiler or be silently sent after its receiver exits.
 
         // Tell all BHMs to exit, and to ensure their monitored components exit even when currently
         // hanging (on JS or sync XHR). This must be done before starting the process of closing all
@@ -4335,15 +4434,19 @@ where
     }
 
     #[servo_tracing::instrument(skip_all)]
-    fn handle_shutdown(&mut self) {
+    fn handle_shutdown(&mut self) -> Option<ShutdownFailure> {
         debug!("Handling shutdown.");
+        let mut first_thread_failure = self.finished_event_loop_failure.take();
+        let mut shutdown_protocol_failed = false;
 
         emit_lifecycle_phase(LifecyclePhase::ScriptThreadsJoinBegin);
-        let mut script_thread_join_failed = false;
+        let mut script_thread_join_failed = first_thread_failure.is_some();
         for join_handle in self.event_loop_join_handles.drain(..) {
-            if join_handle.join().is_err() {
+            if let Err(payload) = join_handle.join() {
                 script_thread_join_failed = true;
-                error!("Failed to join on a script-thread.");
+                if first_thread_failure.is_none() {
+                    first_thread_failure = Some(payload);
+                }
             }
         }
         emit_lifecycle_phase(if script_thread_join_failed {
@@ -4354,10 +4457,44 @@ where
 
         // In single process mode, join on the background hang monitor worker thread.
         drop(self.background_monitor_register.take());
-        if let Some(join_handle) = self.background_monitor_register_join_handle.take()
-            && join_handle.join().is_err()
-        {
-            error!("Failed to join on the bhm background thread.");
+        if let Some(join_handle) = self.background_monitor_register_join_handle.take() {
+            if let Err(payload) = join_handle.join() {
+                if first_thread_failure.is_none() {
+                    first_thread_failure = Some(payload);
+                }
+                error!("Failed to join on the bhm background thread.");
+            }
+        }
+
+        // ScriptThread termination proves that no layout caller or async stylesheet callback can
+        // still enqueue Stylo work. Physically join the default single-process style workers before
+        // claiming subsystem shutdown or tearing down shared runtimes.
+        if !opts::get().multiprocess {
+            emit_lifecycle_phase(LifecyclePhase::StyleThreadPoolShutdownBegin);
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                StyleThreadPool::shutdown();
+            })) {
+                Ok(()) => emit_lifecycle_phase(LifecyclePhase::StyleThreadPoolShutdownEnd),
+                Err(payload) => {
+                    emit_lifecycle_phase(LifecyclePhase::StyleThreadPoolShutdownFailed);
+                    if first_thread_failure.is_none() {
+                        first_thread_failure = Some(payload);
+                    }
+                },
+            }
+        }
+
+        // Fetch callbacks can still own resource channels and route responses. Fence their
+        // physical thread before beginning ResourceManager shutdown or tearing down ROUTER.
+        emit_lifecycle_phase(LifecyclePhase::FetchThreadJoinBegin);
+        match FetchThread::exit_and_join() {
+            Ok(()) => emit_lifecycle_phase(LifecyclePhase::FetchThreadJoinEnd),
+            Err(payload) => {
+                emit_lifecycle_phase(LifecyclePhase::FetchThreadJoinFailed);
+                if first_thread_failure.is_none() {
+                    first_thread_failure = Some(payload);
+                }
+            },
         }
 
         // At this point, there are no active pipelines,
@@ -4387,6 +4524,7 @@ where
             .public_resource_threads
             .send(net_traits::CoreResourceMsg::Exit(core_ipc_sender))
         {
+            shutdown_protocol_failed = true;
             warn!("Exit resource thread failed ({})", e);
         }
 
@@ -4403,6 +4541,7 @@ where
             &self.public_storage_threads,
             ClientStorageThreadMessage::Exit(public_client_storage_generic_sender),
         ) {
+            shutdown_protocol_failed = true;
             warn!("Exit public client storage thread failed ({})", e);
         }
         debug!("Exiting private client storage thread.");
@@ -4410,6 +4549,7 @@ where
             &self.private_storage_threads,
             ClientStorageThreadMessage::Exit(private_client_storage_generic_sender),
         ) {
+            shutdown_protocol_failed = true;
             warn!("Exit private client storage thread failed ({})", e);
         }
 
@@ -4418,6 +4558,7 @@ where
             &self.public_storage_threads,
             CacheStorageThreadMessage::Exit(public_cache_storage_generic_sender),
         ) {
+            shutdown_protocol_failed = true;
             warn!("Exit public cache storage thread failed ({})", e);
         }
         debug!("Exiting private cache storage thread.");
@@ -4425,6 +4566,7 @@ where
             &self.private_storage_threads,
             CacheStorageThreadMessage::Exit(private_cache_storage_generic_sender),
         ) {
+            shutdown_protocol_failed = true;
             warn!("Exit private cache storage thread failed ({})", e);
         }
 
@@ -4435,6 +4577,7 @@ where
                     public_indexeddb_ipc_sender,
                 )))
         {
+            shutdown_protocol_failed = true;
             warn!("Exit public indexeddb thread failed ({})", e);
         }
 
@@ -4445,6 +4588,7 @@ where
                     private_indexeddb_ipc_sender,
                 )))
         {
+            shutdown_protocol_failed = true;
             warn!("Exit private indexeddb thread failed ({})", e);
         }
 
@@ -4453,6 +4597,7 @@ where
             &self.public_storage_threads,
             WebStorageThreadMsg::Exit(public_web_storage_generic_sender),
         ) {
+            shutdown_protocol_failed = true;
             warn!("Exit public web storage thread failed ({})", e);
         }
 
@@ -4461,6 +4606,7 @@ where
             &self.private_storage_threads,
             WebStorageThreadMsg::Exit(private_web_storage_generic_sender),
         ) {
+            shutdown_protocol_failed = true;
             warn!("Exit private web storage thread failed ({})", e);
         }
 
@@ -4479,13 +4625,14 @@ where
             }
         }
 
-        let canvas_exit_receiver = if let Some((canvas_sender, _)) = self.canvas.get() {
+        let canvas_shutdown = if let Some((canvas_sender, _, owner)) = self.canvas.take() {
             debug!("Exiting Canvas Paint thread.");
             let (canvas_exit_sender, canvas_exit_receiver) = unbounded();
             if let Err(e) = canvas_sender.send(ConstellationCanvasMsg::Exit(canvas_exit_sender)) {
+                shutdown_protocol_failed = true;
                 warn!("Exit Canvas Paint thread failed ({})", e);
             }
-            Some(canvas_exit_receiver)
+            Some((canvas_exit_receiver, owner))
         } else {
             None
         };
@@ -4519,50 +4666,182 @@ where
         debug!("Exiting GLPlayer thread.");
         WindowGLContext::get().exit();
 
-        // Wait for the canvas thread to exit before shutting down the font service, as
+        // Wait for the canvas thread to exit before draining the remaining producers, as
         // canvas might still be using the system font service before shutting down.
-        if let Some(canvas_exit_receiver) = canvas_exit_receiver {
-            let _ = canvas_exit_receiver.recv();
+        if let Some((canvas_exit_receiver, owner)) = canvas_shutdown {
+            if let Err(error) = canvas_exit_receiver.recv() {
+                shutdown_protocol_failed = true;
+                warn!("Failed to receive Canvas Paint thread exit response ({error})");
+            }
+            emit_lifecycle_phase(LifecyclePhase::CanvasPaintThreadJoinBegin);
+            match owner.join() {
+                Ok(()) => emit_lifecycle_phase(LifecyclePhase::CanvasPaintThreadJoinEnd),
+                Err(payload) => {
+                    emit_lifecycle_phase(LifecyclePhase::CanvasPaintThreadJoinFailed);
+                    if first_thread_failure.is_none() {
+                        first_thread_failure = Some(payload);
+                    }
+                },
+            }
         }
-
-        debug!("Exiting the system font service thread.");
-        self.system_font_service.exit();
 
         // Receive exit signals from threads.
         if let Err(e) = core_ipc_receiver.recv() {
+            shutdown_protocol_failed = true;
             warn!("Exit resource thread failed ({:?})", e);
         }
         if let Err(e) = public_client_storage_generic_receiver.recv() {
+            shutdown_protocol_failed = true;
             warn!("Exit public client storage thread failed ({:?})", e);
         }
         if let Err(e) = private_client_storage_generic_receiver.recv() {
+            shutdown_protocol_failed = true;
             warn!("Exit private client storage thread failed ({:?})", e);
         }
         if let Err(e) = private_cache_storage_generic_receiver.recv() {
+            shutdown_protocol_failed = true;
             warn!("Exit private cache storage thread failed ({:?})", e);
         }
         if let Err(e) = public_cache_storage_generic_receiver.recv() {
+            shutdown_protocol_failed = true;
             warn!("Exit public cache storage thread failed ({:?})", e);
         }
         if let Err(e) = public_indexeddb_ipc_receiver.recv() {
+            shutdown_protocol_failed = true;
             warn!("Exit public indexeddb thread failed ({:?})", e);
         }
         if let Err(e) = private_indexeddb_ipc_receiver.recv() {
+            shutdown_protocol_failed = true;
             warn!("Exit private indexeddb thread failed ({:?})", e);
         }
         if let Err(e) = public_web_storage_generic_receiver.recv() {
+            shutdown_protocol_failed = true;
             warn!("Exit public web storage thread failed ({:?})", e);
         }
         if let Err(e) = private_web_storage_generic_receiver.recv() {
+            shutdown_protocol_failed = true;
             warn!("Exit private web storage thread failed ({:?})", e);
+        }
+
+        // An exit acknowledgement is only a logical protocol boundary. Join the actual owning OS
+        // threads before either the IPC router or async runtime can be torn down underneath their
+        // final reporter registrations, caches, databases, and network state.
+        match self.resource_manager_thread.take() {
+            Some(owner) => {
+                emit_lifecycle_phase(LifecyclePhase::ResourceManagerJoinBegin);
+                match owner.join() {
+                    Ok(()) => emit_lifecycle_phase(LifecyclePhase::ResourceManagerJoinEnd),
+                    Err(payload) => {
+                        emit_lifecycle_phase(LifecyclePhase::ResourceManagerJoinFailed);
+                        if first_thread_failure.is_none() {
+                            first_thread_failure = Some(payload);
+                        }
+                    },
+                }
+            },
+            None if self.physical_thread_owners_required => {
+                emit_lifecycle_phase(LifecyclePhase::ResourceManagerJoinBegin);
+                emit_lifecycle_phase(LifecyclePhase::ResourceManagerJoinFailed);
+                shutdown_protocol_failed = true;
+            },
+            None => {},
+        }
+
+        match self.storage_threads_owner.take() {
+            Some(owner) => {
+                emit_lifecycle_phase(LifecyclePhase::StorageThreadsJoinBegin);
+                match owner.join() {
+                    Ok(()) => emit_lifecycle_phase(LifecyclePhase::StorageThreadsJoinEnd),
+                    Err(error) => {
+                        emit_lifecycle_phase(LifecyclePhase::StorageThreadsJoinFailed);
+                        if first_thread_failure.is_none() {
+                            first_thread_failure = Some(Box::new(error.to_string()));
+                        }
+                    },
+                }
+            },
+            None if self.physical_thread_owners_required => {
+                emit_lifecycle_phase(LifecyclePhase::StorageThreadsJoinBegin);
+                emit_lifecycle_phase(LifecyclePhase::StorageThreadsJoinFailed);
+                shutdown_protocol_failed = true;
+            },
+            None => {},
+        }
+
+        // Resource, image-cache, and storage producers are now fenced. Drop the shared Rayon
+        // registry and join every retained GlobalPool OS worker before the async runtime/ROUTER.
+        emit_lifecycle_phase(LifecyclePhase::GlobalThreadPoolShutdownBegin);
+        match ThreadPool::shutdown_global() {
+            Ok(()) => emit_lifecycle_phase(LifecyclePhase::GlobalThreadPoolShutdownEnd),
+            Err(payload) => {
+                emit_lifecycle_phase(LifecyclePhase::GlobalThreadPoolShutdownFailed);
+                if first_thread_failure.is_none() {
+                    first_thread_failure = Some(payload);
+                }
+            },
+        }
+
+        // Accepted image-cache work can synchronously resolve SVG fonts. Keep the font service
+        // alive until every producer is fenced and the shared Rayon pool is physically drained,
+        // then join it before tearing down the async runtime or IPC router.
+        debug!("Exiting the system font service thread.");
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.system_font_service.exit();
+        })) {
+            shutdown_protocol_failed = true;
+            if first_thread_failure.is_none() {
+                first_thread_failure = Some(payload);
+            }
+        }
+        match self.system_font_service_thread.take() {
+            Some(owner) => {
+                emit_lifecycle_phase(LifecyclePhase::SystemFontServiceJoinBegin);
+                match owner.join() {
+                    Ok(()) => emit_lifecycle_phase(LifecyclePhase::SystemFontServiceJoinEnd),
+                    Err(payload) => {
+                        emit_lifecycle_phase(LifecyclePhase::SystemFontServiceJoinFailed);
+                        if first_thread_failure.is_none() {
+                            first_thread_failure = Some(payload);
+                        }
+                    },
+                }
+            },
+            None if self.physical_thread_owners_required => {
+                emit_lifecycle_phase(LifecyclePhase::SystemFontServiceJoinBegin);
+                emit_lifecycle_phase(LifecyclePhase::SystemFontServiceJoinFailed);
+                shutdown_protocol_failed = true;
+            },
+            None => {},
+        }
+
+        debug!("Shutting-down the async runtime in constellation.");
+        emit_lifecycle_phase(LifecyclePhase::AsyncRuntimeShutdownBegin);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.async_runtime.shutdown();
+        })) {
+            Ok(()) => emit_lifecycle_phase(LifecyclePhase::AsyncRuntimeShutdownEnd),
+            Err(payload) => {
+                emit_lifecycle_phase(LifecyclePhase::AsyncRuntimeShutdownFailed);
+                if first_thread_failure.is_none() {
+                    first_thread_failure = Some(payload);
+                }
+            },
         }
 
         debug!("Shutting-down IPC router thread in constellation.");
         ROUTER.shutdown();
+        if shutdown_protocol_failed && first_thread_failure.is_none() {
+            first_thread_failure = Some(Box::new(String::from(
+                "a subsystem shutdown protocol boundary failed",
+            )));
+        }
+        emit_lifecycle_phase(if first_thread_failure.is_some() {
+            LifecyclePhase::SubsystemsShutdownFailed
+        } else {
+            LifecyclePhase::SubsystemsShutdownEnd
+        });
 
-        debug!("Shutting-down the async runtime in constellation.");
-        self.async_runtime.shutdown();
-        emit_lifecycle_phase(LifecyclePhase::SubsystemsShutdownEnd);
+        first_thread_failure
     }
 
     fn handle_pipeline_exited(&mut self, pipeline_id: PipelineId) {
@@ -6992,7 +7271,7 @@ where
         response_sender: GenericSender<Option<(GenericSender<CanvasMsg>, CanvasId)>>,
     ) {
         let (canvas_data_sender, canvas_data_receiver) = unbounded();
-        let (canvas_sender, canvas_ipc_sender) = self
+        let (canvas_sender, canvas_ipc_sender, _) = self
             .canvas
             .get_or_init(|| self.create_canvas_paint_thread());
 
@@ -8255,8 +8534,12 @@ where
 
     fn create_canvas_paint_thread(
         &self,
-    ) -> (Sender<ConstellationCanvasMsg>, GenericSender<CanvasMsg>) {
-        CanvasPaintThread::start(
+    ) -> (
+        Sender<ConstellationCanvasMsg>,
+        GenericSender<CanvasMsg>,
+        CanvasPaintThreadOwner,
+    ) {
+        CanvasPaintThread::start_with_owner(
             self.paint_proxy.cross_process_paint_api.clone(),
             self.mem_profiler_chan.clone(),
         )

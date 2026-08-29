@@ -439,6 +439,12 @@ static RUSTLS_PLATFORM_VERIFIER_CACHE: LazyLock<Arc<rustls_platform_verifier::Ve
 /// the initialization will happen much later, on a tokio runtime thread.
 #[inline]
 pub fn prewarm_tls() {
+    drop(prewarm_tls_with_owner());
+}
+
+/// Prewarm TLS while retaining physical ownership of the startup thread.
+#[inline]
+pub fn prewarm_tls_with_owner() -> Option<std::thread::JoinHandle<()>> {
     #[servo_tracing::instrument]
     fn prewarm_tls_impl() {
         let mut sink = [0u8; 32];
@@ -448,11 +454,15 @@ pub fn prewarm_tls() {
         // since the resource manager thread will do that during startup.
     }
 
-    if let Err(error) = std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("Net-TLS-prewarm".into())
         .spawn(prewarm_tls_impl)
     {
-        warn!("Failed to spawn thread to prewarm TLS: {error:?}");
+        Ok(join_handle) => Some(join_handle),
+        Err(error) => {
+            warn!("Failed to spawn thread to prewarm TLS: {error:?}");
+            None
+        },
     }
 }
 

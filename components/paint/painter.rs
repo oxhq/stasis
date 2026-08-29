@@ -144,47 +144,135 @@ pub(crate) struct Painter {
     web_content_animator: WebContentAnimator,
 }
 
+type PainterShutdownFailure = Box<dyn std::any::Any + Send + 'static>;
+
+fn retain_first_shutdown_failure(
+    first_failure: &mut Option<PainterShutdownFailure>,
+    failure: PainterShutdownFailure,
+) {
+    if first_failure.is_none() {
+        *first_failure = Some(failure);
+    }
+}
+
+/// Attempt every physical WebRender shutdown boundary, retaining the first failure.
+///
+/// The synchronous protocol request can panic before its acknowledgement when a backend channel
+/// has already failed. That is precisely when dropping the retained handles would be unsafe, so
+/// every backend, worker, and renderer cleanup step must still be attempted.
+fn shut_down_owned_webrender<R, Stop, ShutDown, Force, JoinBackend, JoinWorkers, Deinit>(
+    mut renderer: Option<R>,
+    stop_render_backend: Stop,
+    shut_down: ShutDown,
+    force_shut_down: Force,
+    join_backend_threads: JoinBackend,
+    join_workers: JoinWorkers,
+    deinit_renderer: Deinit,
+) -> Option<PainterShutdownFailure>
+where
+    Stop: FnOnce(),
+    ShutDown: FnOnce(),
+    Force: FnOnce(),
+    JoinBackend: FnOnce(&mut R) -> std::thread::Result<()>,
+    JoinWorkers: FnOnce() -> std::thread::Result<()>,
+    Deinit: FnOnce(R),
+{
+    let mut first_failure = None;
+
+    emit_lifecycle_phase(LifecyclePhase::PainterWebRenderShutdownBegin);
+    let stop_result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(stop_render_backend));
+    let shutdown_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(shut_down));
+    emit_lifecycle_phase(
+        if stop_result.is_ok() && shutdown_result.is_ok() {
+            LifecyclePhase::PainterWebRenderShutdownAckObserved
+        } else {
+            LifecyclePhase::PainterWebRenderShutdownFailed
+        },
+    );
+    if let Err(payload) = stop_result {
+        retain_first_shutdown_failure(&mut first_failure, payload);
+    }
+    if let Err(payload) = shutdown_result {
+        retain_first_shutdown_failure(&mut first_failure, payload);
+    }
+
+    if let Err(payload) =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(force_shut_down))
+    {
+        retain_first_shutdown_failure(&mut first_failure, payload);
+    }
+
+    if let Some(renderer) = renderer.as_mut() {
+        emit_lifecycle_phase(LifecyclePhase::PainterWebRenderThreadsJoinBegin);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            join_backend_threads(renderer)
+        })) {
+            Ok(Ok(())) => {
+                emit_lifecycle_phase(LifecyclePhase::PainterWebRenderThreadsJoinEnd);
+            },
+            Ok(Err(payload)) | Err(payload) => {
+                emit_lifecycle_phase(LifecyclePhase::PainterWebRenderThreadsJoinFailed);
+                retain_first_shutdown_failure(&mut first_failure, payload);
+            },
+        }
+    }
+
+    emit_lifecycle_phase(LifecyclePhase::PainterWebRenderWorkersJoinBegin);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(join_workers)) {
+        Ok(Ok(())) => {
+            emit_lifecycle_phase(LifecyclePhase::PainterWebRenderWorkersJoinEnd);
+        },
+        Ok(Err(payload)) | Err(payload) => {
+            emit_lifecycle_phase(LifecyclePhase::PainterWebRenderWorkersJoinFailed);
+            retain_first_shutdown_failure(&mut first_failure, payload);
+        },
+    }
+
+    if let Some(renderer) = renderer.take() {
+        emit_lifecycle_phase(LifecyclePhase::PainterRendererDeinitBegin);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            deinit_renderer(renderer)
+        })) {
+            Ok(()) => emit_lifecycle_phase(LifecyclePhase::PainterRendererDeinitEnd),
+            Err(payload) => {
+                emit_lifecycle_phase(LifecyclePhase::PainterRendererDeinitFailed);
+                retain_first_shutdown_failure(&mut first_failure, payload);
+            },
+        }
+    }
+
+    first_failure
+}
+
 impl Drop for Painter {
     fn drop(&mut self) {
         emit_lifecycle_phase(LifecyclePhase::PainterDropBegin);
-        if let Err(error) = self.rendering_context.make_current() {
-            error!("Failed to make the rendering context current: {error:?}");
-        }
-
-        self.webrender_api.stop_render_backend();
-        emit_lifecycle_phase(LifecyclePhase::PainterWebRenderShutdownBegin);
-        self.webrender_api.shut_down(true);
-        emit_lifecycle_phase(LifecyclePhase::PainterWebRenderShutdownAckObserved);
-
-        let mut first_thread_failure = None;
-        if let Some(mut renderer) = self.webrender_renderer.take() {
-            emit_lifecycle_phase(LifecyclePhase::PainterWebRenderThreadsJoinBegin);
-            match renderer.join_backend_threads() {
-                Ok(()) => {
-                    emit_lifecycle_phase(LifecyclePhase::PainterWebRenderThreadsJoinEnd);
+        let mut first_thread_failure =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.rendering_context.make_current()
+            })) {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => {
+                    error!("Failed to make the rendering context current: {error:?}");
+                    None
                 },
-                Err(payload) => {
-                    emit_lifecycle_phase(LifecyclePhase::PainterWebRenderThreadsJoinFailed);
-                    first_thread_failure = Some(payload);
-                },
-            }
+                Err(payload) => Some(payload),
+            };
 
-            emit_lifecycle_phase(LifecyclePhase::PainterWebRenderWorkersJoinBegin);
-            match self.webrender_worker_owner.join_all() {
-                Ok(()) => {
-                    emit_lifecycle_phase(LifecyclePhase::PainterWebRenderWorkersJoinEnd);
-                },
-                Err(payload) => {
-                    emit_lifecycle_phase(LifecyclePhase::PainterWebRenderWorkersJoinFailed);
-                    if first_thread_failure.is_none() {
-                        first_thread_failure = Some(payload);
-                    }
-                },
-            }
-
-            emit_lifecycle_phase(LifecyclePhase::PainterRendererDeinitBegin);
-            renderer.deinit();
-            emit_lifecycle_phase(LifecyclePhase::PainterRendererDeinitEnd);
+        let renderer = self.webrender_renderer.take();
+        let webrender_api = &self.webrender_api;
+        let worker_owner = &self.webrender_worker_owner;
+        if let Some(payload) = shut_down_owned_webrender(
+            renderer,
+            || webrender_api.stop_render_backend(),
+            || webrender_api.shut_down(true),
+            || webrender_api.force_shut_down(),
+            |renderer| renderer.join_backend_threads(),
+            || worker_owner.join_all(),
+            |renderer| renderer.deinit(),
+        ) {
+            retain_first_shutdown_failure(&mut first_thread_failure, payload);
         }
         emit_lifecycle_phase(LifecyclePhase::PainterDropBodyEnd);
 
@@ -195,6 +283,101 @@ impl Drop for Painter {
                 std::panic::resume_unwind(payload);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod thread_ownership_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+
+    use super::shut_down_owned_webrender;
+
+    #[test]
+    fn force_shutdown_wakes_surviving_queues_after_low_priority_disconnect() {
+        webrender::stasis_force_shutdown_disconnected_low_priority_regression();
+    }
+
+    #[test]
+    fn pre_ack_shutdown_failure_forces_every_queue_before_joining_physical_owners() {
+        let backend_join_attempted = Arc::new(AtomicBool::new(false));
+        let worker_join_attempted = Arc::new(AtomicBool::new(false));
+        let renderer_deinit_attempted = Arc::new(AtomicBool::new(false));
+        let backend_dropped = Arc::new(AtomicBool::new(false));
+        let scene_builder_dropped = Arc::new(AtomicBool::new(false));
+        let worker_dropped = Arc::new(AtomicBool::new(false));
+
+        struct DropSentinel(Arc<AtomicBool>);
+
+        impl Drop for DropSentinel {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let (release_backend_sender, release_backend_receiver) = mpsc::sync_channel(0);
+        let (release_scene_sender, release_scene_receiver) = mpsc::sync_channel(0);
+        let (release_worker_sender, release_worker_receiver) = mpsc::sync_channel(0);
+        let backend_dropped_in_thread = Arc::clone(&backend_dropped);
+        let scene_dropped_in_thread = Arc::clone(&scene_builder_dropped);
+        let worker_dropped_in_thread = Arc::clone(&worker_dropped);
+        let backend = thread::spawn(move || {
+            let _sentinel = DropSentinel(backend_dropped_in_thread);
+            release_backend_receiver.recv().unwrap();
+            release_worker_sender.send(()).unwrap();
+            std::panic::panic_any("secondary backend join failure")
+        });
+        let scene_builder = thread::spawn(move || {
+            let _sentinel = DropSentinel(scene_dropped_in_thread);
+            release_scene_receiver.recv().unwrap();
+        });
+        let worker = thread::spawn(move || {
+            let _sentinel = DropSentinel(worker_dropped_in_thread);
+            release_worker_receiver.recv().unwrap();
+        });
+        let backend_threads =
+            webrender::BackendThreadHandles::new(backend, scene_builder, None);
+
+        let backend_join_observed = Arc::clone(&backend_join_attempted);
+        let worker_join_observed = Arc::clone(&worker_join_attempted);
+        let renderer_deinit_observed = Arc::clone(&renderer_deinit_attempted);
+        let failure = shut_down_owned_webrender(
+            Some(backend_threads),
+            || {},
+            || {
+                std::panic::panic_any("deterministic pre-ACK shutdown failure")
+            },
+            move || {
+                release_backend_sender.send(()).unwrap();
+                release_scene_sender.send(()).unwrap();
+            },
+            move |backend_threads| {
+                backend_join_observed.store(true, Ordering::SeqCst);
+                backend_threads.join_all()
+            },
+            move || {
+                worker_join_observed.store(true, Ordering::SeqCst);
+                worker.join()
+            },
+            move |_| {
+                renderer_deinit_observed.store(true, Ordering::SeqCst);
+                std::panic::panic_any("secondary renderer deinit failure")
+            },
+        )
+        .expect("the pre-ACK shutdown failure must remain observable");
+
+        assert_eq!(
+            failure.downcast_ref::<&'static str>(),
+            Some(&"deterministic pre-ACK shutdown failure")
+        );
+        assert!(backend_join_attempted.load(Ordering::SeqCst));
+        assert!(worker_join_attempted.load(Ordering::SeqCst));
+        assert!(renderer_deinit_attempted.load(Ordering::SeqCst));
+        assert!(backend_dropped.load(Ordering::SeqCst));
+        assert!(scene_builder_dropped.load(Ordering::SeqCst));
+        assert!(worker_dropped.load(Ordering::SeqCst));
     }
 }
 

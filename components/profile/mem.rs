@@ -20,6 +20,27 @@ use crate::system_reporter;
 
 const LOG_FILE_VAR: &str = "UNTRACKED_LOG_FILE";
 
+/// Physical ownership of the memory-profiler thread.
+///
+/// Keeping the channel alone does not prove that the profiler thread and its reporter map have
+/// finished dropping. The embedding runtime retains this owner until every reporter-owning helper
+/// has terminated, then sends [`ProfilerMsg::Exit`] and joins the thread.
+#[must_use = "dropping the memory profiler thread owner detaches the profiler thread"]
+pub struct MemoryProfilerThreadOwner {
+    join_handle: thread::JoinHandle<()>,
+}
+
+impl MemoryProfilerThreadOwner {
+    fn new(join_handle: thread::JoinHandle<()>) -> Self {
+        Self { join_handle }
+    }
+
+    /// Wait for the profiler thread and all of its thread-owned state to finish dropping.
+    pub fn join(self) -> thread::Result<()> {
+        self.join_handle.join()
+    }
+}
+
 pub struct Profiler {
     /// The port through which messages are received.
     pub port: GenericReceiver<ProfilerMsg>,
@@ -30,6 +51,11 @@ pub struct Profiler {
 
 impl Profiler {
     pub fn create() -> ProfilerChan {
+        Self::create_owned().0
+    }
+
+    /// Create the memory profiler while retaining authority to join its physical termination.
+    pub fn create_owned() -> (ProfilerChan, MemoryProfilerThreadOwner) {
         let (chan, port) = generic_channel::channel().unwrap();
 
         if servo_allocator::is_tracking_unmeasured() && std::env::var(LOG_FILE_VAR).is_err() {
@@ -38,7 +64,7 @@ impl Profiler {
 
         // Always spawn the memory profiler. If there is no timer thread it won't receive regular
         // `Print` events, but it will still receive the other events.
-        thread::Builder::new()
+        let join_handle = thread::Builder::new()
             .name("MemoryProfiler".to_owned())
             .spawn(move || {
                 let mut mem_profiler = Profiler::new(port);
@@ -61,7 +87,10 @@ impl Profiler {
             Reporter(callback),
         ));
 
-        mem_profiler_chan
+        (
+            mem_profiler_chan,
+            MemoryProfilerThreadOwner::new(join_handle),
+        )
     }
 
     pub fn new(port: GenericReceiver<ProfilerMsg>) -> Profiler {
@@ -147,5 +176,69 @@ impl Profiler {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod thread_ownership_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+
+    use profile_traits::mem::ProfilerMsg;
+
+    use super::{MemoryProfilerThreadOwner, Profiler};
+
+    struct DropSentinel(Arc<AtomicBool>);
+
+    impl Drop for DropSentinel {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn memory_profiler_owner_joins_the_real_profiler_after_exit() {
+        let (chan, owner) = Profiler::create_owned();
+        chan.send(ProfilerMsg::Exit);
+        owner
+            .join()
+            .expect("the memory profiler should physically terminate after Exit");
+    }
+
+    #[test]
+    fn memory_profiler_owner_join_fences_thread_owned_state() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let thread_dropped = dropped.clone();
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = mpsc::sync_channel(0);
+        let owner = MemoryProfilerThreadOwner::new(thread::spawn(move || {
+            let _sentinel = DropSentinel(thread_dropped);
+            ready_sender
+                .send(())
+                .expect("the deterministic readiness receiver should remain open");
+            release_receiver
+                .recv()
+                .expect("the deterministic release sender should remain open");
+        }));
+
+        ready_receiver
+            .recv()
+            .expect("the deterministic profiler should report readiness");
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "a live profiler thread must still own its state"
+        );
+        release_sender
+            .send(())
+            .expect("the deterministic profiler should remain blocked until release");
+        owner
+            .join()
+            .expect("the deterministic profiler thread should exit cleanly");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "joining must fence profiler-owned state drop"
+        );
     }
 }

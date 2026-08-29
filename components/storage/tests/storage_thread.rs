@@ -49,13 +49,13 @@ fn shutdown_storage_group(threads: &StorageThreads) {
 #[test]
 fn test_new_storage_threads_create_independent_groups() {
     let mem_profiler_chan = profile_mem::Profiler::create();
-    let (private_storage_threads, public_storage_threads) =
-        storage::new_storage_threads(mem_profiler_chan, None, false);
+    let (private_storage_threads, public_storage_threads, owner) =
+        storage::new_storage_threads_with_owner(mem_profiler_chan, None, false);
+    assert_eq!(owner.thread_count(), 8);
 
     shutdown_storage_group(&private_storage_threads);
     shutdown_storage_group(&public_storage_threads);
-
-    // Workaround for https://github.com/servo/servo/issues/32912
-    #[cfg(windows)]
-    std::thread::sleep(std::time::Duration::from_millis(1000));
+    owner
+        .join()
+        .expect("storage manager threads failed to join");
 }

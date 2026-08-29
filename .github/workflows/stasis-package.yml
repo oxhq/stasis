@@ -207,29 +207,98 @@ jobs:
           file target/production-stripped/stasis | grep -F 'ELF 64-bit LSB'
 
           ownership_log="$RUNNER_TEMP/stasis-lifecycle-${{ matrix.lane }}-ownership.log"
-          # Keep the standalone ownership tests in Stasis's bundled-FreeType feature graph.
+          : > "$ownership_log"
+          # Keep font ownership tests in Stasis's bundled-FreeType feature graph, and run every
+          # other owner regression through a real test target rather than trusting a zero-test
+          # package invocation.
+          ownership_status=0
           set +e
           cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-base --lib global_thread_pool_ownership_tests \
+            -- --test-threads=1 --show-output >> "$ownership_log" 2>&1 || ownership_status=$?
+          cargo test --locked --profile production-stripped \
             -p stasis-shell -p servo-paint --lib thread_ownership \
-            -- --test-threads=1 --show-output > "$ownership_log" 2>&1
-          ownership_status=$?
+            -- --test-threads=1 --show-output >> "$ownership_log" 2>&1 || ownership_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-fonts --lib thread_owner_join \
+            -- --test-threads=1 --show-output >> "$ownership_log" 2>&1 || ownership_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-profile --lib thread_ownership_tests \
+            -- --test-threads=1 --show-output >> "$ownership_log" 2>&1 || ownership_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-media --lib initialization_tests \
+            -- --test-threads=1 --show-output >> "$ownership_log" 2>&1 || ownership_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-canvas --lib thread_ownership_tests \
+            -- --test-threads=1 --show-output >> "$ownership_log" 2>&1 || ownership_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo --lib shutdown_thread_ownership_tests \
+            -- --test-threads=1 --show-output >> "$ownership_log" 2>&1 || ownership_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-constellation --lib finished_event_loop_cleanup_tests \
+            -- --test-threads=1 --show-output >> "$ownership_log" 2>&1 || ownership_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-net-traits --lib fetch_thread_ownership_tests \
+            -- --test-threads=1 --show-output >> "$ownership_log" 2>&1 || ownership_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-net --lib thread_ownership_tests \
+            -- --test-threads=1 --show-output >> "$ownership_log" 2>&1 || ownership_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-net --features servo-net/test-util --test main \
+            resource_thread::exit_ack_precedes_physical_resource_thread_termination \
+            -- --exact --test-threads=1 --show-output >> "$ownership_log" 2>&1 || ownership_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-net --features servo-net/test-util --test main \
+            resource_thread::resource_thread_owner_join_surfaces_post_ack_panic \
+            -- --exact --test-threads=1 --show-output >> "$ownership_log" 2>&1 || ownership_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-storage --lib owner_ \
+            -- --test-threads=1 --show-output >> "$ownership_log" 2>&1 || ownership_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-storage --test main \
+            storage_thread::test_new_storage_threads_create_independent_groups \
+            -- --exact --test-threads=1 --show-output >> "$ownership_log" 2>&1 || ownership_status=$?
           set -e
           if (( ownership_status != 0 )); then
             cat "$ownership_log"
             rm -f -- "$ownership_log"
             exit "$ownership_status"
           fi
-          expected_ownership_tests=(
-            backend_join_continues_after_the_first_panicking_handle
-            backend_join_fences_post_ack_thread_owned_state
-            backend_shutdown_ack_does_not_hide_a_later_thread_panic
-            production_spawn_handler_joins_every_custom_rayon_worker
-            worker_join_continues_after_the_first_panicking_handle
+          expected_ownership_records=(
+            'test threadpool::global_thread_pool_ownership_tests::shutdown_fences_accepted_work_and_physical_worker_drop ... ok'
+            'test threadpool::global_thread_pool_ownership_tests::shutdown_surfaces_first_and_drains_every_unhandled_task_panic ... ok'
+            'test threadpool::global_thread_pool_ownership_tests::worker_join_continues_after_first_panicking_handle ... ok'
+            'test thread_ownership::tests::backend_join_continues_after_the_first_panicking_handle ... ok'
+            'test thread_ownership::tests::backend_join_fences_post_ack_thread_owned_state ... ok'
+            'test thread_ownership::tests::backend_shutdown_ack_does_not_hide_a_later_thread_panic ... ok'
+            'test thread_ownership::tests::production_spawn_handler_joins_every_custom_rayon_worker ... ok'
+            'test thread_ownership::tests::worker_join_continues_after_the_first_panicking_handle ... ok'
+            'test painter::thread_ownership_tests::pre_ack_shutdown_failure_forces_every_queue_before_joining_physical_owners ... ok'
+            'test painter::thread_ownership_tests::force_shutdown_wakes_surviving_queues_after_low_priority_disconnect ... ok'
+            'test system_font_service::tests::thread_owner_join_fences_post_ack_thread_owned_state ... ok'
+            'test system_font_service::tests::thread_owner_join_surfaces_post_ack_panic ... ok'
+            'test mem::thread_ownership_tests::memory_profiler_owner_join_fences_thread_owned_state ... ok'
+            'test mem::thread_ownership_tests::memory_profiler_owner_joins_the_real_profiler_after_exit ... ok'
+            'test initialization_tests::initialization_completes_on_the_calling_thread_before_returning ... ok'
+            'test initialization_tests::initializer_panic_is_synchronous_and_leaves_the_cell_uninitialized ... ok'
+            'test canvas_paint_thread::thread_ownership_tests::owner_join_fences_real_exit_ack_before_post_ack_drop ... ok'
+            'test canvas_paint_thread::thread_ownership_tests::owner_join_surfaces_real_post_ack_panic ... ok'
+            'test servo::shutdown_thread_ownership_tests::late_owner_panic_does_not_replace_primary_unwind ... ok'
+            'test servo::shutdown_thread_ownership_tests::missing_shutdown_terminal_remains_failure_after_tls_owner_join ... ok'
+            'test constellation::finished_event_loop_cleanup_tests::finished_event_loop_handles_are_joined_while_running_handles_are_retained ... ok'
+            'test constellation::finished_event_loop_cleanup_tests::normally_finished_event_loop_handles_join_without_failure ... ok'
+            'test fetch_thread_ownership_tests::exit_and_join_fences_callback_drop_and_surfaces_post_exit_panic ... ok'
+            'test async_runtime::thread_ownership_tests::shutdown_waits_for_worker_owned_task_drop ... ok'
+            'test resource_thread::exit_ack_precedes_physical_resource_thread_termination ... ok'
+            'test resource_thread::resource_thread_owner_join_surfaces_post_ack_panic ... ok'
+            'test cache_storage::tests::owner_join_closes_exit_acknowledgement_before_physical_drop_gap ... ok'
+            'test storage_thread::tests::owner_attempts_every_join_and_reports_every_failure ... ok'
+            'test storage_thread::test_new_storage_threads_create_independent_groups ... ok'
           )
-          for test_name in "${expected_ownership_tests[@]}"; do
-            test "$(grep -Fxc "test thread_ownership::tests::${test_name} ... ok" "$ownership_log")" = '1'
+          test "${#expected_ownership_records[@]}" = '29'
+          for test_record in "${expected_ownership_records[@]}"; do
+            test "$(grep -Fxc "$test_record" "$ownership_log")" = '1'
           done
-          test "$(grep -Ec '^test thread_ownership::tests::.* \.\.\. ok$' "$ownership_log")" = '5'
           cat "$ownership_log"
           rm -f -- "$ownership_log"
 
@@ -237,8 +306,8 @@ jobs:
           set +e
           xvfb-run -a cargo test --locked --profile production-stripped \
             -p stasis-shell --test controlled_mvp \
-            source_binary_single_close_lifecycle_is_owner_ordered \
-            -- --exact --test-threads=1 --show-output > "$oracle_log" 2>&1
+            source_binary_ \
+            -- --test-threads=1 --show-output > "$oracle_log" 2>&1
           oracle_status=$?
           set -e
           if (( oracle_status != 0 )); then
@@ -252,8 +321,9 @@ jobs:
             rm -f -- "$oracle_log" "$oracle_summary"
             exit "$oracle_status"
           fi
+          test "$(grep -Fxc 'test source_binary_canvas_close_lifecycle_joins_physical_owner ... ok' "$oracle_log")" = '1'
           test "$(grep -Fxc 'test source_binary_single_close_lifecycle_is_owner_ordered ... ok' "$oracle_log")" = '1'
-          test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s$' "$oracle_log")" = '1'
+          test "$(grep -Ec '^test result: ok\. 2 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s$' "$oracle_log")" = '1'
           cat "$oracle_log"
           rm -f -- "$oracle_log"
 

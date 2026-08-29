@@ -669,41 +669,48 @@ pub trait ClientStorageThreadFactory {
     fn new(config_dir: Option<PathBuf>, temporary_storage: bool) -> Self;
 }
 
+pub(crate) fn new_client_storage_thread(
+    config_dir: Option<PathBuf>,
+    temporary_storage: bool,
+) -> (ClientStorageThreadHandle, thread::JoinHandle<()>) {
+    let (generic_sender, generic_receiver) = generic_channel::channel().unwrap();
+    let mut temp_dir: Option<tempfile::TempDir> = None;
+    let base_dir = config_dir
+        .unwrap_or_else(|| {
+            let tmp_dir = tempfile::tempdir().unwrap();
+            let path = tmp_dir.path().to_path_buf();
+            temp_dir = Some(tmp_dir);
+            path
+        })
+        .join("clientstorage");
+    let storage_dir = if temporary_storage {
+        let unique_id = uuid::Uuid::new_v4().to_string();
+        base_dir.join("temporary").join(unique_id)
+    } else {
+        base_dir.join("default_v1")
+    };
+    std::fs::create_dir_all(&storage_dir)
+        .expect("Failed to create ClientStorage storage directory");
+    let sender_clone = generic_sender.clone();
+    let thread = thread::Builder::new()
+        .name("ClientStorageThread".to_owned())
+        .spawn(move || {
+            // Keep temp_dir alive while the thread runs.
+            let _ = temp_dir;
+            let engine = SqliteEngine::new(storage_dir).unwrap_or_else(|error| {
+                warn!("Failed to initialize ClientStorage engine into storage dir: {error:?}");
+                SqliteEngine::memory().unwrap()
+            });
+            ClientStorageThread::new(sender_clone, generic_receiver, engine).start();
+        })
+        .expect("Thread spawning failed");
+
+    (ClientStorageThreadHandle::new(generic_sender), thread)
+}
+
 impl ClientStorageThreadFactory for ClientStorageThreadHandle {
     fn new(config_dir: Option<PathBuf>, temporary_storage: bool) -> ClientStorageThreadHandle {
-        let (generic_sender, generic_receiver) = generic_channel::channel().unwrap();
-        let mut temp_dir: Option<tempfile::TempDir> = None;
-        let base_dir = config_dir
-            .unwrap_or_else(|| {
-                let tmp_dir = tempfile::tempdir().unwrap();
-                let path = tmp_dir.path().to_path_buf();
-                temp_dir = Some(tmp_dir);
-                path
-            })
-            .join("clientstorage");
-        let storage_dir = if temporary_storage {
-            let unique_id = uuid::Uuid::new_v4().to_string();
-            base_dir.join("temporary").join(unique_id)
-        } else {
-            base_dir.join("default_v1")
-        };
-        std::fs::create_dir_all(&storage_dir)
-            .expect("Failed to create ClientStorage storage directory");
-        let sender_clone = generic_sender.clone();
-        thread::Builder::new()
-            .name("ClientStorageThread".to_owned())
-            .spawn(move || {
-                // Keep temp_dir alive while the thread runs.
-                let _ = temp_dir;
-                let engine = SqliteEngine::new(storage_dir).unwrap_or_else(|error| {
-                    warn!("Failed to initialize ClientStorage engine into storage dir: {error:?}");
-                    SqliteEngine::memory().unwrap()
-                });
-                ClientStorageThread::new(sender_clone, generic_receiver, engine).start();
-            })
-            .expect("Thread spawning failed");
-
-        ClientStorageThreadHandle::new(generic_sender)
+        new_client_storage_thread(config_dir, temporary_storage).0
     }
 }
 

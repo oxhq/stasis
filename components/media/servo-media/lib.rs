@@ -10,7 +10,6 @@ pub extern crate servo_media_webrtc as webrtc;
 
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
 
 use audio::context::{AudioContext, AudioContextOptions};
 use audio::sink::AudioSinkError;
@@ -29,6 +28,13 @@ use webrtc::{WebRtcController, WebRtcSignaller};
 pub struct ServoMedia(Box<dyn Backend>);
 
 static INSTANCE: OnceLock<Arc<ServoMedia>> = OnceLock::new();
+
+fn initialize_once<T, F>(instance: &OnceLock<T>, factory: F) -> &T
+where
+    F: FnOnce() -> T,
+{
+    instance.get_or_init(factory)
+}
 
 pub trait BackendInit {
     fn init() -> Box<dyn Backend>;
@@ -97,18 +103,54 @@ pub enum SupportsMediaType {
 
 impl ServoMedia {
     pub fn init<B: BackendInit>() {
-        thread::spawn(|| INSTANCE.get_or_init(|| Arc::new(ServoMedia(B::init()))));
+        initialize_once(&INSTANCE, || Arc::new(ServoMedia(B::init())));
     }
 
     pub fn init_with_backend<F>(backend_factory: F)
     where
         F: Fn() -> Box<dyn Backend> + Send + 'static,
     {
-        thread::spawn(move || INSTANCE.get_or_init(|| Arc::new(ServoMedia(backend_factory()))));
+        initialize_once(&INSTANCE, || Arc::new(ServoMedia(backend_factory())));
     }
 
     pub fn get() -> Arc<ServoMedia> {
         INSTANCE.wait().clone()
+    }
+}
+
+#[cfg(test)]
+mod initialization_tests {
+    use std::sync::OnceLock;
+    use std::thread;
+
+    use super::initialize_once;
+
+    #[test]
+    fn initialization_completes_on_the_calling_thread_before_returning() {
+        let instance = OnceLock::new();
+        let caller = thread::current().id();
+
+        let initialized_on = initialize_once(&instance, || thread::current().id());
+
+        assert_eq!(*initialized_on, caller);
+        assert_eq!(instance.get(), Some(&caller));
+    }
+
+    #[test]
+    fn initializer_panic_is_synchronous_and_leaves_the_cell_uninitialized() {
+        let instance = OnceLock::<()>::new();
+        let failure = std::panic::catch_unwind(|| {
+            initialize_once(&instance, || {
+                std::panic::panic_any("deterministic media initializer failure")
+            });
+        })
+        .expect_err("the initializer panic must remain observable by its caller");
+
+        assert_eq!(
+            failure.downcast_ref::<&'static str>(),
+            Some(&"deterministic media initializer failure")
+        );
+        assert!(instance.get().is_none());
     }
 }
 

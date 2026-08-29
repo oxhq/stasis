@@ -28,6 +28,25 @@ pub struct CanvasPaintThread {
     paint_api: CrossProcessPaintApi,
 }
 
+/// Physical ownership of the operating-system thread running a [`CanvasPaintThread`].
+///
+/// The canvas Exit response is a logical acknowledgement sent before thread-owned canvas state is
+/// dropped. Retain this owner and call [`CanvasPaintThreadOwner::join`] after receiving that
+/// acknowledgement to fence physical termination.
+#[must_use = "dropping the canvas paint thread owner detaches the Canvas thread"]
+pub struct CanvasPaintThreadOwner(thread::JoinHandle<()>);
+
+impl CanvasPaintThreadOwner {
+    fn new(join_handle: thread::JoinHandle<()>) -> Self {
+        Self(join_handle)
+    }
+
+    /// Wait for the canvas thread and all of its thread-owned state to finish dropping.
+    pub fn join(self) -> thread::Result<()> {
+        self.0.join()
+    }
+}
+
 impl CanvasPaintThread {
     fn new(paint_api: CrossProcessPaintApi) -> CanvasPaintThread {
         CanvasPaintThread {
@@ -43,6 +62,35 @@ impl CanvasPaintThread {
         paint_api: CrossProcessPaintApi,
         mem_profiler_chan: ProfilerChan,
     ) -> (Sender<ConstellationCanvasMsg>, GenericSender<CanvasMsg>) {
+        let (create_sender, canvas_sender, _owner) =
+            Self::start_with_owner(paint_api, mem_profiler_chan);
+        (create_sender, canvas_sender)
+    }
+
+    /// Creates a new `CanvasPaintThread` while retaining physical ownership of its OS thread.
+    pub fn start_with_owner(
+        paint_api: CrossProcessPaintApi,
+        mem_profiler_chan: ProfilerChan,
+    ) -> (
+        Sender<ConstellationCanvasMsg>,
+        GenericSender<CanvasMsg>,
+        CanvasPaintThreadOwner,
+    ) {
+        Self::start_with_owner_and_after_exit_ack(paint_api, mem_profiler_chan, || {})
+    }
+
+    fn start_with_owner_and_after_exit_ack<F>(
+        paint_api: CrossProcessPaintApi,
+        mem_profiler_chan: ProfilerChan,
+        after_exit_ack: F,
+    ) -> (
+        Sender<ConstellationCanvasMsg>,
+        GenericSender<CanvasMsg>,
+        CanvasPaintThreadOwner,
+    )
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let (ipc_sender, ipc_receiver) = generic_channel::channel::<CanvasMsg>().unwrap();
         let msg_receiver = ipc_receiver.route_preserving_errors();
         let (create_sender, create_receiver) = unbounded();
@@ -51,13 +99,12 @@ impl CanvasPaintThread {
             create_sender.clone(),
             ConstellationCanvasMsg::CollectMemoryReport,
         );
-        thread::Builder::new()
+        let join_handle = thread::Builder::new()
             .name("Canvas".to_owned())
             .spawn(move || {
                 let _registration = registration;
-                let mut canvas_paint_thread = CanvasPaintThread::new(
-                    paint_api);
-                loop {
+                let mut canvas_paint_thread = CanvasPaintThread::new(paint_api);
+                let exit_acknowledged = loop {
                     select! {
                         recv(msg_receiver) -> msg => {
                             match msg {
@@ -69,7 +116,7 @@ impl CanvasPaintThread {
                                 }
                                 Err(_disconnected) => {
                                     warn!("CanvasMsg receiver disconnected");
-                                    break;
+                                    break false;
                                 },
                             }
                         }
@@ -85,20 +132,27 @@ impl CanvasPaintThread {
                                 },
                                 Ok(ConstellationCanvasMsg::Exit(exit_sender)) => {
                                     let _ = exit_sender.send(());
-                                    break;
+                                    break true;
                                 },
                                 Err(e) => {
                                     warn!("Error on CanvasPaintThread receive ({})", e);
-                                    break;
+                                    break false;
                                 },
                             }
                         }
                     }
+                };
+                if exit_acknowledged {
+                    after_exit_ack();
                 }
             })
             .expect("Thread spawning failed");
 
-        (create_sender, ipc_sender)
+        (
+            create_sender,
+            ipc_sender,
+            CanvasPaintThreadOwner::new(join_handle),
+        )
     }
 
     #[servo_tracing::instrument(skip_all)]
@@ -632,5 +686,111 @@ impl Canvas {
             Canvas::Vello(canvas_data) => canvas_data.recreate(size),
             Canvas::VelloCPU(canvas_data) => canvas_data.recreate(size),
         }
+    }
+}
+
+#[cfg(test)]
+mod thread_ownership_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    use crossbeam_channel::unbounded;
+    use paint_api::CrossProcessPaintApi;
+    use profile_traits::mem::ProfilerChan;
+    use servo_base::generic_channel;
+    use servo_canvas_traits::ConstellationCanvasMsg;
+
+    use super::CanvasPaintThread;
+
+    struct DropSentinel(Arc<AtomicBool>);
+
+    impl Drop for DropSentinel {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn owner_join_fences_real_exit_ack_before_post_ack_drop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let thread_dropped = dropped.clone();
+        let (hook_entered_sender, hook_entered_receiver) = mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = mpsc::sync_channel(0);
+        let (profiler_sender, _profiler_receiver) = generic_channel::channel().unwrap();
+
+        let (constellation_sender, _canvas_sender, owner) =
+            CanvasPaintThread::start_with_owner_and_after_exit_ack(
+                CrossProcessPaintApi::dummy(),
+                ProfilerChan(profiler_sender),
+                move || {
+                    let _thread_owned_state = DropSentinel(thread_dropped);
+                    hook_entered_sender
+                        .send(())
+                        .expect("the test must observe the real post-ACK boundary");
+                    release_receiver
+                        .recv()
+                        .expect("the test must control post-ACK thread termination");
+                },
+            );
+
+        let (exit_sender, exit_receiver) = unbounded();
+        constellation_sender
+            .send(ConstellationCanvasMsg::Exit(exit_sender))
+            .expect("the real Canvas thread must accept Exit");
+        exit_receiver
+            .recv()
+            .expect("the real Canvas thread must acknowledge Exit");
+        hook_entered_receiver
+            .recv()
+            .expect("the Canvas thread must remain live after its Exit ACK");
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "the Exit ACK must precede post-ACK thread-owned state drop"
+        );
+
+        release_sender
+            .send(())
+            .expect("the Canvas thread must remain blocked until explicitly released");
+        owner
+            .join()
+            .expect("the real Canvas thread should physically terminate");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "joining must fence post-ACK thread-owned state drop"
+        );
+    }
+
+    #[test]
+    fn owner_join_surfaces_real_post_ack_panic() {
+        let (hook_entered_sender, hook_entered_receiver) = mpsc::sync_channel(0);
+        let (profiler_sender, _profiler_receiver) = generic_channel::channel().unwrap();
+        let (constellation_sender, _canvas_sender, owner) =
+            CanvasPaintThread::start_with_owner_and_after_exit_ack(
+                CrossProcessPaintApi::dummy(),
+                ProfilerChan(profiler_sender),
+                move || {
+                    hook_entered_sender
+                        .send(())
+                        .expect("the test must observe the real post-ACK boundary");
+                    panic!("deterministic post-ACK Canvas thread panic");
+                },
+            );
+
+        let (exit_sender, exit_receiver) = unbounded();
+        constellation_sender
+            .send(ConstellationCanvasMsg::Exit(exit_sender))
+            .expect("the real Canvas thread must accept Exit");
+        exit_receiver
+            .recv()
+            .expect("the real Canvas thread must acknowledge Exit");
+        hook_entered_receiver
+            .recv()
+            .expect("the Canvas thread must enter its post-ACK path");
+
+        assert!(
+            owner.join().is_err(),
+            "the owner must surface a panic after the real Exit ACK"
+        );
     }
 }

@@ -31,6 +31,27 @@ use crate::platform::font_list::{
     default_system_generic_font_family, for_each_available_family, for_each_variation,
 };
 
+/// Physical ownership of the thread running a [`SystemFontService`].
+///
+/// The service's exit acknowledgement only reports that its message loop accepted shutdown. The
+/// thread can still be unregistering its memory reporter and dropping thread-owned font state, so
+/// the runtime owner must retain this value and join it after observing that acknowledgement.
+#[must_use = "dropping the system font service thread owner detaches the service thread"]
+pub struct SystemFontServiceThreadOwner {
+    join_handle: thread::JoinHandle<()>,
+}
+
+impl SystemFontServiceThreadOwner {
+    fn new(join_handle: thread::JoinHandle<()>) -> Self {
+        Self { join_handle }
+    }
+
+    /// Wait for the service thread and all of its thread-owned state to finish dropping.
+    pub fn join(self) -> thread::Result<()> {
+        self.join_handle.join()
+    }
+}
+
 #[derive(Default, MallocSizeOf)]
 struct ResolvedGenericFontFamilies {
     default: OnceCell<LowercaseFontFamilyName>,
@@ -83,10 +104,18 @@ impl SystemFontService {
         paint_api: CrossProcessPaintApi,
         memory_profiler_sender: ProfilerChan,
     ) -> SystemFontServiceProxySender {
+        Self::spawn_with_owner(paint_api, memory_profiler_sender).0
+    }
+
+    /// Spawn the system font service while retaining physical ownership of its OS thread.
+    pub fn spawn_with_owner(
+        paint_api: CrossProcessPaintApi,
+        memory_profiler_sender: ProfilerChan,
+    ) -> (SystemFontServiceProxySender, SystemFontServiceThreadOwner) {
         let (sender, receiver) = generic_channel::channel().unwrap();
         let memory_reporter_sender = sender.clone();
 
-        thread::Builder::new()
+        let join_handle = thread::Builder::new()
             .name("SystemFontService".to_owned())
             .spawn(move || {
                 let mut cache = SystemFontService {
@@ -111,7 +140,10 @@ impl SystemFontService {
             })
             .expect("Thread spawning failed");
 
-        SystemFontServiceProxySender(sender)
+        (
+            SystemFontServiceProxySender(sender),
+            SystemFontServiceThreadOwner::new(join_handle),
+        )
     }
 
     fn run(&mut self) {
@@ -348,5 +380,77 @@ impl SystemFontService {
                 default_system_generic_font_family(*generic)
             })
             .clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+
+    use super::SystemFontServiceThreadOwner;
+
+    struct DropSentinel(Arc<AtomicBool>);
+
+    impl Drop for DropSentinel {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn thread_owner_join_fences_post_ack_thread_owned_state() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let thread_dropped = dropped.clone();
+        let (ack_sender, ack_receiver) = mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = mpsc::sync_channel(0);
+        let owner = SystemFontServiceThreadOwner::new(thread::spawn(move || {
+            let _sentinel = DropSentinel(thread_dropped);
+            ack_sender
+                .send(())
+                .expect("the deterministic acknowledgement receiver should remain open");
+            release_receiver
+                .recv()
+                .expect("the deterministic release sender should remain open");
+        }));
+
+        ack_receiver
+            .recv()
+            .expect("the deterministic service should acknowledge shutdown");
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "the shutdown acknowledgement must precede thread-owned state drop"
+        );
+        release_sender
+            .send(())
+            .expect("the deterministic service should remain blocked until release");
+        owner
+            .join()
+            .expect("the deterministic service thread should exit cleanly");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "joining must fence thread-owned state drop"
+        );
+    }
+
+    #[test]
+    fn thread_owner_join_surfaces_post_ack_panic() {
+        let (ack_sender, ack_receiver) = mpsc::sync_channel(0);
+        let owner = SystemFontServiceThreadOwner::new(thread::spawn(move || {
+            ack_sender
+                .send(())
+                .expect("the deterministic acknowledgement receiver should remain open");
+            std::panic::resume_unwind(Box::new("deterministic post-ack font service panic"));
+        }));
+
+        ack_receiver
+            .recv()
+            .expect("the deterministic service should acknowledge shutdown");
+        assert!(
+            owner.join().is_err(),
+            "joining must surface a service panic that occurs after acknowledgement"
+        );
     }
 }

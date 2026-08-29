@@ -34,34 +34,28 @@ use uuid::Uuid;
 use crate::indexeddb::engines::{KvsEngine, KvsOperation, KvsTransaction, SqliteEngine};
 use crate::shared::is_sqlite_disk_full_error;
 
-pub trait IndexedDBThreadFactory {
-    fn new(mem_profiler_chan: MemProfilerChan, reporter_name: String) -> Self;
-}
+pub(crate) fn new_indexeddb_thread(
+    mem_profiler_chan: MemProfilerChan,
+    reporter_name: String,
+) -> (GenericSender<IndexedDBThreadMsg>, thread::JoinHandle<()>) {
+    let (chan, port) = generic_channel::channel().unwrap();
+    let chan2 = chan.clone();
 
-impl IndexedDBThreadFactory for GenericSender<IndexedDBThreadMsg> {
-    fn new(
-        mem_profiler_chan: MemProfilerChan,
-        reporter_name: String,
-    ) -> GenericSender<IndexedDBThreadMsg> {
-        let (chan, port) = generic_channel::channel().unwrap();
-        let chan2 = chan.clone();
+    let manager_sender = chan.clone();
 
-        let manager_sender = chan.clone();
+    let thread = thread::Builder::new()
+        .name("IndexedDBManager".to_owned())
+        .spawn(move || {
+            mem_profiler_chan.run_with_memory_reporting(
+                || IndexedDBManager::new(port, manager_sender).start(),
+                reporter_name,
+                chan2,
+                IndexedDBThreadMsg::CollectMemoryReport,
+            );
+        })
+        .expect("Thread spawning failed");
 
-        thread::Builder::new()
-            .name("IndexedDBManager".to_owned())
-            .spawn(move || {
-                mem_profiler_chan.run_with_memory_reporting(
-                    || IndexedDBManager::new(port, manager_sender).start(),
-                    reporter_name,
-                    chan2,
-                    IndexedDBThreadMsg::CollectMemoryReport,
-                );
-            })
-            .expect("Thread spawning failed");
-
-        chan
-    }
+    (chan, thread)
 }
 
 /// A key used to track databases.

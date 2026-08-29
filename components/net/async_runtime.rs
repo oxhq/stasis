@@ -4,7 +4,6 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
 
 use futures::Future;
 use net_traits::AsyncRuntime;
@@ -26,10 +25,65 @@ impl AsyncRuntimeHolder {
 
 impl AsyncRuntime for AsyncRuntimeHolder {
     fn shutdown(&mut self) {
-        self.runtime
-            .take()
-            .expect("Runtime should have been initialized on start-up.")
-            .shutdown_timeout(Duration::from_millis(100))
+        // Dropping a Runtime outside one of its own async contexts waits for its worker threads to
+        // terminate. A bounded shutdown timeout deliberately leaks unfinished worker threads,
+        // which is not a physical lifecycle boundary for process-global memory/JS teardown.
+        drop(
+            self.runtime
+                .take()
+                .expect("Runtime should have been initialized on start-up."),
+        );
+    }
+}
+
+#[cfg(test)]
+mod thread_ownership_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    use futures::future;
+    use net_traits::AsyncRuntime;
+    use tokio::runtime::Builder;
+
+    use super::AsyncRuntimeHolder;
+
+    struct DropSentinel(Arc<AtomicBool>);
+
+    impl Drop for DropSentinel {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn shutdown_waits_for_worker_owned_task_drop() {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("the deterministic test runtime should build");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(0);
+        runtime.spawn(async move {
+            let _task_state = DropSentinel(task_dropped);
+            entered_sender
+                .send(())
+                .expect("the test must observe the live runtime task");
+            future::pending::<()>().await;
+        });
+        entered_receiver
+            .recv()
+            .expect("the runtime task must start without scheduler timing assumptions");
+
+        let mut owner = AsyncRuntimeHolder::new(runtime);
+        owner.shutdown();
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "shutdown must not return before worker-owned task state is dropped"
+        );
     }
 }
 

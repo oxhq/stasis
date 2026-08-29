@@ -33,6 +33,7 @@ LIFECYCLE_PHASES = frozenset(
         "painter_drop_begin",
         "painter_webrender_shutdown_begin",
         "painter_webrender_shutdown_ack_observed",
+        "painter_webrender_shutdown_failed",
         "painter_webrender_threads_join_begin",
         "painter_webrender_threads_join_end",
         "painter_webrender_threads_join_failed",
@@ -41,6 +42,7 @@ LIFECYCLE_PHASES = frozenset(
         "painter_webrender_workers_join_failed",
         "painter_renderer_deinit_begin",
         "painter_renderer_deinit_end",
+        "painter_renderer_deinit_failed",
         "painter_drop_body_end",
         "webview_drop_end",
         "pre_shutdown_spin_begin",
@@ -51,7 +53,17 @@ LIFECYCLE_PHASES = frozenset(
         "script_threads_join_begin",
         "script_threads_join_end",
         "script_threads_join_failed",
+        "style_thread_pool_shutdown_begin",
+        "style_thread_pool_shutdown_end",
+        "style_thread_pool_shutdown_failed",
+        "fetch_thread_join_begin",
+        "fetch_thread_join_end",
+        "fetch_thread_join_failed",
+        "canvas_paint_thread_join_begin",
+        "canvas_paint_thread_join_end",
+        "canvas_paint_thread_join_failed",
         "subsystems_shutdown_end",
+        "subsystems_shutdown_failed",
         "constellation_run_end",
         "constellation_state_drop_begin",
         "constellation_state_drop_end",
@@ -60,9 +72,32 @@ LIFECYCLE_PHASES = frozenset(
         "constellation_join_begin",
         "constellation_join_end",
         "constellation_join_failed",
+        "system_font_service_join_begin",
+        "system_font_service_join_end",
+        "system_font_service_join_failed",
+        "resource_manager_join_begin",
+        "resource_manager_join_end",
+        "resource_manager_join_failed",
+        "storage_threads_join_begin",
+        "storage_threads_join_end",
+        "storage_threads_join_failed",
+        "global_thread_pool_shutdown_begin",
+        "global_thread_pool_shutdown_end",
+        "global_thread_pool_shutdown_failed",
+        "async_runtime_shutdown_begin",
+        "async_runtime_shutdown_end",
+        "async_runtime_shutdown_failed",
+        "tls_prewarm_join_begin",
+        "tls_prewarm_join_end",
+        "tls_prewarm_join_failed",
+        "memory_profiler_exit_send_begin",
+        "memory_profiler_join_begin",
+        "memory_profiler_join_end",
+        "memory_profiler_join_failed",
         "servo_inner_drop_body_end",
         "js_engine_drop_begin",
         "js_engine_drop_end",
+        "js_engine_drop_failed",
         "servo_owner_drop_end",
         "engine_close_end",
         "engine_session_drop_begin",
@@ -78,6 +113,9 @@ LIFECYCLE_PHASES = frozenset(
         "protocol_reader_join_begin",
         "protocol_reader_join_end",
         "protocol_reader_join_failed",
+        "shell_drop_begin",
+        "shell_drop_end",
+        "main_body_end",
     }
 )
 PHASE_PATTERN = re.compile(rb"stasis_lifecycle_v1 phase=([a-z_]+)")
@@ -260,7 +298,8 @@ def self_test() -> None:
         "stasis_lifecycle_v1 phase=painter_webrender_shutdown_ack_observed\\n"
         "stasis_lifecycle_v1 phase=painter_webrender_threads_join_end\\n"
         "stasis_lifecycle_v1 phase=painter_webrender_workers_join_end\\n"
-        "stasis_lifecycle_v1 phase=painter_renderer_deinit_end\\n',"
+        "stasis_lifecycle_v1 phase=painter_renderer_deinit_end\\n"
+        "stasis_lifecycle_v1 phase=memory_profiler_join_end\\n',"
     )
     hostile = "url=https://secret.invalid/?token=HOSTILE_SECRET env=HOSTILE_SECRET"
     unknown = "stasis_lifecycle_v1 phase=hostile_secret"
@@ -297,12 +336,13 @@ def self_test() -> None:
         "lifecycle_phase=painter_webrender_threads_join_end",
         "lifecycle_phase=painter_webrender_workers_join_end",
         "lifecycle_phase=painter_renderer_deinit_end",
+        "lifecycle_phase=memory_profiler_join_end",
     ]
     positions = [sanitized.index(phase) for phase in expected_phases]
     assert positions == sorted(positions)
     assert "north_star_lane=traced sample=047/150" in sanitized
     assert "stderr_marker=mozalloc_abort" in sanitized
-    assert "lifecycle_phase_count=5" in sanitized
+    assert "lifecycle_phase_count=6" in sanitized
     assert "HOSTILE_SECRET" not in sanitized
     assert "secret.invalid" not in sanitized
     assert "hostile_secret" not in sanitized

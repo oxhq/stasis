@@ -25,6 +25,7 @@ pub enum LifecyclePhase {
     PainterDropBegin,
     PainterWebRenderShutdownBegin,
     PainterWebRenderShutdownAckObserved,
+    PainterWebRenderShutdownFailed,
     PainterWebRenderThreadsJoinBegin,
     PainterWebRenderThreadsJoinEnd,
     PainterWebRenderThreadsJoinFailed,
@@ -33,6 +34,7 @@ pub enum LifecyclePhase {
     PainterWebRenderWorkersJoinFailed,
     PainterRendererDeinitBegin,
     PainterRendererDeinitEnd,
+    PainterRendererDeinitFailed,
     PainterDropBodyEnd,
     WebViewDropEnd,
     PreShutdownSpinBegin,
@@ -43,7 +45,32 @@ pub enum LifecyclePhase {
     ScriptThreadsJoinBegin,
     ScriptThreadsJoinEnd,
     ScriptThreadsJoinFailed,
+    StyleThreadPoolShutdownBegin,
+    StyleThreadPoolShutdownEnd,
+    StyleThreadPoolShutdownFailed,
+    FetchThreadJoinBegin,
+    FetchThreadJoinEnd,
+    FetchThreadJoinFailed,
+    CanvasPaintThreadJoinBegin,
+    CanvasPaintThreadJoinEnd,
+    CanvasPaintThreadJoinFailed,
+    SystemFontServiceJoinBegin,
+    SystemFontServiceJoinEnd,
+    SystemFontServiceJoinFailed,
+    ResourceManagerJoinBegin,
+    ResourceManagerJoinEnd,
+    ResourceManagerJoinFailed,
+    StorageThreadsJoinBegin,
+    StorageThreadsJoinEnd,
+    StorageThreadsJoinFailed,
+    GlobalThreadPoolShutdownBegin,
+    GlobalThreadPoolShutdownEnd,
+    GlobalThreadPoolShutdownFailed,
+    AsyncRuntimeShutdownBegin,
+    AsyncRuntimeShutdownEnd,
+    AsyncRuntimeShutdownFailed,
     SubsystemsShutdownEnd,
+    SubsystemsShutdownFailed,
     ConstellationRunEnd,
     ConstellationStateDropBegin,
     ConstellationStateDropEnd,
@@ -52,9 +79,17 @@ pub enum LifecyclePhase {
     ConstellationJoinBegin,
     ConstellationJoinEnd,
     ConstellationJoinFailed,
+    TlsPrewarmJoinBegin,
+    TlsPrewarmJoinEnd,
+    TlsPrewarmJoinFailed,
     ServoInnerDropBodyEnd,
+    MemoryProfilerExitSendBegin,
+    MemoryProfilerJoinBegin,
+    MemoryProfilerJoinEnd,
+    MemoryProfilerJoinFailed,
     JsEngineDropBegin,
     JsEngineDropEnd,
+    JsEngineDropFailed,
     ServoOwnerDropEnd,
     EngineCloseEnd,
     EngineSessionDropEnd,
@@ -69,6 +104,9 @@ pub enum LifecyclePhase {
     ProtocolReaderJoinBegin,
     ProtocolReaderJoinEnd,
     ProtocolReaderJoinFailed,
+    ShellDropBegin,
+    ShellDropEnd,
+    MainBodyEnd,
 }
 
 impl LifecyclePhase {
@@ -80,6 +118,7 @@ impl LifecyclePhase {
         Self::PainterDropBegin,
         Self::PainterWebRenderShutdownBegin,
         Self::PainterWebRenderShutdownAckObserved,
+        Self::PainterWebRenderShutdownFailed,
         Self::PainterWebRenderThreadsJoinBegin,
         Self::PainterWebRenderThreadsJoinEnd,
         Self::PainterWebRenderThreadsJoinFailed,
@@ -88,6 +127,7 @@ impl LifecyclePhase {
         Self::PainterWebRenderWorkersJoinFailed,
         Self::PainterRendererDeinitBegin,
         Self::PainterRendererDeinitEnd,
+        Self::PainterRendererDeinitFailed,
         Self::PainterDropBodyEnd,
         Self::WebViewDropEnd,
         Self::PreShutdownSpinBegin,
@@ -98,7 +138,32 @@ impl LifecyclePhase {
         Self::ScriptThreadsJoinBegin,
         Self::ScriptThreadsJoinEnd,
         Self::ScriptThreadsJoinFailed,
+        Self::StyleThreadPoolShutdownBegin,
+        Self::StyleThreadPoolShutdownEnd,
+        Self::StyleThreadPoolShutdownFailed,
+        Self::FetchThreadJoinBegin,
+        Self::FetchThreadJoinEnd,
+        Self::FetchThreadJoinFailed,
+        Self::CanvasPaintThreadJoinBegin,
+        Self::CanvasPaintThreadJoinEnd,
+        Self::CanvasPaintThreadJoinFailed,
+        Self::ResourceManagerJoinBegin,
+        Self::ResourceManagerJoinEnd,
+        Self::ResourceManagerJoinFailed,
+        Self::StorageThreadsJoinBegin,
+        Self::StorageThreadsJoinEnd,
+        Self::StorageThreadsJoinFailed,
+        Self::GlobalThreadPoolShutdownBegin,
+        Self::GlobalThreadPoolShutdownEnd,
+        Self::GlobalThreadPoolShutdownFailed,
+        Self::SystemFontServiceJoinBegin,
+        Self::SystemFontServiceJoinEnd,
+        Self::SystemFontServiceJoinFailed,
+        Self::AsyncRuntimeShutdownBegin,
+        Self::AsyncRuntimeShutdownEnd,
+        Self::AsyncRuntimeShutdownFailed,
         Self::SubsystemsShutdownEnd,
+        Self::SubsystemsShutdownFailed,
         Self::ConstellationRunEnd,
         Self::ConstellationStateDropBegin,
         Self::ConstellationStateDropEnd,
@@ -107,9 +172,17 @@ impl LifecyclePhase {
         Self::ConstellationJoinBegin,
         Self::ConstellationJoinEnd,
         Self::ConstellationJoinFailed,
+        Self::TlsPrewarmJoinBegin,
+        Self::TlsPrewarmJoinEnd,
+        Self::TlsPrewarmJoinFailed,
         Self::ServoInnerDropBodyEnd,
+        Self::MemoryProfilerExitSendBegin,
+        Self::MemoryProfilerJoinBegin,
+        Self::MemoryProfilerJoinEnd,
+        Self::MemoryProfilerJoinFailed,
         Self::JsEngineDropBegin,
         Self::JsEngineDropEnd,
+        Self::JsEngineDropFailed,
         Self::ServoOwnerDropEnd,
         Self::EngineCloseEnd,
         Self::EngineSessionDropBegin,
@@ -125,6 +198,9 @@ impl LifecyclePhase {
         Self::ProtocolReaderJoinBegin,
         Self::ProtocolReaderJoinEnd,
         Self::ProtocolReaderJoinFailed,
+        Self::ShellDropBegin,
+        Self::ShellDropEnd,
+        Self::MainBodyEnd,
     ];
 
     /// Return the stable ASCII wire name used by the release diagnostic sanitizer.
@@ -136,25 +212,17 @@ impl LifecyclePhase {
             Self::WebViewDropBegin => "webview_drop_begin",
             Self::PainterDropBegin => "painter_drop_begin",
             Self::PainterWebRenderShutdownBegin => "painter_webrender_shutdown_begin",
-            Self::PainterWebRenderShutdownAckObserved => {
-                "painter_webrender_shutdown_ack_observed"
-            },
-            Self::PainterWebRenderThreadsJoinBegin => {
-                "painter_webrender_threads_join_begin"
-            },
+            Self::PainterWebRenderShutdownAckObserved => "painter_webrender_shutdown_ack_observed",
+            Self::PainterWebRenderShutdownFailed => "painter_webrender_shutdown_failed",
+            Self::PainterWebRenderThreadsJoinBegin => "painter_webrender_threads_join_begin",
             Self::PainterWebRenderThreadsJoinEnd => "painter_webrender_threads_join_end",
-            Self::PainterWebRenderThreadsJoinFailed => {
-                "painter_webrender_threads_join_failed"
-            },
-            Self::PainterWebRenderWorkersJoinBegin => {
-                "painter_webrender_workers_join_begin"
-            },
+            Self::PainterWebRenderThreadsJoinFailed => "painter_webrender_threads_join_failed",
+            Self::PainterWebRenderWorkersJoinBegin => "painter_webrender_workers_join_begin",
             Self::PainterWebRenderWorkersJoinEnd => "painter_webrender_workers_join_end",
-            Self::PainterWebRenderWorkersJoinFailed => {
-                "painter_webrender_workers_join_failed"
-            },
+            Self::PainterWebRenderWorkersJoinFailed => "painter_webrender_workers_join_failed",
             Self::PainterRendererDeinitBegin => "painter_renderer_deinit_begin",
             Self::PainterRendererDeinitEnd => "painter_renderer_deinit_end",
+            Self::PainterRendererDeinitFailed => "painter_renderer_deinit_failed",
             Self::PainterDropBodyEnd => "painter_drop_body_end",
             Self::WebViewDropEnd => "webview_drop_end",
             Self::PreShutdownSpinBegin => "pre_shutdown_spin_begin",
@@ -165,7 +233,17 @@ impl LifecyclePhase {
             Self::ScriptThreadsJoinBegin => "script_threads_join_begin",
             Self::ScriptThreadsJoinEnd => "script_threads_join_end",
             Self::ScriptThreadsJoinFailed => "script_threads_join_failed",
+            Self::StyleThreadPoolShutdownBegin => "style_thread_pool_shutdown_begin",
+            Self::StyleThreadPoolShutdownEnd => "style_thread_pool_shutdown_end",
+            Self::StyleThreadPoolShutdownFailed => "style_thread_pool_shutdown_failed",
+            Self::FetchThreadJoinBegin => "fetch_thread_join_begin",
+            Self::FetchThreadJoinEnd => "fetch_thread_join_end",
+            Self::FetchThreadJoinFailed => "fetch_thread_join_failed",
+            Self::CanvasPaintThreadJoinBegin => "canvas_paint_thread_join_begin",
+            Self::CanvasPaintThreadJoinEnd => "canvas_paint_thread_join_end",
+            Self::CanvasPaintThreadJoinFailed => "canvas_paint_thread_join_failed",
             Self::SubsystemsShutdownEnd => "subsystems_shutdown_end",
+            Self::SubsystemsShutdownFailed => "subsystems_shutdown_failed",
             Self::ConstellationRunEnd => "constellation_run_end",
             Self::ConstellationStateDropBegin => "constellation_state_drop_begin",
             Self::ConstellationStateDropEnd => "constellation_state_drop_end",
@@ -174,17 +252,38 @@ impl LifecyclePhase {
             Self::ConstellationJoinBegin => "constellation_join_begin",
             Self::ConstellationJoinEnd => "constellation_join_end",
             Self::ConstellationJoinFailed => "constellation_join_failed",
+            Self::SystemFontServiceJoinBegin => "system_font_service_join_begin",
+            Self::SystemFontServiceJoinEnd => "system_font_service_join_end",
+            Self::SystemFontServiceJoinFailed => "system_font_service_join_failed",
+            Self::ResourceManagerJoinBegin => "resource_manager_join_begin",
+            Self::ResourceManagerJoinEnd => "resource_manager_join_end",
+            Self::ResourceManagerJoinFailed => "resource_manager_join_failed",
+            Self::StorageThreadsJoinBegin => "storage_threads_join_begin",
+            Self::StorageThreadsJoinEnd => "storage_threads_join_end",
+            Self::StorageThreadsJoinFailed => "storage_threads_join_failed",
+            Self::GlobalThreadPoolShutdownBegin => "global_thread_pool_shutdown_begin",
+            Self::GlobalThreadPoolShutdownEnd => "global_thread_pool_shutdown_end",
+            Self::GlobalThreadPoolShutdownFailed => "global_thread_pool_shutdown_failed",
+            Self::AsyncRuntimeShutdownBegin => "async_runtime_shutdown_begin",
+            Self::AsyncRuntimeShutdownEnd => "async_runtime_shutdown_end",
+            Self::AsyncRuntimeShutdownFailed => "async_runtime_shutdown_failed",
+            Self::TlsPrewarmJoinBegin => "tls_prewarm_join_begin",
+            Self::TlsPrewarmJoinEnd => "tls_prewarm_join_end",
+            Self::TlsPrewarmJoinFailed => "tls_prewarm_join_failed",
+            Self::MemoryProfilerExitSendBegin => "memory_profiler_exit_send_begin",
+            Self::MemoryProfilerJoinBegin => "memory_profiler_join_begin",
+            Self::MemoryProfilerJoinEnd => "memory_profiler_join_end",
+            Self::MemoryProfilerJoinFailed => "memory_profiler_join_failed",
             Self::ServoInnerDropBodyEnd => "servo_inner_drop_body_end",
             Self::JsEngineDropBegin => "js_engine_drop_begin",
             Self::JsEngineDropEnd => "js_engine_drop_end",
+            Self::JsEngineDropFailed => "js_engine_drop_failed",
             Self::ServoOwnerDropEnd => "servo_owner_drop_end",
             Self::EngineCloseEnd => "engine_close_end",
             Self::EngineSessionDropEnd => "engine_session_drop_end",
             Self::RenderingContextOwnerDropBegin => "rendering_context_owner_drop_begin",
             Self::SoftwareRenderingContextDropBegin => "software_rendering_context_drop_begin",
-            Self::SoftwareRenderingContextDropBodyEnd => {
-                "software_rendering_context_drop_body_end"
-            },
+            Self::SoftwareRenderingContextDropBodyEnd => "software_rendering_context_drop_body_end",
             Self::SurfmanRenderingContextDropBegin => "surfman_rendering_context_drop_begin",
             Self::SurfmanRenderingContextDropBodyEnd => "surfman_rendering_context_drop_body_end",
             Self::RenderingContextOwnerDropEnd => "rendering_context_owner_drop_end",
@@ -193,6 +292,9 @@ impl LifecyclePhase {
             Self::ProtocolReaderJoinBegin => "protocol_reader_join_begin",
             Self::ProtocolReaderJoinEnd => "protocol_reader_join_end",
             Self::ProtocolReaderJoinFailed => "protocol_reader_join_failed",
+            Self::ShellDropBegin => "shell_drop_begin",
+            Self::ShellDropEnd => "shell_drop_end",
+            Self::MainBodyEnd => "main_body_end",
         }
     }
 }
@@ -240,8 +342,8 @@ mod tests {
 
         assert_eq!(names.len(), LifecyclePhase::ALL.len());
         assert!(names.iter().all(|name| {
-            !name.is_empty() &&
-                name
+            !name.is_empty()
+                && name
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
         }));
@@ -250,8 +352,12 @@ mod tests {
     #[test]
     fn lifecycle_trace_enablement_requires_the_exact_v1_value() {
         assert!(lifecycle_trace_requested(Some(OsStr::new("1"))));
-        for value in [None, Some(OsStr::new("")), Some(OsStr::new("0")), Some(OsStr::new("true"))]
-        {
+        for value in [
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("0")),
+            Some(OsStr::new("true")),
+        ] {
             assert!(!lifecycle_trace_requested(value));
         }
     }

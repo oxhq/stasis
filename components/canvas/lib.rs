@@ -8,6 +8,7 @@
 mod backend;
 pub mod canvas_data;
 pub mod canvas_paint_thread;
+pub use canvas_paint_thread::CanvasPaintThreadOwner;
 mod peniko_conversions;
 #[cfg(feature = "vello")]
 mod vello_backend;

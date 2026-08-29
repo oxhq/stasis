@@ -56,6 +56,7 @@ gecko = [
     "glyph_rasterizer/gecko",
 ]
 leak_checks = []
+stasis_owner_regression = []
 profiler = ["tracy-rs/enable_profiler"]
 replay = [
     "api/deserialize",

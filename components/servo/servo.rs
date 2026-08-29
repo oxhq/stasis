@@ -32,18 +32,21 @@ use media::{GlApi, NativeDisplay, WindowGLContext};
 use net::embedder::NetToEmbedderMsg;
 use net::image_cache::ImageCacheFactoryImpl;
 use net::protocols::ProtocolRegistry;
-use net::resource_thread::new_resource_threads;
+use net::resource_thread::{ResourceThreadOwner, new_resource_threads_with_owner};
 use net_traits::{FetchThread, ResourceThreads};
 use paint::{InitialPaintState, Paint};
 pub use paint_api::rendering_context::RenderingContext;
 use paint_api::{CrossProcessPaintApi, PaintMessage, PaintProxy};
+use profile::mem::MemoryProfilerThreadOwner;
 use profile::{mem as profile_mem, system_reporter, time as profile_time};
 use profile_traits::mem::{MemoryReportResult, ProfilerMsg, Reporter};
 use profile_traits::{mem, time};
 use rustc_hash::FxHashMap;
 use script::{JSEngineSetup, ServiceWorkerManager};
 use servo_background_hang_monitor::HangMonitorRegister;
-use servo_base::generic_channel::{GenericCallback, GenericSender, RoutedReceiver};
+#[cfg(feature = "bluetooth")]
+use servo_base::generic_channel::GenericSender;
+use servo_base::generic_channel::{GenericCallback, RoutedReceiver};
 pub use servo_base::id::WebViewId;
 use servo_base::id::{EMBEDDER_PIPELINE_NAMESPACE_ID, PipelineNamespace};
 use servo_base::lifecycle_trace::{LifecyclePhase, emit_lifecycle_phase};
@@ -66,8 +69,9 @@ use servo_config::{opts, pref, prefs};
 ))]
 use servo_constellation::content_process_sandbox_profile;
 use servo_constellation::{
-    Constellation, ConstellationToEmbedderMsg, FromEmbedderLogger, FromScriptLogger,
-    InitialConstellationState, NewScriptEventLoopProcessInfo, UnprivilegedContent,
+    Constellation, ConstellationThreadOwners, ConstellationToEmbedderMsg, FromEmbedderLogger,
+    FromScriptLogger, InitialConstellationState, NewScriptEventLoopProcessInfo,
+    UnprivilegedContent,
 };
 use servo_constellation_traits::{EmbedderToConstellationMessage, ScriptToConstellationSender};
 use servo_geometry::{
@@ -76,7 +80,7 @@ use servo_geometry::{
 use servo_media::ServoMedia;
 use servo_media::player::context::GlContext;
 use servo_wakelock::DefaultWakeLockDelegate;
-use storage::new_storage_threads;
+use storage::{StorageThreadOwner, new_storage_threads_with_owner};
 use storage_traits::StorageThreads;
 use style::global_style_data::StyleThreadPool;
 #[cfg(feature = "webxr")]
@@ -241,12 +245,18 @@ struct ServoInner {
     /// Retained until shutdown so JavaScript-engine teardown cannot race the final Constellation
     /// thread unwind after `ShutdownComplete` crosses the embedder channel.
     constellation_thread: Option<JoinHandle<()>>,
+    /// Startup-only TLS work is retained so it cannot outlive the embedding runtime.
+    tls_prewarm_thread: Option<JoinHandle<()>>,
     /// A map  [`WebView`]s that are managed by this [`Servo`] instance. These are stored
     /// as `Weak` references so that the embedding application can control their lifetime.
     /// When accessed, `Servo` will be reponsible for cleaning up the invalid `Weak`
     /// references.
     webviews: RefCell<FxHashMap<WebViewId, Weak<RefCell<WebViewInner>>>>,
     servo_errors: ServoErrorChannel,
+    /// Declared after every default-graph memory reporter and immediately before the JavaScript
+    /// engine. Rust field-drop order therefore unregisters reporters, exits and joins the memory
+    /// profiler, and only then tears down process-global SpiderMonkey state.
+    _memory_profiler: LifecycleTracedMemoryProfiler,
     /// For single-process Servo instances, this field controls the initialization
     /// and deinitialization of the JS Engine. Multiprocess Servo instances have their
     /// own instance that exists in the content process instead.
@@ -260,6 +270,55 @@ struct ServoInner {
 
 struct LifecycleTracedJsEngineSetup(Option<JSEngineSetup>);
 
+struct LifecycleTracedMemoryProfiler {
+    chan: Option<mem::ProfilerChan>,
+    thread: Option<MemoryProfilerThreadOwner>,
+}
+
+type ServoOwnedThreadFailure = Box<dyn std::any::Any + Send + 'static>;
+
+fn resume_owner_failure_unless_already_unwinding(
+    payload: ServoOwnedThreadFailure,
+    owner_name: &str,
+) {
+    if std::thread::panicking() {
+        error!("The {owner_name} panicked while Servo was already unwinding.");
+    } else {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+impl LifecycleTracedMemoryProfiler {
+    fn new(chan: mem::ProfilerChan, thread: MemoryProfilerThreadOwner) -> Self {
+        Self {
+            chan: Some(chan),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for LifecycleTracedMemoryProfiler {
+    fn drop(&mut self) {
+        emit_lifecycle_phase(LifecyclePhase::MemoryProfilerExitSendBegin);
+        if let Some(chan) = self.chan.take() {
+            chan.send(ProfilerMsg::Exit);
+        }
+        emit_lifecycle_phase(LifecyclePhase::MemoryProfilerJoinBegin);
+        let Some(thread) = self.thread.take() else {
+            emit_lifecycle_phase(LifecyclePhase::MemoryProfilerJoinEnd);
+            return;
+        };
+
+        match thread.join() {
+            Ok(()) => emit_lifecycle_phase(LifecyclePhase::MemoryProfilerJoinEnd),
+            Err(payload) => {
+                emit_lifecycle_phase(LifecyclePhase::MemoryProfilerJoinFailed);
+                resume_owner_failure_unless_already_unwinding(payload, "memory profiler thread");
+            },
+        }
+    }
+}
+
 impl LifecycleTracedJsEngineSetup {
     fn new(js_engine_setup: Option<JSEngineSetup>) -> Self {
         Self(js_engine_setup)
@@ -269,8 +328,129 @@ impl LifecycleTracedJsEngineSetup {
 impl Drop for LifecycleTracedJsEngineSetup {
     fn drop(&mut self) {
         emit_lifecycle_phase(LifecyclePhase::JsEngineDropBegin);
-        drop(self.0.take());
-        emit_lifecycle_phase(LifecyclePhase::JsEngineDropEnd);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.0.take()))) {
+            Ok(()) => emit_lifecycle_phase(LifecyclePhase::JsEngineDropEnd),
+            Err(payload) => {
+                emit_lifecycle_phase(LifecyclePhase::JsEngineDropFailed);
+                resume_owner_failure_unless_already_unwinding(payload, "JavaScript engine owner");
+            },
+        }
+    }
+}
+
+fn join_shutdown_threads(
+    constellation_thread: Option<JoinHandle<()>>,
+    shutdown_complete_observed: bool,
+    tls_prewarm_thread: Option<JoinHandle<()>>,
+) -> Option<ServoOwnedThreadFailure> {
+    let mut first_thread_failure = None;
+    emit_lifecycle_phase(LifecyclePhase::ConstellationJoinBegin);
+    match constellation_thread {
+        Some(constellation_thread) => match constellation_thread.join() {
+            Ok(()) if shutdown_complete_observed => {
+                emit_lifecycle_phase(LifecyclePhase::ConstellationJoinEnd)
+            },
+            Ok(()) => {
+                emit_lifecycle_phase(LifecyclePhase::ConstellationJoinFailed);
+                first_thread_failure = Some(Box::new(String::from(
+                    "Constellation terminated without delivering ShutdownComplete",
+                )) as ServoOwnedThreadFailure);
+            },
+            Err(payload) => {
+                emit_lifecycle_phase(LifecyclePhase::ConstellationJoinFailed);
+                first_thread_failure = Some(payload);
+            },
+        },
+        None => {
+            emit_lifecycle_phase(LifecyclePhase::ConstellationJoinFailed);
+            first_thread_failure = Some(Box::new(String::from(
+                "Servo lost physical ownership of the Constellation thread",
+            )) as ServoOwnedThreadFailure);
+        },
+    }
+
+    // TLS prewarming is independently owned startup work. Always fence it, even when the
+    // Constellation thread reported a terminal failure or omitted ShutdownComplete.
+    emit_lifecycle_phase(LifecyclePhase::TlsPrewarmJoinBegin);
+    if let Some(tls_prewarm_thread) = tls_prewarm_thread {
+        match tls_prewarm_thread.join() {
+            Ok(()) => emit_lifecycle_phase(LifecyclePhase::TlsPrewarmJoinEnd),
+            Err(payload) => {
+                emit_lifecycle_phase(LifecyclePhase::TlsPrewarmJoinFailed);
+                if first_thread_failure.is_none() {
+                    first_thread_failure = Some(payload);
+                }
+            },
+        }
+    } else {
+        emit_lifecycle_phase(LifecyclePhase::TlsPrewarmJoinEnd);
+    }
+
+    first_thread_failure
+}
+
+#[cfg(test)]
+mod shutdown_thread_ownership_tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    use super::{join_shutdown_threads, resume_owner_failure_unless_already_unwinding};
+
+    struct PanicOnDrop;
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("secondary late-owner panic");
+        }
+    }
+
+    struct CatchSecondaryOnDrop;
+
+    impl Drop for CatchSecondaryOnDrop {
+        fn drop(&mut self) {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(PanicOnDrop))) {
+                resume_owner_failure_unless_already_unwinding(payload, "test late owner");
+            }
+        }
+    }
+
+    struct DropSentinel(Arc<AtomicBool>);
+
+    impl Drop for DropSentinel {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn late_owner_panic_does_not_replace_primary_unwind() {
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _late_owner = CatchSecondaryOnDrop;
+            std::panic::panic_any("primary owned-thread panic");
+        }))
+        .expect_err("the primary unwind must escape the late-owner cleanup");
+
+        assert_eq!(
+            payload.downcast_ref::<&'static str>(),
+            Some(&"primary owned-thread panic")
+        );
+    }
+
+    #[test]
+    fn missing_shutdown_terminal_remains_failure_after_tls_owner_join() {
+        let tls_dropped = Arc::new(AtomicBool::new(false));
+        let thread_tls_dropped = Arc::clone(&tls_dropped);
+        let constellation = thread::spawn(|| {});
+        let tls = thread::spawn(move || {
+            let _sentinel = DropSentinel(thread_tls_dropped);
+        });
+
+        let failure = join_shutdown_threads(Some(constellation), false, Some(tls));
+
+        assert!(failure.is_some());
+        assert!(tls_dropped.load(Ordering::SeqCst));
     }
 }
 
@@ -1054,18 +1234,37 @@ impl Drop for ServoInner {
             .send(EmbedderToConstellationMessage::Exit);
         self.shutdown_state.set(ShutdownState::ShuttingDown);
         while self.spin_event_loop() {
+            if self
+                .constellation_thread
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+            {
+                // The general selector can stop on another already-disconnected input. Once the
+                // Constellation thread is finished, drain its receiver directly: it can no longer
+                // enqueue messages, so ShutdownComplete is either observed here or definitively
+                // absent.
+                while let Ok(message) = self.constellation_embedder_receiver.try_recv() {
+                    self.handle_constellation_embedder_message(message);
+                    if self.shutdown_state.get() == ShutdownState::FinishedShuttingDown {
+                        break;
+                    }
+                }
+                break;
+            }
             std::thread::sleep(Duration::from_micros(500));
         }
-        if let Some(constellation_thread) = self.constellation_thread.take() {
-            emit_lifecycle_phase(LifecyclePhase::ConstellationJoinBegin);
-            if constellation_thread.join().is_err() {
-                emit_lifecycle_phase(LifecyclePhase::ConstellationJoinFailed);
-                error!("Failed to join the Constellation thread during Servo shutdown.");
-            } else {
-                emit_lifecycle_phase(LifecyclePhase::ConstellationJoinEnd);
-            }
-        }
+        let shutdown_complete_observed =
+            self.shutdown_state.get() == ShutdownState::FinishedShuttingDown;
+        let first_thread_failure = join_shutdown_threads(
+            self.constellation_thread.take(),
+            shutdown_complete_observed,
+            self.tls_prewarm_thread.take(),
+        );
         emit_lifecycle_phase(LifecyclePhase::ServoInnerDropBodyEnd);
+
+        if let Some(payload) = first_thread_failure {
+            resume_owner_failure_unless_already_unwinding(payload, "Servo-owned thread");
+        }
     }
 }
 
@@ -1128,7 +1327,7 @@ impl Servo {
             &opts.time_profiling,
             opts.time_profiler_trace_path.clone(),
         );
-        let mem_profiler_chan = profile_mem::Profiler::create();
+        let (mem_profiler_chan, memory_profiler_thread) = profile_mem::Profiler::create_owned();
 
         let devtools_sender = if pref!(devtools_server_enabled) {
             Some(devtools::start_server(
@@ -1166,23 +1365,28 @@ impl Servo {
         });
 
         let protocols = Arc::new(protocols);
-        let (public_resource_threads, private_resource_threads, async_runtime) =
-            new_resource_threads(
-                devtools_sender.clone(),
-                time_profiler_chan.clone(),
-                mem_profiler_chan.clone(),
-                net_embedder_proxy,
-                opts.config_dir.clone(),
-                opts.certificate_path.clone(),
-                opts.ignore_certificate_errors,
-                protocols.clone(),
-            );
-
-        let (private_storage_threads, public_storage_threads) = new_storage_threads(
+        let (
+            public_resource_threads,
+            private_resource_threads,
+            async_runtime,
+            resource_manager_thread,
+        ) = new_resource_threads_with_owner(
+            devtools_sender.clone(),
+            time_profiler_chan.clone(),
             mem_profiler_chan.clone(),
+            net_embedder_proxy,
             opts.config_dir.clone(),
-            opts.temporary_storage,
+            opts.certificate_path.clone(),
+            opts.ignore_certificate_errors,
+            protocols.clone(),
         );
+
+        let (private_storage_threads, public_storage_threads, storage_threads) =
+            new_storage_threads_with_owner(
+                mem_profiler_chan.clone(),
+                opts.config_dir.clone(),
+                opts.temporary_storage,
+            );
 
         let constellation_thread = create_constellation(
             embedder_to_constellation_receiver,
@@ -1191,17 +1395,19 @@ impl Servo {
             constellation_embedder_proxy,
             paint_proxy,
             time_profiler_chan,
-            mem_profiler_chan,
+            mem_profiler_chan.clone(),
             devtools_sender,
             protocols,
             public_resource_threads.clone(),
             private_resource_threads.clone(),
+            resource_manager_thread,
             async_runtime,
             public_storage_threads.clone(),
             private_storage_threads.clone(),
+            storage_threads,
         );
 
-        net::connector::prewarm_tls();
+        let tls_prewarm_thread = net::connector::prewarm_tls_with_owner();
 
         if opts::get().multiprocess {
             prefs::add_observer(Box::new(constellation_proxy.clone()));
@@ -1229,6 +1435,11 @@ impl Servo {
             constellation_embedder_receiver,
             shutdown_state,
             constellation_thread: Some(constellation_thread),
+            tls_prewarm_thread,
+            _memory_profiler: LifecycleTracedMemoryProfiler::new(
+                mem_profiler_chan,
+                memory_profiler_thread,
+            ),
             webviews: Default::default(),
             servo_errors: ServoErrorChannel::default(),
             _js_engine_setup: LifecycleTracedJsEngineSetup::new(js_engine_setup),
@@ -1404,9 +1615,11 @@ fn create_constellation(
     protocols: Arc<ProtocolRegistry>,
     public_resource_threads: ResourceThreads,
     private_resource_threads: ResourceThreads,
+    resource_manager_thread: ResourceThreadOwner,
     async_runtime: Box<dyn net_traits::AsyncRuntime>,
     public_storage_threads: StorageThreads,
     private_storage_threads: StorageThreads,
+    storage_threads_owner: StorageThreadOwner,
 ) -> JoinHandle<()> {
     // Global configuration options, parsed from the command line.
     let opts = opts::get();
@@ -1417,12 +1630,16 @@ fn create_constellation(
 
     let privileged_urls = protocols.privileged_urls();
 
-    let system_font_service = Arc::new(
-        SystemFontService::spawn(
+    let (system_font_service_sender, system_font_service_thread) =
+        SystemFontService::spawn_with_owner(
             paint_proxy.cross_process_paint_api.clone(),
             mem_profiler_chan.clone(),
-        )
-        .to_proxy(),
+        );
+    let system_font_service = Arc::new(system_font_service_sender.to_proxy());
+    let thread_owners = ConstellationThreadOwners::new(
+        system_font_service_thread,
+        resource_manager_thread,
+        storage_threads_owner,
     );
 
     let initial_state = InitialConstellationState {
@@ -1455,9 +1672,10 @@ fn create_constellation(
 
     let layout_factory = Arc::new(LayoutFactoryImpl());
 
-    Constellation::<script::ScriptThread, script::ServiceWorkerManager>::start_joinable(
+    Constellation::<script::ScriptThread, script::ServiceWorkerManager>::start_joinable_with_thread_owners(
         embedder_to_constellation_receiver,
         initial_state,
+        thread_owners,
         layout_factory,
         opts.random_pipeline_closure_probability,
         opts.random_pipeline_closure_seed,

@@ -32,7 +32,7 @@ pub use glyph::{GlyphInfo, ShapedText, ShapedTextSlice, ShapedTextSliceType, Sha
 use icu_locid::subtags::Language;
 pub use platform::font_list::fallback_font_families;
 pub(crate) use shapers::*;
-pub use system_font_service::SystemFontService;
+pub use system_font_service::{SystemFontService, SystemFontServiceThreadOwner};
 use unicode_properties::{EmojiStatus, UnicodeEmoji, emoji};
 
 /// Whether or not font fallback selection prefers the emoji or text representation

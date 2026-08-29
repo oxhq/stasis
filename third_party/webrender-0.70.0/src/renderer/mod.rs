@@ -4532,7 +4532,9 @@ impl Renderer {
     ///
     /// A synchronous shutdown acknowledgement only proves that the backend handled the
     /// shutdown message. It is not a physical thread-termination fence.
-    /// This must only be called after that acknowledgement has been observed.
+    /// Call this after the synchronous shutdown request has been attempted. If the request cannot
+    /// deliver its acknowledgement because a backend thread failed, joining these handles is the
+    /// remaining authoritative physical-termination boundary.
     #[doc(hidden)]
     pub fn join_backend_threads(&mut self) -> thread::Result<()> {
         self.backend_threads.join_all()

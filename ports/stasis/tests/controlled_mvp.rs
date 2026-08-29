@@ -42,6 +42,18 @@ const CONTROLLED_WEBAPP_V1_PROFILE: &str = "controlled-webapp-v1";
 const CONTROLLED_WEB_SESSION_V1_PROFILE: &str = "controlled-web-session-v1";
 
 const STATIC_FIXTURE: &[u8] = include_bytes!("fixtures/static.html");
+const CANVAS_FIXTURE: &[u8] = br##"<!doctype html>
+<html lang="en">
+  <body>
+    <canvas id="surface" width="8" height="8"></canvas>
+    <output id="result">pending</output>
+    <script>
+      const context = document.querySelector("#surface").getContext("2d");
+      context.fillRect(0, 0, 8, 8);
+      document.querySelector("#result").textContent = "canvas ready";
+    </script>
+  </body>
+</html>"##;
 const INITIAL_STYLESHEET_FIXTURE: &[u8] = include_bytes!("fixtures/initial_stylesheet.html");
 const TIMER_10S_FIXTURE: &[u8] = include_bytes!("fixtures/timer_10s.html");
 const TIMER_MICROTASK_FIXTURE: &[u8] = include_bytes!("fixtures/timer_microtask_order.html");
@@ -143,12 +155,39 @@ fn source_binary_single_close_lifecycle_is_owner_ordered() {
     assert_packaged_single_close_lifecycle(&shell.read_stderr_tail());
 }
 
+#[test]
+fn source_binary_canvas_close_lifecycle_joins_physical_owner() {
+    let _serial = process_test_guard();
+    let server = FixtureServer::start(CANVAS_FIXTURE, false);
+    let mut shell = TestShell::spawn_path_with_lifecycle_trace(PathBuf::from(env!(
+        "CARGO_BIN_EXE_stasis"
+    )));
+
+    shell.initialize();
+    shell.open_controlled(server.url());
+    let settled = shell.settle_default();
+    assert_outcome(&settled, "unsupported_work");
+    assert_eq!(settled["failure"]["code"], "unsupported_rendering");
+    assert_eq!(settled["unsupportedWork"][0]["reason"], "graphics_source");
+    assert_eq!(
+        shell.text("#result", &state_generation(&settled)),
+        "canvas ready"
+    );
+    shell.close_cleanly();
+
+    assert_packaged_single_close_lifecycle_with_canvas(&shell.read_stderr_tail(), true);
+}
+
 fn assert_packaged_single_close_lifecycle(stderr: &str) {
+    assert_packaged_single_close_lifecycle_with_canvas(stderr, false);
+}
+
+fn assert_packaged_single_close_lifecycle_with_canvas(stderr: &str, canvas_started: bool) {
     let observed: Vec<_> = stderr
         .lines()
         .filter_map(|line| line.strip_prefix(LIFECYCLE_TRACE_PREFIX))
         .collect();
-    let expected = [
+    let mut expected = vec![
         "close_accepted",
         "engine_close_begin",
         "webview_drop_begin",
@@ -170,6 +209,20 @@ fn assert_packaged_single_close_lifecycle(stderr: &str) {
         "constellation_exit_send_begin",
         "script_threads_join_begin",
         "script_threads_join_end",
+        "style_thread_pool_shutdown_begin",
+        "style_thread_pool_shutdown_end",
+        "fetch_thread_join_begin",
+        "fetch_thread_join_end",
+        "resource_manager_join_begin",
+        "resource_manager_join_end",
+        "storage_threads_join_begin",
+        "storage_threads_join_end",
+        "global_thread_pool_shutdown_begin",
+        "global_thread_pool_shutdown_end",
+        "system_font_service_join_begin",
+        "system_font_service_join_end",
+        "async_runtime_shutdown_begin",
+        "async_runtime_shutdown_end",
         "subsystems_shutdown_end",
         "constellation_run_end",
         "constellation_state_drop_begin",
@@ -178,7 +231,12 @@ fn assert_packaged_single_close_lifecycle(stderr: &str) {
         "shutdown_complete_observed",
         "constellation_join_begin",
         "constellation_join_end",
+        "tls_prewarm_join_begin",
+        "tls_prewarm_join_end",
         "servo_inner_drop_body_end",
+        "memory_profiler_exit_send_begin",
+        "memory_profiler_join_begin",
+        "memory_profiler_join_end",
         "js_engine_drop_begin",
         "js_engine_drop_end",
         "servo_owner_drop_end",
@@ -195,7 +253,23 @@ fn assert_packaged_single_close_lifecycle(stderr: &str) {
         "shell_run_end",
         "protocol_reader_join_begin",
         "protocol_reader_join_end",
+        "shell_drop_begin",
+        "shell_drop_end",
+        "main_body_end",
     ];
+    if canvas_started {
+        let resource_join = expected
+            .iter()
+            .position(|phase| *phase == "resource_manager_join_begin")
+            .unwrap();
+        expected.splice(
+            resource_join..resource_join,
+            [
+                "canvas_paint_thread_join_begin",
+                "canvas_paint_thread_join_end",
+            ],
+        );
+    }
     assert_eq!(
         observed, expected,
         "the packaged product did not complete the fixed single-close lifecycle in owner order"
@@ -1742,7 +1816,10 @@ impl TestShell {
         let line = match self.output.recv_timeout(timeout) {
             Ok(OutputRead::Line(line)) => line,
             Ok(OutputRead::Error(error)) => panic!("failed to read protocol stdout: {error}"),
-            Ok(OutputRead::Eof) => panic!("stasis stdout reached EOF before a response"),
+            Ok(OutputRead::Eof) => panic!(
+                "stasis stdout reached EOF before a response; stderr tail: {}",
+                self.read_stderr_tail()
+            ),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 panic!(
                     "timed out waiting {timeout:?} for stasis protocol output for request {request_id}"

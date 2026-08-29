@@ -108,6 +108,7 @@ pub enum SceneBuilderRequest {
     WakeUp,
     StopRenderBackend,
     ShutDown(Option<Sender<()>>),
+    ForceShutDown,
     Flush(Sender<()>),
     SetFlags(DebugFlags),
     SetFrameBuilderConfig(FrameBuilderConfig),
@@ -373,6 +374,9 @@ impl SceneBuilderThread {
                 }
                 Ok(SceneBuilderRequest::ShutDown(sync)) => {
                     self.send(SceneBuilderResult::ShutDown(sync));
+                    break;
+                }
+                Ok(SceneBuilderRequest::ForceShutDown) => {
                     break;
                 }
                 Ok(SceneBuilderRequest::SimulateLongSceneBuild(time_ms)) => {
@@ -840,6 +844,9 @@ impl LowPrioritySceneBuilderThread {
                 }
                 Ok(SceneBuilderRequest::ShutDown(sync)) => {
                     self.tx.send(SceneBuilderRequest::ShutDown(sync)).unwrap();
+                    break;
+                }
+                Ok(SceneBuilderRequest::ForceShutDown) => {
                     break;
                 }
                 Ok(other) => {

@@ -61,3 +61,4 @@ wr_malloc_size_of = { workspace = true }
 
 [dev-dependencies]
 surfman = { workspace = true }
+webrender = { workspace = true, features = ["stasis_owner_regression"] }

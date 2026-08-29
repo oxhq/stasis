@@ -3,12 +3,16 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::net::IpAddr;
+use std::sync::mpsc;
 
 use net::connector::CACertificates;
 use net::protocols::ProtocolRegistry;
-use net::resource_thread::new_core_resource_thread;
+use net::resource_thread::{
+    ResourceThreadOwner, new_core_resource_thread_with_owner,
+    new_core_resource_thread_with_owner_and_after_shutdown_for_testing,
+};
 use net::test::parse_hostsfile;
-use net_traits::CoreResourceMsg;
+use net_traits::{CoreResourceMsg, CoreResourceThread};
 use profile_traits::mem::ProfilerChan as MemProfilerChan;
 use profile_traits::time::ProfilerChan;
 use servo_base::generic_channel;
@@ -19,12 +23,37 @@ fn ip(s: &str) -> IpAddr {
     s.parse().unwrap()
 }
 
+fn owned_resource_thread_with_after_shutdown(
+    after_shutdown: impl FnOnce() + Send + 'static,
+) -> (CoreResourceThread, ResourceThreadOwner) {
+    let (tx, _rx) = generic_channel::channel().unwrap();
+    let (mtx, _mrx) = generic_channel::channel().unwrap();
+    let (resource_thread, _private_resource_thread, owner) =
+        new_core_resource_thread_with_owner_and_after_shutdown_for_testing(
+            None,
+            ProfilerChan(Some(tx)),
+            MemProfilerChan(mtx),
+            create_generic_embedder_proxy(),
+            None,
+            CACertificates::Default,
+            false,
+            std::sync::Arc::new(ProtocolRegistry::default()),
+            after_shutdown,
+        );
+    (resource_thread, owner)
+}
+
+fn request_exit(resource_thread: &CoreResourceThread) {
+    let (sender, receiver) = generic_channel::oneshot().unwrap();
+    resource_thread.send(CoreResourceMsg::Exit(sender)).unwrap();
+    receiver.recv().unwrap();
+}
+
 #[test]
 fn test_exit() {
     let (tx, _rx) = generic_channel::channel().unwrap();
     let (mtx, _mrx) = generic_channel::channel().unwrap();
-    let (sender, receiver) = generic_channel::oneshot().unwrap();
-    let (resource_thread, _private_resource_thread) = new_core_resource_thread(
+    let (resource_thread, _private_resource_thread, owner) = new_core_resource_thread_with_owner(
         None,
         ProfilerChan(Some(tx)),
         MemProfilerChan(mtx),
@@ -34,11 +63,45 @@ fn test_exit() {
         false, /* ignore_certificate_errors */
         std::sync::Arc::new(ProtocolRegistry::default()),
     );
-    resource_thread.send(CoreResourceMsg::Exit(sender)).unwrap();
-    receiver.recv().unwrap();
-    // Workaround for https://github.com/servo/servo/issues/32912
-    #[cfg(windows)]
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    request_exit(&resource_thread);
+    owner.join().unwrap();
+}
+
+#[test]
+fn exit_ack_precedes_physical_resource_thread_termination() {
+    let (after_shutdown_entered, wait_for_after_shutdown) = mpsc::channel();
+    let (allow_shutdown_to_finish, shutdown_may_finish) = mpsc::channel();
+    let (resource_thread, owner) = owned_resource_thread_with_after_shutdown(move || {
+        after_shutdown_entered.send(()).unwrap();
+        shutdown_may_finish.recv().unwrap();
+    });
+
+    request_exit(&resource_thread);
+    wait_for_after_shutdown.recv().unwrap();
+
+    assert!(
+        !owner.is_finished(),
+        "the Exit ACK must not be treated as physical thread termination"
+    );
+    allow_shutdown_to_finish.send(()).unwrap();
+    owner.join().unwrap();
+}
+
+#[test]
+fn resource_thread_owner_join_surfaces_post_ack_panic() {
+    let (after_shutdown_entered, wait_for_after_shutdown) = mpsc::channel();
+    let (resource_thread, owner) = owned_resource_thread_with_after_shutdown(move || {
+        after_shutdown_entered.send(()).unwrap();
+        panic!("post-ACK ResourceManager teardown panic");
+    });
+
+    request_exit(&resource_thread);
+    wait_for_after_shutdown.recv().unwrap();
+
+    assert!(
+        owner.join().is_err(),
+        "joining the physical owner must surface a post-ACK panic"
+    );
 }
 
 #[test]

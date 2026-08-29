@@ -1108,6 +1108,83 @@ pub struct RenderApi {
     resources: ApiResources,
 }
 
+fn force_shutdown_channels(
+    api_sender: &Sender<ApiMsg>,
+    scene_sender: &Sender<SceneBuilderRequest>,
+    low_priority_scene_sender: &Sender<SceneBuilderRequest>,
+) -> (bool, bool, bool) {
+    // These are distinct physical queues. A failed low-priority scene builder cannot be relied on
+    // to forward the normal shutdown request, and a failed normal scene builder cannot be relied
+    // on to wake RenderBackend. Each send is therefore independent and deliberately best-effort.
+    let low_priority_delivered = low_priority_scene_sender
+        .send(SceneBuilderRequest::ForceShutDown)
+        .is_ok();
+    let normal_delivered = scene_sender
+        .send(SceneBuilderRequest::ForceShutDown)
+        .is_ok();
+    let backend_delivered = api_sender
+        .send(ApiMsg::SceneBuilderResult(SceneBuilderResult::ShutDown(None)))
+        .is_ok();
+    (low_priority_delivered, normal_delivered, backend_delivered)
+}
+
+/// Exercise the real three-queue force-shutdown route with a disconnected low-priority builder.
+///
+/// This narrow seam is enabled only by Stasis's owner-regression feature. It proves that failure
+/// of the first intermediary does not prevent the normal scene builder and RenderBackend from
+/// receiving their independent terminal messages and physically exiting.
+#[cfg(feature = "stasis_owner_regression")]
+#[doc(hidden)]
+pub fn stasis_force_shutdown_disconnected_low_priority_regression() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    struct DropSentinel(Arc<AtomicBool>);
+
+    impl Drop for DropSentinel {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let (api_sender, api_receiver) = unbounded_channel();
+    let (scene_sender, scene_receiver) = unbounded_channel();
+    let (low_priority_scene_sender, low_priority_scene_receiver) = unbounded_channel();
+    drop(low_priority_scene_receiver);
+
+    let scene_builder_dropped = Arc::new(AtomicBool::new(false));
+    let backend_dropped = Arc::new(AtomicBool::new(false));
+    let scene_builder_sentinel = Arc::clone(&scene_builder_dropped);
+    let backend_sentinel = Arc::clone(&backend_dropped);
+    let scene_builder = thread::spawn(move || {
+        let _sentinel = DropSentinel(scene_builder_sentinel);
+        assert!(matches!(
+            scene_receiver.recv(),
+            Ok(SceneBuilderRequest::ForceShutDown)
+        ));
+    });
+    let render_backend = thread::spawn(move || {
+        let _sentinel = DropSentinel(backend_sentinel);
+        assert!(matches!(
+            api_receiver.recv(),
+            Ok(ApiMsg::SceneBuilderResult(SceneBuilderResult::ShutDown(None)))
+        ));
+    });
+
+    let delivery = force_shutdown_channels(
+        &api_sender,
+        &scene_sender,
+        &low_priority_scene_sender,
+    );
+    assert_eq!(delivery, (false, true, true));
+
+    scene_builder.join().unwrap();
+    render_backend.join().unwrap();
+    assert!(scene_builder_dropped.load(Ordering::SeqCst));
+    assert!(backend_dropped.load(Ordering::SeqCst));
+}
+
 impl RenderApi {
     /// Returns the namespace ID used by this API object.
     pub fn get_namespace_id(&self) -> IdNamespace {
@@ -1271,6 +1348,20 @@ impl RenderApi {
         } else {
             self.low_priority_scene_sender.send(SceneBuilderRequest::ShutDown(None)).unwrap();
         }
+    }
+
+    /// Best-effort terminal wake-up for every physical WebRender backend queue.
+    ///
+    /// This does not replace the normal synchronous shutdown protocol. It is the failure-recovery
+    /// path used immediately before joining retained backend handles, when any intermediary may
+    /// already have exited before forwarding the normal shutdown request.
+    #[doc(hidden)]
+    pub fn force_shut_down(&self) {
+        let _ = force_shutdown_channels(
+            &self.api_sender,
+            &self.scene_sender,
+            &self.low_priority_scene_sender,
+        );
     }
 
     /// Create a new unique key that can be used for
