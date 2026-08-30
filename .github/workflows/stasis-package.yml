@@ -1320,13 +1320,54 @@ jobs:
       - name: Gate Stasis library and controlled-source invariants on Windows
         run: |
           $ErrorActionPreference = 'Stop'
+          function Invoke-WindowsCargoTestGate {
+            param(
+              [Parameter(Mandatory)]
+              [ValidatePattern('^[a-z0-9-]+$')]
+              [string] $Name,
+              [Parameter(Mandatory)]
+              [string] $Command,
+              [int] $ExpectedPassCount = 0,
+              [string] $ExpectedRecordPattern = ''
+            )
+            $log = Join-Path $env:RUNNER_TEMP "stasis-windows-$Name.raw.log"
+            & .\mach.ps1 exec -- pwsh -NoProfile -Command $Command *> $log
+            $status = $LASTEXITCODE
+            $lines = @(Get-Content -LiteralPath $log)
+            $lines | Write-Output
+            if ($status -ne 0) {
+              throw "the Windows $Name gate failed with exit code $status"
+            }
+            if ($ExpectedPassCount -gt 0) {
+              $summaryPrefix = "test result: ok. $ExpectedPassCount passed; 0 failed;"
+              $summaryCount = @($lines | Where-Object {
+                $_.StartsWith($summaryPrefix, [System.StringComparison]::Ordinal)
+              }).Count
+              if ($summaryCount -ne 1) {
+                throw "the Windows $Name gate omitted its exact $ExpectedPassCount-test summary"
+              }
+              $recordCount = @($lines | Where-Object {
+                $_ -match $ExpectedRecordPattern
+              }).Count
+              if ($recordCount -ne $ExpectedPassCount) {
+                throw "the Windows $Name gate emitted $recordCount exact records instead of $ExpectedPassCount"
+              }
+            } else {
+              $positiveSummaryCount = @($lines | Where-Object {
+                $_ -match '^test result: ok\. [1-9][0-9]* passed; 0 failed;'
+              }).Count
+              if ($positiveSummaryCount -lt 1) {
+                throw "the Windows $Name gate emitted no positive passing summary"
+              }
+            }
+            Remove-Item -LiteralPath $log -Force
+            Write-Output "windows_$Name=passed"
+          }
           $stasisLibTestCommand = '$ErrorActionPreference = ''Stop''; ' +
             '& cargo test --locked --profile production-stripped -p stasis-shell --lib ' +
             '-- --test-threads=1 --show-output; exit $LASTEXITCODE'
-          & .\mach.ps1 exec -- pwsh -NoProfile -Command $stasisLibTestCommand
-          if ($LASTEXITCODE -ne 0) {
-            throw "the Windows Stasis library-invariant gate failed with exit code $LASTEXITCODE"
-          }
+          Invoke-WindowsCargoTestGate -Name 'stasis-library-invariants' `
+            -Command $stasisLibTestCommand
           # Unify Stasis's release features into every component-test invocation. In
           # particular, stasis-shell owns the js_jit feature used by the shipped binary;
           # testing servo-script alone silently selects a different MozJS source-build path.
@@ -1355,58 +1396,46 @@ jobs:
             '& cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib ' +
             'pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output; ' +
             'exit $LASTEXITCODE'
-          & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledImageCapacityTestCommand
-          if ($LASTEXITCODE -ne 0) {
-            throw "the Windows controlled-image capacity gate failed with exit code $LASTEXITCODE"
-          }
+          Invoke-WindowsCargoTestGate -Name 'controlled-image-capacity' `
+            -Command $controlledImageCapacityTestCommand `
+            -ExpectedPassCount 17 `
+            -ExpectedRecordPattern '^test .*pending_nonanimated_image_observation_tests::.* \.\.\. ok$'
           $controlledDocumentControlDisconnectTestCommand = '$ErrorActionPreference = ''Stop''; ' +
             '& cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib ' +
             'controlled_document_control_disconnect_tests -- --test-threads=1 --show-output; ' +
             'exit $LASTEXITCODE'
-          & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledDocumentControlDisconnectTestCommand
-          if ($LASTEXITCODE -ne 0) {
-            throw "the Windows controlled document-control disconnect gate failed with exit code $LASTEXITCODE"
-          }
+          Invoke-WindowsCargoTestGate -Name 'controlled-document-control-disconnect' `
+            -Command $controlledDocumentControlDisconnectTestCommand
           $controlledCookieContextTestCommand = '$ErrorActionPreference = ''Stop''; ' +
             '& cargo test --locked --profile production-stripped -p stasis-shell -p servo --lib ' +
             'controlled_cookie_context_tests -- --test-threads=1 --show-output; ' +
             'exit $LASTEXITCODE'
-          & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledCookieContextTestCommand
-          if ($LASTEXITCODE -ne 0) {
-            throw "the Windows controlled-cookie context gate failed with exit code $LASTEXITCODE"
-          }
+          Invoke-WindowsCargoTestGate -Name 'controlled-cookie-context' `
+            -Command $controlledCookieContextTestCommand
           $requestInterceptorTestCommand = '$ErrorActionPreference = ''Stop''; ' +
             '& cargo test --locked --profile production-stripped -p stasis-shell -p servo-net --lib ' +
             'request_interceptor::tests -- --test-threads=1 --show-output; ' +
             'exit $LASTEXITCODE'
-          & .\mach.ps1 exec -- pwsh -NoProfile -Command $requestInterceptorTestCommand
-          if ($LASTEXITCODE -ne 0) {
-            throw "the Windows request-interceptor provenance gate failed with exit code $LASTEXITCODE"
-          }
+          Invoke-WindowsCargoTestGate -Name 'request-interceptor-provenance' `
+            -Command $requestInterceptorTestCommand
           $controlledCookieRetrievalTestCommand = '$ErrorActionPreference = ''Stop''; ' +
             '& cargo test --locked --profile production-stripped -p stasis-shell -p servo-net --test main ' +
             'cookie::controlled_cookie_v2_retrieval_obeys_the_samesite_matrix -- --exact ' +
             '--test-threads=1 --show-output; exit $LASTEXITCODE'
-          & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledCookieRetrievalTestCommand
-          if ($LASTEXITCODE -ne 0) {
-            throw "the Windows controlled-cookie retrieval gate failed with exit code $LASTEXITCODE"
-          }
+          Invoke-WindowsCargoTestGate -Name 'controlled-cookie-retrieval' `
+            -Command $controlledCookieRetrievalTestCommand
           $controlledCookieStorageTestCommand = '$ErrorActionPreference = ''Stop''; ' +
             '& cargo test --locked --profile production-stripped -p stasis-shell -p servo-net --test main ' +
             'cookie::controlled_cookie_v2_storage_obeys_the_samesite_matrix -- --exact ' +
             '--test-threads=1 --show-output; exit $LASTEXITCODE'
-          & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledCookieStorageTestCommand
-          if ($LASTEXITCODE -ne 0) {
-            throw "the Windows controlled-cookie storage gate failed with exit code $LASTEXITCODE"
-          }
+          Invoke-WindowsCargoTestGate -Name 'controlled-cookie-storage' `
+            -Command $controlledCookieStorageTestCommand
           $controlledNavigationLoadDataTestCommand = '$ErrorActionPreference = ''Stop''; ' +
             '& cargo test --locked --profile production-stripped -p stasis-shell -p servo-constellation --lib ' +
             'controlled_session_navigation_load_data_tests -- --test-threads=1 --show-output; ' +
             'exit $LASTEXITCODE'
-          & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledNavigationLoadDataTestCommand
-          if ($LASTEXITCODE -ne 0) {
-            throw "the Windows controlled-session navigation/load-data gate failed with exit code $LASTEXITCODE"
-          }
+          Invoke-WindowsCargoTestGate -Name 'controlled-session-navigation-load-data' `
+            -Command $controlledNavigationLoadDataTestCommand
 
       - name: Stage the required ANGLE runtime beside Stasis
         run: |
