@@ -884,6 +884,9 @@ impl EngineSession {
         if closing {
             emit_lifecycle_phase(LifecyclePhase::EngineCloseBegin);
         }
+        if let Some(servo) = self.servo.as_ref() {
+            servo.prepare_for_shutdown();
+        }
         if let Some(operation) = self.pending_control.take() {
             let _ = operation.cancel();
         }

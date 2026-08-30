@@ -125,6 +125,16 @@ pub struct Paint {
     /// a single [`RenderingContext`].
     painters: Vec<Rc<RefCell<Painter>>>,
 
+    /// Painters whose final published WebView has closed. They are removed from live dispatch but
+    /// remain physically owned until Servo has joined the Constellation and its subsystem graph.
+    /// This prevents WebRender shutdown from racing producers that can outlive logical WebView
+    /// closure.
+    deferred_painters: Vec<Rc<RefCell<Painter>>>,
+
+    /// Whether the embedder has declared that no later WebView can be registered and final
+    /// Painter destruction must wait for Servo's physical shutdown fence.
+    defer_painter_destruction_until_shutdown: bool,
+
     /// A [`PaintProxy`] which can be used to allow other parts of Servo to communicate
     /// with this [`Paint`].
     pub(crate) paint_proxy: PaintProxy,
@@ -168,6 +178,66 @@ pub struct Paint {
     /// An map of external images shared between all `WebGpuExternalImages`.
     #[cfg(feature = "webgpu")]
     webgpu_image_map: std::cell::OnceCell<WebGpuExternalImageMap>,
+}
+
+enum WebViewOwnerRemoval {
+    SharedOwnerRetained,
+    FinalOwner(usize),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum FinalOwnerDisposition {
+    Removed,
+    Deferred,
+}
+
+fn remove_webview_and_locate_empty_owner<T, OwnsWebView, RemoveWebView>(
+    active_owners: &mut Vec<T>,
+    owns_webview: OwnsWebView,
+    remove_webview_and_is_empty: RemoveWebView,
+) -> WebViewOwnerRemoval
+where
+    OwnsWebView: Fn(&T) -> bool,
+    RemoveWebView: FnOnce(&mut T) -> bool,
+{
+    let owner_index = active_owners
+        .iter()
+        .position(owns_webview)
+        .expect("painter_id not found");
+
+    if !remove_webview_and_is_empty(&mut active_owners[owner_index]) {
+        return WebViewOwnerRemoval::SharedOwnerRetained;
+    }
+
+    WebViewOwnerRemoval::FinalOwner(owner_index)
+}
+
+fn retain_or_drop_final_owner<T>(
+    owner: T,
+    deferred_owners: &mut Vec<T>,
+    defer_until_shutdown: bool,
+) -> FinalOwnerDisposition {
+    if defer_until_shutdown {
+        deferred_owners.push(owner);
+        FinalOwnerDisposition::Deferred
+    } else {
+        drop(owner);
+        FinalOwnerDisposition::Removed
+    }
+}
+
+type DeferredPainterDropFailure = Box<dyn std::any::Any + Send + 'static>;
+
+fn drop_deferred_owners<T>(owners: &mut Vec<T>) -> Option<DeferredPainterDropFailure> {
+    let mut first_failure = None;
+    for owner in std::mem::take(owners) {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(owner)))
+            && first_failure.is_none()
+        {
+            first_failure = Some(payload);
+        }
+    }
+    first_failure
 }
 
 /// Why we need to be repainted. This is used for debugging.
@@ -232,6 +302,8 @@ impl Paint {
         };
         Rc::new(RefCell::new(Paint {
             painters: Default::default(),
+            deferred_painters: Default::default(),
+            defer_painter_destruction_until_shutdown: false,
             paint_proxy: state.paint_proxy,
             event_loop_waker: state.event_loop_waker,
             shutdown_state: state.shutdown_state,
@@ -260,6 +332,10 @@ impl Paint {
         &mut self,
         rendering_context: Rc<dyn RenderingContext>,
     ) -> PainterId {
+        assert!(
+            !self.defer_painter_destruction_until_shutdown,
+            "cannot register a RenderingContext after terminal Servo shutdown was prepared"
+        );
         if let Some(painter_id) = self.painters.iter().find_map(|painter| {
             let painter = painter.borrow();
             if Rc::ptr_eq(&painter.rendering_context, &rendering_context) {
@@ -291,7 +367,7 @@ impl Paint {
         painter_id
     }
 
-    fn remove_painter(&mut self, painter_id: PainterId) {
+    fn clear_painter_registration(&mut self, painter_id: PainterId) {
         // The shared details map must be removed first in order to avoid the creation of new
         // devices after `clear_painter_resources` is called.
         self.painter_surfman_details_map.remove(painter_id);
@@ -304,6 +380,10 @@ impl Paint {
         {
             warn!("Could not clear {painter_id:?} resources in WebGLThread");
         }
+    }
+
+    fn remove_painter(&mut self, painter_id: PainterId) {
+        self.clear_painter_registration(painter_id);
 
         // This is called last so that the surfman `Device` is dropped on this thread.
         self.painters
@@ -380,6 +460,13 @@ impl Paint {
             .iter()
             .flat_map(|painter| painter.borrow().webviews_needing_repaint())
             .collect()
+    }
+
+    /// Declare a terminal embedder shutdown before its final WebView handle is dropped. Ordinary
+    /// WebView removal keeps immediate Painter reclamation; only this terminal path defers the
+    /// physical WebRender owner until Servo has joined its producer graph.
+    pub fn prepare_for_shutdown(&mut self) {
+        self.defer_painter_destruction_until_shutdown = true;
     }
 
     pub fn finish_shutting_down(&self) {
@@ -597,16 +684,30 @@ impl Paint {
 
     pub fn remove_webview(&mut self, webview_id: WebViewId) {
         let painter_id = webview_id.into();
-
-        {
-            let mut painter = self.painter_mut(painter_id);
-            painter.remove_webview(webview_id);
-            if !painter.is_empty() {
-                return;
-            }
+        let removal = remove_webview_and_locate_empty_owner(
+            &mut self.painters,
+            |painter| painter.borrow().painter_id == painter_id,
+            |painter| {
+                let mut painter = painter.borrow_mut();
+                painter.remove_webview(webview_id);
+                painter.is_empty()
+            },
+        );
+        match removal {
+            WebViewOwnerRemoval::SharedOwnerRetained => {},
+            WebViewOwnerRemoval::FinalOwner(painter_index) => {
+                // Preserve the existing logical close ordering: WebGL and surfman registrations
+                // are cleared while the physical owner remains retained in `painters`. Only after
+                // cleanup succeeds can the owner be dropped or transferred across the fence.
+                self.clear_painter_registration(painter_id);
+                let painter = self.painters.remove(painter_index);
+                retain_or_drop_final_owner(
+                    painter,
+                    &mut self.deferred_painters,
+                    self.defer_painter_destruction_until_shutdown,
+                );
+            },
         }
-
-        self.remove_painter(painter_id);
     }
 
     /// Release a rendering-context registration when WebView construction is rejected before the
@@ -615,6 +716,15 @@ impl Paint {
         let painter_id = webview_id.into();
         if self.painter_mut(painter_id).is_empty() {
             self.remove_painter(painter_id);
+        }
+    }
+
+    /// Release physical WebRender owners only after Servo has joined every producer-owning
+    /// Constellation subsystem. Returns the first owner failure after attempting every drop.
+    pub fn release_deferred_painters(&mut self) -> std::thread::Result<()> {
+        match drop_deferred_owners(&mut self.deferred_painters) {
+            Some(payload) => Err(payload),
+            None => Ok(()),
         }
     }
 
@@ -989,5 +1099,152 @@ impl Paint {
             .collect();
 
         let _ = result_sender.send((font_keys, font_instance_keys));
+    }
+}
+
+#[cfg(test)]
+mod deferred_painter_thread_ownership_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::{
+        FinalOwnerDisposition, WebViewOwnerRemoval, drop_deferred_owners,
+        remove_webview_and_locate_empty_owner, retain_or_drop_final_owner,
+    };
+
+    struct DropSentinel(Arc<AtomicUsize>);
+
+    impl Drop for DropSentinel {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct RecordedDrop {
+        id: u8,
+        attempts: Arc<Mutex<Vec<u8>>>,
+        failure: Option<&'static str>,
+    }
+
+    impl Drop for RecordedDrop {
+        fn drop(&mut self) {
+            self.attempts.lock().unwrap().push(self.id);
+            if let Some(failure) = self.failure {
+                std::panic::panic_any(failure);
+            }
+        }
+    }
+
+    struct MockPainter {
+        webviews: Vec<u8>,
+        _physical_owner: DropSentinel,
+    }
+
+    fn remove_webview(active: &mut Vec<MockPainter>, webview_id: u8) -> WebViewOwnerRemoval {
+        remove_webview_and_locate_empty_owner(
+            active,
+            |painter| painter.webviews.contains(&webview_id),
+            |painter| {
+                painter
+                    .webviews
+                    .retain(|candidate| *candidate != webview_id);
+                painter.webviews.is_empty()
+            },
+        )
+    }
+
+    #[test]
+    fn terminal_shared_painter_final_owner_waits_for_producer_fence() {
+        let physical_drops = Arc::new(AtomicUsize::new(0));
+        let mut active = vec![MockPainter {
+            webviews: vec![1, 2],
+            _physical_owner: DropSentinel(Arc::clone(&physical_drops)),
+        }];
+        let mut deferred = Vec::new();
+
+        assert!(matches!(
+            remove_webview(&mut active, 1),
+            WebViewOwnerRemoval::SharedOwnerRetained
+        ));
+        assert_eq!(active.len(), 1);
+        assert!(deferred.is_empty());
+        assert_eq!(physical_drops.load(Ordering::SeqCst), 0);
+
+        let owner_index = match remove_webview(&mut active, 2) {
+            WebViewOwnerRemoval::FinalOwner(owner_index) => owner_index,
+            _ => panic!("the final shared WebView must detach its physical owner"),
+        };
+        let owner = active.remove(owner_index);
+        assert!(active.is_empty());
+        assert_eq!(physical_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            retain_or_drop_final_owner(owner, &mut deferred, true),
+            FinalOwnerDisposition::Deferred
+        );
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(physical_drops.load(Ordering::SeqCst), 0);
+
+        // The Servo-level regression independently proves that production reaches this release
+        // only after the Constellation and TLS owners have been physically joined. This helper
+        // regression proves that the final Painter remains owned until that explicit release.
+        assert!(drop_deferred_owners(&mut deferred).is_none());
+        assert!(deferred.is_empty());
+        assert_eq!(physical_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ordinary_final_owner_drops_without_deferral() {
+        let physical_drops = Arc::new(AtomicUsize::new(0));
+        let mut active = vec![MockPainter {
+            webviews: vec![1],
+            _physical_owner: DropSentinel(Arc::clone(&physical_drops)),
+        }];
+        let mut deferred = Vec::new();
+
+        let owner_index = match remove_webview(&mut active, 1) {
+            WebViewOwnerRemoval::FinalOwner(owner_index) => owner_index,
+            _ => panic!("the ordinary final WebView must detach its physical owner"),
+        };
+        let owner = active.remove(owner_index);
+        assert_eq!(physical_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            retain_or_drop_final_owner(owner, &mut deferred, false),
+            FinalOwnerDisposition::Removed
+        );
+        assert!(active.is_empty());
+        assert!(deferred.is_empty());
+        assert_eq!(physical_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn drop_deferred_owners_attempts_every_owner_and_reports_first_panic() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let mut owners = vec![
+            RecordedDrop {
+                id: 1,
+                attempts: Arc::clone(&attempts),
+                failure: Some("first deferred owner failure"),
+            },
+            RecordedDrop {
+                id: 2,
+                attempts: Arc::clone(&attempts),
+                failure: None,
+            },
+            RecordedDrop {
+                id: 3,
+                attempts: Arc::clone(&attempts),
+                failure: Some("later deferred owner failure"),
+            },
+        ];
+
+        let failure = drop_deferred_owners(&mut owners)
+            .expect("the first deferred owner panic must be reported");
+
+        assert!(owners.is_empty());
+        assert_eq!(*attempts.lock().unwrap(), vec![1, 2, 3]);
+        assert_eq!(
+            failure.downcast_ref::<&'static str>(),
+            Some(&"first deferred owner failure")
+        );
     }
 }

@@ -7,7 +7,6 @@ use std::cmp::max;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 pub use embedder_traits::*;
@@ -157,6 +156,36 @@ enum Message {
     FromNet(NetToEmbedderMsg),
     FromConstellation(ConstellationToEmbedderMsg),
     FromUnknown(EmbedderMsg),
+}
+
+#[derive(Clone, Copy)]
+enum ShutdownAuxiliaryReceiver {
+    Paint,
+    Embedder,
+    Net,
+}
+
+struct ShutdownReceiversOpen {
+    paint: bool,
+    embedder: bool,
+    net: bool,
+}
+
+impl Default for ShutdownReceiversOpen {
+    fn default() -> Self {
+        Self {
+            paint: true,
+            embedder: true,
+            net: true,
+        }
+    }
+}
+
+enum ShutdownProgress {
+    Paint(Result<PaintMessage, ipc_channel::IpcError>),
+    Message(Message),
+    AuxiliaryDisconnected(ShutdownAuxiliaryReceiver),
+    ConstellationDisconnected,
 }
 
 /// Holds a prebuilt `crossbeam_channel::Select` over the crossbeam
@@ -389,6 +418,28 @@ fn join_shutdown_threads(
     first_thread_failure
 }
 
+fn join_shutdown_threads_then_release_painters<ReleasePainters>(
+    constellation_thread: Option<JoinHandle<()>>,
+    shutdown_complete_observed: bool,
+    tls_prewarm_thread: Option<JoinHandle<()>>,
+    release_painters: ReleasePainters,
+) -> Option<ServoOwnedThreadFailure>
+where
+    ReleasePainters: FnOnce() -> std::thread::Result<()>,
+{
+    let mut first_thread_failure = join_shutdown_threads(
+        constellation_thread,
+        shutdown_complete_observed,
+        tls_prewarm_thread,
+    );
+    if let Err(payload) = release_painters()
+        && first_thread_failure.is_none()
+    {
+        first_thread_failure = Some(payload);
+    }
+    first_thread_failure
+}
+
 #[cfg(test)]
 mod shutdown_thread_ownership_tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -396,7 +447,10 @@ mod shutdown_thread_ownership_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
-    use super::{join_shutdown_threads, resume_owner_failure_unless_already_unwinding};
+    use super::{
+        join_shutdown_threads, join_shutdown_threads_then_release_painters,
+        resume_owner_failure_unless_already_unwinding,
+    };
 
     struct PanicOnDrop;
 
@@ -452,6 +506,89 @@ mod shutdown_thread_ownership_tests {
         assert!(failure.is_some());
         assert!(tls_dropped.load(Ordering::SeqCst));
     }
+
+    #[test]
+    fn deferred_painter_release_follows_physical_producer_joins() {
+        let constellation_dropped = Arc::new(AtomicBool::new(false));
+        let tls_dropped = Arc::new(AtomicBool::new(false));
+        let painter_dropped = Arc::new(AtomicBool::new(false));
+
+        let constellation_thread_dropped = Arc::clone(&constellation_dropped);
+        let constellation = thread::spawn(move || {
+            let _sentinel = DropSentinel(constellation_thread_dropped);
+        });
+        let tls_thread_dropped = Arc::clone(&tls_dropped);
+        let tls = thread::spawn(move || {
+            let _sentinel = DropSentinel(tls_thread_dropped);
+        });
+
+        let release_observed_constellation = Arc::clone(&constellation_dropped);
+        let release_observed_tls = Arc::clone(&tls_dropped);
+        let painter_drop_observed = Arc::clone(&painter_dropped);
+        let failure = join_shutdown_threads_then_release_painters(
+            Some(constellation),
+            true,
+            Some(tls),
+            move || {
+                if !release_observed_constellation.load(Ordering::SeqCst)
+                    || !release_observed_tls.load(Ordering::SeqCst)
+                {
+                    return Err(Box::new(String::from(
+                        "a deferred Painter was released before its producer joins",
+                    )));
+                }
+                drop(DropSentinel(painter_drop_observed));
+                Ok(())
+            },
+        );
+
+        assert!(failure.is_none());
+        assert!(constellation_dropped.load(Ordering::SeqCst));
+        assert!(tls_dropped.load(Ordering::SeqCst));
+        assert!(painter_dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn deferred_painter_release_runs_after_failed_producer_join_without_replacing_primary_failure()
+    {
+        let constellation_dropped = Arc::new(AtomicBool::new(false));
+        let tls_dropped = Arc::new(AtomicBool::new(false));
+        let release_attempted = Arc::new(AtomicBool::new(false));
+
+        let constellation_thread_dropped = Arc::clone(&constellation_dropped);
+        let constellation = thread::spawn(move || {
+            let _sentinel = DropSentinel(constellation_thread_dropped);
+            std::panic::panic_any("primary producer-owner failure");
+        });
+        let tls_thread_dropped = Arc::clone(&tls_dropped);
+        let tls = thread::spawn(move || {
+            let _sentinel = DropSentinel(tls_thread_dropped);
+        });
+
+        let release_observed_constellation = Arc::clone(&constellation_dropped);
+        let release_observed_tls = Arc::clone(&tls_dropped);
+        let release_was_attempted = Arc::clone(&release_attempted);
+        let failure = join_shutdown_threads_then_release_painters(
+            Some(constellation),
+            true,
+            Some(tls),
+            move || {
+                assert!(release_observed_constellation.load(Ordering::SeqCst));
+                assert!(release_observed_tls.load(Ordering::SeqCst));
+                release_was_attempted.store(true, Ordering::SeqCst);
+                Err(Box::new(String::from("secondary Painter release failure")))
+            },
+        )
+        .expect("the primary producer-owner panic must be reported");
+
+        assert!(constellation_dropped.load(Ordering::SeqCst));
+        assert!(tls_dropped.load(Ordering::SeqCst));
+        assert!(release_attempted.load(Ordering::SeqCst));
+        assert_eq!(
+            failure.downcast_ref::<&'static str>(),
+            Some(&"primary producer-owner failure")
+        );
+    }
 }
 
 impl ServoInner {
@@ -489,13 +626,7 @@ impl ServoInner {
         );
         // Only handle incoming embedder messages if `Paint` hasn't already started shutting down.
         while let Some(message) = selector.try_recv_one_message() {
-            match message {
-                Message::FromUnknown(message) => self.handle_embedder_message(message),
-                Message::FromNet(message) => self.handle_net_embedder_message(message),
-                Message::FromConstellation(message) => {
-                    self.handle_constellation_embedder_message(message)
-                },
-            }
+            self.handle_selected_message(message);
             if self.shutdown_state.get() == ShutdownState::FinishedShuttingDown {
                 break;
             }
@@ -537,6 +668,60 @@ impl ServoInner {
         }
 
         true
+    }
+
+    fn handle_selected_message(&self, message: Message) {
+        match message {
+            Message::FromUnknown(message) => self.handle_embedder_message(message),
+            Message::FromNet(message) => self.handle_net_embedder_message(message),
+            Message::FromConstellation(message) => {
+                self.handle_constellation_embedder_message(message)
+            },
+        }
+    }
+
+    /// Block for real shutdown progress instead of polling on a timer. Disconnected auxiliary
+    /// receivers are removed from later selections; Constellation disconnection is terminal and
+    /// is classified by the subsequent owned-thread join.
+    fn wait_for_shutdown_progress(&self, open: &ShutdownReceiversOpen) -> ShutdownProgress {
+        let paint_receiver = self.paint.borrow().receiver().clone();
+        let embedder_receiver = self.embedder_receiver.clone();
+        let net_receiver = self.net_embedder_receiver.clone();
+        let constellation_receiver = self.constellation_embedder_receiver.clone();
+
+        let mut select = crossbeam_channel::Select::new();
+        let paint_index = open.paint.then(|| select.recv(&paint_receiver));
+        let embedder_index = open.embedder.then(|| select.recv(&embedder_receiver));
+        let net_index = open.net.then(|| select.recv(&net_receiver));
+        let constellation_index = select.recv(&constellation_receiver);
+
+        let operation = select.select();
+        let selected_index = operation.index();
+        if paint_index == Some(selected_index) {
+            return match operation.recv(&paint_receiver) {
+                Ok(message) => ShutdownProgress::Paint(message),
+                Err(_) => ShutdownProgress::AuxiliaryDisconnected(ShutdownAuxiliaryReceiver::Paint),
+            };
+        }
+        if embedder_index == Some(selected_index) {
+            return match operation.recv(&embedder_receiver) {
+                Ok(message) => ShutdownProgress::Message(Message::FromUnknown(message)),
+                Err(_) => {
+                    ShutdownProgress::AuxiliaryDisconnected(ShutdownAuxiliaryReceiver::Embedder)
+                },
+            };
+        }
+        if net_index == Some(selected_index) {
+            return match operation.recv(&net_receiver) {
+                Ok(message) => ShutdownProgress::Message(Message::FromNet(message)),
+                Err(_) => ShutdownProgress::AuxiliaryDisconnected(ShutdownAuxiliaryReceiver::Net),
+            };
+        }
+        debug_assert_eq!(selected_index, constellation_index);
+        match operation.recv(&constellation_receiver) {
+            Ok(message) => ShutdownProgress::Message(Message::FromConstellation(message)),
+            Err(_) => ShutdownProgress::ConstellationDisconnected,
+        }
     }
 
     fn send_new_frame_ready_messages(&self) {
@@ -1233,6 +1418,7 @@ impl Drop for ServoInner {
         self.constellation_proxy
             .send(EmbedderToConstellationMessage::Exit);
         self.shutdown_state.set(ShutdownState::ShuttingDown);
+        let mut shutdown_receivers_open = ShutdownReceiversOpen::default();
         while self.spin_event_loop() {
             if self
                 .constellation_thread
@@ -1251,14 +1437,29 @@ impl Drop for ServoInner {
                 }
                 break;
             }
-            std::thread::sleep(Duration::from_micros(500));
+            match self.wait_for_shutdown_progress(&shutdown_receivers_open) {
+                ShutdownProgress::Paint(Ok(message)) => {
+                    self.paint.borrow().handle_messages(vec![message]);
+                },
+                ShutdownProgress::Paint(Err(error)) => {
+                    warn!("Router deserialization error: {error}. Ignoring this PaintMessage.");
+                },
+                ShutdownProgress::Message(message) => self.handle_selected_message(message),
+                ShutdownProgress::AuxiliaryDisconnected(receiver) => match receiver {
+                    ShutdownAuxiliaryReceiver::Paint => shutdown_receivers_open.paint = false,
+                    ShutdownAuxiliaryReceiver::Embedder => shutdown_receivers_open.embedder = false,
+                    ShutdownAuxiliaryReceiver::Net => shutdown_receivers_open.net = false,
+                },
+                ShutdownProgress::ConstellationDisconnected => break,
+            }
         }
         let shutdown_complete_observed =
             self.shutdown_state.get() == ShutdownState::FinishedShuttingDown;
-        let first_thread_failure = join_shutdown_threads(
+        let first_thread_failure = join_shutdown_threads_then_release_painters(
             self.constellation_thread.take(),
             shutdown_complete_observed,
             self.tls_prewarm_thread.take(),
+            || self.paint.borrow_mut().release_deferred_painters(),
         );
         emit_lifecycle_phase(LifecyclePhase::ServoInnerDropBodyEnd);
 
@@ -1469,6 +1670,15 @@ impl Servo {
     ///   - Maybe update the rendered `Paint` output, but *without* swapping buffers.
     pub fn spin_event_loop(&self) {
         self.0.spin_event_loop();
+    }
+
+    /// Declare that the embedder is beginning terminal shutdown before it drops its final
+    /// [`WebView`]. This keeps the final physical WebRender owner alive until Servo has joined the
+    /// Constellation and every producer-owning subsystem. The declaration is irreversible; the
+    /// embedder must not create another WebView afterward.
+    #[doc(hidden)]
+    pub fn prepare_for_shutdown(&self) {
+        self.0.paint.borrow_mut().prepare_for_shutdown();
     }
 
     pub fn setup_logging(&self) {
