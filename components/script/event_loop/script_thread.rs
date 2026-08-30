@@ -2269,7 +2269,7 @@ impl ScriptThread {
             let fully_active = self.get_fully_active_document_ids();
             match self.receivers.recv_controlled(
                 &self.task_queue,
-                &self.timer_scheduler.borrow(),
+                &self.timer_scheduler,
                 &fully_active,
             ) {
                 ControlledMessage::Control(message) => self.admit_controlled_command(message),

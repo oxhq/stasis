@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use core::fmt;
-#[cfg(feature = "webgpu")]
 use std::cell::RefCell;
 use std::option::Option;
 use std::result::Result;
@@ -1540,7 +1539,7 @@ impl ScriptThreadReceivers {
     pub(crate) fn recv_controlled(
         &self,
         task_queue: &TaskQueue<MainThreadScriptMsg>,
-        timer_scheduler: &TimerScheduler,
+        timer_scheduler: &RefCell<TimerScheduler>,
         fully_active: &FxHashSet<PipelineId>,
     ) -> ControlledMessage {
         // A blocking wait begins a fresh event-loop intake iteration. Reset before the
@@ -1623,7 +1622,10 @@ impl ScriptThreadReceivers {
             }
         };
 
-        if let Some(deadline) = timer_scheduler.next_deadline() {
+        // Terminal handling can immediately dispatch timers. Keep this guard inside the deadline
+        // snapshot so no scheduler borrow survives into the caller's selected-message match arm.
+        let next_deadline = { timer_scheduler.borrow().next_deadline() };
+        if let Some(deadline) = next_deadline {
             select
                 .select_deadline(deadline)
                 .map(message_from_operation)
@@ -1763,12 +1765,19 @@ mod controlled_document_control_disconnect_tests {
             webgpu_receiver: RefCell::new(crossbeam_channel::never()),
         };
 
-        let message = receivers.recv_controlled(
+        let timer_scheduler = RefCell::new(TimerScheduler::default());
+        match receivers.recv_controlled(
             &task_queue,
-            &TimerScheduler::default(),
+            &timer_scheduler,
             &FxHashSet::default(),
-        );
-
-        assert!(matches!(message, ControlledMessage::DocumentControlClosed));
+        ) {
+            ControlledMessage::DocumentControlClosed => {
+                let mut timer_scheduler = timer_scheduler.try_borrow_mut().expect(
+                    "selected control-lane shutdown must release the scheduler before its terminal turn",
+                );
+                timer_scheduler.dispatch_completed_timers();
+            },
+            _ => panic!("disconnected document-control lane must be terminal"),
+        }
     }
 }
