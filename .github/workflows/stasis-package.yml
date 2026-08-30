@@ -1327,8 +1327,32 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "the Windows Stasis library-invariant gate failed with exit code $LASTEXITCODE"
           }
+          # Unify Stasis's release features into every component-test invocation. In
+          # particular, stasis-shell owns the js_jit feature used by the shipped binary;
+          # testing servo-script alone silently selects a different MozJS source-build path.
+          $featureGraphLog = Join-Path $env:RUNNER_TEMP 'stasis-windows-mozjs-feature-graph.log'
+          $featureGraphCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo tree --locked -p stasis-shell -p servo-script ' +
+            '-i mozjs_sys@140.13.0-4 -e normal --format ''{p}|{f}'' --prefix none; ' +
+            'exit $LASTEXITCODE'
+          & .\mach.ps1 exec -- pwsh -NoProfile -Command $featureGraphCommand *> $featureGraphLog
+          $featureGraphStatus = $LASTEXITCODE
+          $featureGraphLines = @(Get-Content -LiteralPath $featureGraphLog)
+          $featureGraphLines | Write-Output
+          Remove-Item -LiteralPath $featureGraphLog -Force
+          if ($featureGraphStatus -ne 0) {
+            throw "the Windows release feature-graph oracle failed with exit code $featureGraphStatus"
+          }
+          $expectedMozjsFeatures = 'mozjs_sys v140.13.0-4|intl,jit,libz-sys'
+          $mozjsFeatureLines = @($featureGraphLines | Where-Object {
+            $_ -match '^mozjs_sys v140\.13\.0-4\|'
+          })
+          if ($mozjsFeatureLines.Count -ne 1 -or
+              $mozjsFeatureLines[0] -cne $expectedMozjsFeatures) {
+            throw "the Windows component tests resolved outside the Stasis MozJS feature graph"
+          }
           $controlledImageCapacityTestCommand = '$ErrorActionPreference = ''Stop''; ' +
-            '& cargo test --locked --profile production-stripped -p servo-script --lib ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib ' +
             'pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output; ' +
             'exit $LASTEXITCODE'
           & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledImageCapacityTestCommand
@@ -1344,7 +1368,7 @@ jobs:
             throw "the Windows controlled document-control disconnect gate failed with exit code $LASTEXITCODE"
           }
           $controlledCookieContextTestCommand = '$ErrorActionPreference = ''Stop''; ' +
-            '& cargo test --locked --profile production-stripped -p servo --lib ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell -p servo --lib ' +
             'controlled_cookie_context_tests -- --test-threads=1 --show-output; ' +
             'exit $LASTEXITCODE'
           & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledCookieContextTestCommand
@@ -1352,7 +1376,7 @@ jobs:
             throw "the Windows controlled-cookie context gate failed with exit code $LASTEXITCODE"
           }
           $requestInterceptorTestCommand = '$ErrorActionPreference = ''Stop''; ' +
-            '& cargo test --locked --profile production-stripped -p servo-net --lib ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell -p servo-net --lib ' +
             'request_interceptor::tests -- --test-threads=1 --show-output; ' +
             'exit $LASTEXITCODE'
           & .\mach.ps1 exec -- pwsh -NoProfile -Command $requestInterceptorTestCommand
@@ -1360,7 +1384,7 @@ jobs:
             throw "the Windows request-interceptor provenance gate failed with exit code $LASTEXITCODE"
           }
           $controlledCookieRetrievalTestCommand = '$ErrorActionPreference = ''Stop''; ' +
-            '& cargo test --locked --profile production-stripped -p servo-net --test main ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell -p servo-net --test main ' +
             'cookie::controlled_cookie_v2_retrieval_obeys_the_samesite_matrix -- --exact ' +
             '--test-threads=1 --show-output; exit $LASTEXITCODE'
           & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledCookieRetrievalTestCommand
@@ -1368,7 +1392,7 @@ jobs:
             throw "the Windows controlled-cookie retrieval gate failed with exit code $LASTEXITCODE"
           }
           $controlledCookieStorageTestCommand = '$ErrorActionPreference = ''Stop''; ' +
-            '& cargo test --locked --profile production-stripped -p servo-net --test main ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell -p servo-net --test main ' +
             'cookie::controlled_cookie_v2_storage_obeys_the_samesite_matrix -- --exact ' +
             '--test-threads=1 --show-output; exit $LASTEXITCODE'
           & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledCookieStorageTestCommand
@@ -1376,7 +1400,7 @@ jobs:
             throw "the Windows controlled-cookie storage gate failed with exit code $LASTEXITCODE"
           }
           $controlledNavigationLoadDataTestCommand = '$ErrorActionPreference = ''Stop''; ' +
-            '& cargo test --locked --profile production-stripped -p servo-constellation --lib ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell -p servo-constellation --lib ' +
             'controlled_session_navigation_load_data_tests -- --test-threads=1 --show-output; ' +
             'exit $LASTEXITCODE'
           & .\mach.ps1 exec -- pwsh -NoProfile -Command $controlledNavigationLoadDataTestCommand
