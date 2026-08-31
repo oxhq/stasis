@@ -5953,10 +5953,73 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "credential-free package workflow must run the complete Stasis library invariant suite "
             "once in the macOS/Linux native matrix"
         )
+    windows_cargo_test_gate_runner = (
+        "            & .\\mach.ps1 exec -- pwsh -NoProfile -Command $Command *> $log\n"
+        "            $status = $LASTEXITCODE\n"
+        "            $lines = @(Get-Content -LiteralPath $log)\n"
+        "            $lines | Write-Output\n"
+        "            if ($status -ne 0) {\n"
+        "              throw \"the Windows $Name gate failed with exit code $status\"\n"
+        "            }\n"
+    )
+    if public_release_workflow.count(windows_cargo_test_gate_runner) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must run the shared Windows invariant gate through "
+            "mach.ps1 and reject its nonzero status"
+        )
+    windows_cargo_test_gate_positive_summary = (
+        "              $positiveSummaryCount = @($lines | Where-Object {\n"
+        "                $_ -match '^test result: ok\\. [1-9][0-9]* passed; 0 failed;'\n"
+        "              }).Count\n"
+        "              if ($positiveSummaryCount -lt 1) {\n"
+        "                throw \"the Windows $Name gate emitted no positive passing summary\"\n"
+        "              }\n"
+    )
+    if public_release_workflow.count(windows_cargo_test_gate_positive_summary) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must reject an empty successful Windows invariant gate"
+        )
+    windows_cargo_test_gate_invocations = (
+        ("stasis-library-invariants", "stasisLibTestCommand"),
+        ("controlled-image-capacity", "controlledImageCapacityTestCommand"),
+        (
+            "controlled-document-control-disconnect",
+            "controlledDocumentControlDisconnectTestCommand",
+        ),
+        ("controlled-cookie-context", "controlledCookieContextTestCommand"),
+        ("request-interceptor-provenance", "requestInterceptorTestCommand"),
+        ("controlled-cookie-retrieval", "controlledCookieRetrievalTestCommand"),
+        ("controlled-cookie-storage", "controlledCookieStorageTestCommand"),
+        (
+            "controlled-session-navigation-load-data",
+            "controlledNavigationLoadDataTestCommand",
+        ),
+    )
+    for gate_name, command_name in windows_cargo_test_gate_invocations:
+        if public_release_workflow.count(f"${command_name}") != 2:
+            raise ReleaseError(
+                "credential-free package workflow must use each Windows invariant command variable "
+                "exactly once as its definition and once as its shared-gate argument"
+            )
+        invocation = (
+            f"          Invoke-WindowsCargoTestGate -Name '{gate_name}' `\n"
+            f"            -Command ${command_name}"
+        )
+        if public_release_workflow.count(invocation) != 1:
+            raise ReleaseError(
+                "credential-free package workflow must route each named Windows invariant command "
+                "exactly once through the shared gate"
+            )
+    if public_release_workflow.count("Invoke-WindowsCargoTestGate") != (
+        len(windows_cargo_test_gate_invocations) + 1
+    ):
+        raise ReleaseError(
+            "credential-free package workflow must contain exactly the shared Windows invariant "
+            "gate definition and its named invocations"
+        )
     windows_stasis_lib_gate = (
         "& cargo test --locked --profile production-stripped -p stasis-shell --lib ' +\n"
         "            '-- --test-threads=1 --show-output; exit $LASTEXITCODE'\n"
-        "          & .\\mach.ps1 exec -- pwsh -NoProfile -Command $stasisLibTestCommand"
     )
     if public_release_workflow.count(windows_stasis_lib_gate) != 1:
         raise ReleaseError(
@@ -5979,20 +6042,27 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "once in the macOS/Linux native matrix"
         )
     windows_controlled_image_capacity_gate = (
-        "& cargo test --locked --profile production-stripped -p servo-script --lib ' +\n"
+        "& cargo test --locked --profile production-stripped -p stasis-shell "
+        "-p servo-script --lib ' +\n"
         "            'pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output; ' +\n"
         "            'exit $LASTEXITCODE'\n"
-        "          & .\\mach.ps1 exec -- pwsh -NoProfile -Command $controlledImageCapacityTestCommand"
     )
     if public_release_workflow.count(windows_controlled_image_capacity_gate) != 1:
         raise ReleaseError(
             "credential-free package workflow must run the controlled image capacity invariants "
             "once through mach.ps1 on Windows"
         )
-    if public_release_workflow.count("pending_nonanimated_image_observation_tests") != 2:
+    windows_controlled_image_capacity_result_gate = (
+        "          Invoke-WindowsCargoTestGate -Name 'controlled-image-capacity' `\n"
+        "            -Command $controlledImageCapacityTestCommand `\n"
+        "            -ExpectedPassCount 17 `\n"
+        "            -ExpectedRecordPattern '^test .*pending_nonanimated_image_observation_tests::"
+        ".* \\.\\.\\. ok$'\n"
+    )
+    if public_release_workflow.count(windows_controlled_image_capacity_result_gate) != 1:
         raise ReleaseError(
-            "credential-free package workflow must retain exactly the native-matrix and Windows "
-            "controlled image capacity invocations"
+            "credential-free package workflow must require the exact 17-test Windows controlled "
+            "image capacity result"
         )
     posix_document_control_disconnect_gate = (
         "          cargo test --locked --profile production-stripped -p stasis-shell "
@@ -6010,18 +6080,25 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "            'controlled_document_control_disconnect_tests -- --test-threads=1 "
         "--show-output; ' +\n"
         "            'exit $LASTEXITCODE'\n"
-        "          & .\\mach.ps1 exec -- pwsh -NoProfile -Command "
-        "$controlledDocumentControlDisconnectTestCommand"
     )
     if public_release_workflow.count(windows_document_control_disconnect_gate) != 1:
         raise ReleaseError(
             "credential-free package workflow must run the controlled document-control "
             "disconnect regression once through mach.ps1 on Windows"
         )
-    if public_release_workflow.count("controlled_document_control_disconnect_tests") != 2:
+    windows_document_control_disconnect_result_gate = (
+        "          Invoke-WindowsCargoTestGate -Name "
+        "'controlled-document-control-disconnect' `\n"
+        "            -Command $controlledDocumentControlDisconnectTestCommand `\n"
+        "            -ExpectedPassCount 1 `\n"
+        "            -ExpectedRecordPattern '^test "
+        "messaging::controlled_document_control_disconnect_tests::"
+        "disconnected_selected_control_lane_is_terminal \\.\\.\\. ok$'\n"
+    )
+    if public_release_workflow.count(windows_document_control_disconnect_result_gate) != 1:
         raise ReleaseError(
-            "credential-free package workflow must retain exactly the native-matrix and Windows "
-            "controlled document-control disconnect regression invocations"
+            "credential-free package workflow must require the exact one-test Windows controlled "
+            "document-control disconnect result"
         )
     posix_release_graph_component_gates = (
         "          cargo test --locked --profile production-stripped -p stasis-shell "
@@ -7306,6 +7383,28 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
+            "            & .\\mach.ps1 exec -- pwsh -NoProfile -Command $Command *> $log\n"
+            "            $status = $LASTEXITCODE\n",
+            "            & pwsh -NoProfile -Command $Command *> $log\n"
+            "            $status = $LASTEXITCODE\n",
+            "Windows shared invariant gate mach runner",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          Invoke-WindowsCargoTestGate -Name 'stasis-library-invariants' `\n"
+            "            -Command $stasisLibTestCommand",
+            "          Invoke-WindowsCargoTestGate -Name 'stasis-library-invariants' `\n"
+            "            -Command $controlledImageCapacityTestCommand",
+            "Windows named invariant command routing",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "$_ -match '^test result: ok\\. [1-9][0-9]* passed; 0 failed;'",
+            "$_ -match '^test result: ok\\. [0-9]+ passed; 0 failed;'",
+            "Windows positive invariant summary requirement",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
             "          cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output\n",
             "          cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib unrelated_tests -- --test-threads=1 --show-output\n",
             "macOS and Linux controlled image capacity invariant gate",
@@ -7324,9 +7423,9 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
-            "& cargo test --locked --profile production-stripped -p servo-script --lib ' +\n"
+            "& cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib ' +\n"
             "            'pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output; ' +",
-            "& cargo test --locked --profile production-stripped -p servo-script --lib ' +\n"
+            "& cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib ' +\n"
             "            'unrelated_tests -- --test-threads=1 --show-output; ' +",
             "Windows controlled image capacity invariant gate",
         )
@@ -7337,6 +7436,34 @@ def self_test() -> None:
             "& cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib ' +\n"
             "            'unrelated_disconnect_tests -- --test-threads=1 --show-output; ' +",
             "Windows controlled document-control disconnect regression gate",
+        )
+        disconnect_invocation = (
+            "          Invoke-WindowsCargoTestGate -Name "
+            "'controlled-document-control-disconnect' `\n"
+            "            -Command $controlledDocumentControlDisconnectTestCommand `\n"
+            "            -ExpectedPassCount 1 `\n"
+            "            -ExpectedRecordPattern '^test "
+            "messaging::controlled_document_control_disconnect_tests::"
+            "disconnected_selected_control_lane_is_terminal \\.\\.\\. ok$'"
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            disconnect_invocation,
+            "          # controlled document-control disconnect invocation removed",
+            "missing Windows controlled document-control disconnect invocation",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            disconnect_invocation,
+            "          & .\\mach.ps1 exec -- pwsh -NoProfile -Command "
+            "$controlledDocumentControlDisconnectTestCommand",
+            "direct Windows controlled document-control disconnect invocation bypass",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            disconnect_invocation,
+            f"{disconnect_invocation}\n{disconnect_invocation}",
+            "duplicate Windows controlled document-control disconnect invocation",
         )
         require_public_marker_mutation_rejected(
             CONTROLLED_PROFILE_WIRE_SOURCE,

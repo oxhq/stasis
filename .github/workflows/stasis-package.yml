@@ -1405,7 +1405,9 @@ jobs:
             'controlled_document_control_disconnect_tests -- --test-threads=1 --show-output; ' +
             'exit $LASTEXITCODE'
           Invoke-WindowsCargoTestGate -Name 'controlled-document-control-disconnect' `
-            -Command $controlledDocumentControlDisconnectTestCommand
+            -Command $controlledDocumentControlDisconnectTestCommand `
+            -ExpectedPassCount 1 `
+            -ExpectedRecordPattern '^test messaging::controlled_document_control_disconnect_tests::disconnected_selected_control_lane_is_terminal \.\.\. ok$'
           $controlledCookieContextTestCommand = '$ErrorActionPreference = ''Stop''; ' +
             '& cargo test --locked --profile production-stripped -p stasis-shell -p servo --lib ' +
             'controlled_cookie_context_tests -- --test-threads=1 --show-output; ' +
