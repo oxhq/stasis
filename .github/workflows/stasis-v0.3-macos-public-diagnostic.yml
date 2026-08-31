@@ -1,0 +1,238 @@
+name: Diagnostic only - Stasis v0.3.0 macOS public verifier
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: stasis-v0.3-macos-public-diagnostic
+  cancel-in-progress: false
+
+env:
+  DIAGNOSTIC_SAMPLE_COUNT: "20"
+  EXACT_ARCHIVE_SHA256: 7a3a16c78670b31e1610fe49f8c5f49041054433db21dde201eca9164b90fbea
+  EXACT_BINARY_SHA256: 5ffe929adee3f6c4b113ab4f9763ec2d9e1e85539e3dbd3cc7274f23961a9591
+  EXACT_NPM_INTEGRITY: sha512-I6Sfsh669FmJHas5ALAMGy2AzTtfZJwOAmTW+TtsT5qksOhaj5eRLs4HOQAW2nXsD9qtoopS6x8pa91s6jjhdA==
+  EXACT_NPM_SHA256: fc54afe844ab72e0c6b04876c4858762d5f0f58ad4fb2565cec2a8277e3b3d85
+  EXACT_RELEASE_REVISION: d4d5d1a99f5b95fd921632852deebe7b10aba147
+  EXACT_RELEASE_TAG: v0.3.0
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+
+jobs:
+  diagnose:
+    name: DIAGNOSTIC ONLY - fixed macOS sample census
+    runs-on: macos-15
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Reject non-main diagnostic control
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'oxhq/stasis'
+          test "$GITHUB_REF" = 'refs/heads/main'
+          test "$GITHUB_REF_TYPE" = 'branch'
+          test "$GITHUB_REF_NAME" = 'main'
+
+      - name: Check out current-main diagnostic control
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+          path: diagnostic-control
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Check out immutable v0.3.0 source separately
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+          path: release-source
+          persist-credentials: false
+          ref: v0.3.0
+
+      - name: Verify native diagnostic host and bounded workspace capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = 'Darwin'
+          test "$(uname -m)" = 'arm64'
+          test "$(sysctl -n hw.optional.arm64)" = '1'
+          bash release-source/etc/ci/stasis/prepare_macos_runner.sh check 4194304
+
+      - name: Set up Node without publication credentials
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Bind immutable tag, release assets, and public npm bytes
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$GITHUB_WORKSPACE/diagnostic-evidence"
+          release_root="$RUNNER_TEMP/stasis-v03-release"
+          registry_root="$RUNNER_TEMP/stasis-v03-registry"
+          mkdir -p "$evidence" "$release_root" "$registry_root"
+          test "$(git -C diagnostic-control rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C release-source rev-parse HEAD)" = "$EXACT_RELEASE_REVISION"
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$EXACT_RELEASE_TAG" > "$evidence/tag-ref.json"
+          jq -e --arg revision "$EXACT_RELEASE_REVISION" '
+            .object.type == "commit" and .object.sha == $revision
+          ' "$evidence/tag-ref.json" > /dev/null
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$EXACT_RELEASE_TAG" > "$evidence/release.json"
+          jq -e --arg revision "$EXACT_RELEASE_REVISION" '
+            .tag_name == "v0.3.0"
+            and .draft == false
+            and .prerelease == false
+            and .immutable == true
+            and .target_commitish == $revision
+          ' "$evidence/release.json" > /dev/null
+          gh release download "$EXACT_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --dir "$release_root" \
+            --pattern 'stasis-0.3.0-macos-aarch64.tar.gz' \
+            --pattern 'stasis-0.3.0-macos-aarch64.tar.gz.sha256' \
+            --pattern 'stasis-0.3.0-macos-aarch64.binary.sha256'
+          archive="$release_root/stasis-0.3.0-macos-aarch64.tar.gz"
+          test "$(shasum -a 256 "$archive" | awk '{print $1}')" = "$EXACT_ARCHIVE_SHA256"
+          grep -Fx "$EXACT_ARCHIVE_SHA256  stasis-0.3.0-macos-aarch64.tar.gz" \
+            "$archive.sha256"
+          tar -xzf "$archive" -C "$release_root"
+          binary="$release_root/stasis-0.3.0-macos-aarch64/stasis"
+          test -x "$binary"
+          test "$(shasum -a 256 "$binary" | awk '{print $1}')" = "$EXACT_BINARY_SHA256"
+          grep -Fx "$EXACT_BINARY_SHA256  stasis-0.3.0-macos-aarch64/stasis" \
+            "$release_root/stasis-0.3.0-macos-aarch64.binary.sha256"
+          (
+            unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_TOKEN
+            npm install --global npm@11.19.0 --registry="$NPM_CONFIG_REGISTRY"
+            test "$(npm --version)" = '11.19.0'
+            npm pack '@oxhq/stasis@0.3.0' --ignore-scripts \
+              --pack-destination "$registry_root" --registry="$NPM_CONFIG_REGISTRY"
+          )
+          npm_tarball="$registry_root/oxhq-stasis-0.3.0.tgz"
+          test "$(shasum -a 256 "$npm_tarball" | awk '{print $1}')" = "$EXACT_NPM_SHA256"
+          npm_integrity=$(node -e '
+            const crypto = require("node:crypto");
+            const fs = require("node:fs");
+            process.stdout.write("sha512-" + crypto.createHash("sha512")
+              .update(fs.readFileSync(process.argv[1])).digest("base64"));
+          ' "$npm_tarball")
+          test "$npm_integrity" = "$EXACT_NPM_INTEGRITY"
+          cp "$npm_tarball" "$evidence/oxhq-stasis-0.3.0.tgz"
+          jq -n \
+            --arg schema 'stasis-v0.3-macos-public-diagnostic-identity-v1' \
+            --arg harnessRevision "$GITHUB_SHA" \
+            --arg releaseRevision "$EXACT_RELEASE_REVISION" \
+            --arg archiveSha256 "$EXACT_ARCHIVE_SHA256" \
+            --arg binarySha256 "$EXACT_BINARY_SHA256" \
+            --arg npmSha256 "$EXACT_NPM_SHA256" \
+            --arg npmIntegrity "$EXACT_NPM_INTEGRITY" \
+            --argjson sampleCount "$DIAGNOSTIC_SAMPLE_COUNT" \
+            '{schema: $schema, diagnosticHarnessRevision: $harnessRevision,
+              releaseRevision: $releaseRevision, archiveSha256: $archiveSha256,
+              binarySha256: $binarySha256, npmSha256: $npmSha256,
+              npmIntegrity: $npmIntegrity, sampleCount: $sampleCount,
+              releaseGateAuthority: false}' > "$evidence/identity.json"
+          {
+            echo "binary=$binary"
+            echo "evidence=$evidence"
+            echo "npm_tarball=$npm_tarball"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create a diagnostic copy of only the exact tagged verifier
+        id: instrument
+        shell: bash
+        run: |
+          set -euo pipefail
+          verifier="$RUNNER_TEMP/verify_registry_sdk.v03-diagnostic.mjs"
+          node diagnostic-control/etc/ci/stasis/instrument_v03_registry_diagnostic.mjs \
+            --input release-source/etc/ci/stasis/verify_registry_sdk.mjs \
+            --output "$verifier" \
+            | tee "${{ steps.identity.outputs.evidence }}/transform.json"
+          node --check "$verifier"
+          echo "verifier=$verifier" >> "$GITHUB_OUTPUT"
+
+      - name: Run the predeclared diagnostic sample census
+        shell: bash
+        env:
+          BINARY: ${{ steps.identity.outputs.binary }}
+          EVIDENCE: ${{ steps.identity.outputs.evidence }}
+          NPM_TARBALL: ${{ steps.identity.outputs.npm_tarball }}
+          VERIFIER: ${{ steps.instrument.outputs.verifier }}
+        run: |
+          set -euo pipefail
+          for sample in $(seq 1 "$DIAGNOSTIC_SAMPLE_COUNT"); do
+            sample_id=$(printf '%03d' "$sample")
+            consumer="$RUNNER_TEMP/stasis-v03-consumer-$sample_id"
+            log="$EVIDENCE/sample-$sample_id.log"
+            mkdir "$consumer"
+            set +e
+            (
+              unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_TOKEN
+              cd "$consumer"
+              npm init --yes > /dev/null
+              npm install --ignore-scripts "$NPM_TARBALL" \
+                --registry="$NPM_CONFIG_REGISTRY" > /dev/null
+              cd "$GITHUB_WORKSPACE/release-source"
+              STASIS_V03_DIAGNOSTIC_SAMPLE="$sample" node "$VERIFIER" \
+                --binary "$BINARY" \
+                --fixture ports/stasis/tests/fixtures/timer_10s.html \
+                --session-v2-fixture ports/stasis/tests/fixtures/message_channel_buffered.html \
+                --session-v2-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_data_svg.html \
+                --session-v2-http-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_http.html \
+                --session-v2-inline-svg-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg.html \
+                --session-v2-inline-svg-shared-pending-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg_shared_pending.html \
+                --session-v2-settlement-url-fixture ports/stasis/tests/fixtures/controlled_v2_settlement_url.html \
+                --session-v2-interval-before-finite-fixture ports/stasis/tests/fixtures/controlled_v2_interval_before_finite.html \
+                --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
+                --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
+                --session-v2-css-animation-event-fixture ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html \
+                --session-v2-cookie-fixture sdk/typescript/test/fixtures/controlled-v2-cookie-login.html \
+                --consumer-root "$consumer" \
+                --package "$NPM_TARBALL" \
+                --revision "$EXACT_RELEASE_REVISION" \
+                --version '0.3.0'
+            ) > "$log" 2>&1
+            status=$?
+            set -e
+            printf '%s\n' "$status" > "$EVIDENCE/sample-$sample_id.status"
+            printf 'diagnostic sample %s/%s exit=%s\n' \
+              "$sample" "$DIAGNOSTIC_SAMPLE_COUNT" "$status"
+          done
+          test "$(git -C release-source rev-parse HEAD)" = "$EXACT_RELEASE_REVISION"
+          test "$(shasum -a 256 "$BINARY" | awk '{print $1}')" = "$EXACT_BINARY_SHA256"
+          test "$(shasum -a 256 "$NPM_TARBALL" | awk '{print $1}')" = "$EXACT_NPM_SHA256"
+
+      - name: Summarize diagnostic-only phase evidence
+        if: always()
+        shell: bash
+        env:
+          EVIDENCE: ${{ steps.identity.outputs.evidence }}
+        run: |
+          set -euo pipefail
+          test -d "$EVIDENCE"
+          node diagnostic-control/etc/ci/stasis/summarize_v03_registry_diagnostic.mjs \
+            --directory "$EVIDENCE" \
+            --samples "$DIAGNOSTIC_SAMPLE_COUNT" \
+            | tee "$EVIDENCE/summary.json"
+
+      - name: Preserve diagnostic-only evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stasis-v0.3.0-macos-public-diagnostic-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: diagnostic-evidence
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Refuse release-gate semantics
+        if: always()
+        shell: bash
+        run: |
+          echo 'DIAGNOSTIC_ONLY: this workflow can never satisfy a release gate.' >&2
+          exit 1
