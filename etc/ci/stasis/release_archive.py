@@ -1739,6 +1739,7 @@ def verify_controlled_css_animation_event_timestamp_source(
             'include_bytes!("fixtures/controlled_v2_css_animation_event_timestamp.html")',
             "fn controlled_session_v2_css_animation_events_use_owned_dispatch_time()",
             '"armed:5|animationstart:trusted:20:20:owned>animationend:trusted:20:20:owned"',
+            '"armed:20|animationstart:trusted:70:70>animationcancel:trusted:90:90"',
             'exercise_css_animation_event_profile("controlled-web-session-v1"',
             "None",
             "fn controlled_session_v2_drains_animation_events_queued_after_reflow()",
@@ -1748,6 +1749,14 @@ def verify_controlled_css_animation_event_timestamp_source(
             '"armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70"',
             "fn controlled_session_v2_script_created_animation_and_transition_events_remain_host_stamped()",
             "fn exercise_css_animation_event_profile(",
+            'settled["result"]["virtualTimeNs"], "20000000"',
+            'post_reflow_settled["result"]["virtualTimeNs"], "90000000"',
+            'post_reflow_settled["result"]["snapshot"]["rendering"]',
+            '.get("nextOpportunityNs")',
+            'post_reflow_settled["result"]["processed"]["renderingOpportunities"], "5"',
+            'post_reflow_pending["result"]["virtualTimeNs"], "90000000"',
+            'post_reflow_pending["result"]["rendering"]["pendingAnimationEvents"], "0"',
+            '.get("nextOpportunityNs")',
             '"timeSurface": "host_timestamp"',
             "fn exercise_script_created_css_event_timestamp_boundary()",
             '"armed:-1|script:0,0"',
@@ -3927,8 +3936,8 @@ def credential_free_v2_css_verifier_block(source: str, description: str) -> str:
         description,
         (
             '"postReflowOutcome": "quiescent"',
-            '"postReflowVirtualTimeNs": "70000000"',
-            '"postReflowTrace": "armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70"',
+            '"postReflowVirtualTimeNs": "90000000"',
+            '"postReflowTrace": "armed:20|animationstart:trusted:70:70>animationcancel:trusted:90:90"',
             '"postReflowEventCount": "2"',
             '"postReflowEventKinds": "animationcancel,animationstart"',
             '"postReflowRuntimeFailures": "0"',
@@ -4107,23 +4116,31 @@ def verify_registry_sdk_durable_v2_fixture_source(source: str) -> None:
     require_source_fragments_in_order(
         source,
         (
+            "const v2CssPostReflowSessionBaselineVirtualTimeNs = v2CssSettled.virtualTimeNs",
+            "assert.equal(v2CssPostReflowSessionBaselineVirtualTimeNs, 20_000_000n)",
             'const v2CssPostReflowStarted = await v2CssSession.activate(',
             '"#post-reflow"',
             "const v2CssPostReflowSettled = await v2CssSession.settle(",
             'assert.equal(v2CssPostReflowSettled.outcome, "quiescent")',
-            "assert.equal(v2CssPostReflowSettled.virtualTimeNs, 70_000_000n)",
+            "const v2CssPostReflowElapsedVirtualTimeNs =",
+            "v2CssPostReflowSettled.virtualTimeNs - v2CssPostReflowSessionBaselineVirtualTimeNs",
+            "assert.equal(v2CssPostReflowElapsedVirtualTimeNs, 70_000_000n)",
+            "assert.equal(v2CssPostReflowSettled.virtualTimeNs, 90_000_000n)",
             "v2CssPostReflowSettled.snapshot.rendering.pendingAnimationEvents, 0n",
-            "v2CssPostReflowSettled.snapshot.rendering.nextOpportunityNs, null",
+            "v2CssPostReflowSettled.snapshot.rendering.nextOpportunityNs, undefined",
             "const v2CssPostReflowPending = await v2CssSession.pending(",
+            "v2CssPostReflowPending.virtualTimeNs",
+            "v2CssPostReflowSettled.virtualTimeNs",
             "v2CssPostReflowPending.rendering.pendingAnimationEvents, 0n",
-            "v2CssPostReflowPending.rendering.nextOpportunityNs, null",
+            "v2CssPostReflowPending.rendering.nextOpportunityNs, undefined",
             "v2CssPostReflowPending.stateToken",
             "v2CssPostReflowSettled.stateToken",
             '"#post-reflow-result"',
-            '"armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70"',
+            '"armed:20|animationstart:trusted:70:70>animationcancel:trusted:90:90"',
             'postReflowTrace: v2CssPostReflowTraceResult.value',
             'postReflowPendingAnimationEvents: String(',
             'postReflowNextOpportunityNs:',
+            "v2CssPostReflowPending.rendering.nextOpportunityNs === undefined",
             'postReflowProcessedRenderingOpportunities: String(',
             'postReflowStateTokenPreserved:',
             'postReflowOwnedQueueDrain: true',
@@ -7338,9 +7355,21 @@ def self_test() -> None:
             ),
             (
                 PUBLIC_RELEASE_WORKFLOW,
-                '"postReflowTrace": "armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70"',
-                '"postReflowTrace": "armed:5|animationstart:trusted:50:50"',
+                '"postReflowTrace": "armed:20|animationstart:trusted:70:70>animationcancel:trusted:90:90"',
+                '"postReflowTrace": "armed:20|animationstart:trusted:70:70"',
                 "package attestation post-reflow CSS exact trace",
+            ),
+            (
+                REGISTRY_SDK_VERIFIER_SOURCE,
+                "assert.equal(v2CssPostReflowSessionBaselineVirtualTimeNs, 20_000_000n)",
+                "assert.equal(v2CssPostReflowSessionBaselineVirtualTimeNs, 5_000_000n)",
+                "packed SDK post-reflow CSS same-session baseline",
+            ),
+            (
+                REGISTRY_SDK_VERIFIER_SOURCE,
+                "v2CssPostReflowPending.rendering.nextOpportunityNs === undefined",
+                "v2CssPostReflowPending.rendering.nextOpportunityNs === null",
+                "packed SDK post-reflow CSS omitted opportunity encoding",
             ),
             (
                 PUBLIC_STASIS_BOUNDARY,
@@ -8947,6 +8976,28 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             encoding="utf-8",
         )
         require_candidate_mutation_rejected("native post-reflow CSS queue-drain proof")
+
+        reset_candidate_authority_sources()
+        css_protocol_filename = candidate_profile_root / MESSAGE_CHANNEL_BASELINE_TEST_SOURCE
+        css_protocol_source = css_protocol_filename.read_text(encoding="utf-8")
+        same_session_post_reflow_trace = (
+            "armed:20|animationstart:trusted:70:70>animationcancel:trusted:90:90"
+        )
+        if css_protocol_source.count(same_session_post_reflow_trace) != 1:
+            raise ReleaseError(
+                "self-test cannot uniquely locate native same-session post-reflow CSS trace"
+            )
+        css_protocol_filename.write_text(
+            css_protocol_source.replace(
+                same_session_post_reflow_trace,
+                "armed:20|animationstart:trusted:70:70",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        require_candidate_mutation_rejected(
+            "native same-session post-reflow CSS clock-composition proof"
+        )
 
         reset_candidate_authority_sources()
         css_fixture_filename = candidate_profile_root / CONTROLLED_CSS_ANIMATION_EVENT_FIXTURE

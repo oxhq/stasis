@@ -3419,12 +3419,17 @@ fn controlled_session_v2_form_automation_events_share_the_advanced_document_time
 
 #[test]
 fn controlled_session_v2_css_animation_events_use_owned_dispatch_time() {
-    let trace =
+    let (trace, same_session_post_reflow_trace) =
         exercise_css_animation_event_profile("controlled-web-session-v2", "css-events-v2", true)
             .expect("v2 CSS events must produce an owned trace");
     assert_eq!(
         trace, "armed:5|animationstart:trusted:20:20:owned>animationend:trusted:20:20:owned",
         "the RWA-proven internal animation events must use the owned dispatch batch time",
+    );
+    assert_eq!(
+        same_session_post_reflow_trace,
+        "armed:20|animationstart:trusted:70:70>animationcancel:trusted:90:90",
+        "the post-reflow proof must retain the same-session clock advanced by the first CSS case",
     );
 
     assert_eq!(
@@ -6368,7 +6373,7 @@ fn exercise_css_animation_event_profile(
     profile: &str,
     case_id: &str,
     expect_owned: bool,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let url = format!("https://controlled-css-{case_id}.example.test/");
     let mut child = Command::new(env!("CARGO_BIN_EXE_stasis"))
         .stdin(Stdio::piped())
@@ -6458,6 +6463,10 @@ fn exercise_css_animation_event_profile(
     let trace = if expect_owned {
         assert_eq!(settled["result"]["outcome"], "quiescent", "{settled:#}");
         assert_eq!(
+            settled["result"]["virtualTimeNs"], "20000000",
+            "the first CSS proof must establish the later same-session baseline: {settled:#}",
+        );
+        assert_eq!(
             settled["result"]["unsupportedWork"],
             json!([]),
             "{settled:#}"
@@ -6472,12 +6481,96 @@ fn exercise_css_animation_event_profile(
                 "expectedStateToken": state_token(&settled, "settled CSS events"),
             }),
         );
-        Some(
-            text["result"]["value"]
-                .as_str()
-                .expect("CSS event trace must be text")
-                .to_owned(),
-        )
+        let controlled_trace = text["result"]["value"]
+            .as_str()
+            .expect("CSS event trace must be text")
+            .to_owned();
+
+        let (_, post_reflow_action_token) = call_controlled_action(
+            &mut input,
+            &responses,
+            &format!("post-reflow-{case_id}"),
+            "action.activate",
+            json!({"selector": "#post-reflow"}),
+            &state_token(&text, "inspected first CSS event trace"),
+        );
+        let post_reflow_settled = call_session(
+            &mut input,
+            &responses,
+            &format!("settle-post-reflow-{case_id}"),
+            "runtime.settle",
+            json!({"expectedStateToken": post_reflow_action_token}),
+        );
+        assert_eq!(
+            post_reflow_settled["result"]["outcome"], "quiescent",
+            "{post_reflow_settled:#}",
+        );
+        assert_eq!(
+            post_reflow_settled["result"]["virtualTimeNs"], "90000000",
+            "the post-reflow proof must add 70 ms to the 20 ms same-session baseline: {post_reflow_settled:#}",
+        );
+        assert_eq!(
+            post_reflow_settled["result"]["snapshot"]["rendering"]["pendingAnimationEvents"],
+            "0",
+            "the same-session post-reflow event queue must drain: {post_reflow_settled:#}",
+        );
+        assert!(
+            post_reflow_settled["result"]["snapshot"]["rendering"]
+                .get("nextOpportunityNs")
+                .is_none(),
+            "the same-session post-reflow settle must not retain an opportunity: {post_reflow_settled:#}",
+        );
+        assert_eq!(
+            post_reflow_settled["result"]["processed"]["renderingOpportunities"], "5",
+            "the same-session post-reflow proof must process its exact five rendering opportunities: {post_reflow_settled:#}",
+        );
+        let post_reflow_pending = call_session(
+            &mut input,
+            &responses,
+            &format!("pending-post-reflow-{case_id}"),
+            "runtime.pending",
+            json!({}),
+        );
+        assert_eq!(
+            post_reflow_pending["result"]["virtualTimeNs"], "90000000",
+            "passive pending observation changed the same-session CSS clock: {post_reflow_pending:#}",
+        );
+        assert_eq!(
+            post_reflow_pending["result"]["rendering"]["pendingAnimationEvents"], "0",
+            "passive pending observation found same-session CSS event work: {post_reflow_pending:#}",
+        );
+        assert!(
+            post_reflow_pending["result"]["rendering"]
+                .get("nextOpportunityNs")
+                .is_none(),
+            "passive pending observation found a same-session CSS opportunity: {post_reflow_pending:#}",
+        );
+        assert_eq!(
+            state_token(
+                &post_reflow_pending,
+                "same-session post-reflow pending observation"
+            ),
+            state_token(&post_reflow_settled, "same-session post-reflow settlement"),
+            "passive pending observation changed the same-session post-reflow authority",
+        );
+        let post_reflow_text = call_session(
+            &mut input,
+            &responses,
+            &format!("text-post-reflow-{case_id}"),
+            "dom.text",
+            json!({
+                "selector": "#post-reflow-result",
+                "expectedStateToken": state_token(
+                    &post_reflow_settled,
+                    "same-session post-reflow settlement",
+                ),
+            }),
+        );
+        let post_reflow_trace = post_reflow_text["result"]["value"]
+            .as_str()
+            .expect("same-session post-reflow CSS trace must be text")
+            .to_owned();
+        Some((controlled_trace, post_reflow_trace))
     } else {
         assert_eq!(
             settled["result"]["outcome"], "unsupported_work",

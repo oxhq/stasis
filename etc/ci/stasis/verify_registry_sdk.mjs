@@ -2078,6 +2078,8 @@ try {
   const v2CssEvidence = v2CssSession.settlementEvidence(v2CssSettled);
   assert.equal(v2CssEvidence.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
 
+  const v2CssPostReflowSessionBaselineVirtualTimeNs = v2CssSettled.virtualTimeNs;
+  assert.equal(v2CssPostReflowSessionBaselineVirtualTimeNs, 20_000_000n);
   const v2CssPostReflowStarted = await v2CssSession.activate(
     "#post-reflow",
     v2CssControlledTraceResult.stateToken,
@@ -2089,17 +2091,23 @@ try {
     commandDeadline(),
   );
   assert.equal(v2CssPostReflowSettled.outcome, "quiescent");
-  assert.equal(v2CssPostReflowSettled.virtualTimeNs, 70_000_000n);
+  const v2CssPostReflowElapsedVirtualTimeNs =
+    v2CssPostReflowSettled.virtualTimeNs - v2CssPostReflowSessionBaselineVirtualTimeNs;
+  assert.equal(v2CssPostReflowElapsedVirtualTimeNs, 70_000_000n);
+  assert.equal(v2CssPostReflowSettled.virtualTimeNs, 90_000_000n);
   assert.deepEqual(v2CssPostReflowSettled.unsupportedWork, []);
   assert.deepEqual(v2CssPostReflowSettled.externalIo, []);
   assert.deepEqual(v2CssPostReflowSettled.snapshot.runtimeFailures, []);
   assert.equal(v2CssPostReflowSettled.snapshot.rendering.pendingAnimationEvents, 0n);
-  assert.equal(v2CssPostReflowSettled.snapshot.rendering.nextOpportunityNs, null);
+  assert.equal(v2CssPostReflowSettled.snapshot.rendering.nextOpportunityNs, undefined);
   assert.ok(v2CssPostReflowSettled.processed.renderingOpportunities > 0n);
   const v2CssPostReflowPending = await v2CssSession.pending(commandDeadline());
-  assert.equal(v2CssPostReflowPending.virtualTimeNs, 70_000_000n);
+  assert.equal(
+    v2CssPostReflowPending.virtualTimeNs,
+    v2CssPostReflowSettled.virtualTimeNs,
+  );
   assert.equal(v2CssPostReflowPending.rendering.pendingAnimationEvents, 0n);
-  assert.equal(v2CssPostReflowPending.rendering.nextOpportunityNs, null);
+  assert.equal(v2CssPostReflowPending.rendering.nextOpportunityNs, undefined);
   assert.deepEqual(v2CssPostReflowPending.runtimeFailures, []);
   assert.equal(
     v2CssPostReflowPending.stateToken,
@@ -2113,7 +2121,7 @@ try {
   );
   assert.equal(
     v2CssPostReflowTraceResult.value,
-    "armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70",
+    "armed:20|animationstart:trusted:70:70>animationcancel:trusted:90:90",
   );
   const v2CssPostReflowEvents =
     v2CssPostReflowTraceResult.value.split("|")[1]?.split(">") ?? [];
@@ -2210,7 +2218,7 @@ try {
       v2CssPostReflowPending.rendering.pendingAnimationEvents,
     ),
     postReflowNextOpportunityNs:
-      v2CssPostReflowPending.rendering.nextOpportunityNs === null
+      v2CssPostReflowPending.rendering.nextOpportunityNs === undefined
         ? "none"
         : String(v2CssPostReflowPending.rendering.nextOpportunityNs),
     postReflowProcessedRenderingOpportunities: String(

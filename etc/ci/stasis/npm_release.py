@@ -1135,8 +1135,8 @@ def require_v2_css_animation_event_timestamps_proof(
         "unsupportedAnimations": "0",
         "producerPending": "0",
         "postReflowOutcome": "quiescent",
-        "postReflowVirtualTimeNs": "70000000",
-        "postReflowTrace": "armed:5|animationstart:trusted:50:50>animationcancel:trusted:70:70",
+        "postReflowVirtualTimeNs": "90000000",
+        "postReflowTrace": "armed:20|animationstart:trusted:70:70>animationcancel:trusted:90:90",
         "postReflowEventCount": "2",
         "postReflowEventKinds": "animationcancel,animationstart",
         "postReflowRuntimeFailures": "0",
@@ -1819,10 +1819,10 @@ def self_test() -> None:
                 "producerTerminal": False,
                 "processedRenderingOpportunities": "3",
                 "postReflowOutcome": "quiescent",
-                "postReflowVirtualTimeNs": "70000000",
+                "postReflowVirtualTimeNs": "90000000",
                 "postReflowTrace": (
-                    "armed:5|animationstart:trusted:50:50>"
-                    "animationcancel:trusted:70:70"
+                    "armed:20|animationstart:trusted:70:70>"
+                    "animationcancel:trusted:90:90"
                 ),
                 "postReflowEventCount": "2",
                 "postReflowEventKinds": "animationcancel,animationstart",
@@ -2869,7 +2869,7 @@ def self_test() -> None:
                     (
                         "wrong post-reflow CSS trace",
                         "postReflowTrace",
-                        "armed:5|animationstart:trusted:50:50",
+                        "armed:20|animationstart:trusted:70:70",
                     ),
                     ("wrong post-reflow CSS event count", "postReflowEventCount", "1"),
                     (
