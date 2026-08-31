@@ -9,8 +9,10 @@ import { parseArgs } from "node:util";
 
 export const EXACT_V03_VERIFIER_SHA256 =
   "86aa09719204ad917471475bdc0d0d1adb28398d829f0e2d6eed36fc0e5f2add";
-export const DIAGNOSTIC_CLIENT_TIMEOUT_MS = 45_000;
-const DIAGNOSTIC_CLIENT_TIMEOUT_LITERAL = "45_000";
+export const DIAGNOSTIC_SIGNAL_TIMEOUT_MS = 60_000;
+export const DIAGNOSTIC_SDK_TIMEOUT_MS = 45_000;
+const DIAGNOSTIC_SIGNAL_TIMEOUT_LITERAL = "60_000";
+const DIAGNOSTIC_SDK_TIMEOUT_LITERAL = "45_000";
 
 const DIAGNOSTIC_SUPPORT = `
 const STASIS_V03_DIAGNOSTIC_SCHEMA = "stasis-v0.3-macos-public-diagnostic-v1";
@@ -101,10 +103,24 @@ function replaceExactlyOnce(source, anchor, replacement, label) {
   return source.replace(anchor, replacement);
 }
 
+function replaceExactly(source, anchor, replacement, expectedCount, label) {
+  const count = source.split(anchor).length - 1;
+  assert.equal(
+    count,
+    expectedCount,
+    `${label} anchor count changed in the exact v0.3.0 verifier`,
+  );
+  return source.replaceAll(anchor, replacement);
+}
+
 export function instrumentExactV03Verifier(source) {
   assert.equal(
-    Number(DIAGNOSTIC_CLIENT_TIMEOUT_LITERAL.replace("_", "")),
-    DIAGNOSTIC_CLIENT_TIMEOUT_MS,
+    Number(DIAGNOSTIC_SIGNAL_TIMEOUT_LITERAL.replace("_", "")),
+    DIAGNOSTIC_SIGNAL_TIMEOUT_MS,
+  );
+  assert.equal(
+    Number(DIAGNOSTIC_SDK_TIMEOUT_LITERAL.replace("_", "")),
+    DIAGNOSTIC_SDK_TIMEOUT_MS,
   );
   assert.equal(
     sha256(Buffer.from(source, "utf8")),
@@ -116,8 +132,19 @@ export function instrumentExactV03Verifier(source) {
   let instrumented = replaceExactlyOnce(
     source,
     deadlineAnchor,
-    `const commandDeadline = () => ({ signal: AbortSignal.timeout(${DIAGNOSTIC_CLIENT_TIMEOUT_LITERAL}) });\n${DIAGNOSTIC_SUPPORT}`,
-    "diagnostic client deadline",
+    `const commandDeadline = () => ({ signal: AbortSignal.timeout(${DIAGNOSTIC_SIGNAL_TIMEOUT_LITERAL}) });\n${DIAGNOSTIC_SUPPORT}`,
+    "diagnostic outer signal deadline",
+  );
+  const launchDeadlineAnchor = `    closeTimeoutMs: 30_000,
+    ...commandDeadline(),`;
+  instrumented = replaceExactly(
+    instrumented,
+    launchDeadlineAnchor,
+    `    closeTimeoutMs: 30_000,
+    commandTimeoutMs: ${DIAGNOSTIC_SDK_TIMEOUT_LITERAL},
+    ...commandDeadline(),`,
+    7,
+    "diagnostic SDK command deadline",
   );
   const wrapperExecAnchor = `      'exec "$STASIS_EXPLICIT_OVERRIDE_BINARY" "$@"',`;
   instrumented = replaceExactlyOnce(
@@ -177,7 +204,9 @@ async function main() {
       schema: "stasis-v0.3-macos-public-diagnostic-transform-v1",
       inputSha256: EXACT_V03_VERIFIER_SHA256,
       outputSha256: sha256(Buffer.from(instrumented, "utf8")),
-      clientCommandTimeoutMs: DIAGNOSTIC_CLIENT_TIMEOUT_MS,
+      outerSignalTimeoutMs: DIAGNOSTIC_SIGNAL_TIMEOUT_MS,
+      sdkCommandTimeoutMs: DIAGNOSTIC_SDK_TIMEOUT_MS,
+      nativeCommandTimeoutMs: 30_000,
       nativeLifecycleTrace: true,
       releaseGateAuthority: false,
     })}\n`,

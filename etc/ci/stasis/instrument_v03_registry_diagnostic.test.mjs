@@ -3,7 +3,8 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
-  DIAGNOSTIC_CLIENT_TIMEOUT_MS,
+  DIAGNOSTIC_SDK_TIMEOUT_MS,
+  DIAGNOSTIC_SIGNAL_TIMEOUT_MS,
   EXACT_V03_VERIFIER_SHA256,
   instrumentExactV03Verifier,
 } from "./instrument_v03_registry_diagnostic.mjs";
@@ -18,11 +19,16 @@ test("instruments only the two ambiguous request-5 settlements", async () => {
   assert.equal((instrumented.match(/"css-start-settle"/gu) ?? []).length, 3);
   assert.equal((instrumented.match(/"cookie-submit-settle"/gu) ?? []).length, 3);
   assert.equal(
-    (instrumented.match(/const commandDeadline = \(\) => \(\{ signal: AbortSignal\.timeout\(45_000\) \}\);/gu) ?? [])
+    (instrumented.match(/const commandDeadline = \(\) => \(\{ signal: AbortSignal\.timeout\(60_000\) \}\);/gu) ?? [])
       .length,
     1,
   );
-  assert.equal(DIAGNOSTIC_CLIENT_TIMEOUT_MS, 45_000);
+  assert.equal(DIAGNOSTIC_SIGNAL_TIMEOUT_MS, 60_000);
+  assert.equal(DIAGNOSTIC_SDK_TIMEOUT_MS, 45_000);
+  assert.equal(
+    (instrumented.match(/commandTimeoutMs: 45_000,/gu) ?? []).length,
+    7,
+  );
   assert.equal(
     (instrumented.match(/export STASIS_LIFECYCLE_TRACE_V1=1/gu) ?? []).length,
     1,
