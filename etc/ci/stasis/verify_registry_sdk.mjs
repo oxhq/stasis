@@ -39,6 +39,12 @@ const REQUIRED_METHODS = [
   "dom.text",
   "dom.extract",
 ];
+const REQUIRED_REGISTRY_SDK_EXPORTS = Object.freeze([
+  "CONTROLLED_WEB_SESSION_V2_PROFILE",
+  "StasisProtocolError",
+  "launch",
+  "settlementEvidence",
+]);
 const CONTROLLED_WEBAPP_V1_PROFILE = "controlled-webapp-v1";
 const CONTROLLED_WEB_SESSION_V2_PROFILE = "controlled-web-session-v2";
 const INITIAL_VIRTUAL_TIME_NS = 1_000_000_000n;
@@ -503,10 +509,10 @@ assert.deepEqual(packageMetadata.exports, {
 const importProbe = join(consumerRoot, `.stasis-release-import-${process.pid}.mjs`);
 await writeFile(
   importProbe,
-  'export { CONTROLLED_WEB_SESSION_V2_PROFILE, StasisProtocolError, launch } from "@oxhq/stasis";\n',
+  `export { ${REQUIRED_REGISTRY_SDK_EXPORTS.join(", ")} } from "@oxhq/stasis";\n`,
   {
-  encoding: "utf8",
-  flag: "wx",
+    encoding: "utf8",
+    flag: "wx",
   },
 );
 let sdk;
@@ -516,6 +522,11 @@ try {
   await unlink(importProbe);
 }
 assert.equal(typeof sdk.launch, "function", "registry SDK does not export launch()");
+assert.equal(
+  typeof sdk.settlementEvidence,
+  "function",
+  "registry SDK does not export settlementEvidence()",
+);
 assert.equal(
   sdk.CONTROLLED_WEB_SESSION_V2_PROFILE,
   CONTROLLED_WEB_SESSION_V2_PROFILE,

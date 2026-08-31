@@ -4087,6 +4087,57 @@ def verify_registry_sdk_durable_v2_fixture_source(source: str) -> None:
     )
 
 
+def verify_registry_sdk_import_proxy_source(source: str) -> None:
+    expected_exports = (
+        "CONTROLLED_WEB_SESSION_V2_PROFILE",
+        "StasisProtocolError",
+        "launch",
+        "settlementEvidence",
+    )
+    export_block_match = re.search(
+        r"const REQUIRED_REGISTRY_SDK_EXPORTS = Object\.freeze\(\[\n"
+        r"(?P<body>(?:  \"[A-Za-z_$][A-Za-z0-9_$]*\",\n)+)"
+        r"\]\);",
+        source,
+    )
+    if export_block_match is None:
+        raise ReleaseError("packed SDK verifier must declare one frozen registry export set")
+    declared_exports = tuple(
+        re.findall(
+            r'^  "([A-Za-z_$][A-Za-z0-9_$]*)",$',
+            export_block_match.group("body"),
+            re.MULTILINE,
+        )
+    )
+    if declared_exports != expected_exports:
+        raise ReleaseError(
+            "packed SDK verifier frozen registry export order, membership, or uniqueness changed"
+        )
+    if re.search(r"\bsdk(?:\s+\.|\?\.|\s*\[)", source):
+        raise ReleaseError(
+            "packed SDK verifier must use canonical sdk.member access for complete inventory"
+        )
+    used_exports = set(re.findall(r"\bsdk\.([A-Za-z_$][A-Za-z0-9_$]*)", source))
+    if used_exports != set(expected_exports):
+        raise ReleaseError(
+            "packed SDK verifier consumer proxy must import every referenced public SDK member"
+        )
+    require_source_fragments_in_order(
+        source,
+        (
+            'const REQUIRED_REGISTRY_SDK_EXPORTS = Object.freeze([',
+            '`export { ${REQUIRED_REGISTRY_SDK_EXPORTS.join(", ")} } from "@oxhq/stasis";\\n`',
+            'assert.equal(typeof sdk.launch, "function", "registry SDK does not export launch()")',
+            "assert.equal(\n"
+            "  typeof sdk.settlementEvidence,\n"
+            '  "function",\n'
+            '  "registry SDK does not export settlementEvidence()",\n'
+            ");",
+        ),
+        "packed SDK consumer import proxy",
+    )
+
+
 def verify_registry_sdk_durable_v2_fixture_invocations(
     source: str,
     description: str,
@@ -6182,6 +6233,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "npm-publish workflow",
         2,
     )
+    verify_registry_sdk_import_proxy_source(registry_sdk_verifier_source)
     verify_registry_sdk_durable_v2_fixture_source(registry_sdk_verifier_source)
     package_v2_fixture_verifier = credential_free_v2_fixture_verifier_block(
         public_release_workflow,
@@ -7357,6 +7409,42 @@ def self_test() -> None:
             "reportTrace: v2PersistentIntervalReportTrace.value",
             "reportTrace: v2PersistentIntervalStrictTrace.value",
             "packed SDK persistent-interval report trace linkage",
+        )
+        require_public_marker_mutation_rejected(
+            REGISTRY_SDK_VERIFIER_SOURCE,
+            '  "settlementEvidence",\n]);',
+            "]);",
+            "packed SDK consumer settlementEvidence import",
+        )
+        require_public_marker_mutation_rejected(
+            REGISTRY_SDK_VERIFIER_SOURCE,
+            '  "settlementEvidence",\n]);',
+            '  "settlementEvidence",\n  "settlementEvidence",\n]);',
+            "packed SDK consumer duplicate settlementEvidence import",
+        )
+        require_public_marker_mutation_rejected(
+            REGISTRY_SDK_VERIFIER_SOURCE,
+            '  typeof sdk.settlementEvidence,\n  "function",',
+            '  typeof sdk.settlementEvidence,\n  "undefined",',
+            "packed SDK consumer settlementEvidence type assertion",
+        )
+        require_public_marker_mutation_rejected(
+            REGISTRY_SDK_VERIFIER_SOURCE,
+            "  runtime = await sdk.launch({",
+            "  runtime = await sdk .launch({",
+            "packed SDK consumer whitespace member access",
+        )
+        require_public_marker_mutation_rejected(
+            REGISTRY_SDK_VERIFIER_SOURCE,
+            "  runtime = await sdk.launch({",
+            "  runtime = await sdk?.launch({",
+            "packed SDK consumer optional member access",
+        )
+        require_public_marker_mutation_rejected(
+            REGISTRY_SDK_VERIFIER_SOURCE,
+            "  runtime = await sdk.launch({",
+            '  runtime = await sdk["launch"]({',
+            "packed SDK consumer bracket member access",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
