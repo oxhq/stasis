@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and verify the exact Stasis 0.3.1 native release archives."""
+"""Build and verify the exact Stasis 0.3.2 native release archives."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import BinaryIO, Iterable
 
 
-RELEASE_VERSION = "0.3.1"
+RELEASE_VERSION = "0.3.2"
 VERSION_RE = re.compile(re.escape(RELEASE_VERSION))
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -5818,11 +5818,14 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         public_top_level_readme,
         "top-level public README",
         (
-            "target the 0.3.1 corrective train",
+            "target the 0.3.2 corrective train",
             "`controlled-web-session-v1` still the default",
             "[`controlled-web-session-v2` contract](docs/stasis/session-v0.3-candidate.md)",
             "Source version and package CI are not publication proof",
-            "0.3.1 is the stable successor only when its",
+            "Version 0.3.2 is the\n"
+            "stable successor only when its",
+            "automatic npm prepublication failed in the packed SDK's\n"
+            "cookie-replacement settlement, and `@oxhq/stasis@0.3.1` was never published",
             "Verify those public artifacts rather than inferring release status from this checkout.",
         ),
         forbidden=(
@@ -5834,7 +5837,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         public_stasis_boundary,
         "public Stasis product boundary",
         (
-            "Source version `0.3.1` is not a publication claim",
+            "Source version `0.3.2` is not a publication claim",
             "canonical HTTP(S) URL no larger than 65,536 bytes",
             "without inventing an asynchronous `Image` producer lease",
             "Finite\n  asynchronous cache/decode completion is fenced by an `Image` producer",
@@ -6042,6 +6045,86 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "Strict policy and both predecessor profiles retain stop-at-interval behavior",
         ),
     )
+    linux_lifecycle_job_marker = "  linux-lifecycle-stress:\n"
+    package_native_job_marker = "  package-native:\n"
+    package_windows_job_marker = "  package-windows-ci:\n"
+    for marker, description in (
+        (linux_lifecycle_job_marker, "native Jammy lifecycle stress job"),
+        (package_native_job_marker, "native package job"),
+        (package_windows_job_marker, "Windows package job"),
+    ):
+        if public_release_workflow.count(marker) != 1:
+            raise ReleaseError(
+                f"credential-free package workflow must define exactly one {description}"
+            )
+    linux_lifecycle_start = public_release_workflow.index(linux_lifecycle_job_marker)
+    package_native_start = public_release_workflow.index(
+        package_native_job_marker, linux_lifecycle_start
+    )
+    package_windows_start = public_release_workflow.index(
+        package_windows_job_marker, package_native_start
+    )
+    linux_lifecycle_job = public_release_workflow[
+        linux_lifecycle_start:package_native_start
+    ]
+    package_native_job = public_release_workflow[
+        package_native_start:package_windows_start
+    ]
+
+    linux_lifecycle_topology = (
+        "  linux-lifecycle-stress:\n"
+        "    name: Ubuntu 22.04 lifecycle stress (${{ matrix.lane }})\n"
+        "    needs:\n"
+        "      - validate-invocation\n"
+        "      - archive-contract\n"
+        "    if: |\n"
+        "      needs.validate-invocation.outputs.mode == 'package'\n"
+        "        && needs.archive-contract.result == 'success'\n"
+        "    strategy:\n"
+        "      fail-fast: false\n"
+        "      matrix:\n"
+        "        lane:\n"
+        "          - traced\n"
+        "          - untraced\n"
+        "    runs-on: ubuntu-22.04\n"
+    )
+    if linux_lifecycle_job.count(linux_lifecycle_topology) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must run exactly two independent traced and "
+            "untraced native lifecycle lanes on Ubuntu 22.04"
+        )
+    linux_lifecycle_lane_semantics = (
+        "          trace_environment=(env -u STASIS_LIFECYCLE_TRACE_V1)\n"
+        "          if [[ \"$STASIS_LIFECYCLE_LANE\" == 'traced' ]]; then\n"
+        "            trace_environment=(env STASIS_LIFECYCLE_TRACE_V1=1)\n"
+        "          elif [[ \"$STASIS_LIFECYCLE_LANE\" != 'untraced' ]]; then\n"
+        "            echo 'unknown lifecycle lane' >&2\n"
+        "            exit 1\n"
+        "          fi\n"
+    )
+    if linux_lifecycle_job.count(linux_lifecycle_lane_semantics) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must map only the traced lane to the fixed "
+            "lifecycle trace and keep the independent untraced lane disabled"
+        )
+    package_native_lifecycle_gate = (
+        "  package-native:\n"
+        "    name: Package and gate ${{ matrix.release_platform }}\n"
+        "    needs:\n"
+        "      - validate-invocation\n"
+        "      - archive-contract\n"
+        "      - linux-lifecycle-stress\n"
+        "    if: |\n"
+        "      needs.validate-invocation.outputs.mode == 'package'\n"
+        "        && needs.archive-contract.result == 'success'\n"
+        "        && needs.linux-lifecycle-stress.result == 'success'\n"
+    )
+    if package_native_job.count(package_native_lifecycle_gate) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must make every native package lane depend on "
+            "and results-gate the complete two-lane Jammy lifecycle job"
+        )
+
     paint_retirement_command_blocks = (
         (
             "          cargo test --locked --profile production-stripped \\\n"
@@ -6063,13 +6146,25 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         ),
         (
             "          cargo test --locked --profile production-stripped \\\n"
+            "            -p stasis-shell -p servo-paint --lib \\\n"
+            "            pipeline_retirement_dispatch_tests \\\n"
+            "            -- --test-threads=1 --show-output >> \"$retirement_log\" 2>&1 || retirement_status=$?\n"
+        ),
+        (
+            "          cargo test --locked --profile production-stripped \\\n"
+            "            -p stasis-shell -p servo-paint --lib \\\n"
+            "            pipeline_retirement_transaction_tests \\\n"
+            "            -- --test-threads=1 --show-output >> \"$retirement_log\" 2>&1 || retirement_status=$?\n"
+        ),
+        (
+            "          cargo test --locked --profile production-stripped \\\n"
             "            -p stasis-shell -p servo-script --lib \\\n"
-            "            pipeline_exit_dispatches_paint_before_constellation \\\n"
+            "            pipeline_exit_paint_marker_tests \\\n"
             "            -- --test-threads=1 --show-output >> \"$retirement_log\" 2>&1 || retirement_status=$?\n"
         ),
     )
     for command_block in paint_retirement_command_blocks:
-        if public_release_workflow.count(command_block) != 1:
+        if linux_lifecycle_job.count(command_block) != 1:
             raise ReleaseError(
                 "credential-free package workflow must run every causal Paint-retirement "
                 "regression command exactly once in each native Jammy lifecycle lane"
@@ -6078,7 +6173,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "          retirement_status=0\n"
         "          set +e\n"
     )
-    if public_release_workflow.count(paint_retirement_status_initialization) != 1:
+    if linux_lifecycle_job.count(paint_retirement_status_initialization) != 1:
         raise ReleaseError(
             "credential-free package workflow must collect every causal Paint-retirement "
             "command status before evaluating the exact result census"
@@ -6091,7 +6186,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "            exit \"$retirement_status\"\n"
         "          fi\n"
     )
-    if public_release_workflow.count(paint_retirement_failure_control) != 1:
+    if linux_lifecycle_job.count(paint_retirement_failure_control) != 1:
         raise ReleaseError(
             "credential-free package workflow must restore fail-fast behavior and reject a "
             "nonzero causal Paint-retirement command status before the result census"
@@ -6099,7 +6194,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     paint_retirement_log_marker = (
         '          retirement_log="$RUNNER_TEMP/stasis-lifecycle-${{ matrix.lane }}-paint-retirement.log"\n'
     )
-    if public_release_workflow.count(paint_retirement_log_marker) != 1:
+    if linux_lifecycle_job.count(paint_retirement_log_marker) != 1:
         raise ReleaseError(
             "credential-free package workflow must retain one lane-local causal "
             "Paint-retirement log"
@@ -6108,28 +6203,44 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "          expected_retirement_records=(\n"
         "            'test paint_proxy_tests::checked_send_reports_a_closed_paint_queue ... ok'\n"
         "            'test constellation::deferred_replacement_activation_tests::classifies_only_the_correlated_source_and_replacement_exits ... ok'\n"
+        "            'test constellation::deferred_replacement_activation_tests::paint_marker_failure_before_logical_exit_fails_when_exit_arrives ... ok'\n"
         "            'test constellation::deferred_replacement_activation_tests::paint_retirement_delivery_failure_is_a_one_shot_terminal_action ... ok'\n"
         "            'test constellation::deferred_replacement_activation_tests::source_exit_waits_for_paint_retirement_before_exactly_one_reroute ... ok'\n"
+        "            'test paint::pipeline_retirement_dispatch_tests::callback_bearing_retirement_transfers_without_immediate_success ... ok'\n"
+        "            'test paint::pipeline_retirement_dispatch_tests::pending_owner_marker_does_not_dispatch_the_webrender_transaction ... ok'\n"
+        "            'test paint::pipeline_retirement_dispatch_tests::production_handler_transfers_callback_to_renderer_retirement ... ok'\n"
+        "            'test paint::pipeline_retirement_dispatch_tests::retired_without_callback_still_dispatches_the_webrender_transaction ... ok'\n"
         "            'test pipeline_details::pipeline_retirement_tests::pipeline_retirement_completes_only_after_both_owners_in_either_order ... ok'\n"
-        "            'test event_loop::script_thread::pipeline_exit_notification_tests::pipeline_exit_dispatches_paint_before_constellation ... ok'\n"
+        "            'test painter::pipeline_retirement_transaction_tests::closed_paint_queue_reports_owner_failure_never_success ... ok'\n"
+        "            'test painter::pipeline_retirement_transaction_tests::coalesced_renderer_removals_are_matched_exactly_without_stealing ... ok'\n"
+        "            'test painter::pipeline_retirement_transaction_tests::dropped_or_unexpected_notification_is_a_paint_local_typed_failure ... ok'\n"
+        "            'test painter::pipeline_retirement_transaction_tests::frame_built_only_queues_paint_and_success_waits_for_exact_renderer_removal ... ok'\n"
+        "            'test painter::pipeline_retirement_transaction_tests::missing_and_wrong_renderer_removals_are_distinct_typed_failures ... ok'\n"
+        "            'test painter::pipeline_retirement_transaction_tests::one_renderer_removal_cannot_acknowledge_duplicate_pending_transactions ... ok'\n"
+        "            'test painter::pipeline_retirement_transaction_tests::production_retirement_path_is_bound_to_transaction_send_and_renderer_consumption ... ok'\n"
+        "            'test painter::pipeline_retirement_transaction_tests::retirement_plan_removes_rebuilds_generates_and_waits_for_frame_built ... ok'\n"
+        "            'test painter::pipeline_retirement_transaction_tests::vendored_renderer_pipeline_info_drain_preserves_current_epochs ... ok'\n"
+        "            'test event_loop::script_thread::pipeline_exit_paint_marker_tests::marker_loss_reports_exactly_one_failure ... ok'\n"
+        "            'test event_loop::script_thread::pipeline_exit_paint_marker_tests::recorded_ack_is_terminal_and_never_reports_failure ... ok'\n"
+        "            'test event_loop::script_thread::pipeline_exit_paint_marker_tests::script_marker_is_published_before_logical_pipeline_exit ... ok'\n"
         "          )\n"
     )
-    if public_release_workflow.count(paint_retirement_expected_record_block) != 1:
+    if linux_lifecycle_job.count(paint_retirement_expected_record_block) != 1:
         raise ReleaseError(
-            "credential-free package workflow must bind the exact six distinct causal "
-            "Paint-retirement regression records"
+            "credential-free package workflow must bind the exact 22 distinct causal "
+            "Paint-retirement and vendored WebRender regression records"
         )
     paint_retirement_population_gate = (
-        "          test \"${#expected_retirement_records[@]}\" = '6'\n"
-        "          test \"$(printf '%s\\n' \"${expected_retirement_records[@]}\" | LC_ALL=C sort -u | awk 'END { print NR }')\" = '6'\n"
-        "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$retirement_log\")\" = '6'\n"
+        "          test \"${#expected_retirement_records[@]}\" = '22'\n"
+        "          test \"$(printf '%s\\n' \"${expected_retirement_records[@]}\" | LC_ALL=C sort -u | awk 'END { print NR }')\" = '22'\n"
+        "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$retirement_log\")\" = '22'\n"
         "          for test_record in \"${expected_retirement_records[@]}\"; do\n"
         "            test \"$(grep -Fxc \"$test_record\" \"$retirement_log\")\" = '1'\n"
         "          done\n"
     )
-    if public_release_workflow.count(paint_retirement_population_gate) != 1:
+    if linux_lifecycle_job.count(paint_retirement_population_gate) != 1:
         raise ReleaseError(
-            "credential-free package workflow must prove exactly the six named causal "
+            "credential-free package workflow must prove exactly the 22 named causal "
             "Paint-retirement regression records and no additional passing test record"
         )
     linux_pkg_config_isolation = (
@@ -7272,8 +7383,8 @@ def self_test() -> None:
             ),
             (
                 PUBLIC_TOP_LEVEL_README,
-                "0.3.1 is the stable successor only when its",
-                "0.3.1 is the stable successor even before its",
+                "Version 0.3.2 is the\nstable successor only when its",
+                "Version 0.3.2 is the\nstable successor even before its",
                 "top-level immutable public-successor evidence boundary",
             ),
             (
@@ -7284,8 +7395,8 @@ def self_test() -> None:
             ),
             (
                 PUBLIC_STASIS_BOUNDARY,
-                "Source version `0.3.1` is not a publication claim",
-                "Source version `0.3.1` is a publication claim",
+                "Source version `0.3.2` is not a publication claim",
+                "Source version `0.3.2` is a publication claim",
                 "STASIS source-versus-publication boundary",
             ),
             (
@@ -7669,6 +7780,125 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
+            "    name: Ubuntu 22.04 lifecycle stress (${{ matrix.lane }})\n"
+            "    needs:\n"
+            "      - validate-invocation\n"
+            "      - archive-contract\n"
+            "    if: |\n"
+            "      needs.validate-invocation.outputs.mode == 'package'\n"
+            "        && needs.archive-contract.result == 'success'\n"
+            "    strategy:\n"
+            "      fail-fast: false\n"
+            "      matrix:\n"
+            "        lane:\n"
+            "          - traced\n"
+            "          - untraced\n"
+            "    runs-on: ubuntu-22.04\n",
+            "    name: Ubuntu 22.04 lifecycle stress (${{ matrix.lane }})\n"
+            "    needs:\n"
+            "      - validate-invocation\n"
+            "      - archive-contract\n"
+            "    if: |\n"
+            "      needs.validate-invocation.outputs.mode == 'package'\n"
+            "        && needs.archive-contract.result == 'success'\n"
+            "    strategy:\n"
+            "      fail-fast: false\n"
+            "      matrix:\n"
+            "        lane:\n"
+            "          - traced\n"
+            "          - observational\n"
+            "    runs-on: ubuntu-22.04\n",
+            "native Jammy exact traced and untraced lane population",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "    name: Ubuntu 22.04 lifecycle stress (${{ matrix.lane }})\n"
+            "    needs:\n"
+            "      - validate-invocation\n"
+            "      - archive-contract\n"
+            "    if: |\n"
+            "      needs.validate-invocation.outputs.mode == 'package'\n"
+            "        && needs.archive-contract.result == 'success'\n"
+            "    strategy:\n"
+            "      fail-fast: false\n"
+            "      matrix:\n"
+            "        lane:\n"
+            "          - traced\n"
+            "          - untraced\n"
+            "    runs-on: ubuntu-22.04\n",
+            "    name: Ubuntu 22.04 lifecycle stress (${{ matrix.lane }})\n"
+            "    needs:\n"
+            "      - validate-invocation\n"
+            "      - archive-contract\n"
+            "    if: |\n"
+            "      needs.validate-invocation.outputs.mode == 'package'\n"
+            "        && needs.archive-contract.result == 'success'\n"
+            "    strategy:\n"
+            "      fail-fast: false\n"
+            "      matrix:\n"
+            "        lane:\n"
+            "          - traced\n"
+            "          - untraced\n"
+            "    runs-on: ubuntu-24.04\n",
+            "native Jammy exact Ubuntu 22.04 runner",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "      - linux-lifecycle-stress\n"
+            "    if: |\n"
+            "      needs.validate-invocation.outputs.mode == 'package'\n"
+            "        && needs.archive-contract.result == 'success'\n"
+            "        && needs.linux-lifecycle-stress.result == 'success'\n",
+            "    if: |\n"
+            "      needs.validate-invocation.outputs.mode == 'package'\n"
+            "        && needs.archive-contract.result == 'success'\n"
+            "        && needs.linux-lifecycle-stress.result == 'success'\n",
+            "native package dependency on the complete Jammy lifecycle matrix",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "        && needs.linux-lifecycle-stress.result == 'success'\n",
+            "        && needs.linux-lifecycle-stress.result != 'failure'\n",
+            "native package strict Jammy lifecycle result gate",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          trace_environment=(env -u STASIS_LIFECYCLE_TRACE_V1)\n"
+            "          if [[ \"$STASIS_LIFECYCLE_LANE\" == 'traced' ]]; then\n"
+            "            trace_environment=(env STASIS_LIFECYCLE_TRACE_V1=1)\n"
+            "          elif [[ \"$STASIS_LIFECYCLE_LANE\" != 'untraced' ]]; then\n",
+            "          trace_environment=(env STASIS_LIFECYCLE_TRACE_V1=1)\n"
+            "          if [[ \"$STASIS_LIFECYCLE_LANE\" == 'traced' ]]; then\n"
+            "            trace_environment=(env STASIS_LIFECYCLE_TRACE_V1=1)\n"
+            "          elif [[ \"$STASIS_LIFECYCLE_LANE\" != 'untraced' ]]; then\n",
+            "native Jammy untraced lane trace disablement",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          cargo test --locked --profile production-stripped \\\n"
+            "            -p stasis-shell -p servo-paint --lib \\\n"
+            "            pipeline_retirement_transaction_tests \\\n"
+            "            -- --test-threads=1 --show-output >> \"$retirement_log\" 2>&1 || retirement_status=$?\n",
+            "          cargo test --locked --profile production-stripped \\\n"
+            "            -p stasis-shell -p servo-paint --lib \\\n"
+            "            pipeline_retirement_transaction_test \\\n"
+            "            -- --test-threads=1 --show-output >> \"$retirement_log\" 2>&1 || retirement_status=$?\n",
+            "native Jammy causal WebRender-retirement transaction-test command",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "            'test painter::pipeline_retirement_transaction_tests::vendored_renderer_pipeline_info_drain_preserves_current_epochs ... ok'\n",
+            "            'test painter::pipeline_retirement_transaction_tests::production_retirement_path_is_bound_to_transaction_send_and_renderer_consumption ... ok'\n",
+            "native Jammy root-locked vendored WebRender epoch-preservation record",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "            'test painter::pipeline_retirement_transaction_tests::frame_built_only_queues_paint_and_success_waits_for_exact_renderer_removal ... ok'\n",
+            "            'test painter::pipeline_retirement_transaction_tests::dropped_or_unexpected_notification_is_a_paint_local_typed_failure ... ok'\n",
+            "native Jammy causal WebRender-retirement distinct named records",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
             "          set -e\n"
             "          if (( retirement_status != 0 )); then\n",
             "          set +e\n"
@@ -7683,8 +7913,8 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
-            "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$retirement_log\")\" = '6'\n",
-            "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$retirement_log\")\" = '5'\n",
+            "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$retirement_log\")\" = '22'\n",
+            "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$retirement_log\")\" = '21'\n",
             "native Jammy causal Paint-retirement exact test population",
         )
         require_public_marker_mutation_rejected(
@@ -10962,8 +11192,10 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             "0.2.0",
             "0.2.1",
             "0.3.0",
+            "0.3.1",
             "v0.3.0",
             "v0.3.1",
+            "v0.3.2",
         ):
             try:
                 validate_identity(invalid_version, "macos-aarch64", revision, repository)

@@ -1,7 +1,7 @@
 /*
  * Fail-closed source-tree placeholder: these are the immutable historical
- * v0.1.0-alpha.0 bytes, not a v0.3.1 distribution manifest. The gated release
- * workflow must replace this module with the exact generated v0.3.1 manifest
+ * v0.1.0-alpha.0 bytes, not a v0.3.2 distribution manifest. The gated release
+ * workflow must replace this module with the exact generated v0.3.2 manifest
  * before packing; local prepack intentionally rejects this placeholder.
  */
 import type { RuntimeDistributionManifest } from "./runtime-manifest.js";

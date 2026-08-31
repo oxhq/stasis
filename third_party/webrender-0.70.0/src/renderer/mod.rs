@@ -996,6 +996,11 @@ impl Renderer {
         mem::replace(&mut self.pipeline_info, PipelineInfo::default())
     }
 
+    /// Take renderer-consumed pipeline removals without clearing current pipeline epochs.
+    pub fn take_removed_pipelines(&mut self) -> Vec<(PipelineId, DocumentId)> {
+        self.pipeline_info.take_removed_pipelines()
+    }
+
     /// Returns the Epoch of the current frame in a pipeline.
     pub fn current_epoch(&self, document_id: DocumentId, pipeline_id: PipelineId) -> Option<Epoch> {
         self.pipeline_info.epochs.get(&(pipeline_id, document_id)).cloned()
@@ -4821,6 +4826,51 @@ impl ExternalImageHandler for DummyExternalImageHandler {
 pub struct PipelineInfo {
     pub epochs: FastHashMap<(PipelineId, DocumentId), Epoch>,
     pub removed_pipelines: Vec<(PipelineId, DocumentId)>,
+}
+
+impl PipelineInfo {
+    fn take_removed_pipelines(&mut self) -> Vec<(PipelineId, DocumentId)> {
+        mem::take(&mut self.removed_pipelines)
+    }
+
+    /// Exercise the exact removal-drain helper used by [`Renderer`] while retaining epoch state.
+    #[cfg(feature = "stasis_owner_regression")]
+    #[doc(hidden)]
+    pub fn stasis_take_removed_pipelines_regression(
+        &mut self,
+    ) -> Vec<(PipelineId, DocumentId)> {
+        self.take_removed_pipelines()
+    }
+}
+
+#[cfg(test)]
+mod pipeline_info_tests {
+    use api::{DocumentId, Epoch, IdNamespace, PipelineId};
+
+    use super::PipelineInfo;
+
+    #[test]
+    fn taking_removed_pipelines_preserves_current_epochs() {
+        let pipeline_id = PipelineId(7, 11);
+        let document_id = DocumentId::new(IdNamespace(17), 3);
+        let mut pipeline_info = PipelineInfo::default();
+        pipeline_info
+            .epochs
+            .insert((pipeline_id, document_id), Epoch(23));
+        pipeline_info
+            .removed_pipelines
+            .push((pipeline_id, document_id));
+
+        assert_eq!(
+            pipeline_info.take_removed_pipelines(),
+            [(pipeline_id, document_id)]
+        );
+        assert_eq!(
+            pipeline_info.epochs.get(&(pipeline_id, document_id)),
+            Some(&Epoch(23))
+        );
+        assert!(pipeline_info.removed_pipelines.is_empty());
+    }
 }
 
 impl Renderer {

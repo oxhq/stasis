@@ -35,6 +35,9 @@ mod from_constellation {
                 Self::SetThrottled(..) => target!("SetThrottled"),
                 Self::NewWebRenderFrameReady(..) => target!("NewWebRenderFrameReady"),
                 Self::PipelineExited(..) => target!("PipelineExited"),
+                Self::PipelineRetirementCheckpoint(..) => {
+                    target!("PipelineRetirementCheckpoint")
+                },
                 Self::SendInitialTransaction(..) => target!("SendInitialTransaction"),
                 Self::ScrollNodeByDelta(..) => target!("ScrollNodeByDelta"),
                 Self::ScrollViewportByDelta(..) => target!("ScrollViewportByDelta"),

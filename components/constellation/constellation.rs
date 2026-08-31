@@ -146,8 +146,8 @@ use net::resource_thread::ResourceThreadOwner;
 use net_traits::pub_domains::registered_domain_name;
 use net_traits::{self, AsyncRuntime, FetchThread, ResourceThreads};
 use paint_api::{
-    PaintMessage, PaintProxy, PinchZoomInfos, PipelineExitSource, SendableFrameTree,
-    WebRenderExternalImageIdManager,
+    PaintMessage, PaintProxy, PinchZoomInfos, PipelineExitSource, PipelineRetirementStatus,
+    SendableFrameTree, WebRenderExternalImageIdManager,
 };
 use profile_traits::mem::ProfilerMsg;
 use profile_traits::{mem, time};
@@ -255,6 +255,7 @@ enum DeferredReplacementExit {
 enum DeferredReplacementSourceRetirement {
     AwaitingLogicalExit,
     AwaitingPaintRetirement,
+    PaintRetirementFailedBeforeLogicalExit,
     Completed,
 }
 
@@ -277,6 +278,39 @@ enum DeferredReplacementLifecycleAction {
 enum PaintRetirementNotification {
     Retired(PipelineId),
     DeliveryFailed(PipelineId),
+}
+
+impl PaintRetirementNotification {
+    fn lifecycle_event(self) -> (PipelineId, DeferredReplacementLifecycleEvent) {
+        match self {
+            Self::Retired(pipeline_id) => {
+                (pipeline_id, DeferredReplacementLifecycleEvent::PaintRetired)
+            },
+            Self::DeliveryFailed(pipeline_id) => (
+                pipeline_id,
+                DeferredReplacementLifecycleEvent::PaintRetirementFailed,
+            ),
+        }
+    }
+}
+
+fn paint_retirement_notification_from_callback(
+    pipeline_id: PipelineId,
+    result: Result<PipelineRetirementStatus, IpcError>,
+) -> PaintRetirementNotification {
+    match result {
+        Ok(PipelineRetirementStatus::RendererRemovalConsumed) => {
+            PaintRetirementNotification::Retired(pipeline_id)
+        },
+        Ok(
+            PipelineRetirementStatus::TransactionDropped
+            | PipelineRetirementStatus::PaintOwnerUnavailable
+            | PipelineRetirementStatus::RendererRemovalMissing
+            | PipelineRetirementStatus::RendererRemovalMismatch
+            | PipelineRetirementStatus::DuplicateRetirement,
+        )
+        | Err(_) => PaintRetirementNotification::DeliveryFailed(pipeline_id),
+    }
 }
 
 fn controlled_session_navigation_load_data(
@@ -319,12 +353,25 @@ impl DeferredReplacementActivation {
         pipeline_id: PipelineId,
         event: DeferredReplacementLifecycleEvent,
     ) -> DeferredReplacementLifecycleAction {
+        let paint_failure_before_logical_exit = matches!(
+            (self.classify_exit(pipeline_id), event, self.source_retirement),
+            (
+                Some(DeferredReplacementExit::Source),
+                DeferredReplacementLifecycleEvent::PaintRetirementFailed,
+                DeferredReplacementSourceRetirement::AwaitingLogicalExit,
+            )
+        );
         let action = match (self.classify_exit(pipeline_id), event, self.source_retirement) {
             (
                 Some(DeferredReplacementExit::Source),
                 DeferredReplacementLifecycleEvent::LogicalPipelineExit,
                 DeferredReplacementSourceRetirement::AwaitingLogicalExit,
             ) => DeferredReplacementLifecycleAction::WaitForPaintRetirement,
+            (
+                Some(DeferredReplacementExit::Source),
+                DeferredReplacementLifecycleEvent::LogicalPipelineExit,
+                DeferredReplacementSourceRetirement::PaintRetirementFailedBeforeLogicalExit,
+            ) => DeferredReplacementLifecycleAction::Fail,
             (
                 Some(DeferredReplacementExit::Source),
                 DeferredReplacementLifecycleEvent::PaintRetired,
@@ -334,7 +381,8 @@ impl DeferredReplacementActivation {
                 Some(DeferredReplacementExit::Replacement),
                 DeferredReplacementLifecycleEvent::LogicalPipelineExit,
                 DeferredReplacementSourceRetirement::AwaitingLogicalExit
-                | DeferredReplacementSourceRetirement::AwaitingPaintRetirement,
+                | DeferredReplacementSourceRetirement::AwaitingPaintRetirement
+                | DeferredReplacementSourceRetirement::PaintRetirementFailedBeforeLogicalExit,
             ) => DeferredReplacementLifecycleAction::Resume,
             (
                 Some(DeferredReplacementExit::Source),
@@ -353,6 +401,10 @@ impl DeferredReplacementActivation {
                 self.source_retirement = DeferredReplacementSourceRetirement::Completed;
             },
             DeferredReplacementLifecycleAction::Ignore => {},
+        }
+        if paint_failure_before_logical_exit {
+            self.source_retirement =
+                DeferredReplacementSourceRetirement::PaintRetirementFailedBeforeLogicalExit;
         }
         action
     }
@@ -425,11 +477,13 @@ mod finished_event_loop_cleanup_tests {
 
 #[cfg(test)]
 mod deferred_replacement_activation_tests {
+    use ipc_channel::IpcError;
+    use paint_api::PipelineRetirementStatus;
     use servo_base::id::{PipelineNamespaceId, TEST_PIPELINE_INDEX};
 
     use super::{
-        DeferredReplacementActivation, DeferredReplacementExit,
-        DeferredReplacementLifecycleAction, DeferredReplacementLifecycleEvent, PipelineId,
+        DeferredReplacementActivation, DeferredReplacementExit, DeferredReplacementLifecycleAction,
+        DeferredReplacementLifecycleEvent, PipelineId, paint_retirement_notification_from_callback,
     };
 
     fn pipeline_id(namespace: u32) -> PipelineId {
@@ -475,14 +529,22 @@ mod deferred_replacement_activation_tests {
             DeferredReplacementLifecycleAction::Ignore,
         );
 
-        let paint_retired =
-            activation.lifecycle_action(source, DeferredReplacementLifecycleEvent::PaintRetired);
-        assert_eq!(paint_retired, DeferredReplacementLifecycleAction::Resume);
-        assert_eq!(
-            activation.lifecycle_action(
+        let (retired_pipeline_id, paint_retired_event) =
+            paint_retirement_notification_from_callback(
                 source,
-                DeferredReplacementLifecycleEvent::PaintRetired,
-            ),
+                Ok(PipelineRetirementStatus::RendererRemovalConsumed),
+            )
+            .lifecycle_event();
+        let paint_retired = activation.lifecycle_action(retired_pipeline_id, paint_retired_event);
+        assert_eq!(paint_retired, DeferredReplacementLifecycleAction::Resume);
+        let (duplicate_pipeline_id, duplicate_paint_retired_event) =
+            paint_retirement_notification_from_callback(
+                source,
+                Ok(PipelineRetirementStatus::RendererRemovalConsumed),
+            )
+            .lifecycle_event();
+        assert_eq!(
+            activation.lifecycle_action(duplicate_pipeline_id, duplicate_paint_retired_event),
             DeferredReplacementLifecycleAction::Ignore,
         );
 
@@ -513,12 +575,61 @@ mod deferred_replacement_activation_tests {
     fn paint_retirement_delivery_failure_is_a_one_shot_terminal_action() {
         let source = pipeline_id(1);
         let replacement = pipeline_id(2);
+
+        for failed_result in [
+            Ok(PipelineRetirementStatus::TransactionDropped),
+            Ok(PipelineRetirementStatus::PaintOwnerUnavailable),
+            Ok(PipelineRetirementStatus::RendererRemovalMissing),
+            Ok(PipelineRetirementStatus::RendererRemovalMismatch),
+            Ok(PipelineRetirementStatus::DuplicateRetirement),
+            Err(IpcError::Disconnected),
+        ] {
+            let mut activation = DeferredReplacementActivation::new(source, replacement);
+            assert_eq!(
+                activation.lifecycle_action(
+                    source,
+                    DeferredReplacementLifecycleEvent::PaintRetired,
+                ),
+                DeferredReplacementLifecycleAction::Ignore,
+            );
+            assert_eq!(
+                activation.lifecycle_action(
+                    source,
+                    DeferredReplacementLifecycleEvent::LogicalPipelineExit,
+                ),
+                DeferredReplacementLifecycleAction::WaitForPaintRetirement,
+            );
+            let (failed_pipeline_id, failed_event) =
+                paint_retirement_notification_from_callback(source, failed_result)
+                    .lifecycle_event();
+            assert_eq!(
+                activation.lifecycle_action(failed_pipeline_id, failed_event),
+                DeferredReplacementLifecycleAction::Fail,
+            );
+
+            let (late_success_pipeline_id, late_success_event) =
+                paint_retirement_notification_from_callback(
+                    source,
+                    Ok(PipelineRetirementStatus::RendererRemovalConsumed),
+                )
+                .lifecycle_event();
+            assert_eq!(
+                activation.lifecycle_action(late_success_pipeline_id, late_success_event),
+                DeferredReplacementLifecycleAction::Ignore,
+            );
+        }
+    }
+
+    #[test]
+    fn paint_marker_failure_before_logical_exit_fails_when_exit_arrives() {
+        let source = pipeline_id(1);
+        let replacement = pipeline_id(2);
         let mut activation = DeferredReplacementActivation::new(source, replacement);
 
         assert_eq!(
             activation.lifecycle_action(
                 source,
-                DeferredReplacementLifecycleEvent::PaintRetired,
+                DeferredReplacementLifecycleEvent::PaintRetirementFailed,
             ),
             DeferredReplacementLifecycleAction::Ignore,
         );
@@ -526,13 +637,6 @@ mod deferred_replacement_activation_tests {
             activation.lifecycle_action(
                 source,
                 DeferredReplacementLifecycleEvent::LogicalPipelineExit,
-            ),
-            DeferredReplacementLifecycleAction::WaitForPaintRetirement,
-        );
-        assert_eq!(
-            activation.lifecycle_action(
-                source,
-                DeferredReplacementLifecycleEvent::PaintRetirementFailed,
             ),
             DeferredReplacementLifecycleAction::Fail,
         );
@@ -3240,6 +3344,7 @@ where
             self.fail_document_control_request(request_id, DocumentControlError::ChannelClosed);
             return;
         }
+        emit_lifecycle_phase(LifecyclePhase::ControlledReplacementRerouteBegin);
         let captured = match self.capture_document_control_target(webview_id) {
             Ok(captured)
                 if captured.route_pipeline_id == activation.pipeline_id
@@ -3289,16 +3394,7 @@ where
     }
 
     fn handle_paint_retirement_notification(&mut self, notification: PaintRetirementNotification) {
-        let (pipeline_id, event) = match notification {
-            PaintRetirementNotification::Retired(pipeline_id) => (
-                pipeline_id,
-                DeferredReplacementLifecycleEvent::PaintRetired,
-            ),
-            PaintRetirementNotification::DeliveryFailed(pipeline_id) => (
-                pipeline_id,
-                DeferredReplacementLifecycleEvent::PaintRetirementFailed,
-            ),
-        };
+        let (pipeline_id, event) = notification.lifecycle_event();
         match self.deferred_replacement_lifecycle_request(pipeline_id, event) {
             Some((_, DeferredReplacementLifecycleAction::Resume)) => {
                 self.resume_deferred_replacement_activation(pipeline_id);
@@ -3586,6 +3682,11 @@ where
             },
             ScriptToConstellationMessage::PipelineExited => {
                 self.handle_pipeline_exited(source_pipeline_id);
+            },
+            ScriptToConstellationMessage::PipelineExitPaintMarkerFailed => {
+                self.handle_paint_retirement_notification(
+                    PaintRetirementNotification::DeliveryFailed(source_pipeline_id),
+                );
             },
             ScriptToConstellationMessage::DiscardDocument => {
                 self.handle_discard_document(webview_id, source_pipeline_id);
@@ -5096,11 +5197,9 @@ where
             Some((_, DeferredReplacementLifecycleAction::WaitForPaintRetirement))
         ) {
             let notification_sender = self.paint_retirement_sender.clone();
-            match GenericCallback::new(move |result: Result<(), IpcError>| {
-                let notification = match result {
-                    Ok(()) => PaintRetirementNotification::Retired(pipeline_id),
-                    Err(_) => PaintRetirementNotification::DeliveryFailed(pipeline_id),
-                };
+            match GenericCallback::new(move |result: Result<PipelineRetirementStatus, IpcError>| {
+                emit_lifecycle_phase(LifecyclePhase::ConstellationPaintRetirementCallbackObserved);
+                let notification = paint_retirement_notification_from_callback(pipeline_id, result);
                 let _ = notification_sender.send(notification);
             }) {
                 Ok(callback) => {
@@ -5124,17 +5223,18 @@ where
             None
         };
 
-        // Publish Constellation's Paint-retirement marker before any correlated replacement
-        // command can be rerouted. Controlled replacement additionally waits for Paint to consume
-        // both this marker and Script's marker before exposing the new pipeline as ready.
-        let paint_retirement_enqueued =
-            self.paint_proxy
-                .send_checked(PaintMessage::PipelineExited(
-                    pipeline.webview_id,
-                    pipeline.id,
-                    PipelineExitSource::Constellation,
-                    retirement_callback,
-                ));
+        // Script separately published its FIFO-ordered marker before this message. Constellation
+        // now publishes only its own owner bit; Paint performs one physical transaction after it
+        // has recorded both markers.
+        let paint_retirement_enqueued = self
+            .paint_proxy
+            .send_checked(PaintMessage::PipelineExited(
+                pipeline.webview_id,
+                pipeline.id,
+                PipelineExitSource::Constellation,
+                retirement_callback,
+                None,
+            ));
 
         // Clean up any registered interests for this pipeline.
         self.pipeline_interests.retain(|_, set| {
@@ -5142,7 +5242,9 @@ where
             !set.is_empty()
         });
 
-        if waits_for_paint_retirement && !paint_retirement_enqueued {
+        if let Some((request_id, DeferredReplacementLifecycleAction::Fail)) = deferred_action {
+            self.fail_document_control_request(request_id, DocumentControlError::ChannelClosed);
+        } else if waits_for_paint_retirement && !paint_retirement_enqueued {
             self.handle_paint_retirement_notification(
                 PaintRetirementNotification::DeliveryFailed(pipeline_id),
             );

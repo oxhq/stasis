@@ -6,6 +6,7 @@ use std::cell::{Cell, LazyCell};
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::Sender;
 use dpi::PhysicalSize;
@@ -23,8 +24,10 @@ use paint_api::largest_contentful_paint_candidate::LCPCandidate;
 use paint_api::rendering_context::RenderingContext;
 use paint_api::viewport_description::ViewportDescription;
 use paint_api::{
-    ImageUpdate, PipelineExitSource, SendableFrameTree, SerializableDisplayListPayload,
-    SerializableImageData, WebRenderExternalImageHandlers, WebViewTrait,
+    ImageUpdate, PaintMessage, PaintThreadProxy, PipelineExitSource, PipelineRetirementCheckpoint,
+    PipelineRetirementId, PipelineRetirementStatus, SendableFrameTree,
+    SerializableDisplayListPayload, SerializableImageData, WebRenderExternalImageHandlers,
+    WebViewTrait,
 };
 #[cfg(any(feature = "webgl", feature = "webgpu"))]
 use paint_api::WebRenderImageHandlerType;
@@ -51,11 +54,12 @@ use webrender_api::units::{
     WorldPoint,
 };
 use webrender_api::{
-    self, BuiltDisplayList, BuiltDisplayListDescriptor, ColorF, DirtyRect, DisplayListPayload,
-    DocumentId, DynamicProperties, Epoch as WebRenderEpoch, ExternalScrollId, FontInstanceFlags,
-    FontInstanceKey, FontInstanceOptions, FontKey, FontVariation, ImageData, ImageKey,
-    NativeFontHandle, PipelineId as WebRenderPipelineId, PropertyBinding, ReferenceFrameKind,
-    RenderReasons, SampledScrollOffset, SpaceAndClipInfo, SpatialId, TransformStyle,
+    self, BuiltDisplayList, BuiltDisplayListDescriptor, Checkpoint, ColorF, DirtyRect,
+    DisplayListPayload, DocumentId, DynamicProperties, Epoch as WebRenderEpoch, ExternalScrollId,
+    FontInstanceFlags, FontInstanceKey, FontInstanceOptions, FontKey, FontVariation, ImageData,
+    ImageKey, NativeFontHandle, NotificationHandler, NotificationRequest,
+    PipelineId as WebRenderPipelineId, PropertyBinding, ReferenceFrameKind, RenderReasons,
+    SampledScrollOffset, SpaceAndClipInfo, SpatialId, TransformStyle,
 };
 use wr_malloc_size_of::MallocSizeOfOps;
 
@@ -72,6 +76,224 @@ use crate::web_content_animation::WebContentAnimator;
 use crate::webrender_external_images::WebGLExternalImages;
 use crate::webview_renderer::{PinchZoomResult, ScrollResult, UnknownWebView, WebViewRenderer};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PipelineRetirementTransactionStep {
+    RemovePipeline(WebRenderPipelineId),
+    RebuildRootDisplayList,
+    GenerateFrame,
+    Notify(Checkpoint),
+}
+
+fn pipeline_retirement_transaction_plan(
+    pipeline_id: WebRenderPipelineId,
+) -> [PipelineRetirementTransactionStep; 4] {
+    [
+        PipelineRetirementTransactionStep::RemovePipeline(pipeline_id),
+        PipelineRetirementTransactionStep::RebuildRootDisplayList,
+        PipelineRetirementTransactionStep::GenerateFrame,
+        PipelineRetirementTransactionStep::Notify(Checkpoint::FrameBuilt),
+    ]
+}
+
+fn pipeline_retirement_checkpoint(checkpoint: Checkpoint) -> PipelineRetirementCheckpoint {
+    match checkpoint {
+        Checkpoint::FrameBuilt => PipelineRetirementCheckpoint::FrameBuilt,
+        Checkpoint::SceneBuilt
+        | Checkpoint::FrameTexturesUpdated
+        | Checkpoint::FrameRendered
+        | Checkpoint::TransactionDropped => PipelineRetirementCheckpoint::TransactionDropped,
+    }
+}
+
+struct PipelineRetirementNotification {
+    paint_proxy: PaintThreadProxy,
+    painter_id: PainterId,
+    retirement_id: PipelineRetirementId,
+    completion: PipelineRetirementCompletion,
+}
+
+impl NotificationHandler for PipelineRetirementNotification {
+    fn notify(&self, checkpoint: Checkpoint) {
+        let checkpoint = pipeline_retirement_checkpoint(checkpoint);
+        emit_lifecycle_phase(match checkpoint {
+            PipelineRetirementCheckpoint::FrameBuilt => {
+                LifecyclePhase::PainterWebRenderRetirementFrameBuiltQueued
+            },
+            PipelineRetirementCheckpoint::TransactionDropped => {
+                LifecyclePhase::PainterWebRenderRetirementTransactionFailed
+            },
+        });
+        let delivered = self.paint_proxy.send_checked(
+            PaintMessage::PipelineRetirementCheckpoint(
+                self.painter_id,
+                self.retirement_id,
+                checkpoint,
+            ),
+        );
+        if !delivered {
+            // Paint is no longer available to consume Renderer state. Failure may be delivered
+            // directly; success is exclusively Paint-owned after Renderer::update.
+            self.completion
+                .send(PipelineRetirementStatus::PaintOwnerUnavailable);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PipelineRetirementCompletion {
+    callback: Option<GenericCallback<PipelineRetirementStatus>>,
+    delivered: Arc<AtomicBool>,
+}
+
+impl PipelineRetirementCompletion {
+    fn new(callback: Option<GenericCallback<PipelineRetirementStatus>>) -> Self {
+        Self {
+            callback,
+            delivered: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn send(&self, status: PipelineRetirementStatus) {
+        if self.delivered.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(callback) = &self.callback {
+            let _ = callback.send(status);
+        }
+    }
+}
+
+struct PendingPipelineRetirement {
+    pipeline_id: WebRenderPipelineId,
+    document_id: DocumentId,
+    removal_observed: bool,
+    completion: PipelineRetirementCompletion,
+}
+
+#[derive(Default)]
+struct PipelineRetirementCoordinator {
+    next_id: PipelineRetirementId,
+    pending: Vec<(PipelineRetirementId, PendingPipelineRetirement)>,
+}
+
+impl PipelineRetirementCoordinator {
+    fn register(
+        &mut self,
+        pipeline_id: WebRenderPipelineId,
+        document_id: DocumentId,
+        callback: Option<GenericCallback<PipelineRetirementStatus>>,
+    ) -> Result<
+        (PipelineRetirementId, PipelineRetirementCompletion),
+        PipelineRetirementCompletion,
+    > {
+        let completion = PipelineRetirementCompletion::new(callback);
+        if self.pending.iter().any(|(_, pending)| {
+            pending.pipeline_id == pipeline_id && pending.document_id == document_id
+        }) {
+            return Err(completion);
+        }
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("pipeline retirement id exhausted");
+        let retirement_id = self.next_id;
+        self.pending.push((
+            retirement_id,
+            PendingPipelineRetirement {
+                pipeline_id,
+                document_id,
+                removal_observed: false,
+                completion: completion.clone(),
+            },
+        ));
+        Ok((retirement_id, completion))
+    }
+
+    fn observe_removed_pipelines(&mut self, removed: &[(WebRenderPipelineId, DocumentId)]) {
+        // A renderer removal can acknowledge at most one retirement. This matters if duplicate
+        // retirement transactions for the same pipeline are ever coalesced into one update.
+        for &(pipeline_id, document_id) in removed {
+            if let Some((_, pending)) = self.pending.iter_mut().find(|(_, pending)| {
+                !pending.removal_observed &&
+                    pending.pipeline_id == pipeline_id &&
+                    pending.document_id == document_id
+            }) {
+                pending.removal_observed = true;
+            }
+        }
+    }
+
+    fn finish_frame_built(
+        &mut self,
+        retirement_id: PipelineRetirementId,
+        removed: &[(WebRenderPipelineId, DocumentId)],
+    ) -> Option<(
+        PipelineRetirementCompletion,
+        PipelineRetirementStatus,
+    )> {
+        self.observe_removed_pipelines(removed);
+        let index = self
+            .pending
+            .iter()
+            .position(|(pending_id, _)| *pending_id == retirement_id)?;
+        let (_, pending) = self.pending.remove(index);
+        let status = if pending.removal_observed {
+            PipelineRetirementStatus::RendererRemovalConsumed
+        } else if removed.is_empty() {
+            PipelineRetirementStatus::RendererRemovalMissing
+        } else {
+            PipelineRetirementStatus::RendererRemovalMismatch
+        };
+        Some((pending.completion, status))
+    }
+
+    fn finish_failure(
+        &mut self,
+        retirement_id: PipelineRetirementId,
+        status: PipelineRetirementStatus,
+    ) -> Option<(
+        PipelineRetirementCompletion,
+        PipelineRetirementStatus,
+    )> {
+        let index = self
+            .pending
+            .iter()
+            .position(|(pending_id, _)| *pending_id == retirement_id)?;
+        Some((self.pending.remove(index).1.completion, status))
+    }
+
+    fn take_all_completions(&mut self) -> Vec<PipelineRetirementCompletion> {
+        std::mem::take(&mut self.pending)
+            .into_iter()
+            .map(|(_, pending)| pending.completion)
+            .collect()
+    }
+}
+
+fn deliver_pipeline_retirement_completion(
+    completion: Option<(
+        PipelineRetirementCompletion,
+        PipelineRetirementStatus,
+    )>,
+) {
+    let Some((completion, status)) = completion else {
+        return;
+    };
+    emit_lifecycle_phase(match status {
+        PipelineRetirementStatus::RendererRemovalConsumed => {
+            LifecyclePhase::PainterRendererRetirementRemovalConsumed
+        },
+        PipelineRetirementStatus::TransactionDropped
+        | PipelineRetirementStatus::PaintOwnerUnavailable
+        | PipelineRetirementStatus::RendererRemovalMissing
+        | PipelineRetirementStatus::RendererRemovalMismatch
+        | PipelineRetirementStatus::DuplicateRetirement => {
+            LifecyclePhase::PainterWebRenderRetirementTransactionFailed
+        },
+    });
+    completion.send(status);
+}
+
 /// A [`Painter`] is responsible for all of the painting to a particular [`RenderingContext`].
 /// This holds all of the WebRender specific data structures and state necessary for painting
 /// and handling events that happen to `WebView`s that use a particular [`RenderingContext`].
@@ -87,6 +309,10 @@ pub(crate) struct Painter {
 
     /// The ID of this painter.
     pub(crate) painter_id: PainterId,
+
+    /// Paint-local queue used by WebRender checkpoint handlers. Those handlers never complete a
+    /// controlled replacement directly from a render-backend thread.
+    paint_proxy: PaintThreadProxy,
 
     /// Our [`WebViewRenderer`]s, one for every `WebView`.
     pub(crate) webview_renderers: FxHashMap<WebViewId, WebViewRenderer>,
@@ -111,6 +337,9 @@ pub(crate) struct Painter {
 
     /// The webrender renderer.
     pub(crate) webrender_renderer: Option<webrender::Renderer>,
+
+    /// Paint-owned state joining render-backend checkpoints to exact renderer-consumed removals.
+    pipeline_retirement_coordinator: PipelineRetirementCoordinator,
 
     /// Physical ownership of the custom Rayon workers supplied to WebRender.
     webrender_worker_owner: Arc<RayonWorkerOwner>,
@@ -249,6 +478,7 @@ where
 impl Drop for Painter {
     fn drop(&mut self) {
         emit_lifecycle_phase(LifecyclePhase::PainterDropBegin);
+        self.fail_all_pipeline_retirements(PipelineRetirementStatus::PaintOwnerUnavailable);
         let mut first_thread_failure =
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.rendering_context.make_current()
@@ -379,6 +609,404 @@ mod thread_ownership_tests {
         assert!(backend_dropped.load(Ordering::SeqCst));
         assert!(scene_builder_dropped.load(Ordering::SeqCst));
         assert!(worker_dropped.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod pipeline_retirement_transaction_tests {
+    use std::sync::{Arc, Mutex};
+
+    use crossbeam_channel::unbounded;
+    use embedder_traits::EventLoopWaker;
+    use paint_api::{
+        CrossProcessPaintApi, PaintMessage, PaintProxy, PaintThreadProxy,
+        PipelineRetirementCheckpoint, PipelineRetirementStatus,
+    };
+    use servo_base::generic_channel::{GenericCallback, RoutedReceiver};
+    use servo_base::id::TEST_PAINTER_ID;
+    use webrender::PipelineInfo;
+    use webrender_api::{
+        Checkpoint, DocumentId, Epoch as WebRenderEpoch, IdNamespace, NotificationHandler,
+        NotificationRequest, PipelineId as WebRenderPipelineId,
+    };
+
+    use super::{
+        PipelineRetirementCompletion, PipelineRetirementCoordinator, PipelineRetirementNotification,
+        PipelineRetirementTransactionStep, deliver_pipeline_retirement_completion,
+        pipeline_retirement_checkpoint, pipeline_retirement_transaction_plan,
+    };
+
+    #[derive(Clone)]
+    struct NoopWaker;
+
+    impl EventLoopWaker for NoopWaker {
+        fn clone_box(&self) -> Box<dyn EventLoopWaker> {
+            Box::new(self.clone())
+        }
+
+        fn wake(&self) {}
+    }
+
+    fn paint_queue() -> (PaintThreadProxy, RoutedReceiver<PaintMessage>) {
+        let (sender, receiver) = unbounded();
+        let proxy = PaintProxy {
+            sender,
+            cross_process_paint_api: CrossProcessPaintApi::dummy(),
+            event_loop_waker: Box::new(NoopWaker),
+        };
+        (proxy.thread_proxy(), receiver)
+    }
+
+    fn document_id(id: u32) -> DocumentId {
+        DocumentId::new(IdNamespace(17), id)
+    }
+
+    #[test]
+    fn vendored_renderer_pipeline_info_drain_preserves_current_epochs() {
+        let pipeline_id = WebRenderPipelineId(7, 11);
+        let document_id = document_id(3);
+        let mut pipeline_info = PipelineInfo::default();
+        pipeline_info
+            .epochs
+            .insert((pipeline_id, document_id), WebRenderEpoch(23));
+        pipeline_info
+            .removed_pipelines
+            .push((pipeline_id, document_id));
+
+        assert_eq!(
+            pipeline_info.stasis_take_removed_pipelines_regression(),
+            [(pipeline_id, document_id)]
+        );
+        assert_eq!(
+            pipeline_info.epochs.get(&(pipeline_id, document_id)),
+            Some(&WebRenderEpoch(23))
+        );
+        assert!(pipeline_info.removed_pipelines.is_empty());
+    }
+
+    fn recording_callback(
+        deliveries: Arc<Mutex<Vec<PipelineRetirementStatus>>>,
+    ) -> GenericCallback<PipelineRetirementStatus> {
+        GenericCallback::new(move |result| {
+            deliveries
+                .lock()
+                .expect("pipeline retirement deliveries mutex poisoned")
+                .push(result.expect("pipeline retirement callback delivery failed"));
+        })
+        .expect("failed to create pipeline retirement callback")
+    }
+
+    #[test]
+    fn retirement_plan_removes_rebuilds_generates_and_waits_for_frame_built() {
+        let pipeline_id = WebRenderPipelineId(7, 11);
+
+        assert_eq!(
+            pipeline_retirement_transaction_plan(pipeline_id),
+            [
+                PipelineRetirementTransactionStep::RemovePipeline(pipeline_id),
+                PipelineRetirementTransactionStep::RebuildRootDisplayList,
+                PipelineRetirementTransactionStep::GenerateFrame,
+                PipelineRetirementTransactionStep::Notify(Checkpoint::FrameBuilt),
+            ]
+        );
+    }
+
+    fn assert_source_order(source: &str, ordered_needles: &[&str]) {
+        let mut cursor = 0;
+        for needle in ordered_needles {
+            let offset = source[cursor..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("production path is missing {needle:?}"));
+            cursor += offset + needle.len();
+        }
+    }
+
+    #[test]
+    fn production_retirement_path_is_bound_to_transaction_send_and_renderer_consumption() {
+        let source = include_str!("painter.rs");
+        let retirement_start = source
+            .rfind("pub(crate) fn retire_pipeline_in_webrender")
+            .unwrap();
+        let checkpoint_start = source[retirement_start..]
+            .find("pub(crate) fn handle_pipeline_retirement_checkpoint")
+            .map(|offset| retirement_start + offset)
+            .unwrap();
+        let failure_start = source[checkpoint_start..]
+            .find("pub(crate) fn fail_pipeline_retirement")
+            .map(|offset| checkpoint_start + offset)
+            .unwrap();
+        let retirement_source = &source[retirement_start..checkpoint_start];
+        let checkpoint_source = &source[checkpoint_start..failure_start];
+
+        assert_source_order(
+            retirement_source,
+            &[
+                "pipeline_retirement_coordinator.register",
+                "pipeline_retirement_transaction_plan",
+                "transaction.remove_pipeline",
+                "send_root_pipeline_display_list_in_transaction",
+                "generate_frame",
+                "transaction.notify",
+                "send_transaction",
+            ],
+        );
+        assert_source_order(
+            checkpoint_source,
+            &[
+                "rendering_context.make_current",
+                "rendering_context.prepare_for_rendering",
+                "renderer.update",
+                "renderer.take_removed_pipelines",
+                "finish_frame_built",
+                "deliver_pipeline_retirement_completion",
+            ],
+        );
+        assert!(
+            !checkpoint_source.contains("renderer.render"),
+            "retirement consumption must not render"
+        );
+        assert!(
+            !retirement_source.contains("RendererRemovalConsumed"),
+            "transaction construction must not claim renderer-consumed success"
+        );
+    }
+
+    #[test]
+    fn frame_built_only_queues_paint_and_success_waits_for_exact_renderer_removal() {
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let callback = recording_callback(Arc::clone(&deliveries));
+        let pipeline_id = WebRenderPipelineId(7, 11);
+        let document_id = document_id(3);
+        let mut coordinator = PipelineRetirementCoordinator::default();
+        let (retirement_id, completion) = coordinator
+            .register(pipeline_id, document_id, Some(callback))
+            .unwrap();
+        let (paint_proxy, receiver) = paint_queue();
+        let request = NotificationRequest::new(
+            Checkpoint::FrameBuilt,
+            Box::new(PipelineRetirementNotification {
+                paint_proxy,
+                painter_id: TEST_PAINTER_ID,
+                retirement_id,
+                completion,
+            }),
+        );
+
+        assert!(deliveries.lock().unwrap().is_empty());
+        request.notify();
+        assert!(deliveries.lock().unwrap().is_empty());
+        assert!(matches!(
+            receiver.recv().unwrap().unwrap(),
+            PaintMessage::PipelineRetirementCheckpoint(
+                TEST_PAINTER_ID,
+                received_id,
+                PipelineRetirementCheckpoint::FrameBuilt,
+            ) if received_id == retirement_id
+        ));
+        assert!(deliveries.lock().unwrap().is_empty());
+
+        let completion = coordinator.finish_frame_built(
+            retirement_id,
+            &[(pipeline_id, document_id)],
+        );
+        assert!(deliveries.lock().unwrap().is_empty());
+        deliver_pipeline_retirement_completion(completion);
+        assert_eq!(
+            *deliveries.lock().unwrap(),
+            [PipelineRetirementStatus::RendererRemovalConsumed]
+        );
+    }
+
+    #[test]
+    fn dropped_or_unexpected_notification_is_a_paint_local_typed_failure() {
+        for checkpoint in [
+            Checkpoint::SceneBuilt,
+            Checkpoint::FrameTexturesUpdated,
+            Checkpoint::FrameRendered,
+            Checkpoint::TransactionDropped,
+        ] {
+            assert_eq!(
+                pipeline_retirement_checkpoint(checkpoint),
+                PipelineRetirementCheckpoint::TransactionDropped
+            );
+        }
+
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let callback = recording_callback(Arc::clone(&deliveries));
+        let mut coordinator = PipelineRetirementCoordinator::default();
+        let (retirement_id, completion) = coordinator
+            .register(
+                WebRenderPipelineId(7, 11),
+                document_id(3),
+                Some(callback),
+            )
+            .unwrap();
+        let (paint_proxy, receiver) = paint_queue();
+        let request = NotificationRequest::new(
+            Checkpoint::FrameBuilt,
+            Box::new(PipelineRetirementNotification {
+                paint_proxy,
+                painter_id: TEST_PAINTER_ID,
+                retirement_id,
+                completion,
+            }),
+        );
+        drop(request);
+
+        assert!(deliveries.lock().unwrap().is_empty());
+        assert!(matches!(
+            receiver.recv().unwrap().unwrap(),
+            PaintMessage::PipelineRetirementCheckpoint(
+                TEST_PAINTER_ID,
+                received_id,
+                PipelineRetirementCheckpoint::TransactionDropped,
+            ) if received_id == retirement_id
+        ));
+        let completion = coordinator.finish_failure(
+            retirement_id,
+            PipelineRetirementStatus::TransactionDropped,
+        );
+        deliver_pipeline_retirement_completion(completion);
+        assert_eq!(
+            *deliveries.lock().unwrap(),
+            [PipelineRetirementStatus::TransactionDropped]
+        );
+    }
+
+    #[test]
+    fn missing_and_wrong_renderer_removals_are_distinct_typed_failures() {
+        for (removed, expected) in [
+            (Vec::new(), PipelineRetirementStatus::RendererRemovalMissing),
+            (
+                vec![(WebRenderPipelineId(99, 1), document_id(3))],
+                PipelineRetirementStatus::RendererRemovalMismatch,
+            ),
+            (
+                vec![(WebRenderPipelineId(7, 11), document_id(99))],
+                PipelineRetirementStatus::RendererRemovalMismatch,
+            ),
+        ] {
+            let deliveries = Arc::new(Mutex::new(Vec::new()));
+            let mut coordinator = PipelineRetirementCoordinator::default();
+            let (retirement_id, _) = coordinator
+                .register(
+                    WebRenderPipelineId(7, 11),
+                    document_id(3),
+                    Some(recording_callback(Arc::clone(&deliveries))),
+                )
+                .unwrap();
+            deliver_pipeline_retirement_completion(
+                coordinator.finish_frame_built(retirement_id, &removed),
+            );
+            assert_eq!(*deliveries.lock().unwrap(), [expected]);
+        }
+    }
+
+    #[test]
+    fn coalesced_renderer_removals_are_matched_exactly_without_stealing() {
+        let first_deliveries = Arc::new(Mutex::new(Vec::new()));
+        let second_deliveries = Arc::new(Mutex::new(Vec::new()));
+        let first_pipeline = WebRenderPipelineId(7, 11);
+        let second_pipeline = WebRenderPipelineId(7, 12);
+        let document_id = document_id(3);
+        let mut coordinator = PipelineRetirementCoordinator::default();
+        let (first_id, _) = coordinator
+            .register(
+                first_pipeline,
+                document_id,
+                Some(recording_callback(Arc::clone(&first_deliveries))),
+            )
+            .unwrap();
+        let (second_id, _) = coordinator
+            .register(
+                second_pipeline,
+                document_id,
+                Some(recording_callback(Arc::clone(&second_deliveries))),
+            )
+            .unwrap();
+
+        deliver_pipeline_retirement_completion(coordinator.finish_frame_built(
+            first_id,
+            &[
+                (second_pipeline, document_id),
+                (first_pipeline, document_id),
+            ],
+        ));
+        assert_eq!(
+            *first_deliveries.lock().unwrap(),
+            [PipelineRetirementStatus::RendererRemovalConsumed]
+        );
+        assert!(second_deliveries.lock().unwrap().is_empty());
+
+        // The second exact removal was already consumed by the same Renderer::update; its later
+        // FrameBuilt message completes without borrowing the first transaction's acknowledgement.
+        deliver_pipeline_retirement_completion(
+            coordinator.finish_frame_built(second_id, &[]),
+        );
+        assert_eq!(
+            *second_deliveries.lock().unwrap(),
+            [PipelineRetirementStatus::RendererRemovalConsumed]
+        );
+    }
+
+    #[test]
+    fn one_renderer_removal_cannot_acknowledge_duplicate_pending_transactions() {
+        let first_deliveries = Arc::new(Mutex::new(Vec::new()));
+        let second_deliveries = Arc::new(Mutex::new(Vec::new()));
+        let pipeline_id = WebRenderPipelineId(7, 11);
+        let document_id = document_id(3);
+        let mut coordinator = PipelineRetirementCoordinator::default();
+        let (first_id, _) = coordinator
+            .register(
+                pipeline_id,
+                document_id,
+                Some(recording_callback(Arc::clone(&first_deliveries))),
+            )
+            .unwrap();
+        let duplicate_completion = match coordinator.register(
+            pipeline_id,
+            document_id,
+            Some(recording_callback(Arc::clone(&second_deliveries))),
+        ) {
+            Err(completion) => completion,
+            Ok(_) => panic!("duplicate retirement was accepted"),
+        };
+        duplicate_completion.send(PipelineRetirementStatus::DuplicateRetirement);
+
+        deliver_pipeline_retirement_completion(coordinator.finish_frame_built(
+            first_id,
+            &[(pipeline_id, document_id)],
+        ));
+        assert_eq!(
+            *first_deliveries.lock().unwrap(),
+            [PipelineRetirementStatus::RendererRemovalConsumed]
+        );
+        assert_eq!(
+            *second_deliveries.lock().unwrap(),
+            [PipelineRetirementStatus::DuplicateRetirement]
+        );
+    }
+
+    #[test]
+    fn closed_paint_queue_reports_owner_failure_never_success() {
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let callback = recording_callback(Arc::clone(&deliveries));
+        let (paint_proxy, receiver) = paint_queue();
+        drop(receiver);
+        let completion = PipelineRetirementCompletion::new(Some(callback));
+        PipelineRetirementNotification {
+            paint_proxy,
+            painter_id: TEST_PAINTER_ID,
+            retirement_id: 1,
+            completion: completion.clone(),
+        }
+        .notify(Checkpoint::FrameBuilt);
+        completion.send(PipelineRetirementStatus::RendererRemovalConsumed);
+
+        assert_eq!(
+            *deliveries.lock().unwrap(),
+            [PipelineRetirementStatus::PaintOwnerUnavailable]
+        );
     }
 }
 
@@ -522,6 +1150,7 @@ impl Painter {
 
         let painter = Painter {
             painter_id,
+            paint_proxy: paint.paint_proxy.thread_proxy(),
             embedder_to_constellation_sender,
             webview_renderers: Default::default(),
             rendering_context,
@@ -531,6 +1160,7 @@ impl Painter {
             refresh_driver,
             animation_refresh_driver_observer,
             webrender_renderer: Some(webrender_renderer),
+            pipeline_retirement_coordinator: Default::default(),
             webrender_worker_owner,
             webrender_api,
             webrender_document,
@@ -1092,9 +1722,13 @@ impl Painter {
         webview_id: WebViewId,
         pipeline_id: PipelineId,
         pipeline_exit_source: PipelineExitSource,
-        retirement_callback: Option<GenericCallback<()>>,
+        retirement_callback: Option<GenericCallback<PipelineRetirementStatus>>,
     ) -> PipelineRetirement {
         debug!("Paint got pipeline exited: {webview_id:?} {pipeline_id:?}",);
+        let pipeline_was_present = self
+            .webview_renderers
+            .get(&webview_id)
+            .is_some_and(|renderer| renderer.pipelines.contains_key(&pipeline_id));
         let retirement = match self.webview_renderers.get_mut(&webview_id) {
             Some(webview_renderer) => webview_renderer.pipeline_exited(
                 pipeline_id,
@@ -1105,7 +1739,128 @@ impl Painter {
         };
         self.lcp_calculator
             .remove_lcp_candidates_for_pipeline(&pipeline_id.into());
+        if pipeline_was_present && matches!(&retirement, PipelineRetirement::Retired(_)) {
+            emit_lifecycle_phase(LifecyclePhase::PaintPipelineRetirementOwnersObserved);
+        }
         retirement
+    }
+
+    pub(crate) fn retire_pipeline_in_webrender(
+        &mut self,
+        pipeline_id: PipelineId,
+        retirement_callback: Option<GenericCallback<PipelineRetirementStatus>>,
+    ) {
+        let (retirement_id, completion) = match self.pipeline_retirement_coordinator.register(
+            pipeline_id.into(),
+            self.webrender_document,
+            retirement_callback,
+        ) {
+            Ok(retirement) => retirement,
+            Err(completion) => {
+                emit_lifecycle_phase(
+                    LifecyclePhase::PainterWebRenderRetirementTransactionFailed,
+                );
+                completion.send(PipelineRetirementStatus::DuplicateRetirement);
+                return;
+            },
+        };
+        let mut transaction = Transaction::new();
+        for step in pipeline_retirement_transaction_plan(pipeline_id.into()) {
+            match step {
+                PipelineRetirementTransactionStep::RemovePipeline(pipeline_id) => {
+                    transaction.remove_pipeline(pipeline_id);
+                },
+                PipelineRetirementTransactionStep::RebuildRootDisplayList => {
+                    // WebRender 0.70 does not rebuild the scene for RemovePipeline alone.
+                    // Re-emitting the root display list makes the removal part of the scene
+                    // whose frame reaches the retirement checkpoint.
+                    self.send_root_pipeline_display_list_in_transaction(&mut transaction);
+                },
+                PipelineRetirementTransactionStep::GenerateFrame => {
+                    self.generate_frame(&mut transaction, RenderReasons::SCENE);
+                },
+                PipelineRetirementTransactionStep::Notify(checkpoint) => {
+                    transaction.notify(NotificationRequest::new(
+                        checkpoint,
+                        Box::new(PipelineRetirementNotification {
+                            paint_proxy: self.paint_proxy.clone(),
+                            painter_id: self.painter_id,
+                            retirement_id,
+                            completion: completion.clone(),
+                        }),
+                    ));
+                },
+            }
+        }
+        emit_lifecycle_phase(LifecyclePhase::PainterWebRenderRetirementSendBegin);
+        self.send_transaction(transaction);
+    }
+
+    pub(crate) fn handle_pipeline_retirement_checkpoint(
+        &mut self,
+        retirement_id: PipelineRetirementId,
+        checkpoint: PipelineRetirementCheckpoint,
+    ) {
+        if checkpoint == PipelineRetirementCheckpoint::TransactionDropped {
+            let completion = self.pipeline_retirement_coordinator.finish_failure(
+                retirement_id,
+                PipelineRetirementStatus::TransactionDropped,
+            );
+            deliver_pipeline_retirement_completion(completion);
+            return;
+        }
+
+        // The FrameBuilt callback runs on WebRender's render-backend thread. It only queued this
+        // Paint-local message. The Paint thread owns the GL context and is the sole authority that
+        // can consume Renderer state and prove the exact physical pipeline removal.
+        if let Err(error) = self.rendering_context.make_current() {
+            warn!("Could not make the rendering context current for pipeline retirement: {error:?}");
+            let completion = self.pipeline_retirement_coordinator.finish_failure(
+                retirement_id,
+                PipelineRetirementStatus::PaintOwnerUnavailable,
+            );
+            deliver_pipeline_retirement_completion(completion);
+            return;
+        }
+        // `Renderer::update` may apply texture-cache work or draw an older off-screen frame while
+        // replacing its active document. Match the normal render path's context preparation even
+        // though this retirement fence never renders or presents the new frame.
+        self.rendering_context.prepare_for_rendering();
+        let Some(renderer) = self.webrender_renderer.as_mut() else {
+            let completion = self.pipeline_retirement_coordinator.finish_failure(
+                retirement_id,
+                PipelineRetirementStatus::PaintOwnerUnavailable,
+            );
+            deliver_pipeline_retirement_completion(completion);
+            return;
+        };
+        renderer.update();
+        let removed_pipelines = renderer.take_removed_pipelines();
+        let completion = self
+            .pipeline_retirement_coordinator
+            .finish_frame_built(retirement_id, &removed_pipelines);
+        deliver_pipeline_retirement_completion(completion);
+    }
+
+    pub(crate) fn fail_pipeline_retirement(
+        &mut self,
+        retirement_id: PipelineRetirementId,
+        status: PipelineRetirementStatus,
+    ) {
+        let completion = self
+            .pipeline_retirement_coordinator
+            .finish_failure(retirement_id, status);
+        deliver_pipeline_retirement_completion(completion);
+    }
+
+    fn fail_all_pipeline_retirements(&mut self, status: PipelineRetirementStatus) {
+        let completions = self.pipeline_retirement_coordinator.take_all_completions();
+        if !completions.is_empty() {
+            emit_lifecycle_phase(LifecyclePhase::PainterWebRenderRetirementTransactionFailed);
+        }
+        for completion in completions {
+            completion.send(status);
+        }
     }
 
     pub(crate) fn send_initial_pipeline_transaction(

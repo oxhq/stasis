@@ -839,6 +839,9 @@ pub enum ScriptToConstellationMessage {
     DiscardTopLevelBrowsingContext,
     /// Notifies the constellation that this pipeline has exited.
     PipelineExited,
+    /// Paint could not record Script's FIFO-ordered pipeline-exit marker. A controlled
+    /// replacement must fail instead of waiting for (or accepting) physical retirement.
+    PipelineExitPaintMarkerFailed,
     /// Send messages from postMessage calls from serviceworker
     /// to constellation for storing in service worker manager
     ForwardDOMMessage(DOMMessage, ServoUrl),

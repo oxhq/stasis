@@ -35,7 +35,9 @@ use net::resource_thread::{ResourceThreadOwner, new_resource_threads_with_owner}
 use net_traits::{FetchThread, ResourceThreads};
 use paint::{InitialPaintState, Paint};
 pub use paint_api::rendering_context::RenderingContext;
-use paint_api::{CrossProcessPaintApi, PaintMessage, PaintProxy};
+use paint_api::{
+    CrossProcessPaintApi, PaintMessage, PaintProxy, PipelineExitMarkerStatus,
+};
 use profile::mem::MemoryProfilerThreadOwner;
 use profile::{mem as profile_mem, system_reporter, time as profile_time};
 use profile_traits::mem::{MemoryReportResult, ProfilerMsg, Reporter};
@@ -1795,6 +1797,11 @@ fn create_paint_channel(
     // This callback is equivalent to `PaintProxy::send`
     let result_callback = move |msg: Result<PaintMessage, ipc_channel::IpcError>| {
         if let Err(err) = sender_clone.send(msg) {
+            if let Ok(message) = &err.0 {
+                message.send_pipeline_exit_marker_status(
+                    PipelineExitMarkerStatus::LocalQueueRejected,
+                );
+            }
             warn!("Failed to send response ({:?}).", err);
         }
         event_loop_waker_clone.wake();

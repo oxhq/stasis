@@ -18,6 +18,13 @@ static LIFECYCLE_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 /// A fixed phase in the normal Stasis browser-session shutdown lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecyclePhase {
+    PaintPipelineRetirementOwnersObserved,
+    PainterWebRenderRetirementSendBegin,
+    PainterWebRenderRetirementFrameBuiltQueued,
+    PainterRendererRetirementRemovalConsumed,
+    PainterWebRenderRetirementTransactionFailed,
+    ConstellationPaintRetirementCallbackObserved,
+    ControlledReplacementRerouteBegin,
     CloseAccepted,
     EngineSessionDropBegin,
     EngineCloseBegin,
@@ -112,6 +119,13 @@ pub enum LifecyclePhase {
 impl LifecyclePhase {
     /// All v1 phases in their stable vocabulary order.
     pub const ALL: &'static [Self] = &[
+        Self::PaintPipelineRetirementOwnersObserved,
+        Self::PainterWebRenderRetirementSendBegin,
+        Self::PainterWebRenderRetirementFrameBuiltQueued,
+        Self::PainterRendererRetirementRemovalConsumed,
+        Self::PainterWebRenderRetirementTransactionFailed,
+        Self::ConstellationPaintRetirementCallbackObserved,
+        Self::ControlledReplacementRerouteBegin,
         Self::CloseAccepted,
         Self::EngineCloseBegin,
         Self::WebViewDropBegin,
@@ -206,6 +220,23 @@ impl LifecyclePhase {
     /// Return the stable ASCII wire name used by the release diagnostic sanitizer.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::PaintPipelineRetirementOwnersObserved => {
+                "paint_pipeline_retirement_owners_observed"
+            },
+            Self::PainterWebRenderRetirementSendBegin => "painter_webrender_retirement_send_begin",
+            Self::PainterWebRenderRetirementFrameBuiltQueued => {
+                "painter_webrender_retirement_frame_built_queued"
+            },
+            Self::PainterRendererRetirementRemovalConsumed => {
+                "painter_renderer_retirement_removal_consumed"
+            },
+            Self::PainterWebRenderRetirementTransactionFailed => {
+                "painter_webrender_retirement_transaction_failed"
+            },
+            Self::ConstellationPaintRetirementCallbackObserved => {
+                "constellation_paint_retirement_callback_observed"
+            },
+            Self::ControlledReplacementRerouteBegin => "controlled_replacement_reroute_begin",
             Self::CloseAccepted => "close_accepted",
             Self::EngineSessionDropBegin => "engine_session_drop_begin",
             Self::EngineCloseBegin => "engine_close_begin",
@@ -347,6 +378,42 @@ mod tests {
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
         }));
+    }
+
+    #[test]
+    fn physical_pipeline_retirement_phases_have_stable_wire_names() {
+        for (phase, expected) in [
+            (
+                LifecyclePhase::PaintPipelineRetirementOwnersObserved,
+                "paint_pipeline_retirement_owners_observed",
+            ),
+            (
+                LifecyclePhase::PainterWebRenderRetirementSendBegin,
+                "painter_webrender_retirement_send_begin",
+            ),
+            (
+                LifecyclePhase::PainterWebRenderRetirementFrameBuiltQueued,
+                "painter_webrender_retirement_frame_built_queued",
+            ),
+            (
+                LifecyclePhase::PainterRendererRetirementRemovalConsumed,
+                "painter_renderer_retirement_removal_consumed",
+            ),
+            (
+                LifecyclePhase::PainterWebRenderRetirementTransactionFailed,
+                "painter_webrender_retirement_transaction_failed",
+            ),
+            (
+                LifecyclePhase::ConstellationPaintRetirementCallbackObserved,
+                "constellation_paint_retirement_callback_observed",
+            ),
+            (
+                LifecyclePhase::ControlledReplacementRerouteBegin,
+                "controlled_replacement_reroute_begin",
+            ),
+        ] {
+            assert_eq!(phase.as_str(), expected);
+        }
     }
 
     #[test]

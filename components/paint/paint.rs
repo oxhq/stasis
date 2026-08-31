@@ -26,15 +26,17 @@ use log::warn;
 use paint_api::rendering_context::RenderingContext;
 use paint_api::{
     PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
-    WebRenderExternalImageIdManager, WebViewTrait,
+    PipelineExitMarkerStatus, PipelineRetirementStatus, WebRenderExternalImageIdManager,
+    WebViewTrait,
 };
 use profile_traits::mem::{
     ProcessReports, ProfilerRegistration, Report, ReportKind, perform_memory_report,
 };
 use profile_traits::path;
 use profile_traits::time::{self as profile_time};
-use servo_base::generic_channel::{self, GenericSender, RoutedReceiver};
+use servo_base::generic_channel::{self, GenericCallback, GenericSender, RoutedReceiver};
 use servo_base::id::{PainterId, PipelineId, WebViewId};
+use servo_base::lifecycle_trace::{LifecyclePhase, emit_lifecycle_phase};
 #[cfg(feature = "webgl")]
 use servo_canvas_traits::webgl::{WebGLContextId, WebGLThreads};
 use servo_config::pref;
@@ -190,6 +192,15 @@ enum WebViewOwnerRemoval {
 enum FinalOwnerDisposition {
     Removed,
     Deferred,
+}
+
+fn dispatch_retired_pipeline_transaction(
+    retirement: PipelineRetirement,
+    retire: impl FnOnce(Option<GenericCallback<PipelineRetirementStatus>>),
+) {
+    if let PipelineRetirement::Retired(callback) = retirement {
+        retire(callback);
+    }
 }
 
 fn remove_webview_and_locate_empty_owner<T, OwnsWebView, RemoveWebView>(
@@ -413,6 +424,17 @@ impl Paint {
             .find(|painter| painter.painter_id == painter_id)
     }
 
+    fn maybe_live_or_deferred_painter_mut<'a>(
+        &'a self,
+        painter_id: PainterId,
+    ) -> Option<RefMut<'a, Painter>> {
+        self.painters
+            .iter()
+            .chain(self.deferred_painters.iter())
+            .map(|painter| painter.borrow_mut())
+            .find(|painter| painter.painter_id == painter_id)
+    }
+
     pub(crate) fn painter_mut<'a>(&'a self, painter_id: PainterId) -> RefMut<'a, Painter> {
         self.maybe_painter_mut(painter_id)
             .expect("painter_id not found")
@@ -473,7 +495,13 @@ impl Paint {
     pub fn finish_shutting_down(&self) {
         // Drain paint port, sometimes messages contain channels that are blocking
         // another thread from finishing (i.e. SetFrameTree).
-        while self.paint_receiver.try_recv().is_ok() {}
+        while let Ok(message) = self.paint_receiver.try_recv() {
+            if let Ok(message) = message {
+                message.send_pipeline_exit_marker_status(
+                    PipelineExitMarkerStatus::DrainedDuringShutdown,
+                );
+            }
+        }
 
         #[cfg(feature = "webgl")]
         self.webgl_paint.shutdown();
@@ -497,6 +525,9 @@ impl Paint {
             },
             ShutdownState::FinishedShuttingDown => {
                 // Messages to Paint are ignored after shutdown is complete.
+                msg.send_pipeline_exit_marker_status(
+                    PipelineExitMarkerStatus::PaintShutdownFinished,
+                );
                 return;
             },
         }
@@ -533,20 +564,44 @@ impl Paint {
                 pipeline_id,
                 pipeline_exit_source,
                 retirement_callback,
+                marker_ack,
             ) => {
                 if let Some(mut painter) = self.maybe_painter_mut(webview_id.into()) {
-                    if let PipelineRetirement::Retired(Some(callback)) = painter
-                        .notify_pipeline_exited(
-                            webview_id,
-                            pipeline_id,
-                            pipeline_exit_source,
-                            retirement_callback,
-                        )
-                    {
-                        let _ = callback.send(());
+                    let retirement = painter.notify_pipeline_exited(
+                        webview_id,
+                        pipeline_id,
+                        pipeline_exit_source,
+                        retirement_callback,
+                    );
+                    if let Some(marker_ack) = marker_ack {
+                        let _ = marker_ack.send(PipelineExitMarkerStatus::Recorded);
                     }
-                } else if let Some(callback) = retirement_callback {
-                    let _ = callback.send(());
+                    dispatch_retired_pipeline_transaction(retirement, |callback| {
+                        painter.retire_pipeline_in_webrender(pipeline_id, callback);
+                    });
+                } else {
+                    if let Some(marker_ack) = marker_ack {
+                        let _ = marker_ack.send(PipelineExitMarkerStatus::PaintOwnerUnavailable);
+                    }
+                    if let Some(callback) = retirement_callback {
+                        emit_lifecycle_phase(
+                            LifecyclePhase::PainterWebRenderRetirementTransactionFailed,
+                        );
+                        let _ = callback.send(PipelineRetirementStatus::PaintOwnerUnavailable);
+                    }
+                }
+            },
+            PaintMessage::PipelineRetirementCheckpoint(
+                painter_id,
+                retirement_id,
+                checkpoint,
+            ) => {
+                if let Some(mut painter) = self.maybe_live_or_deferred_painter_mut(painter_id) {
+                    painter.handle_pipeline_retirement_checkpoint(retirement_id, checkpoint);
+                } else {
+                    emit_lifecycle_phase(
+                        LifecyclePhase::PainterWebRenderRetirementTransactionFailed,
+                    );
                 }
             },
             PaintMessage::NewWebRenderFrameReady(..) => {
@@ -796,25 +851,55 @@ impl Paint {
     /// `Paint` no longer does any WebRender frame generation.
     fn handle_browser_message_while_shutting_down(&self, msg: PaintMessage) {
         match msg {
+            PaintMessage::PipelineRetirementCheckpoint(
+                painter_id,
+                retirement_id,
+                _,
+            ) => {
+                if let Some(mut painter) = self.maybe_live_or_deferred_painter_mut(painter_id) {
+                    painter.fail_pipeline_retirement(
+                        retirement_id,
+                        PipelineRetirementStatus::PaintOwnerUnavailable,
+                    );
+                }
+            },
             PaintMessage::PipelineExited(
                 webview_id,
                 pipeline_id,
                 pipeline_exit_source,
                 retirement_callback,
+                marker_ack,
             ) => {
-                if let Some(mut painter) = self.maybe_painter_mut(webview_id.into()) {
-                    if let PipelineRetirement::Retired(Some(callback)) = painter
-                        .notify_pipeline_exited(
-                            webview_id,
-                            pipeline_id,
-                            pipeline_exit_source,
-                            retirement_callback,
-                        )
-                    {
-                        let _ = callback.send(());
+                if let Some(mut painter) =
+                    self.maybe_live_or_deferred_painter_mut(webview_id.into())
+                {
+                    let retirement = painter.notify_pipeline_exited(
+                        webview_id,
+                        pipeline_id,
+                        pipeline_exit_source,
+                        retirement_callback,
+                    );
+                    if let Some(marker_ack) = marker_ack {
+                        let _ = marker_ack.send(PipelineExitMarkerStatus::Recorded);
                     }
-                } else if let Some(callback) = retirement_callback {
-                    let _ = callback.send(());
+                    if let PipelineRetirement::Retired(Some(callback)) = retirement {
+                        // Paint cannot generate a new WebRender frame after shutdown begins, so
+                        // fail the held controlled replacement instead of claiming retirement.
+                        emit_lifecycle_phase(
+                            LifecyclePhase::PainterWebRenderRetirementTransactionFailed,
+                        );
+                        let _ = callback.send(PipelineRetirementStatus::PaintOwnerUnavailable);
+                    }
+                } else {
+                    if let Some(marker_ack) = marker_ack {
+                        let _ = marker_ack.send(PipelineExitMarkerStatus::PaintOwnerUnavailable);
+                    }
+                    if let Some(callback) = retirement_callback {
+                        emit_lifecycle_phase(
+                            LifecyclePhase::PainterWebRenderRetirementTransactionFailed,
+                        );
+                        let _ = callback.send(PipelineRetirementStatus::PaintOwnerUnavailable);
+                    }
                 }
             },
             PaintMessage::GenerateImageKey(webview_id, result_sender) => {
@@ -1132,6 +1217,102 @@ impl Paint {
             .collect();
 
         let _ = result_sender.send((font_keys, font_instance_keys));
+    }
+}
+
+#[cfg(test)]
+mod pipeline_retirement_dispatch_tests {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use paint_api::PipelineRetirementStatus;
+    use servo_base::generic_channel::GenericCallback;
+
+    use super::{PipelineRetirement, dispatch_retired_pipeline_transaction};
+
+    #[test]
+    fn retired_without_callback_still_dispatches_the_webrender_transaction() {
+        let transactions = Cell::new(0);
+        dispatch_retired_pipeline_transaction(PipelineRetirement::Retired(None), |callback| {
+            assert!(callback.is_none());
+            transactions.set(transactions.get() + 1);
+        });
+        assert_eq!(transactions.get(), 1);
+    }
+
+    #[test]
+    fn pending_owner_marker_does_not_dispatch_the_webrender_transaction() {
+        let transactions = Cell::new(0);
+        dispatch_retired_pipeline_transaction(PipelineRetirement::Pending, |_| {
+            transactions.set(transactions.get() + 1);
+        });
+        assert_eq!(transactions.get(), 0);
+    }
+
+    #[test]
+    fn callback_bearing_retirement_transfers_without_immediate_success() {
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let deliveries_in_callback = deliveries.clone();
+        let callback = GenericCallback::new(move |result| {
+            assert_eq!(
+                result.unwrap(),
+                PipelineRetirementStatus::RendererRemovalConsumed
+            );
+            deliveries_in_callback.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+        let transferred = Arc::new(Mutex::new(None));
+        let transferred_in_dispatch = transferred.clone();
+        let deliveries_in_dispatch = deliveries.clone();
+
+        dispatch_retired_pipeline_transaction(
+            PipelineRetirement::Retired(Some(callback)),
+            move |callback| {
+                assert_eq!(deliveries_in_dispatch.load(Ordering::SeqCst), 0);
+                *transferred_in_dispatch.lock().unwrap() = callback;
+            },
+        );
+
+        assert_eq!(deliveries.load(Ordering::SeqCst), 0);
+        transferred
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .send(PipelineRetirementStatus::RendererRemovalConsumed)
+            .unwrap();
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn production_handler_transfers_callback_to_renderer_retirement() {
+        let source = include_str!("paint.rs");
+        let start = source
+            .find("fn handle_browser_message(&self, msg: PaintMessage)")
+            .unwrap();
+        let end = source[start..]
+            .find("fn handle_browser_message_while_shutting_down")
+            .map(|offset| start + offset)
+            .unwrap();
+        let handler = &source[start..end];
+        let records_owners = handler.find("painter.notify_pipeline_exited(").unwrap();
+        let records_script_marker = handler
+            .find("marker_ack.send(PipelineExitMarkerStatus::Recorded)")
+            .unwrap();
+        let dispatches = handler
+            .find("dispatch_retired_pipeline_transaction(retirement")
+            .unwrap();
+        let transfers = handler
+            .find("painter.retire_pipeline_in_webrender(pipeline_id, callback)")
+            .unwrap();
+
+        assert!(records_owners < records_script_marker);
+        assert!(records_script_marker < dispatches);
+        assert!(dispatches < transfers);
+        assert!(!handler.contains(
+            "callback.send(PipelineRetirementStatus::RendererRemovalConsumed)"
+        ));
     }
 }
 

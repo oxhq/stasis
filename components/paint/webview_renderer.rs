@@ -18,7 +18,7 @@ use paint_api::display_list::ScrollType;
 use paint_api::viewport_description::{
     DEFAULT_PAGE_ZOOM, MAX_PAGE_ZOOM, MIN_PAGE_ZOOM, ViewportDescription,
 };
-use paint_api::{PipelineExitSource, SendableFrameTree, WebViewTrait};
+use paint_api::{PipelineExitSource, PipelineRetirementStatus, SendableFrameTree, WebViewTrait};
 use rustc_hash::FxHashMap;
 use servo_base::generic_channel::GenericCallback;
 use servo_base::id::{PipelineId, WebViewId};
@@ -207,12 +207,12 @@ impl WebViewRenderer {
         &mut self,
         pipeline_id: PipelineId,
         source: PipelineExitSource,
-        retirement_callback: Option<GenericCallback<()>>,
+        retirement_callback: Option<GenericCallback<PipelineRetirementStatus>>,
     ) -> PipelineRetirement {
         let Some(pipeline) = self.pipelines.get_mut(&pipeline_id) else {
             // The Paint-side state is already absent. A late or duplicate marker must not
-            // recreate a partial PipelineDetails tombstone, and a retained completion callback
-            // may be acknowledged immediately.
+            // recreate a partial PipelineDetails tombstone. Return any retained callback so the
+            // Painter can still fence completion on WebRender rather than acknowledging locally.
             return PipelineRetirement::Retired(retirement_callback);
         };
 

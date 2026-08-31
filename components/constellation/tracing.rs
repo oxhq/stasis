@@ -198,6 +198,9 @@ mod from_script {
                 Self::DiscardDocument => target!("DiscardDocument"),
                 Self::DiscardTopLevelBrowsingContext => target!("DiscardTopLevelBrowsingContext"),
                 Self::PipelineExited => target!("PipelineExited"),
+                Self::PipelineExitPaintMarkerFailed => {
+                    target!("PipelineExitPaintMarkerFailed")
+                },
                 Self::ForwardDOMMessage(..) => target!("ForwardDOMMessage"),
                 Self::MediaSessionEvent(..) => target!("MediaSessionEvent"),
                 #[cfg(feature = "webgpu")]

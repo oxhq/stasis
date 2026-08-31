@@ -6,7 +6,7 @@ use std::cell::Cell;
 
 use euclid::Scale;
 use paint_api::display_list::ScrollTree;
-use paint_api::{CompositionPipeline, PipelineExitSource};
+use paint_api::{CompositionPipeline, PipelineExitSource, PipelineRetirementStatus};
 use servo_base::Epoch;
 use servo_base::generic_channel::GenericCallback;
 use servo_base::id::PipelineId;
@@ -18,7 +18,7 @@ use crate::web_content_animation::PipelineAnimations;
 
 pub(crate) enum PipelineRetirement {
     Pending,
-    Retired(Option<GenericCallback<()>>),
+    Retired(Option<GenericCallback<PipelineRetirementStatus>>),
 }
 
 pub(crate) struct PipelineDetails {
@@ -63,8 +63,9 @@ pub(crate) struct PipelineDetails {
     exited: PipelineExitSource,
 
     /// Completion callback for a controlled replacement whose logical activation remains held
-    /// until Paint has consumed both pipeline-retirement publications.
-    retirement_callback: Option<GenericCallback<()>>,
+    /// until Paint has consumed both retirement publications and then observed WebRender's exact
+    /// renderer-side source removal after the source-removal frame was built.
+    retirement_callback: Option<GenericCallback<PipelineRetirementStatus>>,
 
     /// The [`Epoch`] of the latest display list received for this `Pipeline` or `None` if no
     /// display list has been received.
@@ -112,7 +113,7 @@ impl PipelineDetails {
     pub(crate) fn record_pipeline_exit(
         &mut self,
         source: PipelineExitSource,
-        retirement_callback: Option<GenericCallback<()>>,
+        retirement_callback: Option<GenericCallback<PipelineRetirementStatus>>,
     ) -> PipelineRetirement {
         if let Some(retirement_callback) = retirement_callback {
             debug_assert!(
@@ -143,7 +144,7 @@ mod pipeline_retirement_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use paint_api::PipelineExitSource;
+    use paint_api::{PipelineExitSource, PipelineRetirementStatus};
     use servo_base::generic_channel::GenericCallback;
 
     use super::{PipelineDetails, PipelineRetirement};
@@ -189,7 +190,10 @@ mod pipeline_retirement_tests {
                     panic!("both owners did not return the retained retirement callback")
                 },
             };
-            retirement_callback.send(()).unwrap();
+            assert_eq!(deliveries.load(Ordering::SeqCst), 0);
+            retirement_callback
+                .send(PipelineRetirementStatus::RendererRemovalConsumed)
+                .unwrap();
             assert_eq!(deliveries.load(Ordering::SeqCst), 1);
             assert!(matches!(
                 details.record_pipeline_exit(second, None),

@@ -93,7 +93,9 @@ use net_traits::{
     FetchMetadata, FetchResponseMsg, Metadata, NetworkError, ResourceFetchTiming, ResourceThreads,
     ResourceTimingType,
 };
-use paint_api::{CrossProcessPaintApi, PinchZoomInfos, PipelineExitSource};
+use paint_api::{
+    CrossProcessPaintApi, PinchZoomInfos, PipelineExitMarkerStatus, PipelineExitSource,
+};
 use percent_encoding::percent_decode;
 use profile_traits::mem::{ProcessReports, ReportsChan, perform_memory_report};
 use profile_traits::time::ProfilerCategory;
@@ -531,14 +533,6 @@ fn is_controlled_lifecycle_event(event: &MixedMessage) -> bool {
             ScriptThreadMessage::ExitPipeline(..) | ScriptThreadMessage::ExitScriptThread
         )
     )
-}
-
-fn dispatch_script_pipeline_exit_notifications(
-    notify_paint: impl FnOnce(),
-    notify_constellation: impl FnOnce(),
-) {
-    notify_paint();
-    notify_constellation();
 }
 
 fn replacement_pipeline_bootstrap_queued_event(
@@ -1115,6 +1109,93 @@ fn controlled_session_redirect_limit_before_next_fetch(
     }
     let observed = u64::try_from(current_url_list_len).unwrap_or(u64::MAX);
     (observed > embedder_traits::CONTROLLED_SESSION_MAX_REDIRECTS).then_some(observed)
+}
+
+fn complete_pipeline_exit_marker_ack(
+    completed: &AtomicBool,
+    result: Result<PipelineExitMarkerStatus, ipc_channel::IpcError>,
+    report_failure: impl FnOnce(),
+) {
+    if completed.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if !matches!(result, Ok(PipelineExitMarkerStatus::Recorded)) {
+        report_failure();
+    }
+}
+
+#[cfg(test)]
+mod pipeline_exit_paint_marker_tests {
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicBool;
+
+    use ipc_channel::IpcError;
+    use paint_api::PipelineExitMarkerStatus;
+
+    use super::complete_pipeline_exit_marker_ack;
+
+    #[test]
+    fn recorded_ack_is_terminal_and_never_reports_failure() {
+        let completed = AtomicBool::new(false);
+        let failures = Cell::new(0);
+
+        complete_pipeline_exit_marker_ack(
+            &completed,
+            Ok(PipelineExitMarkerStatus::Recorded),
+            || failures.set(failures.get() + 1),
+        );
+        complete_pipeline_exit_marker_ack(
+            &completed,
+            Ok(PipelineExitMarkerStatus::PaintOwnerUnavailable),
+            || failures.set(failures.get() + 1),
+        );
+
+        assert_eq!(failures.get(), 0);
+    }
+
+    #[test]
+    fn marker_loss_reports_exactly_one_failure() {
+        for result in [
+            Ok(PipelineExitMarkerStatus::CrossProcessSendFailed),
+            Ok(PipelineExitMarkerStatus::LocalQueueRejected),
+            Ok(PipelineExitMarkerStatus::PaintOwnerUnavailable),
+            Ok(PipelineExitMarkerStatus::DrainedDuringShutdown),
+            Ok(PipelineExitMarkerStatus::PaintShutdownFinished),
+            Err(IpcError::Disconnected),
+        ] {
+            let completed = AtomicBool::new(false);
+            let failures = Cell::new(0);
+
+            complete_pipeline_exit_marker_ack(&completed, result, || {
+                failures.set(failures.get() + 1)
+            });
+            complete_pipeline_exit_marker_ack(
+                &completed,
+                Ok(PipelineExitMarkerStatus::Recorded),
+                || failures.set(failures.get() + 1),
+            );
+
+            assert_eq!(failures.get(), 1);
+        }
+    }
+
+    #[test]
+    fn script_marker_is_published_before_logical_pipeline_exit() {
+        let source = include_str!("script_thread.rs");
+        let start = source.rfind("fn handle_exit_pipeline_msg").unwrap();
+        let end = source[start..]
+            .find("/// Handles a request to exit the script thread")
+            .map(|offset| start + offset)
+            .unwrap();
+        let exit_source = &source[start..end];
+        let paint_marker = exit_source.find("self.paint_api.pipeline_exited(").unwrap();
+        let logical_exit = exit_source
+            .find("ScriptToConstellationMessage::PipelineExited,")
+            .unwrap();
+
+        assert!(paint_marker < logical_exit);
+        assert!(exit_source[paint_marker..logical_exit].contains("PipelineExitSource::Script"));
+    }
 }
 
 #[derive(JSTraceable)]
@@ -7292,26 +7373,81 @@ impl ScriptThread {
             self.closed_pipelines.borrow_mut().insert(pipeline_id);
         }
 
-        dispatch_script_pipeline_exit_notifications(
-            || {
-                self.paint_api.pipeline_exited(
+        // This marker is FIFO-ordered behind every earlier Script -> Paint message for the
+        // pipeline. Paint acknowledges only after recording the Script owner bit. Every path
+        // which loses or rejects the marker reports a typed failure to Constellation.
+        let marker_ack_completed = Arc::new(AtomicBool::new(false));
+        let marker_ack_completed_in_callback = marker_ack_completed.clone();
+        let marker_failure_sender = self.senders.pipeline_to_constellation_sender.clone();
+        let marker_ack = generic_channel::GenericCallback::new(
+            move |result: Result<PipelineExitMarkerStatus, ipc_channel::IpcError>| {
+                complete_pipeline_exit_marker_ack(
+                    &marker_ack_completed_in_callback,
+                    result,
+                    || {
+                        let _ = marker_failure_sender.send((
+                            webview_id,
+                            pipeline_id,
+                            ScriptToConstellationMessage::PipelineExitPaintMarkerFailed,
+                        ));
+                    },
+                );
+            },
+        );
+
+        match marker_ack {
+            Ok(marker_ack) => {
+                let retained_marker_ack = marker_ack.clone();
+                if !self.paint_api.pipeline_exited(
                     webview_id,
                     pipeline_id,
                     PipelineExitSource::Script,
+                    marker_ack,
+                ) && retained_marker_ack
+                    .send(PipelineExitMarkerStatus::CrossProcessSendFailed)
+                    .is_err()
+                {
+                    complete_pipeline_exit_marker_ack(
+                        &marker_ack_completed,
+                        Ok(PipelineExitMarkerStatus::CrossProcessSendFailed),
+                        || {
+                            let _ = self.senders.pipeline_to_constellation_sender.send((
+                                webview_id,
+                                pipeline_id,
+                                ScriptToConstellationMessage::PipelineExitPaintMarkerFailed,
+                            ));
+                        },
+                    );
+                }
+            },
+            Err(error) => {
+                warn!("Could not create Paint pipeline-exit marker acknowledgement: {error}");
+                complete_pipeline_exit_marker_ack(
+                    &marker_ack_completed,
+                    Ok(PipelineExitMarkerStatus::CrossProcessSendFailed),
+                    || {
+                        let _ = self.senders.pipeline_to_constellation_sender.send((
+                            webview_id,
+                            pipeline_id,
+                            ScriptToConstellationMessage::PipelineExitPaintMarkerFailed,
+                        ));
+                    },
                 );
             },
-            || {
-                debug!("{pipeline_id}: Sending PipelineExited message to constellation");
-                self.senders
-                    .pipeline_to_constellation_sender
-                    .send((
-                        webview_id,
-                        pipeline_id,
-                        ScriptToConstellationMessage::PipelineExited,
-                    ))
-                    .ok();
-            },
-        );
+        }
+
+        // Logical teardown remains independent of the asynchronous Paint acknowledgement. The
+        // ordering above is nevertheless essential: the Script marker enters the same Paint
+        // channel after prior display/epoch messages and before Constellation publishes its bit.
+        debug!("{pipeline_id}: Sending PipelineExited message to constellation");
+        self.senders
+            .pipeline_to_constellation_sender
+            .send((
+                webview_id,
+                pipeline_id,
+                ScriptToConstellationMessage::PipelineExited,
+            ))
+            .ok();
 
         self.devtools_state.notify_pipeline_exited(pipeline_id);
 
@@ -8714,38 +8850,6 @@ impl Drop for ScriptThread {
         SCRIPT_THREAD_ROOT.with(|root| {
             root.set(None);
         });
-    }
-}
-
-#[cfg(test)]
-mod pipeline_exit_notification_tests {
-    use std::cell::RefCell;
-
-    use super::dispatch_script_pipeline_exit_notifications;
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum ExitNotification {
-        Paint,
-        Constellation,
-    }
-
-    #[test]
-    fn pipeline_exit_dispatches_paint_before_constellation() {
-        let notifications = RefCell::new(Vec::new());
-
-        dispatch_script_pipeline_exit_notifications(
-            || notifications.borrow_mut().push(ExitNotification::Paint),
-            || {
-                notifications
-                    .borrow_mut()
-                    .push(ExitNotification::Constellation);
-            },
-        );
-
-        assert_eq!(
-            notifications.into_inner(),
-            vec![ExitNotification::Paint, ExitNotification::Constellation]
-        );
     }
 }
 

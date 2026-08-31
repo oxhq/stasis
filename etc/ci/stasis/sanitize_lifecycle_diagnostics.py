@@ -27,6 +27,13 @@ FOOTER_BYTE_BUDGET = 512
 
 LIFECYCLE_PHASES = frozenset(
     {
+        "paint_pipeline_retirement_owners_observed",
+        "painter_webrender_retirement_send_begin",
+        "painter_webrender_retirement_frame_built_queued",
+        "painter_renderer_retirement_removal_consumed",
+        "painter_webrender_retirement_transaction_failed",
+        "constellation_paint_retirement_callback_observed",
+        "controlled_replacement_reroute_begin",
         "close_accepted",
         "engine_close_begin",
         "webview_drop_begin",
@@ -295,6 +302,13 @@ def self_test() -> None:
     direct = "stasis_lifecycle_v1 phase=close_accepted"
     escaped = (
         "stderrTail: 'HOSTILE_SECRET\\n"
+        "stasis_lifecycle_v1 phase=paint_pipeline_retirement_owners_observed\\n"
+        "stasis_lifecycle_v1 phase=painter_webrender_retirement_send_begin\\n"
+        "stasis_lifecycle_v1 phase=painter_webrender_retirement_frame_built_queued\\n"
+        "stasis_lifecycle_v1 phase=painter_renderer_retirement_removal_consumed\\n"
+        "stasis_lifecycle_v1 phase=painter_webrender_retirement_transaction_failed\\n"
+        "stasis_lifecycle_v1 phase=constellation_paint_retirement_callback_observed\\n"
+        "stasis_lifecycle_v1 phase=controlled_replacement_reroute_begin\\n"
         "stasis_lifecycle_v1 phase=painter_webrender_shutdown_ack_observed\\n"
         "stasis_lifecycle_v1 phase=painter_webrender_threads_join_end\\n"
         "stasis_lifecycle_v1 phase=painter_webrender_workers_join_end\\n"
@@ -332,6 +346,13 @@ def self_test() -> None:
 
     expected_phases = [
         "lifecycle_phase=close_accepted",
+        "lifecycle_phase=paint_pipeline_retirement_owners_observed",
+        "lifecycle_phase=painter_webrender_retirement_send_begin",
+        "lifecycle_phase=painter_webrender_retirement_frame_built_queued",
+        "lifecycle_phase=painter_renderer_retirement_removal_consumed",
+        "lifecycle_phase=painter_webrender_retirement_transaction_failed",
+        "lifecycle_phase=constellation_paint_retirement_callback_observed",
+        "lifecycle_phase=controlled_replacement_reroute_begin",
         "lifecycle_phase=painter_webrender_shutdown_ack_observed",
         "lifecycle_phase=painter_webrender_threads_join_end",
         "lifecycle_phase=painter_webrender_workers_join_end",
@@ -342,7 +363,7 @@ def self_test() -> None:
     assert positions == sorted(positions)
     assert "north_star_lane=traced sample=047/150" in sanitized
     assert "stderr_marker=mozalloc_abort" in sanitized
-    assert "lifecycle_phase_count=6" in sanitized
+    assert "lifecycle_phase_count=13" in sanitized
     assert "HOSTILE_SECRET" not in sanitized
     assert "secret.invalid" not in sanitized
     assert "hostile_secret" not in sanitized

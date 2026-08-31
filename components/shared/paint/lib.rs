@@ -61,6 +61,24 @@ pub struct PaintProxy {
     pub event_loop_waker: Box<dyn EventLoopWaker>,
 }
 
+/// Thread-safe, process-local route into Paint's event queue.
+///
+/// Unlike [`PaintProxy`], this deliberately excludes the cross-process callback whose message
+/// type is not `Sync`, so WebRender notification handlers may safely retain it.
+#[derive(Clone)]
+pub struct PaintThreadProxy {
+    sender: Sender<Result<PaintMessage, ipc_channel::IpcError>>,
+    event_loop_waker: Box<dyn EventLoopWaker>,
+}
+
+impl PaintThreadProxy {
+    pub fn send_checked(&self, msg: PaintMessage) -> bool {
+        let delivered = self.sender.send(Ok(msg)).is_ok();
+        self.event_loop_waker.wake();
+        delivered
+    }
+}
+
 impl OpaqueSender<PaintMessage> for PaintProxy {
     fn send(&self, message: PaintMessage) {
         PaintProxy::send(self, message)
@@ -68,6 +86,13 @@ impl OpaqueSender<PaintMessage> for PaintProxy {
 }
 
 impl PaintProxy {
+    pub fn thread_proxy(&self) -> PaintThreadProxy {
+        PaintThreadProxy {
+            sender: self.sender.clone(),
+            event_loop_waker: self.event_loop_waker.clone(),
+        }
+    }
+
     pub fn send(&self, msg: PaintMessage) {
         let _ = self.send_checked(msg);
     }
@@ -150,13 +175,22 @@ pub enum PaintMessage {
     /// `DocumentId` of the new frame and the `PainterId` of the associated painter.
     NewWebRenderFrameReady(PainterId, DocumentId, bool),
     /// Script or the Constellation is publishing its Paint-side pipeline-retirement marker.
-    /// The renderer will not discard the Pipeline until both markers have been consumed, to
-    /// avoid recreating it due to any subsequent messages.
+    /// Paint retains the pipeline until both markers have been consumed, then removes it from
+    /// WebRender and reports the terminal render-backend boundary through the optional callback.
     PipelineExited(
         WebViewId,
         PipelineId,
         PipelineExitSource,
-        Option<GenericCallback<()>>,
+        Option<GenericCallback<PipelineRetirementStatus>>,
+        Option<GenericCallback<PipelineExitMarkerStatus>>,
+    ),
+    /// WebRender reached the requested checkpoint for a pipeline-retirement transaction.
+    /// The render-backend thread only enqueues this message; Paint owns renderer consumption and
+    /// completion of any controlled-replacement callback.
+    PipelineRetirementCheckpoint(
+        PainterId,
+        PipelineRetirementId,
+        PipelineRetirementCheckpoint,
     ),
     /// Inform WebRender of the existence of this pipeline.
     SendInitialTransaction(WebViewId, WebRenderPipelineId),
@@ -245,6 +279,18 @@ pub enum PaintMessage {
     SendLCPCandidate(LCPCandidate, WebViewId, PipelineId, Epoch),
     /// Enable LCP calculation for the given WebView.
     EnableLCPCalculation(WebViewId),
+}
+
+impl PaintMessage {
+    /// Deliver a terminal acknowledgement for Script's FIFO-ordered Paint marker when a queue or
+    /// shutdown boundary prevents normal Paint handling.
+    pub fn send_pipeline_exit_marker_status(&self, status: PipelineExitMarkerStatus) {
+        if let Self::PipelineExited(_, _, source, _, Some(callback)) = self &&
+            *source == PipelineExitSource::Script
+        {
+            let _ = callback.send(status);
+        }
+    }
 }
 
 impl Debug for PaintMessage {
@@ -585,13 +631,17 @@ impl CrossProcessPaintApi {
         webview_id: WebViewId,
         pipeline_id: PipelineId,
         source: PipelineExitSource,
-    ) {
-        let _ = self.0.send(PaintMessage::PipelineExited(
-            webview_id,
-            pipeline_id,
-            source,
-            None,
-        ));
+        marker_ack: GenericCallback<PipelineExitMarkerStatus>,
+    ) -> bool {
+        self.0
+            .send(PaintMessage::PipelineExited(
+                webview_id,
+                pipeline_id,
+                source,
+                None,
+                Some(marker_ack),
+            ))
+            .is_ok()
     }
 }
 
@@ -870,6 +920,47 @@ bitflags! {
         const Script = 1 << 0;
         const Constellation = 1 << 1;
     }
+}
+
+/// Paint's acknowledgement that it recorded Script's FIFO-ordered pipeline-exit marker, or the
+/// explicit reason that the marker could not become Paint-owned.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PipelineExitMarkerStatus {
+    Recorded,
+    CrossProcessSendFailed,
+    LocalQueueRejected,
+    PaintOwnerUnavailable,
+    DrainedDuringShutdown,
+    PaintShutdownFinished,
+}
+
+/// Identifies one Paint-owned pipeline-retirement transaction.
+pub type PipelineRetirementId = u64;
+
+/// The render-backend checkpoint delivered back to Paint for a pipeline-retirement transaction.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PipelineRetirementCheckpoint {
+    /// The render backend built the requested frame. Paint must still consume and validate the
+    /// corresponding renderer-side pipeline removal before reporting success.
+    FrameBuilt,
+    /// WebRender dropped the transaction before reaching the requested checkpoint.
+    TransactionDropped,
+}
+
+/// The terminal Paint-owned result for a pipeline-retirement transaction.
+///
+/// Controlled replacement may resume only after WebRender's scene builder and render backend
+/// have consumed the transaction and Paint has run `Renderer::update` and observed the exact
+/// `(PipelineId, DocumentId)` removal. Every earlier boundary and every missing owner/removal is
+/// an explicit failure rather than successful logical retirement.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PipelineRetirementStatus {
+    RendererRemovalConsumed,
+    TransactionDropped,
+    PaintOwnerUnavailable,
+    RendererRemovalMissing,
+    RendererRemovalMismatch,
+    DuplicateRetirement,
 }
 
 /// A [`PinchZoomInfos`] for a root [`Pipeline`] of an [`WebView`]. For any [`Pipeline`]
