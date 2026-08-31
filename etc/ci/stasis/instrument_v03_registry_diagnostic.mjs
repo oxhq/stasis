@@ -9,6 +9,8 @@ import { parseArgs } from "node:util";
 
 export const EXACT_V03_VERIFIER_SHA256 =
   "86aa09719204ad917471475bdc0d0d1adb28398d829f0e2d6eed36fc0e5f2add";
+export const DIAGNOSTIC_CLIENT_TIMEOUT_MS = 45_000;
+const DIAGNOSTIC_CLIENT_TIMEOUT_LITERAL = "45_000";
 
 const DIAGNOSTIC_SUPPORT = `
 const STASIS_V03_DIAGNOSTIC_SCHEMA = "stasis-v0.3-macos-public-diagnostic-v1";
@@ -101,17 +103,28 @@ function replaceExactlyOnce(source, anchor, replacement, label) {
 
 export function instrumentExactV03Verifier(source) {
   assert.equal(
+    Number(DIAGNOSTIC_CLIENT_TIMEOUT_LITERAL.replace("_", "")),
+    DIAGNOSTIC_CLIENT_TIMEOUT_MS,
+  );
+  assert.equal(
     sha256(Buffer.from(source, "utf8")),
     EXACT_V03_VERIFIER_SHA256,
     "diagnostic input is not the immutable v0.3.0 registry verifier",
   );
-  const supportAnchor =
+  const deadlineAnchor =
     "const commandDeadline = () => ({ signal: AbortSignal.timeout(30_000) });";
   let instrumented = replaceExactlyOnce(
     source,
-    supportAnchor,
-    `${supportAnchor}\n${DIAGNOSTIC_SUPPORT}`,
-    "diagnostic support",
+    deadlineAnchor,
+    `const commandDeadline = () => ({ signal: AbortSignal.timeout(${DIAGNOSTIC_CLIENT_TIMEOUT_LITERAL}) });\n${DIAGNOSTIC_SUPPORT}`,
+    "diagnostic client deadline",
+  );
+  const wrapperExecAnchor = `      'exec "$STASIS_EXPLICIT_OVERRIDE_BINARY" "$@"',`;
+  instrumented = replaceExactlyOnce(
+    instrumented,
+    wrapperExecAnchor,
+    `      'export STASIS_LIFECYCLE_TRACE_V1=1',\n${wrapperExecAnchor}`,
+    "diagnostic lifecycle trace",
   );
   instrumented = replaceExactlyOnce(
     instrumented,
@@ -164,6 +177,9 @@ async function main() {
       schema: "stasis-v0.3-macos-public-diagnostic-transform-v1",
       inputSha256: EXACT_V03_VERIFIER_SHA256,
       outputSha256: sha256(Buffer.from(instrumented, "utf8")),
+      clientCommandTimeoutMs: DIAGNOSTIC_CLIENT_TIMEOUT_MS,
+      nativeLifecycleTrace: true,
+      releaseGateAuthority: false,
     })}\n`,
   );
 }

@@ -11,6 +11,7 @@ concurrency:
 
 env:
   DIAGNOSTIC_SAMPLE_COUNT: "20"
+  DIAGNOSTIC_CLIENT_TIMEOUT_MS: "45000"
   EXACT_ARCHIVE_SHA256: 7a3a16c78670b31e1610fe49f8c5f49041054433db21dde201eca9164b90fbea
   EXACT_BINARY_SHA256: 5ffe929adee3f6c4b113ab4f9763ec2d9e1e85539e3dbd3cc7274f23961a9591
   EXACT_NPM_INTEGRITY: sha512-I6Sfsh669FmJHas5ALAMGy2AzTtfZJwOAmTW+TtsT5qksOhaj5eRLs4HOQAW2nXsD9qtoopS6x8pa91s6jjhdA==
@@ -133,10 +134,13 @@ jobs:
             --arg npmSha256 "$EXACT_NPM_SHA256" \
             --arg npmIntegrity "$EXACT_NPM_INTEGRITY" \
             --argjson sampleCount "$DIAGNOSTIC_SAMPLE_COUNT" \
+            --argjson clientCommandTimeoutMs "$DIAGNOSTIC_CLIENT_TIMEOUT_MS" \
             '{schema: $schema, diagnosticHarnessRevision: $harnessRevision,
               releaseRevision: $releaseRevision, archiveSha256: $archiveSha256,
               binarySha256: $binarySha256, npmSha256: $npmSha256,
               npmIntegrity: $npmIntegrity, sampleCount: $sampleCount,
+              clientCommandTimeoutMs: $clientCommandTimeoutMs,
+              nativeCommandTimeoutMs: 30000, nativeLifecycleTrace: true,
               releaseGateAuthority: false}' > "$evidence/identity.json"
           {
             echo "binary=$binary"
