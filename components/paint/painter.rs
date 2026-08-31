@@ -33,7 +33,7 @@ use profile_traits::time_profile;
 use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::Epoch;
 use servo_base::cross_process_instant::CrossProcessInstant;
-use servo_base::generic_channel::{GenericReceiver, GenericSharedMemory};
+use servo_base::generic_channel::{GenericCallback, GenericReceiver, GenericSharedMemory};
 use servo_base::id::{PainterId, PipelineId, WebViewId};
 use servo_base::lifecycle_trace::{LifecyclePhase, emit_lifecycle_phase};
 use servo_base::threadboost::{BoostAffinity, ThreadPriority};
@@ -62,6 +62,7 @@ use wr_malloc_size_of::MallocSizeOfOps;
 use crate::Paint;
 use crate::largest_contentful_paint_calculator::LargestContentfulPaintCalculator;
 use crate::paint::{RepaintReason, WebRenderDebugOption};
+use crate::pipeline_details::PipelineRetirement;
 use crate::refresh_driver::{AnimationRefreshDriverObserver, BaseRefreshDriver};
 use crate::render_notifier::RenderNotifier;
 use crate::screenshot::ScreenshotTaker;
@@ -1091,13 +1092,20 @@ impl Painter {
         webview_id: WebViewId,
         pipeline_id: PipelineId,
         pipeline_exit_source: PipelineExitSource,
-    ) {
+        retirement_callback: Option<GenericCallback<()>>,
+    ) -> PipelineRetirement {
         debug!("Paint got pipeline exited: {webview_id:?} {pipeline_id:?}",);
-        if let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) {
-            webview_renderer.pipeline_exited(pipeline_id, pipeline_exit_source);
-        }
+        let retirement = match self.webview_renderers.get_mut(&webview_id) {
+            Some(webview_renderer) => webview_renderer.pipeline_exited(
+                pipeline_id,
+                pipeline_exit_source,
+                retirement_callback,
+            ),
+            None => PipelineRetirement::Retired(retirement_callback),
+        };
         self.lcp_calculator
             .remove_lcp_candidates_for_pipeline(&pipeline_id.into());
+        retirement
     }
 
     pub(crate) fn send_initial_pipeline_transaction(

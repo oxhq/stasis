@@ -533,6 +533,14 @@ fn is_controlled_lifecycle_event(event: &MixedMessage) -> bool {
     )
 }
 
+fn dispatch_script_pipeline_exit_notifications(
+    notify_paint: impl FnOnce(),
+    notify_constellation: impl FnOnce(),
+) {
+    notify_paint();
+    notify_constellation();
+}
+
 fn replacement_pipeline_bootstrap_queued_event(
     event: &MixedMessage,
 ) -> ReplacementPipelineBootstrapQueuedEvent {
@@ -7284,18 +7292,26 @@ impl ScriptThread {
             self.closed_pipelines.borrow_mut().insert(pipeline_id);
         }
 
-        debug!("{pipeline_id}: Sending PipelineExited message to constellation");
-        self.senders
-            .pipeline_to_constellation_sender
-            .send((
-                webview_id,
-                pipeline_id,
-                ScriptToConstellationMessage::PipelineExited,
-            ))
-            .ok();
-
-        self.paint_api
-            .pipeline_exited(webview_id, pipeline_id, PipelineExitSource::Script);
+        dispatch_script_pipeline_exit_notifications(
+            || {
+                self.paint_api.pipeline_exited(
+                    webview_id,
+                    pipeline_id,
+                    PipelineExitSource::Script,
+                );
+            },
+            || {
+                debug!("{pipeline_id}: Sending PipelineExited message to constellation");
+                self.senders
+                    .pipeline_to_constellation_sender
+                    .send((
+                        webview_id,
+                        pipeline_id,
+                        ScriptToConstellationMessage::PipelineExited,
+                    ))
+                    .ok();
+            },
+        );
 
         self.devtools_state.notify_pipeline_exited(pipeline_id);
 
@@ -8698,6 +8714,38 @@ impl Drop for ScriptThread {
         SCRIPT_THREAD_ROOT.with(|root| {
             root.set(None);
         });
+    }
+}
+
+#[cfg(test)]
+mod pipeline_exit_notification_tests {
+    use std::cell::RefCell;
+
+    use super::dispatch_script_pipeline_exit_notifications;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ExitNotification {
+        Paint,
+        Constellation,
+    }
+
+    #[test]
+    fn pipeline_exit_dispatches_paint_before_constellation() {
+        let notifications = RefCell::new(Vec::new());
+
+        dispatch_script_pipeline_exit_notifications(
+            || notifications.borrow_mut().push(ExitNotification::Paint),
+            || {
+                notifications
+                    .borrow_mut()
+                    .push(ExitNotification::Constellation);
+            },
+        );
+
+        assert_eq!(
+            notifications.into_inner(),
+            vec![ExitNotification::Paint, ExitNotification::Constellation]
+        );
     }
 }
 

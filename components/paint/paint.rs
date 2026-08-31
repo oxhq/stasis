@@ -59,6 +59,7 @@ use webxr::WebXrRegistry;
 
 use crate::InitialPaintState;
 use crate::painter::Painter;
+use crate::pipeline_details::PipelineRetirement;
 use crate::webview_renderer::UnknownWebView;
 
 /// An option to control what kind of WebRender debugging is enabled while Servo is running.
@@ -527,9 +528,25 @@ impl Paint {
                     painter.set_throttled(webview_id, pipeline_id, throttled);
                 }
             },
-            PaintMessage::PipelineExited(webview_id, pipeline_id, pipeline_exit_source) => {
+            PaintMessage::PipelineExited(
+                webview_id,
+                pipeline_id,
+                pipeline_exit_source,
+                retirement_callback,
+            ) => {
                 if let Some(mut painter) = self.maybe_painter_mut(webview_id.into()) {
-                    painter.notify_pipeline_exited(webview_id, pipeline_id, pipeline_exit_source);
+                    if let PipelineRetirement::Retired(Some(callback)) = painter
+                        .notify_pipeline_exited(
+                            webview_id,
+                            pipeline_id,
+                            pipeline_exit_source,
+                            retirement_callback,
+                        )
+                    {
+                        let _ = callback.send(());
+                    }
+                } else if let Some(callback) = retirement_callback {
+                    let _ = callback.send(());
                 }
             },
             PaintMessage::NewWebRenderFrameReady(..) => {
@@ -779,9 +796,25 @@ impl Paint {
     /// `Paint` no longer does any WebRender frame generation.
     fn handle_browser_message_while_shutting_down(&self, msg: PaintMessage) {
         match msg {
-            PaintMessage::PipelineExited(webview_id, pipeline_id, pipeline_exit_source) => {
+            PaintMessage::PipelineExited(
+                webview_id,
+                pipeline_id,
+                pipeline_exit_source,
+                retirement_callback,
+            ) => {
                 if let Some(mut painter) = self.maybe_painter_mut(webview_id.into()) {
-                    painter.notify_pipeline_exited(webview_id, pipeline_id, pipeline_exit_source);
+                    if let PipelineRetirement::Retired(Some(callback)) = painter
+                        .notify_pipeline_exited(
+                            webview_id,
+                            pipeline_id,
+                            pipeline_exit_source,
+                            retirement_callback,
+                        )
+                    {
+                        let _ = callback.send(());
+                    }
+                } else if let Some(callback) = retirement_callback {
+                    let _ = callback.send(());
                 }
             },
             PaintMessage::GenerateImageKey(webview_id, result_sender) => {

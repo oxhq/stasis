@@ -69,6 +69,11 @@ impl OpaqueSender<PaintMessage> for PaintProxy {
 
 impl PaintProxy {
     pub fn send(&self, msg: PaintMessage) {
+        let _ = self.send_checked(msg);
+    }
+
+    /// Send a message and report whether it entered Paint's local queue.
+    pub fn send_checked(&self, msg: PaintMessage) -> bool {
         self.route_msg(Ok(msg))
     }
 
@@ -76,11 +81,58 @@ impl PaintProxy {
     ///
     /// This method is a temporary solution, and will be removed when migrating
     /// to `GenericChannel`.
-    pub fn route_msg(&self, msg: Result<PaintMessage, ipc_channel::IpcError>) {
-        if let Err(err) = self.sender.send(msg) {
-            warn!("Failed to send response ({:?}).", err);
-        }
+    pub fn route_msg(&self, msg: Result<PaintMessage, ipc_channel::IpcError>) -> bool {
+        let delivered = match self.sender.send(msg) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!("Failed to send response ({:?}).", err);
+                false
+            },
+        };
         self.event_loop_waker.wake();
+        delivered
+    }
+}
+
+#[cfg(test)]
+mod paint_proxy_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crossbeam_channel::unbounded;
+    use embedder_traits::EventLoopWaker;
+    use servo_base::id::TEST_WEBVIEW_ID;
+
+    use super::{CrossProcessPaintApi, PaintMessage, PaintProxy};
+
+    #[derive(Clone)]
+    struct CountingWaker(Arc<AtomicUsize>);
+
+    impl EventLoopWaker for CountingWaker {
+        fn clone_box(&self) -> Box<dyn EventLoopWaker> {
+            Box::new(self.clone())
+        }
+
+        fn wake(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn checked_send_reports_a_closed_paint_queue() {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let (sender, receiver) = unbounded();
+        drop(receiver);
+        let proxy = PaintProxy {
+            sender,
+            cross_process_paint_api: CrossProcessPaintApi::dummy(),
+            event_loop_waker: Box::new(CountingWaker(wakes.clone())),
+        };
+
+        assert!(!proxy.send_checked(PaintMessage::EnableLCPCalculation(
+            TEST_WEBVIEW_ID,
+        )));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -97,11 +149,15 @@ pub enum PaintMessage {
     /// the frame is ready. It contains a bool to indicate if it needs to composite, the
     /// `DocumentId` of the new frame and the `PainterId` of the associated painter.
     NewWebRenderFrameReady(PainterId, DocumentId, bool),
-    /// Script or the Constellation is notifying the renderer that a Pipeline has finished
-    /// shutting down. The renderer will not discard the Pipeline until both report that
-    /// they have fully shut it down, to avoid recreating it due to any subsequent
-    /// messages.
-    PipelineExited(WebViewId, PipelineId, PipelineExitSource),
+    /// Script or the Constellation is publishing its Paint-side pipeline-retirement marker.
+    /// The renderer will not discard the Pipeline until both markers have been consumed, to
+    /// avoid recreating it due to any subsequent messages.
+    PipelineExited(
+        WebViewId,
+        PipelineId,
+        PipelineExitSource,
+        Option<GenericCallback<()>>,
+    ),
     /// Inform WebRender of the existence of this pipeline.
     SendInitialTransaction(WebViewId, WebRenderPipelineId),
     /// Scroll the given node ([`ExternalScrollId`]) by the provided delta. This
@@ -534,6 +590,7 @@ impl CrossProcessPaintApi {
             webview_id,
             pipeline_id,
             source,
+            None,
         ));
     }
 }

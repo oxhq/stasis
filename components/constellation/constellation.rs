@@ -242,12 +242,41 @@ struct PendingDocumentControl {
 struct DeferredReplacementActivation {
     source_pipeline_id: PipelineId,
     pipeline_id: PipelineId,
+    source_retirement: DeferredReplacementSourceRetirement,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeferredReplacementExit {
     Source,
     Replacement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredReplacementSourceRetirement {
+    AwaitingLogicalExit,
+    AwaitingPaintRetirement,
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredReplacementLifecycleEvent {
+    LogicalPipelineExit,
+    PaintRetired,
+    PaintRetirementFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredReplacementLifecycleAction {
+    Ignore,
+    WaitForPaintRetirement,
+    Resume,
+    Fail,
+}
+
+#[derive(Debug)]
+enum PaintRetirementNotification {
+    Retired(PipelineId),
+    DeliveryFailed(PipelineId),
 }
 
 fn controlled_session_navigation_load_data(
@@ -267,6 +296,14 @@ fn store_active_controlled_cookie_site(
 }
 
 impl DeferredReplacementActivation {
+    fn new(source_pipeline_id: PipelineId, pipeline_id: PipelineId) -> Self {
+        Self {
+            source_pipeline_id,
+            pipeline_id,
+            source_retirement: DeferredReplacementSourceRetirement::AwaitingLogicalExit,
+        }
+    }
+
     fn classify_exit(self, pipeline_id: PipelineId) -> Option<DeferredReplacementExit> {
         if pipeline_id == self.source_pipeline_id {
             Some(DeferredReplacementExit::Source)
@@ -275,6 +312,49 @@ impl DeferredReplacementActivation {
         } else {
             None
         }
+    }
+
+    fn lifecycle_action(
+        &mut self,
+        pipeline_id: PipelineId,
+        event: DeferredReplacementLifecycleEvent,
+    ) -> DeferredReplacementLifecycleAction {
+        let action = match (self.classify_exit(pipeline_id), event, self.source_retirement) {
+            (
+                Some(DeferredReplacementExit::Source),
+                DeferredReplacementLifecycleEvent::LogicalPipelineExit,
+                DeferredReplacementSourceRetirement::AwaitingLogicalExit,
+            ) => DeferredReplacementLifecycleAction::WaitForPaintRetirement,
+            (
+                Some(DeferredReplacementExit::Source),
+                DeferredReplacementLifecycleEvent::PaintRetired,
+                DeferredReplacementSourceRetirement::AwaitingPaintRetirement,
+            )
+            | (
+                Some(DeferredReplacementExit::Replacement),
+                DeferredReplacementLifecycleEvent::LogicalPipelineExit,
+                DeferredReplacementSourceRetirement::AwaitingLogicalExit
+                | DeferredReplacementSourceRetirement::AwaitingPaintRetirement,
+            ) => DeferredReplacementLifecycleAction::Resume,
+            (
+                Some(DeferredReplacementExit::Source),
+                DeferredReplacementLifecycleEvent::PaintRetirementFailed,
+                DeferredReplacementSourceRetirement::AwaitingPaintRetirement,
+            ) => DeferredReplacementLifecycleAction::Fail,
+            _ => DeferredReplacementLifecycleAction::Ignore,
+        };
+        match action {
+            DeferredReplacementLifecycleAction::WaitForPaintRetirement => {
+                self.source_retirement =
+                    DeferredReplacementSourceRetirement::AwaitingPaintRetirement;
+            },
+            DeferredReplacementLifecycleAction::Resume
+            | DeferredReplacementLifecycleAction::Fail => {
+                self.source_retirement = DeferredReplacementSourceRetirement::Completed;
+            },
+            DeferredReplacementLifecycleAction::Ignore => {},
+        }
+        action
     }
 }
 
@@ -347,7 +427,10 @@ mod finished_event_loop_cleanup_tests {
 mod deferred_replacement_activation_tests {
     use servo_base::id::{PipelineNamespaceId, TEST_PIPELINE_INDEX};
 
-    use super::{DeferredReplacementActivation, DeferredReplacementExit, PipelineId};
+    use super::{
+        DeferredReplacementActivation, DeferredReplacementExit,
+        DeferredReplacementLifecycleAction, DeferredReplacementLifecycleEvent, PipelineId,
+    };
 
     fn pipeline_id(namespace: u32) -> PipelineId {
         PipelineId {
@@ -358,10 +441,7 @@ mod deferred_replacement_activation_tests {
 
     #[test]
     fn classifies_only_the_correlated_source_and_replacement_exits() {
-        let activation = DeferredReplacementActivation {
-            source_pipeline_id: pipeline_id(1),
-            pipeline_id: pipeline_id(2),
-        };
+        let activation = DeferredReplacementActivation::new(pipeline_id(1), pipeline_id(2));
 
         assert_eq!(
             activation.classify_exit(pipeline_id(1)),
@@ -372,6 +452,97 @@ mod deferred_replacement_activation_tests {
             Some(DeferredReplacementExit::Replacement)
         );
         assert_eq!(activation.classify_exit(pipeline_id(3)), None);
+    }
+
+    #[test]
+    fn source_exit_waits_for_paint_retirement_before_exactly_one_reroute() {
+        let source = pipeline_id(1);
+        let replacement = pipeline_id(2);
+        let unrelated = pipeline_id(3);
+        let mut activation = DeferredReplacementActivation::new(source, replacement);
+
+        let source_exit = activation
+            .lifecycle_action(source, DeferredReplacementLifecycleEvent::LogicalPipelineExit);
+        assert_eq!(
+            source_exit,
+            DeferredReplacementLifecycleAction::WaitForPaintRetirement
+        );
+        assert_eq!(
+            activation.lifecycle_action(
+                source,
+                DeferredReplacementLifecycleEvent::LogicalPipelineExit,
+            ),
+            DeferredReplacementLifecycleAction::Ignore,
+        );
+
+        let paint_retired =
+            activation.lifecycle_action(source, DeferredReplacementLifecycleEvent::PaintRetired);
+        assert_eq!(paint_retired, DeferredReplacementLifecycleAction::Resume);
+        assert_eq!(
+            activation.lifecycle_action(
+                source,
+                DeferredReplacementLifecycleEvent::PaintRetired,
+            ),
+            DeferredReplacementLifecycleAction::Ignore,
+        );
+
+        assert_eq!(
+            activation.lifecycle_action(
+                replacement,
+                DeferredReplacementLifecycleEvent::LogicalPipelineExit,
+            ),
+            DeferredReplacementLifecycleAction::Ignore,
+        );
+        assert_eq!(
+            activation.lifecycle_action(
+                replacement,
+                DeferredReplacementLifecycleEvent::PaintRetired,
+            ),
+            DeferredReplacementLifecycleAction::Ignore,
+        );
+        assert_eq!(
+            activation.lifecycle_action(
+                unrelated,
+                DeferredReplacementLifecycleEvent::PaintRetired,
+            ),
+            DeferredReplacementLifecycleAction::Ignore,
+        );
+    }
+
+    #[test]
+    fn paint_retirement_delivery_failure_is_a_one_shot_terminal_action() {
+        let source = pipeline_id(1);
+        let replacement = pipeline_id(2);
+        let mut activation = DeferredReplacementActivation::new(source, replacement);
+
+        assert_eq!(
+            activation.lifecycle_action(
+                source,
+                DeferredReplacementLifecycleEvent::PaintRetired,
+            ),
+            DeferredReplacementLifecycleAction::Ignore,
+        );
+        assert_eq!(
+            activation.lifecycle_action(
+                source,
+                DeferredReplacementLifecycleEvent::LogicalPipelineExit,
+            ),
+            DeferredReplacementLifecycleAction::WaitForPaintRetirement,
+        );
+        assert_eq!(
+            activation.lifecycle_action(
+                source,
+                DeferredReplacementLifecycleEvent::PaintRetirementFailed,
+            ),
+            DeferredReplacementLifecycleAction::Fail,
+        );
+        assert_eq!(
+            activation.lifecycle_action(
+                source,
+                DeferredReplacementLifecycleEvent::PaintRetirementFailed,
+            ),
+            DeferredReplacementLifecycleAction::Ignore,
+        );
     }
 }
 
@@ -687,6 +858,11 @@ pub struct Constellation<STF, SWF> {
 
     /// Sole embedding-owner callback retained for each routed command.
     pending_document_controls: FxHashMap<DocumentControlRequestId, PendingDocumentControl>,
+
+    /// Local, trusted completion lane from Paint. A controlled replacement remains held until
+    /// Paint has consumed both source-pipeline retirement publications.
+    paint_retirement_sender: Sender<PaintRetirementNotification>,
+    paint_retirement_receiver: Receiver<PaintRetirementNotification>,
 
     /// Channels for the constellation to send messages to the public
     /// resource-related threads. There are two groups of resource threads: one
@@ -1094,6 +1270,7 @@ where
                 let (script_ipc_sender, script_ipc_receiver) =
                     generic_channel::channel().expect("ipc channel failure");
                 let script_receiver = script_ipc_receiver.route_preserving_errors();
+                let (paint_retirement_sender, paint_retirement_receiver) = unbounded();
 
                 let (namespace_ipc_sender, namespace_ipc_receiver) =
                     generic_channel::channel().expect("ipc channel failure");
@@ -1159,6 +1336,8 @@ where
                     webviews: Default::default(),
                     next_document_control_request_id: 0,
                     pending_document_controls: Default::default(),
+                    paint_retirement_sender,
+                    paint_retirement_receiver,
                     devtools_sender: state.devtools_sender,
                     script_to_devtools_callback: Default::default(),
                     #[cfg(feature = "bluetooth")]
@@ -1853,6 +2032,7 @@ where
             PipelineNamespace(PipelineNamespaceRequest),
             Script((WebViewId, PipelineId, ScriptToConstellationMessage)),
             BackgroundHangMonitor(HangAlert),
+            PaintRetirement(PaintRetirementNotification),
             Embedder(EmbedderToConstellationMessage),
             RemoveProcess(usize),
         }
@@ -1871,6 +2051,7 @@ where
         sel.recv(&self.namespace_receiver);
         sel.recv(&self.script_receiver);
         sel.recv(&self.background_hang_monitor_receiver);
+        sel.recv(&self.paint_retirement_receiver);
         sel.recv(&self.embedder_to_constellation_receiver);
 
         self.process_manager.register(&mut sel);
@@ -1895,13 +2076,17 @@ where
                     .recv(&self.background_hang_monitor_receiver)
                     .expect("Unexpected BHM channel panic in constellation")
                     .map(Request::BackgroundHangMonitor),
-                3 => Ok(Request::Embedder(
+                3 => Ok(Request::PaintRetirement(
+                    oper.recv(&self.paint_retirement_receiver)
+                        .expect("Unexpected Paint retirement channel closure in constellation"),
+                )),
+                4 => Ok(Request::Embedder(
                     oper.recv(&self.embedder_to_constellation_receiver)
                         .expect("Unexpected embedder channel panic in constellation"),
                 )),
                 _ => {
                     // This can only be a error reading on a closed lifeline receiver.
-                    let process_index = index - 4;
+                    let process_index = index - 5;
                     let _ = oper.recv(self.process_manager.receiver_at(process_index));
                     Ok(Request::RemoveProcess(process_index))
                 },
@@ -1920,6 +2105,9 @@ where
             Request::Embedder(message) => self.handle_request_from_embedder(message),
             Request::Script(message) => {
                 self.handle_request_from_script(message);
+            },
+            Request::PaintRetirement(notification) => {
+                self.handle_paint_retirement_notification(notification);
             },
             Request::BackgroundHangMonitor(message) => {
                 self.handle_request_from_background_hang_monitor(message);
@@ -3008,10 +3196,9 @@ where
                     .pending_document_controls
                     .get_mut(&request_id)
                     .expect("the replacement activation was revalidated above");
-                pending.deferred_replacement_activation = Some(DeferredReplacementActivation {
-                    source_pipeline_id,
-                    pipeline_id,
-                });
+                pending.deferred_replacement_activation = Some(
+                    DeferredReplacementActivation::new(source_pipeline_id, pipeline_id),
+                );
             },
         }
     }
@@ -3079,6 +3266,50 @@ where
             &before,
             captured,
         );
+    }
+
+    fn deferred_replacement_lifecycle_request(
+        &mut self,
+        pipeline_id: PipelineId,
+        event: DeferredReplacementLifecycleEvent,
+    ) -> Option<(
+        DocumentControlRequestId,
+        DeferredReplacementLifecycleAction,
+    )> {
+        self.pending_document_controls
+            .iter_mut()
+            .find_map(|(request_id, pending)| {
+                let action = pending
+                    .deferred_replacement_activation
+                    .as_mut()?
+                    .lifecycle_action(pipeline_id, event);
+                (action != DeferredReplacementLifecycleAction::Ignore)
+                    .then_some((*request_id, action))
+            })
+    }
+
+    fn handle_paint_retirement_notification(&mut self, notification: PaintRetirementNotification) {
+        let (pipeline_id, event) = match notification {
+            PaintRetirementNotification::Retired(pipeline_id) => (
+                pipeline_id,
+                DeferredReplacementLifecycleEvent::PaintRetired,
+            ),
+            PaintRetirementNotification::DeliveryFailed(pipeline_id) => (
+                pipeline_id,
+                DeferredReplacementLifecycleEvent::PaintRetirementFailed,
+            ),
+        };
+        match self.deferred_replacement_lifecycle_request(pipeline_id, event) {
+            Some((_, DeferredReplacementLifecycleAction::Resume)) => {
+                self.resume_deferred_replacement_activation(pipeline_id);
+            },
+            Some((request_id, DeferredReplacementLifecycleAction::Fail)) => {
+                self.fail_document_control_request(request_id, DocumentControlError::ChannelClosed);
+            },
+            Some((_, DeferredReplacementLifecycleAction::Ignore))
+            | Some((_, DeferredReplacementLifecycleAction::WaitForPaintRetirement))
+            | None => {},
+        }
     }
 
     fn handle_document_control_response(
@@ -4854,7 +5085,56 @@ where
         if let Some(webview) = self.webviews.get_mut(&pipeline.webview_id) {
             webview.note_pipeline_membership_change();
         }
-        self.resume_deferred_replacement_activation(pipeline_id);
+
+        let deferred_action = self.deferred_replacement_lifecycle_request(
+            pipeline_id,
+            DeferredReplacementLifecycleEvent::LogicalPipelineExit,
+        );
+        let mut waits_for_paint_retirement = false;
+        let retirement_callback = if matches!(
+            deferred_action,
+            Some((_, DeferredReplacementLifecycleAction::WaitForPaintRetirement))
+        ) {
+            let notification_sender = self.paint_retirement_sender.clone();
+            match GenericCallback::new(move |result: Result<(), IpcError>| {
+                let notification = match result {
+                    Ok(()) => PaintRetirementNotification::Retired(pipeline_id),
+                    Err(_) => PaintRetirementNotification::DeliveryFailed(pipeline_id),
+                };
+                let _ = notification_sender.send(notification);
+            }) {
+                Ok(callback) => {
+                    waits_for_paint_retirement = true;
+                    Some(callback)
+                },
+                Err(error) => {
+                    warn!(
+                        "Could not create Paint retirement callback for {pipeline_id:?}: {error}"
+                    );
+                    if let Some((request_id, _)) = deferred_action {
+                        self.fail_document_control_request(
+                            request_id,
+                            DocumentControlError::ChannelClosed,
+                        );
+                    }
+                    None
+                },
+            }
+        } else {
+            None
+        };
+
+        // Publish Constellation's Paint-retirement marker before any correlated replacement
+        // command can be rerouted. Controlled replacement additionally waits for Paint to consume
+        // both this marker and Script's marker before exposing the new pipeline as ready.
+        let paint_retirement_enqueued =
+            self.paint_proxy
+                .send_checked(PaintMessage::PipelineExited(
+                    pipeline.webview_id,
+                    pipeline.id,
+                    PipelineExitSource::Constellation,
+                    retirement_callback,
+                ));
 
         // Clean up any registered interests for this pipeline.
         self.pipeline_interests.retain(|_, set| {
@@ -4862,14 +5142,13 @@ where
             !set.is_empty()
         });
 
-        // Now that the Script and Constellation parts of Servo no longer have a reference to
-        // this pipeline, tell `Paint` that it has shut down. This is delayed until the
-        // last moment.
-        self.paint_proxy.send(PaintMessage::PipelineExited(
-            pipeline.webview_id,
-            pipeline.id,
-            PipelineExitSource::Constellation,
-        ));
+        if waits_for_paint_retirement && !paint_retirement_enqueued {
+            self.handle_paint_retirement_notification(
+                PaintRetirementNotification::DeliveryFailed(pipeline_id),
+            );
+        } else if !waits_for_paint_retirement {
+            self.resume_deferred_replacement_activation(pipeline_id);
+        }
     }
 
     #[servo_tracing::instrument(skip_all)]

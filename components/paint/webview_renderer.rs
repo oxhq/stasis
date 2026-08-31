@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::collections::hash_map::Entry;
 use std::rc::Rc;
 
 use crossbeam_channel::Sender;
@@ -21,6 +20,7 @@ use paint_api::viewport_description::{
 };
 use paint_api::{PipelineExitSource, SendableFrameTree, WebViewTrait};
 use rustc_hash::FxHashMap;
+use servo_base::generic_channel::GenericCallback;
 use servo_base::id::{PipelineId, WebViewId};
 use servo_constellation_traits::{
     EmbedderToConstellationMessage, ScrollStateUpdate, WindowSizeType,
@@ -34,7 +34,7 @@ use webrender_api::{DocumentId, ExternalScrollId, ScrollLocation};
 use crate::paint::RepaintReason;
 use crate::painter::Painter;
 use crate::pinch_zoom::PinchZoom;
-use crate::pipeline_details::PipelineDetails;
+use crate::pipeline_details::{PipelineDetails, PipelineRetirement};
 use crate::refresh_driver::BaseRefreshDriver;
 use crate::touch::{
     PendingTouchInputEvent, TouchHandler, TouchIdMoveTracking, TouchMoveAllowed, TouchSequenceState,
@@ -203,22 +203,28 @@ impl WebViewRenderer {
             .or_insert_with(PipelineDetails::new)
     }
 
-    pub(crate) fn pipeline_exited(&mut self, pipeline_id: PipelineId, source: PipelineExitSource) {
-        let pipeline = self.pipelines.entry(pipeline_id);
-        let Entry::Occupied(mut pipeline) = pipeline else {
-            return;
+    pub(crate) fn pipeline_exited(
+        &mut self,
+        pipeline_id: PipelineId,
+        source: PipelineExitSource,
+        retirement_callback: Option<GenericCallback<()>>,
+    ) -> PipelineRetirement {
+        let Some(pipeline) = self.pipelines.get_mut(&pipeline_id) else {
+            // The Paint-side state is already absent. A late or duplicate marker must not
+            // recreate a partial PipelineDetails tombstone, and a retained completion callback
+            // may be acknowledged immediately.
+            return PipelineRetirement::Retired(retirement_callback);
         };
 
-        pipeline.get_mut().exited.insert(source);
-
         // Do not remove pipeline details until both the Constellation and Script have
-        // finished processing the pipeline shutdown. This prevents any followup messges
+        // finished processing the pipeline shutdown. This prevents any followup messages
         // from re-adding the pipeline details and creating a zombie.
-        if !pipeline.get().exited.is_all() {
-            return;
+        let retirement = pipeline.record_pipeline_exit(source, retirement_callback);
+        if matches!(retirement, PipelineRetirement::Pending) {
+            return retirement;
         }
-
-        pipeline.remove_entry();
+        self.pipelines.remove(&pipeline_id);
+        retirement
     }
 
     pub(crate) fn set_frame_tree(&mut self, frame_tree: &SendableFrameTree) {

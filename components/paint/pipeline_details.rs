@@ -8,12 +8,18 @@ use euclid::Scale;
 use paint_api::display_list::ScrollTree;
 use paint_api::{CompositionPipeline, PipelineExitSource};
 use servo_base::Epoch;
+use servo_base::generic_channel::GenericCallback;
 use servo_base::id::PipelineId;
 use style_traits::CSSPixel;
 use webrender_api::units::DevicePixel;
 
 use crate::painter::PaintMetricState;
 use crate::web_content_animation::PipelineAnimations;
+
+pub(crate) enum PipelineRetirement {
+    Pending,
+    Retired(Option<GenericCallback<()>>),
+}
 
 pub(crate) struct PipelineDetails {
     /// The pipeline associated with this PipelineDetails object.
@@ -54,7 +60,11 @@ pub(crate) struct PipelineDetails {
 
     /// Which parts of Servo have reported that this `Pipeline` has exited. Only when all
     /// have done so will it be discarded.
-    pub exited: PipelineExitSource,
+    exited: PipelineExitSource,
+
+    /// Completion callback for a controlled replacement whose logical activation remains held
+    /// until Paint has consumed both pipeline-retirement publications.
+    retirement_callback: Option<GenericCallback<()>>,
 
     /// The [`Epoch`] of the latest display list received for this `Pipeline` or `None` if no
     /// display list has been received.
@@ -93,8 +103,31 @@ impl PipelineDetails {
             first_contentful_paint_metric: Cell::new(PaintMetricState::Waiting),
             largest_contentful_paint_metric: Cell::new(PaintMetricState::Waiting),
             exited: PipelineExitSource::empty(),
+            retirement_callback: None,
             display_list_epoch: None,
             animations: Default::default(),
+        }
+    }
+
+    pub(crate) fn record_pipeline_exit(
+        &mut self,
+        source: PipelineExitSource,
+        retirement_callback: Option<GenericCallback<()>>,
+    ) -> PipelineRetirement {
+        if let Some(retirement_callback) = retirement_callback {
+            debug_assert!(
+                self.retirement_callback.is_none(),
+                "a pipeline retirement callback was registered more than once"
+            );
+            if self.retirement_callback.is_none() {
+                self.retirement_callback = Some(retirement_callback);
+            }
+        }
+        self.exited.insert(source);
+        if self.exited.is_all() {
+            PipelineRetirement::Retired(self.retirement_callback.take())
+        } else {
+            PipelineRetirement::Pending
         }
     }
 
@@ -102,5 +135,66 @@ impl PipelineDetails {
         let old_scroll_offsets = self.scroll_tree.scroll_offsets();
         self.scroll_tree = new_scroll_tree;
         self.scroll_tree.set_all_scroll_offsets(&old_scroll_offsets);
+    }
+}
+
+#[cfg(test)]
+mod pipeline_retirement_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use paint_api::PipelineExitSource;
+    use servo_base::generic_channel::GenericCallback;
+
+    use super::{PipelineDetails, PipelineRetirement};
+
+    #[test]
+    fn pipeline_retirement_completes_only_after_both_owners_in_either_order() {
+        for (first, second) in [
+            (
+                PipelineExitSource::Script,
+                PipelineExitSource::Constellation,
+            ),
+            (
+                PipelineExitSource::Constellation,
+                PipelineExitSource::Script,
+            ),
+        ] {
+            let mut details = PipelineDetails::new();
+            let deliveries = Arc::new(AtomicUsize::new(0));
+            let callback_deliveries = deliveries.clone();
+            let mut callback = Some(
+                GenericCallback::new(move |result| {
+                    result.unwrap();
+                    callback_deliveries.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap(),
+            );
+            let first_callback = (first == PipelineExitSource::Constellation)
+                .then(|| callback.take().unwrap());
+            assert!(matches!(
+                details.record_pipeline_exit(first, first_callback),
+                PipelineRetirement::Pending,
+            ));
+            assert!(matches!(
+                details.record_pipeline_exit(first, None),
+                PipelineRetirement::Pending,
+            ));
+
+            let second_callback = (second == PipelineExitSource::Constellation)
+                .then(|| callback.take().unwrap());
+            let retirement_callback = match details.record_pipeline_exit(second, second_callback) {
+                PipelineRetirement::Retired(Some(callback)) => callback,
+                PipelineRetirement::Pending | PipelineRetirement::Retired(None) => {
+                    panic!("both owners did not return the retained retirement callback")
+                },
+            };
+            retirement_callback.send(()).unwrap();
+            assert_eq!(deliveries.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                details.record_pipeline_exit(second, None),
+                PipelineRetirement::Retired(None),
+            ));
+        }
     }
 }
