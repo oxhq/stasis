@@ -4242,6 +4242,11 @@ impl Window {
     }
 
     pub(crate) fn clear_js_runtime(&self) {
+        // This Window owns the logical timer binding, while ScriptThread owns the shared physical
+        // scheduler. Retire the exact binding before the old document stops participating in
+        // pending snapshots, or its unowned head can block settlement of the replacement.
+        self.with_timers(OneshotTimers::cancel_for_global_teardown);
+
         self.as_global_scope()
             .remove_web_messaging_and_dedicated_workers_infra();
 

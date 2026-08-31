@@ -1114,6 +1114,7 @@ fn controlled_session_v2_reuses_image_identity_capacity_across_520_requests() {
 #[test]
 fn controlled_session_v2_implicit_report_advances_intervals_only_until_finite_work_drains() {
     let url = "https://controlled-interval-before-finite.example.test/";
+    let successor_url = "https://controlled-interval-before-finite.example.test/successor";
     let mut child = Command::new(env!("CARGO_BIN_EXE_stasis"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1151,19 +1152,29 @@ fn controlled_session_v2_implicit_report_advances_intervals_only_until_finite_wo
                 "profile": "controlled-web-session-v2",
                 "network": {
                     "mode": "fixtures_only",
-                    "routes": [{
-                        "match": {"method": "GET", "url": {"exact": url}},
-                        "fulfill": {
-                            "status": 200,
-                            "headers": [["content-type", "text/html; charset=utf-8"]],
-                            "body": {
-                                "utf8": std::str::from_utf8(
-                                    CONTROLLED_V2_INTERVAL_BEFORE_FINITE_FIXTURE,
-                                )
-                                .unwrap(),
+                    "routes": [
+                        {
+                            "match": {"method": "GET", "url": {"exact": url}},
+                            "fulfill": {
+                                "status": 200,
+                                "headers": [["content-type", "text/html; charset=utf-8"]],
+                                "body": {
+                                    "utf8": std::str::from_utf8(
+                                        CONTROLLED_V2_INTERVAL_BEFORE_FINITE_FIXTURE,
+                                    )
+                                    .unwrap(),
+                                },
                             },
                         },
-                    }],
+                        {
+                            "match": {"method": "GET", "url": {"exact": successor_url}},
+                            "fulfill": {
+                                "status": 200,
+                                "headers": [["content-type", "text/html; charset=utf-8"]],
+                                "body": {"utf8": "<!doctype html><title>successor</title>"},
+                            },
+                        },
+                    ],
                 },
             },
         }),
@@ -1266,6 +1277,39 @@ fn controlled_session_v2_implicit_report_advances_intervals_only_until_finite_wo
     assert_eq!(
         final_trace["result"]["value"], "interval:1@5000|interval:2@10000|finite@12000",
         "implicit open must execute exactly the interval callbacks needed to reach finite work, and later strict/report checkpoints must not fire another: {final_trace:#}",
+    );
+
+    let navigated = call_session(
+        &mut input,
+        &responses,
+        "navigate-after-controlled-persistent-interval",
+        "session.navigate",
+        json!({
+            "url": successor_url,
+            "expectedStateToken": state_token(&final_trace, "persistent interval final trace"),
+        }),
+    );
+    assert_eq!(
+        navigated["result"]["boundary"], "controlled_ready",
+        "the discarded interval document must not leave an unowned physical scheduler head: {navigated:#}",
+    );
+    let successor = call_session(
+        &mut input,
+        &responses,
+        "settle-successor-after-controlled-persistent-interval",
+        "runtime.settle",
+        json!({
+            "expectedStateToken": state_token(&navigated, "persistent interval successor navigation"),
+        }),
+    );
+    assert_eq!(successor["result"]["outcome"], "quiescent", "{successor:#}");
+    assert_eq!(
+        successor["result"]["snapshot"]["timers"]["persistent"], "0",
+        "the successor inherited the discarded document's persistent timer: {successor:#}",
+    );
+    assert_eq!(
+        successor["result"]["snapshot"]["timers"]["futureFinite"], "0",
+        "the successor inherited finite timer work from the discarded document: {successor:#}",
     );
 
     let closed = call_session(

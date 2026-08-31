@@ -797,6 +797,8 @@ def require_v2_persistent_interval_progression_proof(
     expected_fields = {
         "profile",
         "navigationBoundary",
+        "sessionBaselineVirtualTimeNs",
+        "documentElapsedTimeNs",
         "implicitVirtualTimeNs",
         "implicitPersistentTimers",
         "implicitFutureFinite",
@@ -827,15 +829,12 @@ def require_v2_persistent_interval_progression_proof(
     expected_values = {
         "profile": "controlled-web-session-v2",
         "navigationBoundary": "controlled_ready",
-        "implicitVirtualTimeNs": "12000000000",
         "implicitPersistentTimers": "1",
         "implicitFutureFinite": "0",
         "implicitTrace": expected_trace,
         "strictOutcome": "blocked_on_open_ended_work",
-        "strictVirtualTimeNs": "12000000000",
         "strictTrace": expected_trace,
         "reportOutcome": "quiescent_with_persistent_work",
-        "reportVirtualTimeNs": "12000000000",
         "reportTrace": expected_trace,
         "persistentTimers": "1",
         "futureFinite": "0",
@@ -851,6 +850,41 @@ def require_v2_persistent_interval_progression_proof(
     for field, expected in expected_values.items():
         if require_json_string(value.get(field), f"{description} {field}") != expected:
             raise NpmReleaseError(f"{description} field does not match: {field}")
+    time_values = {
+        field: int(
+            fullmatch(
+                CANONICAL_NONNEGATIVE_INTEGER_RE,
+                require_json_string(value.get(field), f"{description} {field}"),
+                f"{description} {field}",
+            )
+        )
+        for field in (
+            "sessionBaselineVirtualTimeNs",
+            "documentElapsedTimeNs",
+            "implicitVirtualTimeNs",
+            "strictVirtualTimeNs",
+            "reportVirtualTimeNs",
+        )
+    }
+    if time_values["sessionBaselineVirtualTimeNs"] != 260_000_000:
+        raise NpmReleaseError(f"{description} session baseline virtual time changed")
+    if time_values["documentElapsedTimeNs"] != 12_000_000_000:
+        raise NpmReleaseError(f"{description} document elapsed time changed")
+    expected_session_time = (
+        time_values["sessionBaselineVirtualTimeNs"]
+        + time_values["documentElapsedTimeNs"]
+    )
+    if any(
+        time_values[field] != expected_session_time
+        for field in (
+            "implicitVirtualTimeNs",
+            "strictVirtualTimeNs",
+            "reportVirtualTimeNs",
+        )
+    ):
+        raise NpmReleaseError(
+            f"{description} conflates document-relative and session-global time"
+        )
     for field in (
         "sameControlledSession",
         "exactBinaryLaunch",
@@ -1698,15 +1732,17 @@ def self_test() -> None:
             "v2PersistentIntervalProgression": {
                 "profile": "controlled-web-session-v2",
                 "navigationBoundary": "controlled_ready",
-                "implicitVirtualTimeNs": "12000000000",
+                "sessionBaselineVirtualTimeNs": "260000000",
+                "documentElapsedTimeNs": "12000000000",
+                "implicitVirtualTimeNs": "12260000000",
                 "implicitPersistentTimers": "1",
                 "implicitFutureFinite": "0",
                 "implicitTrace": "interval:1@5000|interval:2@10000|finite@12000",
                 "strictOutcome": "blocked_on_open_ended_work",
-                "strictVirtualTimeNs": "12000000000",
+                "strictVirtualTimeNs": "12260000000",
                 "strictTrace": "interval:1@5000|interval:2@10000|finite@12000",
                 "reportOutcome": "quiescent_with_persistent_work",
-                "reportVirtualTimeNs": "12000000000",
+                "reportVirtualTimeNs": "12260000000",
                 "reportTrace": "interval:1@5000|interval:2@10000|finite@12000",
                 "persistentTimers": "1",
                 "futureFinite": "0",
@@ -2423,21 +2459,77 @@ def self_test() -> None:
                 },
             ),
             (
+                "missing interval session baseline",
+                {
+                    key: value
+                    for key, value in base_v2_persistent_interval.items()
+                    if key != "sessionBaselineVirtualTimeNs"
+                },
+            ),
+            (
+                "missing interval document elapsed time",
+                {
+                    key: value
+                    for key, value in base_v2_persistent_interval.items()
+                    if key != "documentElapsedTimeNs"
+                },
+            ),
+            (
                 "extra persistent interval progression field",
                 {**base_v2_persistent_interval, "advancedAfterFinite": True},
+            ),
+            (
+                "coherently shifted interval session baseline",
+                {
+                    **base_v2_persistent_interval,
+                    "sessionBaselineVirtualTimeNs": "270000000",
+                    "implicitVirtualTimeNs": "12270000000",
+                    "strictVirtualTimeNs": "12270000000",
+                    "reportVirtualTimeNs": "12270000000",
+                },
+            ),
+            (
+                "coherently shifted interval document elapsed time",
+                {
+                    **base_v2_persistent_interval,
+                    "documentElapsedTimeNs": "12010000000",
+                    "implicitVirtualTimeNs": "12270000000",
+                    "strictVirtualTimeNs": "12270000000",
+                    "reportVirtualTimeNs": "12270000000",
+                },
+            ),
+            (
+                "document-relative interval totals used as session-global totals",
+                {
+                    **base_v2_persistent_interval,
+                    "implicitVirtualTimeNs": "12000000000",
+                    "strictVirtualTimeNs": "12000000000",
+                    "reportVirtualTimeNs": "12000000000",
+                },
             ),
             *[
                 (label, {**base_v2_persistent_interval, field: value})
                 for label, field, value in (
                     ("wrong interval profile", "profile", "controlled-web-session-v1"),
                     ("wrong interval navigation boundary", "navigationBoundary", "unsupported"),
+                    (
+                        "wrong interval session baseline",
+                        "sessionBaselineVirtualTimeNs",
+                        "0",
+                    ),
+                    (
+                        "noncanonical interval session baseline",
+                        "sessionBaselineVirtualTimeNs",
+                        "0260000000",
+                    ),
+                    ("wrong interval document elapsed time", "documentElapsedTimeNs", "0"),
                     ("wrong implicit interval time", "implicitVirtualTimeNs", "10000000000"),
                     ("missing implicit persistent timer", "implicitPersistentTimers", "0"),
                     ("implicit finite timer remained", "implicitFutureFinite", "1"),
                     ("wrong implicit interval trace", "implicitTrace", "interval:1@5000"),
                     ("wrong strict interval outcome", "strictOutcome", "quiescent"),
                     ("wrong strict interval time", "strictVirtualTimeNs", "10000000000"),
-                    ("numeric strict interval time", "strictVirtualTimeNs", 12000000000),
+                    ("numeric strict interval time", "strictVirtualTimeNs", 12260000000),
                     ("wrong strict interval trace", "strictTrace", "interval:1@5000"),
                     ("wrong report interval outcome", "reportOutcome", "quiescent"),
                     ("wrong report interval time", "reportVirtualTimeNs", "15000000000"),

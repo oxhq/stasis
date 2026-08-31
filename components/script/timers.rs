@@ -1007,6 +1007,13 @@ impl OneshotTimers {
         self.js_timers.remove_min_duration();
     }
 
+    /// Retire the one physical outer-scheduler entry owned by this global before its document is
+    /// discarded. Task-source shutdown prevents the callback from running, but cannot by itself
+    /// remove that entry from the ScriptThread scheduler shared with a replacement document.
+    pub(crate) fn cancel_for_global_teardown(&self) {
+        let _ = self.invalidate_expected_event_id();
+    }
+
     pub(crate) fn suspend(&self) {
         // Suspend is idempotent: do nothing if the timers are already suspended.
         let mut timebase = self.timebase.get();

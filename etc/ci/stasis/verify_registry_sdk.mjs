@@ -1459,6 +1459,8 @@ try {
   const v2FocusEvidence = v2Session.settlementEvidence(v2FocusSettled);
   assert.equal(v2FocusEvidence.profile, CONTROLLED_WEB_SESSION_V2_PROFILE);
 
+  const v2PersistentIntervalSessionBaselineVirtualTimeNs = v2FocusSettled.virtualTimeNs;
+  assert.equal(v2PersistentIntervalSessionBaselineVirtualTimeNs, 260_000_000n);
   const v2PersistentIntervalNavigation = await v2Session.navigate(
     v2IntervalBeforeFiniteFixtureUrl,
     v2FocusTraceResult.stateToken,
@@ -1466,7 +1468,10 @@ try {
   );
   assert.equal(v2PersistentIntervalNavigation.boundary, "controlled_ready");
   const v2PersistentIntervalImplicitPending = await v2Session.pending(commandDeadline());
-  assert.equal(v2PersistentIntervalImplicitPending.virtualTimeNs, 12_000_000_000n);
+  const v2PersistentIntervalDocumentElapsedTimeNs =
+    v2PersistentIntervalImplicitPending.virtualTimeNs -
+    v2PersistentIntervalSessionBaselineVirtualTimeNs;
+  assert.equal(v2PersistentIntervalDocumentElapsedTimeNs, 12_000_000_000n);
   assert.equal(v2PersistentIntervalImplicitPending.timers.persistent, 1n);
   assert.equal(v2PersistentIntervalImplicitPending.timers.futureFinite, 0n);
   assert.deepEqual(v2PersistentIntervalImplicitPending.runtimeFailures, []);
@@ -1485,7 +1490,10 @@ try {
     commandDeadline(),
   );
   assert.equal(v2PersistentIntervalStrict.outcome, "blocked_on_open_ended_work");
-  assert.equal(v2PersistentIntervalStrict.virtualTimeNs, 12_000_000_000n);
+  assert.equal(
+    v2PersistentIntervalStrict.virtualTimeNs,
+    v2PersistentIntervalImplicitPending.virtualTimeNs,
+  );
   assert.equal(v2PersistentIntervalStrict.snapshot.timers.persistent, 1n);
   assert.equal(v2PersistentIntervalStrict.snapshot.timers.futureFinite, 0n);
   assert.deepEqual(v2PersistentIntervalStrict.snapshot.runtimeFailures, []);
@@ -1507,7 +1515,10 @@ try {
     commandDeadline(),
   );
   assert.equal(v2PersistentIntervalReported.outcome, "quiescent_with_persistent_work");
-  assert.equal(v2PersistentIntervalReported.virtualTimeNs, 12_000_000_000n);
+  assert.equal(
+    v2PersistentIntervalReported.virtualTimeNs,
+    v2PersistentIntervalImplicitPending.virtualTimeNs,
+  );
   assert.equal(v2PersistentIntervalReported.snapshot.timers.persistent, 1n);
   assert.equal(v2PersistentIntervalReported.snapshot.timers.futureFinite, 0n);
   assert.deepEqual(v2PersistentIntervalReported.snapshot.runtimeFailures, []);
@@ -1845,6 +1856,10 @@ try {
   v2PersistentIntervalProgression = {
     profile: v2Session.profile,
     navigationBoundary: v2PersistentIntervalNavigation.boundary,
+    sessionBaselineVirtualTimeNs: String(
+      v2PersistentIntervalSessionBaselineVirtualTimeNs,
+    ),
+    documentElapsedTimeNs: String(v2PersistentIntervalDocumentElapsedTimeNs),
     implicitVirtualTimeNs: String(v2PersistentIntervalImplicitPending.virtualTimeNs),
     implicitPersistentTimers: String(v2PersistentIntervalImplicitPending.timers.persistent),
     implicitFutureFinite: String(v2PersistentIntervalImplicitPending.timers.futureFinite),

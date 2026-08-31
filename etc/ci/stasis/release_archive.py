@@ -91,6 +91,7 @@ CONTROLLED_INLINE_SVG_ADVANCED_FIXTURE = Path("ports/stasis/tests/fixtures/contr
 CONTROLLED_SETTLEMENT_URL_FIXTURE = Path(
     "ports/stasis/tests/fixtures/controlled_v2_settlement_url.html"
 )
+CONTROLLED_TIMER_SOURCE = Path("components/script/timers.rs")
 CONTROLLED_INTERVAL_BEFORE_FINITE_FIXTURE = Path(
     "ports/stasis/tests/fixtures/controlled_v2_interval_before_finite.html"
 )
@@ -3736,12 +3737,15 @@ def verify_controlled_settlement_url_fixture_source(source: str) -> None:
 def verify_controlled_interval_before_finite_source(
     protocol_source: str,
     fixture_source: str,
+    timer_source: str,
+    window_source: str,
 ) -> None:
     require_source_fragments_in_order(
         protocol_source,
         (
             'include_bytes!("fixtures/controlled_v2_interval_before_finite.html")',
             "fn controlled_session_v2_implicit_report_advances_intervals_only_until_finite_work_drains()",
+            'let successor_url = "https://controlled-interval-before-finite.example.test/successor"',
             'pending["result"]["virtualTimeNs"], "12000000000"',
             'pending["result"]["timers"]["persistent"], "1"',
             'pending["result"]["timers"]["futureFinite"], "0"',
@@ -3755,6 +3759,13 @@ def verify_controlled_interval_before_finite_source(
             'reported["result"]["snapshot"]["timers"]["futureFinite"], "0"',
             'entry["requestedPeriodNs"] == "5000000000"',
             '"interval:1@5000|interval:2@10000|finite@12000"',
+            '"navigate-after-controlled-persistent-interval"',
+            '"session.navigate"',
+            '"the discarded interval document must not leave an unowned physical scheduler head',
+            '"settle-successor-after-controlled-persistent-interval"',
+            'successor["result"]["outcome"], "quiescent"',
+            'successor["result"]["snapshot"]["timers"]["persistent"], "0"',
+            'successor["result"]["snapshot"]["timers"]["futureFinite"], "0"',
             "fn controlled_session_v1_open_stops_typed_at_interval_head_before_later_finite_work()",
             '"profile": "controlled-web-session-v1"',
             'opened["error"]["code"], "blocked_on_open_ended_work"',
@@ -3764,6 +3775,24 @@ def verify_controlled_interval_before_finite_source(
             "Some(70)",
         ),
         "controlled v2 implicit-report and frozen-v1 persistent interval protocol proofs",
+    )
+    require_source_fragments_in_order(
+        timer_source,
+        (
+            "pub(crate) fn cancel_for_global_teardown(&self) {\n"
+            "        let _ = self.invalidate_expected_event_id();\n"
+            "    }",
+        ),
+        "logical timer physical teardown owner",
+    )
+    require_source_fragments_in_order(
+        window_source,
+        (
+            "pub(crate) fn clear_js_runtime(&self)",
+            "self.with_timers(OneshotTimers::cancel_for_global_teardown)",
+            "cancel_all_tasks_and_ignore_future_tasks()",
+        ),
+        "Window timer teardown ordering",
     )
     require_source_fragments_in_order(
         fixture_source,
@@ -3953,15 +3982,17 @@ def credential_free_v2_fixture_verifier_block(source: str, description: str) -> 
             '"unsupportedFailureCode": "unsupported_clock_surface"',
             '"unsupportedUrl": (',
             '"v2PersistentIntervalProgression": {',
-            '"implicitVirtualTimeNs": "12000000000"',
+            '"sessionBaselineVirtualTimeNs": "260000000"',
+            '"documentElapsedTimeNs": "12000000000"',
+            '"implicitVirtualTimeNs": "12260000000"',
             '"implicitPersistentTimers": "1"',
             '"implicitFutureFinite": "0"',
             '"implicitTrace": "interval:1@5000|interval:2@10000|finite@12000"',
             '"strictOutcome": "blocked_on_open_ended_work"',
-            '"strictVirtualTimeNs": "12000000000"',
+            '"strictVirtualTimeNs": "12260000000"',
             '"strictTrace": "interval:1@5000|interval:2@10000|finite@12000"',
             '"reportOutcome": "quiescent_with_persistent_work"',
-            '"reportVirtualTimeNs": "12000000000"',
+            '"reportVirtualTimeNs": "12260000000"',
             '"reportTrace": "interval:1@5000|interval:2@10000|finite@12000"',
             '"persistentTimers": "1"',
             '"futureFinite": "0"',
@@ -4034,23 +4065,37 @@ def verify_registry_sdk_durable_v2_fixture_source(source: str) -> None:
             '"--session-v2-interval-before-finite-fixture must be a regular file"',
             '"https://packed-sdk-interval-before-finite-v2.example.test/"',
             'body: { utf8: sessionV2IntervalBeforeFiniteFixtureBody }',
+            'const v2PersistentIntervalSessionBaselineVirtualTimeNs = v2FocusSettled.virtualTimeNs',
+            'assert.equal(v2PersistentIntervalSessionBaselineVirtualTimeNs, 260_000_000n)',
             'const v2PersistentIntervalNavigation = await v2Session.navigate(',
             'const v2PersistentIntervalImplicitPending = await v2Session.pending(',
-            'assert.equal(v2PersistentIntervalImplicitPending.virtualTimeNs, 12_000_000_000n)',
+            'const v2PersistentIntervalDocumentElapsedTimeNs =',
+            'v2PersistentIntervalImplicitPending.virtualTimeNs -',
+            'v2PersistentIntervalSessionBaselineVirtualTimeNs',
+            'assert.equal(v2PersistentIntervalDocumentElapsedTimeNs, 12_000_000_000n)',
             'assert.equal(v2PersistentIntervalImplicitPending.timers.persistent, 1n)',
             'assert.equal(v2PersistentIntervalImplicitPending.timers.futureFinite, 0n)',
             '"interval:1@5000|interval:2@10000|finite@12000"',
             '{ persistentWork: "strict" }',
             'assert.equal(v2PersistentIntervalStrict.outcome, "blocked_on_open_ended_work")',
-            'assert.equal(v2PersistentIntervalStrict.virtualTimeNs, 12_000_000_000n)',
+            'v2PersistentIntervalStrict.virtualTimeNs',
+            'v2PersistentIntervalImplicitPending.virtualTimeNs',
             '"strict classification executed another interval callback"',
             '{ persistentWork: "report" }',
             'assert.equal(v2PersistentIntervalReported.outcome, "quiescent_with_persistent_work")',
+            'v2PersistentIntervalReported.virtualTimeNs',
+            'v2PersistentIntervalImplicitPending.virtualTimeNs',
             'assert.equal(v2PersistentIntervalReported.snapshot.timers.futureFinite, 0n)',
             'assert.equal(v2PersistentIntervalWork.requestedPeriodNs, 5_000_000_000n)',
             '"report-mode checkpoint executed another interval callback"',
             'v2PersistentIntervalEvidence.profile',
+            'const v2AutomationNavigation = await v2Session.navigate(',
+            'v2PersistentIntervalReportTrace.stateToken',
+            'assert.equal(v2AutomationNavigation.boundary, "controlled_ready")',
             'v2PersistentIntervalProgression = {',
+            'sessionBaselineVirtualTimeNs: String(',
+            'v2PersistentIntervalSessionBaselineVirtualTimeNs',
+            'documentElapsedTimeNs: String(v2PersistentIntervalDocumentElapsedTimeNs)',
             'implicitTrace: v2PersistentIntervalImplicitTrace.value',
             'strictTrace: v2PersistentIntervalStrictTrace.value',
             'reportTrace: v2PersistentIntervalReportTrace.value',
@@ -4225,6 +4270,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     )
     controlled_inline_svg_advanced_fixture_filename = source_root / CONTROLLED_INLINE_SVG_ADVANCED_FIXTURE
     controlled_settlement_url_fixture_filename = source_root / CONTROLLED_SETTLEMENT_URL_FIXTURE
+    controlled_timer_filename = source_root / CONTROLLED_TIMER_SOURCE
     controlled_interval_before_finite_fixture_filename = (
         source_root / CONTROLLED_INTERVAL_BEFORE_FINITE_FIXTURE
     )
@@ -4353,6 +4399,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         controlled_settlement_url_fixture_filename,
         "controlled settlement URL protocol fixture",
     )
+    require_regular_file(controlled_timer_filename, "controlled logical timer source")
     require_regular_file(
         controlled_interval_before_finite_fixture_filename,
         "controlled interval-before-finite protocol fixture",
@@ -4439,6 +4486,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         controlled_settlement_url_fixture_source = controlled_settlement_url_fixture_filename.read_text(
             encoding="utf-8"
         )
+        controlled_timer_source = controlled_timer_filename.read_text(encoding="utf-8")
         controlled_interval_before_finite_fixture_source = (
             controlled_interval_before_finite_fixture_filename.read_text(encoding="utf-8")
         )
@@ -6347,6 +6395,8 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     verify_controlled_interval_before_finite_source(
         message_baseline_test_source,
         controlled_interval_before_finite_fixture_source,
+        controlled_timer_source,
+        controlled_image_window_source,
     )
     native_bounds = {
         "maximumRetainedNativePortEntriesPerGlobal": rust_usize_constant(
@@ -7064,6 +7114,7 @@ def self_test() -> None:
             CONTROLLED_INLINE_SVG_INCREMENTAL_SAME_TASK_FIXTURE,
             CONTROLLED_INLINE_SVG_ADVANCED_FIXTURE,
             CONTROLLED_SETTLEMENT_URL_FIXTURE,
+            CONTROLLED_TIMER_SOURCE,
             CONTROLLED_INTERVAL_BEFORE_FINITE_FIXTURE,
             EXECUTION_LIMITS_SOURCE,
         )
@@ -7403,6 +7454,56 @@ def self_test() -> None:
             "assert.equal(v2AutomationRejected.url, v2AutomationEventFixtureUrl);",
             "assert.equal(v2AutomationRejected.url, v2FixtureUrl);",
             "packed SDK non-quiescent settlement URL linkage",
+        )
+        for workflow_source, workflow_description in (
+            (PUBLIC_RELEASE_WORKFLOW, "package"),
+            (PUBLIC_NPM_PUBLISH_WORKFLOW, "npm-publish"),
+        ):
+            require_public_marker_mutation_rejected(
+                workflow_source,
+                '"sessionBaselineVirtualTimeNs": "260000000"',
+                '"sessionBaselineVirtualTimeNs": "270000000"',
+                f"{workflow_description} persistent-interval session baseline",
+            )
+            require_public_marker_mutation_rejected(
+                workflow_source,
+                '"documentElapsedTimeNs": "12000000000"',
+                '"documentElapsedTimeNs": "12010000000"',
+                f"{workflow_description} persistent-interval document elapsed time",
+            )
+        require_public_marker_mutation_rejected(
+            REGISTRY_SDK_VERIFIER_SOURCE,
+            "const v2PersistentIntervalSessionBaselineVirtualTimeNs = v2FocusSettled.virtualTimeNs;",
+            "const v2PersistentIntervalSessionBaselineVirtualTimeNs = 0n;",
+            "packed SDK persistent-interval session baseline linkage",
+        )
+        require_public_marker_mutation_rejected(
+            CONTROLLED_TIMER_SOURCE,
+            "pub(crate) fn cancel_for_global_teardown(&self) {\n"
+            "        let _ = self.invalidate_expected_event_id();\n"
+            "    }",
+            "pub(crate) fn cancel_for_global_teardown(&self) {\n"
+            "        self.cancel_scheduled_timer();\n"
+            "    }",
+            "logical timer teardown callback invalidation",
+        )
+        require_public_marker_mutation_rejected(
+            CONTROLLED_IMAGE_WINDOW_SOURCE,
+            "self.with_timers(OneshotTimers::cancel_for_global_teardown);",
+            "self.with_timers(OneshotTimers::speed_up);",
+            "Window physical timer teardown ownership",
+        )
+        require_public_marker_mutation_rejected(
+            REGISTRY_SDK_VERIFIER_SOURCE,
+            "assert.equal(v2PersistentIntervalDocumentElapsedTimeNs, 12_000_000_000n);",
+            "assert.equal(v2PersistentIntervalImplicitPending.virtualTimeNs, 12_000_000_000n);",
+            "packed SDK persistent-interval document clock-domain assertion",
+        )
+        require_public_marker_mutation_rejected(
+            REGISTRY_SDK_VERIFIER_SOURCE,
+            "documentElapsedTimeNs: String(v2PersistentIntervalDocumentElapsedTimeNs),",
+            "documentElapsedTimeNs: String(v2PersistentIntervalImplicitPending.virtualTimeNs),",
+            "packed SDK persistent-interval document elapsed proof linkage",
         )
         require_public_marker_mutation_rejected(
             REGISTRY_SDK_VERIFIER_SOURCE,
