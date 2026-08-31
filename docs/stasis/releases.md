@@ -1,12 +1,12 @@
-# Stasis 0.3 release train
+# Stasis 0.3.1 corrective release train
 
 The source tree, native `stasis-shell` crate, TypeScript package metadata, and
-release validators are aligned to exact version `0.3.0`. Source version is not
-a publication claim. Before promotion, `v0.2.1` and `@oxhq/stasis@0.2.1` remain
-the immutable stable predecessor until an exact `v0.3.0` tag is promoted,
-published immutably, published to npm with provenance, and verified from
-anonymous managed-runtime bytes. After promotion, verify those public artifacts;
-do not infer current registry state from this checked-in text.
+release validators are aligned to exact version `0.3.1`. Source version is not
+a publication claim. `v0.2.1` and `@oxhq/stasis@0.2.1` remain the last fully
+qualified predecessor. Public `v0.3.0` is immutable disqualified release evidence after its
+macOS anonymous-consumer failure. Promote `v0.3.1` only after its exact tag, immutable release,
+npm provenance, and anonymous managed-runtime verification all pass. After promotion, verify
+those public artifacts; do not infer current registry state from this checked-in text.
 
 Version 0.3 adds the explicitly selected `controlled-web-session-v2` profile
 for bounded same-global, untransferred `MessageChannel` work, a bounded direct top-level
@@ -109,9 +109,9 @@ After finite work drains, settlement does not fire another interval cycle and re
 `quiescent_with_persistent_work`. Strict policy and both frozen predecessor profiles still stop at
 the interval head as `blocked_on_open_ended_work`.
 
-The checked-out release and npm workflows accept only exact `v0.3.0` for new
-promotion/publication work. They do not authorize rebuilding or replacing any published `0.2.x`
-bytes. Checked-in version text is not release evidence: verify the immutable tag, hosted promotion,
+The checked-out release and npm workflows accept only exact `v0.3.1` for new
+promotion/publication work. They do not authorize rebuilding or replacing public `v0.3.0` or any
+published `0.2.x` bytes. Checked-in version text is not release evidence: verify the immutable tag, hosted promotion,
 npm provenance, and anonymous public-consumer result.
 
 # Stasis 0.2 release history (immutable predecessor)
@@ -136,8 +136,8 @@ every other stable or prerelease identity. The native matrix remains deliberatel
 bounded to Linux x86-64 and macOS arm64, with the same compatibility,
 ten-member archive, checksum, source-identity, and provenance contracts used by
 the first stable train. The helper at the `v0.2.1` tag accepted only `0.2.1`;
-the current main helper accepts only `0.3.0` and cannot alter or
-re-authorize historical `v0.2.1`, `v0.2.0`, or `0.1.x` bytes.
+the current main helper accepts only `0.3.1` and cannot alter or
+re-authorize historical `v0.3.0`, `v0.2.1`, `v0.2.0`, or `0.1.x` bytes.
 
 ## Windows x86-64 CI-only proof artifact
 
@@ -196,7 +196,7 @@ not GitHub release assets. Build provenance covers all release assets and the
 SDK package/proof. The SDK's checked-in generated runtime-manifest module is an
 intentionally mismatched historical alpha placeholder: local `prepack` fails
 closed until the credential-free package job generates the exact 0.3
-`v0.3.0` manifest from both verified native archives.
+`v0.3.1` manifest from both verified native archives.
 
 ## 0.3 package and product gates
 
@@ -302,24 +302,24 @@ gh workflow run stasis-package.yml \
   --repo oxhq/stasis \
   --ref main \
   -f package_run_id=REPLACE_WITH_SUCCESSFUL_MAIN_PUSH_RUN_ID \
-  -f release_tag=v0.3.0
+  -f release_tag=v0.3.1
 ```
 
 Run that promotion only after the exact source's hosted package gates pass. After
 the exact draft is inspected and published as an immutable,
 non-prerelease GitHub release, the release event may publish only
-`@oxhq/stasis@0.3.0` with npm trusted publishing and provenance. The expected
+`@oxhq/stasis@0.3.1` with npm trusted publishing and provenance. The expected
 post-publication dist-tag map would then be:
 
 ```json
 {
   "alpha": "0.1.0-alpha.0",
-  "latest": "0.3.0"
+  "latest": "0.3.1"
 }
 ```
 
 The workflow fails if the immutable historical `alpha` tag moves, `latest`
-does not point to `0.3.0` after publication, any unexpected dist-tag appears, public registry
+does not point to `0.3.1` after publication, any unexpected dist-tag appears, public registry
 bytes differ from the staged tarball, provenance/signature verification fails,
 or either anonymous North Star fails. Manual npm-workflow dispatch remains
 read-only recovery tied to the original release-event run and attempt; it may
@@ -505,8 +505,8 @@ report `immutable: true`.
 Publishing the stable GitHub release triggers
 `.github/workflows/stasis-publish-npm.yml`. At the immutable `v0.1.0` tag, its
 mutating path accepted only the published, immutable, non-prerelease `v0.1.0`
-release in `oxhq/stasis`; the current main workflow accepts only `v0.3.0` and
-cannot mutate that historical package.
+release in `oxhq/stasis`; the current main workflow accepts only `v0.3.1` and
+cannot mutate public `v0.3.0` or that historical package.
 
 The workflow first runs without npm credentials. It verifies all nine release
 assets and attestations and requires both native proofs to identify the same

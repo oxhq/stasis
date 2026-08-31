@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and verify the exact Stasis 0.3.0 native release archives."""
+"""Build and verify the exact Stasis 0.3.1 native release archives."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import BinaryIO, Iterable
 
 
-RELEASE_VERSION = "0.3.0"
+RELEASE_VERSION = "0.3.1"
 VERSION_RE = re.compile(re.escape(RELEASE_VERSION))
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -31,6 +31,7 @@ FROZEN_V2_PROFILE = Path("profiles/controlled-web-session-v1.json")
 FROZEN_V2_PROFILE_SHA256 = "9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a"
 CANDIDATE_V2_PROFILE = Path("profiles/controlled-web-session-v2.json")
 CANDIDATE_V2_PROFILE_SHA256 = "1351eec7fb3ec307907aaa26ea6776d364ccf686310a62b42a55b91b9ad7e4c4"
+CONTROLLED_WEB_SESSION_V2_TARGET_RELEASE = "0.3.0"
 CANDIDATE_V2_CONTRACT = Path("docs/stasis/session-v0.3-candidate.md")
 CANDIDATE_V2_CONTRACT_SHA256 = "5d1e336b64f703e3bbfcc8ad5d863e6f39636657a5f834911ccdf24a560fcba5"
 PUBLIC_TOP_LEVEL_README = Path("README.md")
@@ -4699,7 +4700,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     expected_identity = {
         "id": "controlled-web-session-v2",
         "releaseStatus": "stable_contract",
-        "targetRelease": RELEASE_VERSION,
+        "targetRelease": CONTROLLED_WEB_SESSION_V2_TARGET_RELEASE,
     }
     for field, expected in expected_identity.items():
         if profile.get(field) != expected:
@@ -5817,11 +5818,11 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         public_top_level_readme,
         "top-level public README",
         (
-            "target the 0.3.0 train",
+            "target the 0.3.1 corrective train",
             "`controlled-web-session-v1` still the default",
             "[`controlled-web-session-v2` contract](docs/stasis/session-v0.3-candidate.md)",
             "Source version and package CI are not publication proof",
-            "are the immutable predecessor; 0.3.0 is the stable successor only when its",
+            "0.3.1 is the stable successor only when its",
             "Verify those public artifacts rather than inferring release status from this checkout.",
         ),
         forbidden=(
@@ -5833,7 +5834,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         public_stasis_boundary,
         "public Stasis product boundary",
         (
-            "Source version `0.3.0` is not a publication claim",
+            "Source version `0.3.1` is not a publication claim",
             "canonical HTTP(S) URL no larger than 65,536 bytes",
             "without inventing an asynchronous `Image` producer lease",
             "Finite\n  asynchronous cache/decode completion is fenced by an `Image` producer",
@@ -6041,6 +6042,60 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "Strict policy and both predecessor profiles retain stop-at-interval behavior",
         ),
     )
+    paint_retirement_command_blocks = (
+        (
+            "          cargo test --locked --profile production-stripped \\\n"
+            "            -p stasis-shell -p servo-paint-api --lib \\\n"
+            "            checked_send_reports_a_closed_paint_queue \\\n"
+            "            -- --test-threads=1 --show-output >> \"$retirement_log\" 2>&1 || retirement_status=$?\n"
+        ),
+        (
+            "          cargo test --locked --profile production-stripped \\\n"
+            "            -p stasis-shell -p servo-constellation --lib \\\n"
+            "            deferred_replacement_activation_tests \\\n"
+            "            -- --test-threads=1 --show-output >> \"$retirement_log\" 2>&1 || retirement_status=$?\n"
+        ),
+        (
+            "          cargo test --locked --profile production-stripped \\\n"
+            "            -p stasis-shell -p servo-paint --lib \\\n"
+            "            pipeline_retirement_completes_only_after_both_owners_in_either_order \\\n"
+            "            -- --test-threads=1 --show-output >> \"$retirement_log\" 2>&1 || retirement_status=$?\n"
+        ),
+        (
+            "          cargo test --locked --profile production-stripped \\\n"
+            "            -p stasis-shell -p servo-script --lib \\\n"
+            "            pipeline_exit_dispatches_paint_before_constellation \\\n"
+            "            -- --test-threads=1 --show-output >> \"$retirement_log\" 2>&1 || retirement_status=$?\n"
+        ),
+    )
+    for command_block in paint_retirement_command_blocks:
+        if public_release_workflow.count(command_block) != 1:
+            raise ReleaseError(
+                "credential-free package workflow must run every causal Paint-retirement "
+                "regression command exactly once in each native Jammy lifecycle lane"
+            )
+    paint_retirement_result_markers = (
+        '          retirement_log="$RUNNER_TEMP/stasis-lifecycle-${{ matrix.lane }}-paint-retirement.log"\n',
+        "          expected_retirement_records=(\n",
+    )
+    for result_marker in paint_retirement_result_markers:
+        if public_release_workflow.count(result_marker) != 1:
+            raise ReleaseError(
+                "credential-free package workflow must retain one lane-local causal "
+                "Paint-retirement log and one exact expected-record census"
+            )
+    paint_retirement_population_gate = (
+        "          test \"${#expected_retirement_records[@]}\" = '6'\n"
+        "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$retirement_log\")\" = '6'\n"
+        "          for test_record in \"${expected_retirement_records[@]}\"; do\n"
+        "            test \"$(grep -Fxc \"$test_record\" \"$retirement_log\")\" = '1'\n"
+        "          done\n"
+    )
+    if public_release_workflow.count(paint_retirement_population_gate) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must prove exactly the six named causal "
+            "Paint-retirement regression records and no additional passing test record"
+        )
     linux_pkg_config_isolation = (
         "          unset PKG_CONFIG_PATH\n"
         "          echo 'PKG_CONFIG_PATH=' >> \"$GITHUB_ENV\"\n"
@@ -7181,8 +7236,8 @@ def self_test() -> None:
             ),
             (
                 PUBLIC_TOP_LEVEL_README,
-                "0.3.0 is the stable successor only when its",
-                "0.3.0 is the stable successor even before its",
+                "0.3.1 is the stable successor only when its",
+                "0.3.1 is the stable successor even before its",
                 "top-level immutable public-successor evidence boundary",
             ),
             (
@@ -7193,8 +7248,8 @@ def self_test() -> None:
             ),
             (
                 PUBLIC_STASIS_BOUNDARY,
-                "Source version `0.3.0` is not a publication claim",
-                "Source version `0.3.0` is a publication claim",
+                "Source version `0.3.1` is not a publication claim",
+                "Source version `0.3.1` is a publication claim",
                 "STASIS source-versus-publication boundary",
             ),
             (
@@ -7575,6 +7630,12 @@ def self_test() -> None:
             "  runtime = await sdk.launch({",
             '  runtime = await sdk["launch"]({',
             "packed SDK consumer bracket member access",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$retirement_log\")\" = '6'\n",
+            "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$retirement_log\")\" = '5'\n",
+            "native Jammy causal Paint-retirement exact test population",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
@@ -10850,8 +10911,9 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             "0.2.0-alpha.0",
             "0.2.0",
             "0.2.1",
-            "0.3.1",
+            "0.3.0",
             "v0.3.0",
+            "v0.3.1",
         ):
             try:
                 validate_identity(invalid_version, "macos-aarch64", revision, repository)

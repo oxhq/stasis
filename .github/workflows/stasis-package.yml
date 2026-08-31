@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       release_tag:
-        description: Exact Stasis release tag; v0.3.0 is the only accepted value
+        description: Exact Stasis release tag; v0.3.1 is the only accepted value
         required: false
         type: string
   push:
@@ -28,7 +28,7 @@ env:
   RUST_BACKTRACE: 1
   STASIS_FROZEN_V1_PROFILE_SHA256: 6e262edf0f8be11a1cece28f68f00d59fdac68b79b0a670ac891d36998720100
   STASIS_FROZEN_V2_PROFILE_SHA256: 9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a
-  STASIS_RELEASE_VERSION: 0.3.0
+  STASIS_RELEASE_VERSION: 0.3.1
 
 jobs:
   validate-invocation:
@@ -306,6 +306,48 @@ jobs:
           done
           cat "$ownership_log"
           rm -f -- "$ownership_log"
+
+          retirement_log="$RUNNER_TEMP/stasis-lifecycle-${{ matrix.lane }}-paint-retirement.log"
+          : > "$retirement_log"
+          retirement_status=0
+          set +e
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-paint-api --lib \
+            checked_send_reports_a_closed_paint_queue \
+            -- --test-threads=1 --show-output >> "$retirement_log" 2>&1 || retirement_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-constellation --lib \
+            deferred_replacement_activation_tests \
+            -- --test-threads=1 --show-output >> "$retirement_log" 2>&1 || retirement_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-paint --lib \
+            pipeline_retirement_completes_only_after_both_owners_in_either_order \
+            -- --test-threads=1 --show-output >> "$retirement_log" 2>&1 || retirement_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-script --lib \
+            pipeline_exit_dispatches_paint_before_constellation \
+            -- --test-threads=1 --show-output >> "$retirement_log" 2>&1 || retirement_status=$?
+          set -e
+          if (( retirement_status != 0 )); then
+            cat "$retirement_log"
+            rm -f -- "$retirement_log"
+            exit "$retirement_status"
+          fi
+          expected_retirement_records=(
+            'test paint_proxy_tests::checked_send_reports_a_closed_paint_queue ... ok'
+            'test constellation::deferred_replacement_activation_tests::classifies_only_the_correlated_source_and_replacement_exits ... ok'
+            'test constellation::deferred_replacement_activation_tests::paint_retirement_delivery_failure_is_a_one_shot_terminal_action ... ok'
+            'test constellation::deferred_replacement_activation_tests::source_exit_waits_for_paint_retirement_before_exactly_one_reroute ... ok'
+            'test pipeline_details::pipeline_retirement_tests::pipeline_retirement_completes_only_after_both_owners_in_either_order ... ok'
+            'test event_loop::script_thread::pipeline_exit_notification_tests::pipeline_exit_dispatches_paint_before_constellation ... ok'
+          )
+          test "${#expected_retirement_records[@]}" = '6'
+          test "$(grep -Ec '^test .* \.\.\. ok$' "$retirement_log")" = '6'
+          for test_record in "${expected_retirement_records[@]}"; do
+            test "$(grep -Fxc "$test_record" "$retirement_log")" = '1'
+          done
+          cat "$retirement_log"
+          rm -f -- "$retirement_log"
 
           oracle_log="$RUNNER_TEMP/stasis-lifecycle-${{ matrix.lane }}-source-oracle.raw.log"
           set +e
@@ -2372,7 +2414,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RUN_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      STASIS_VERSION: 0.3.0
+      STASIS_VERSION: 0.3.1
       STASIS_REVISION: ${{ github.sha }}
     steps:
       - name: Check out the exact event commit
@@ -2694,7 +2736,7 @@ jobs:
               "linux-x86_64": os.environ["LINUX_RUN_ATTEMPT"],
           }
           repository = os.environ["GITHUB_REPOSITORY"]
-          if version != "0.3.0" or not re.fullmatch(r"[0-9a-f]{40}", revision):
+          if version != "0.3.1" or not re.fullmatch(r"[0-9a-f]{40}", revision):
               raise SystemExit("runtime manifest release identity is invalid")
           upstream = tomllib.loads(pathlib.Path("STASIS_UPSTREAM.toml").read_text(encoding="utf-8"))
           expected_upstream_keys = {
@@ -3075,7 +3117,7 @@ jobs:
       - name: Recheck exact identities and digests without repository code
         shell: bash
         env:
-          STASIS_VERSION: 0.3.0
+          STASIS_VERSION: 0.3.1
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -4277,17 +4319,17 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: |
-            release-assets/macos-aarch64/stasis-0.3.0-macos-aarch64.tar.gz
-            release-assets/macos-aarch64/stasis-0.3.0-macos-aarch64.tar.gz.sha256
-            release-assets/macos-aarch64/stasis-0.3.0-macos-aarch64.binary.sha256
-            gate-proof/macos-aarch64/stasis-0.3.0-macos-aarch64-act-settle-inspect.json
-            release-assets/linux-x86_64/stasis-0.3.0-linux-x86_64.tar.gz
-            release-assets/linux-x86_64/stasis-0.3.0-linux-x86_64.tar.gz.sha256
-            release-assets/linux-x86_64/stasis-0.3.0-linux-x86_64.binary.sha256
-            gate-proof/linux-x86_64/stasis-0.3.0-linux-x86_64-act-settle-inspect.json
-            runtime-manifest/stasis-0.3.0-runtime-manifest.json
-            sdk-proof/oxhq-stasis-0.3.0.tgz
-            sdk-proof/stasis-0.3.0-typescript-act-settle-inspect.json
+            release-assets/macos-aarch64/stasis-0.3.1-macos-aarch64.tar.gz
+            release-assets/macos-aarch64/stasis-0.3.1-macos-aarch64.tar.gz.sha256
+            release-assets/macos-aarch64/stasis-0.3.1-macos-aarch64.binary.sha256
+            gate-proof/macos-aarch64/stasis-0.3.1-macos-aarch64-act-settle-inspect.json
+            release-assets/linux-x86_64/stasis-0.3.1-linux-x86_64.tar.gz
+            release-assets/linux-x86_64/stasis-0.3.1-linux-x86_64.tar.gz.sha256
+            release-assets/linux-x86_64/stasis-0.3.1-linux-x86_64.binary.sha256
+            gate-proof/linux-x86_64/stasis-0.3.1-linux-x86_64-act-settle-inspect.json
+            runtime-manifest/stasis-0.3.1-runtime-manifest.json
+            sdk-proof/oxhq-stasis-0.3.1.tgz
+            sdk-proof/stasis-0.3.1-typescript-act-settle-inspect.json
 
   verify-promotion:
     name: Verify immutable promotion inputs

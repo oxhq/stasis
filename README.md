@@ -2,13 +2,14 @@
 
 Stasis is an experimental Servo-based runtime for executing a supported web
 application as a controlled event system. The checked-in native and TypeScript package sources
-target the 0.3.0 train. They retain frozen `controlled-webapp-v1` and
+target the 0.3.1 corrective train. They retain frozen `controlled-webapp-v1` and
 `controlled-web-session-v1` behavior, with `controlled-web-session-v1` still the default, and add
 the separately selected, versioned
 [`controlled-web-session-v2` contract](docs/stasis/session-v0.3-candidate.md).
 
 Source version and package CI are not publication proof. `v0.2.1` and
-`@oxhq/stasis@0.2.1` are the immutable predecessor; 0.3.0 is the stable successor only when its
+`@oxhq/stasis@0.2.1` remain the last fully qualified predecessor. `v0.3.0` is immutable
+disqualified release evidence after its macOS anonymous-consumer failure; 0.3.1 is the stable successor only when its
 exact tag, release, registry package, provenance, and anonymous public-consumer evidence exist.
 Verify those public artifacts rather than inferring release status from this checkout.
 

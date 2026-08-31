@@ -10,10 +10,11 @@ single FIFO protocol lane.
 pnpm add @oxhq/stasis
 ```
 
-This source/package train is versioned `0.3.0`; install those immutable bytes explicitly with
-`pnpm add @oxhq/stasis@0.3.0` after the registry, release, provenance, and anonymous-consumer
+This corrective source/package train is versioned `0.3.1`; install those immutable bytes explicitly
+with `pnpm add @oxhq/stasis@0.3.1` after the registry, release, provenance, and anonymous-consumer
 gates have published them. Untagged source alone does not prove that publication occurred.
-`@oxhq/stasis@0.2.1` remains the immutable stable predecessor.
+`@oxhq/stasis@0.2.1` remains the last fully qualified predecessor; public `0.3.0` is immutable
+disqualified release evidence after its macOS anonymous-consumer failure.
 
 An exact stable package pairs the TypeScript package with the same-version native
 `stasis-shell`, sourced from `https://github.com/oxhq/stasis.git`. Node.js 20 or newer is required. The

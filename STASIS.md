@@ -26,8 +26,8 @@ boundary.
 Release identity and immutable boundaries:
 
 - Servo base and Pliego donor revisions are pinned in `STASIS_UPSTREAM.toml`.
-- `v0.2.1` is the immutable stable predecessor. The source tree's native crate
-  and TypeScript package are versioned `0.3.0` for the next exact release train
+- `v0.2.1` is the last fully qualified stable predecessor. The source tree's native crate
+  and TypeScript package are versioned `0.3.1` for the corrective release train
   and retain the frozen `controlled-webapp-v1` surface. The separately named
   `controlled-web-session-v1` profile adds document/navigation token authority,
   checked top-level replacement and history changes, semantic forms, practical
@@ -43,12 +43,14 @@ Release identity and immutable boundaries:
   open-ended work is reported as a typed outcome instead of silently falling
   back to uncontrolled progress.
 - The published `@oxhq/stasis@0.2.1` remains immutable release history. The
-  `sdk/typescript` source is the matching `0.3.0` train plus process-isolated
+  `sdk/typescript` source is the matching `0.3.1` corrective train plus process-isolated
   session pooling and crawling helpers. The release
   workflows bind the SDK and both native archives to one source revision, retain
   the frozen v0.1 fixture gate, and add the multi-navigation/session-state North
   Star before promotion.
-- Source version `0.3.0` is not a publication claim. Before promotion, `v0.3.0`
+- Public `v0.3.0` and `@oxhq/stasis@0.3.0` are immutable disqualified release evidence after
+  the macOS anonymous-consumer gate failed. Source version `0.3.1` is not a publication claim.
+  Before promotion, `v0.3.1`
   becomes released only after the macOS arm64 and Linux x86-64 provenance gates,
   immutable GitHub release, npm trusted publication, anonymous managed-runtime
   verification, and all public and candidate protocol gates pass. After promotion,
