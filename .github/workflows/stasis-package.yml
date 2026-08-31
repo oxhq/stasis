@@ -342,6 +342,7 @@ jobs:
             'test event_loop::script_thread::pipeline_exit_notification_tests::pipeline_exit_dispatches_paint_before_constellation ... ok'
           )
           test "${#expected_retirement_records[@]}" = '6'
+          test "$(printf '%s\n' "${expected_retirement_records[@]}" | LC_ALL=C sort -u | awk 'END { print NR }')" = '6'
           test "$(grep -Ec '^test .* \.\.\. ok$' "$retirement_log")" = '6'
           for test_record in "${expected_retirement_records[@]}"; do
             test "$(grep -Fxc "$test_record" "$retirement_log")" = '1'

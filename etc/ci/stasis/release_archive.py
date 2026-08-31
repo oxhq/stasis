@@ -6074,18 +6074,54 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
                 "credential-free package workflow must run every causal Paint-retirement "
                 "regression command exactly once in each native Jammy lifecycle lane"
             )
-    paint_retirement_result_markers = (
-        '          retirement_log="$RUNNER_TEMP/stasis-lifecycle-${{ matrix.lane }}-paint-retirement.log"\n',
-        "          expected_retirement_records=(\n",
+    paint_retirement_status_initialization = (
+        "          retirement_status=0\n"
+        "          set +e\n"
     )
-    for result_marker in paint_retirement_result_markers:
-        if public_release_workflow.count(result_marker) != 1:
-            raise ReleaseError(
-                "credential-free package workflow must retain one lane-local causal "
-                "Paint-retirement log and one exact expected-record census"
-            )
+    if public_release_workflow.count(paint_retirement_status_initialization) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must collect every causal Paint-retirement "
+            "command status before evaluating the exact result census"
+        )
+    paint_retirement_failure_control = (
+        "          set -e\n"
+        "          if (( retirement_status != 0 )); then\n"
+        "            cat \"$retirement_log\"\n"
+        "            rm -f -- \"$retirement_log\"\n"
+        "            exit \"$retirement_status\"\n"
+        "          fi\n"
+    )
+    if public_release_workflow.count(paint_retirement_failure_control) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must restore fail-fast behavior and reject a "
+            "nonzero causal Paint-retirement command status before the result census"
+        )
+    paint_retirement_log_marker = (
+        '          retirement_log="$RUNNER_TEMP/stasis-lifecycle-${{ matrix.lane }}-paint-retirement.log"\n'
+    )
+    if public_release_workflow.count(paint_retirement_log_marker) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must retain one lane-local causal "
+            "Paint-retirement log"
+        )
+    paint_retirement_expected_record_block = (
+        "          expected_retirement_records=(\n"
+        "            'test paint_proxy_tests::checked_send_reports_a_closed_paint_queue ... ok'\n"
+        "            'test constellation::deferred_replacement_activation_tests::classifies_only_the_correlated_source_and_replacement_exits ... ok'\n"
+        "            'test constellation::deferred_replacement_activation_tests::paint_retirement_delivery_failure_is_a_one_shot_terminal_action ... ok'\n"
+        "            'test constellation::deferred_replacement_activation_tests::source_exit_waits_for_paint_retirement_before_exactly_one_reroute ... ok'\n"
+        "            'test pipeline_details::pipeline_retirement_tests::pipeline_retirement_completes_only_after_both_owners_in_either_order ... ok'\n"
+        "            'test event_loop::script_thread::pipeline_exit_notification_tests::pipeline_exit_dispatches_paint_before_constellation ... ok'\n"
+        "          )\n"
+    )
+    if public_release_workflow.count(paint_retirement_expected_record_block) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must bind the exact six distinct causal "
+            "Paint-retirement regression records"
+        )
     paint_retirement_population_gate = (
         "          test \"${#expected_retirement_records[@]}\" = '6'\n"
+        "          test \"$(printf '%s\\n' \"${expected_retirement_records[@]}\" | LC_ALL=C sort -u | awk 'END { print NR }')\" = '6'\n"
         "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$retirement_log\")\" = '6'\n"
         "          for test_record in \"${expected_retirement_records[@]}\"; do\n"
         "            test \"$(grep -Fxc \"$test_record\" \"$retirement_log\")\" = '1'\n"
@@ -7630,6 +7666,20 @@ def self_test() -> None:
             "  runtime = await sdk.launch({",
             '  runtime = await sdk["launch"]({',
             "packed SDK consumer bracket member access",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          set -e\n"
+            "          if (( retirement_status != 0 )); then\n",
+            "          set +e\n"
+            "          if (( retirement_status != 0 )); then\n",
+            "native Jammy causal Paint-retirement fail-fast restoration",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "            'test constellation::deferred_replacement_activation_tests::paint_retirement_delivery_failure_is_a_one_shot_terminal_action ... ok'\n",
+            "            'test constellation::deferred_replacement_activation_tests::classifies_only_the_correlated_source_and_replacement_exits ... ok'\n",
+            "native Jammy causal Paint-retirement distinct named records",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
