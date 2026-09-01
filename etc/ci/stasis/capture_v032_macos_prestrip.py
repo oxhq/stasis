@@ -2,9 +2,9 @@
 """Capture the exact pre-strip input of the immutable Stasis v0.3.2 macOS build.
 
 This utility is diagnostic-only.  It replaces the pinned Rust toolchain's
-``rust-objcopy`` with a narrowly scoped forwarding wrapper, records the input
-to the one expected ``--strip-all`` invocation, and restores the original
-tool byte-for-byte after the build.
+``rust-objcopy`` with a narrowly scoped forwarding wrapper, records the one
+``--strip-all`` invocation for Cargo's hashed Stasis executable, and restores
+the original tool byte-for-byte after the build.
 """
 
 from __future__ import annotations
@@ -14,13 +14,19 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 from typing import NoReturn
 
 
-STATE_SCHEMA = "stasis-v0.3.2-macos-rust-objcopy-capture-state-v1"
-RESULT_SCHEMA = "stasis-v0.3.2-macos-rust-objcopy-capture-v1"
+STATE_SCHEMA = "stasis-v0.3.2-macos-rust-objcopy-capture-state-v2"
+RESULT_SCHEMA = "stasis-v0.3.2-macos-rust-objcopy-capture-v2"
+# The pinned Darwin linker strips this hashed output before Cargo surfaces the
+# sibling ``production-stripped/stasis`` executable.
+HASHED_TARGET_PATTERN = re.compile(r"^stasis-[0-9a-f]{16}$")
+RELEASE_BINARY_SHA256 = "42c30bacde31906457b11d0e64ddc4f57e20515016d4cae817d4e1cc8e016c1c"
+RELEASE_BINARY_BYTES = 74_639_920
 
 
 def fail(message: str) -> NoReturn:
@@ -54,21 +60,29 @@ def wrapper_text() -> str:
     return r"""#!/bin/bash
 set -euo pipefail
 
-: "${STASIS_EXPECTED_STRIP_TARGET:?}"
+: "${STASIS_EXPECTED_STRIP_DIRECTORY:?}"
 : "${STASIS_PRESTRIP_CAPTURE:?}"
 : "${STASIS_PRESTRIP_CAPTURE_LOCK:?}"
-: "${STASIS_PRESTRIP_ARGS:?}"
+: "${STASIS_PRESTRIP_INVOCATION:?}"
 : "${STASIS_REAL_RUST_OBJCOPY:?}"
 
 target_argument_count=0
 target_argument=''
+target_canonical=''
 for argument in "$@"; do
   if [[ -e "$argument" ]]; then
     candidate_dir=$(cd -P -- "$(dirname -- "$argument")" && pwd)
     candidate="$candidate_dir/$(basename -- "$argument")"
-    if [[ "$candidate" == "$STASIS_EXPECTED_STRIP_TARGET" ]]; then
+    candidate_name=$(basename -- "$candidate")
+    if [[ "$candidate_dir" == "$STASIS_EXPECTED_STRIP_DIRECTORY" && \
+          "$candidate_name" == stasis* ]]; then
+      if [[ ! "$candidate_name" =~ ^stasis-[0-9a-f]{16}$ ]]; then
+        echo 'unexpected Stasis rust-objcopy target in the hashed deps directory' >&2
+        exit 64
+      fi
       target_argument_count=$((target_argument_count + 1))
       target_argument="$argument"
+      target_canonical="$candidate"
     fi
   fi
 done
@@ -84,7 +98,9 @@ if [[ "$target_argument_count" -ne 0 ]]; then
   trap '/bin/rm -f -- "$temporary"' EXIT
   /bin/cp -p -- "$2" "$temporary"
   /bin/mv -- "$temporary" "$STASIS_PRESTRIP_CAPTURE"
-  printf '%s\0' "$@" > "$STASIS_PRESTRIP_ARGS"
+  working_directory=$(pwd -P)
+  printf '%s\0' "$working_directory" "$target_canonical" "$@" \
+    > "$STASIS_PRESTRIP_INVOCATION"
   /usr/bin/shasum -a 256 "$STASIS_PRESTRIP_CAPTURE" \
     > "${STASIS_PRESTRIP_CAPTURE}.sha256"
   trap - EXIT
@@ -133,9 +149,10 @@ def locate_objcopy(rustc: str) -> tuple[Path, Path, Path]:
 
 
 def install(args: argparse.Namespace) -> None:
-    expected = canonical(args.expected)
+    expected_directory = canonical(args.expected_deps_directory)
+    expected_cargo_output = canonical(args.expected_cargo_output)
     capture = canonical(args.capture)
-    invocation = canonical(args.args_file)
+    invocation = canonical(args.invocation_file)
     lock = canonical(args.lock)
     state_path = canonical(args.state)
     evidence = canonical(args.evidence)
@@ -145,6 +162,12 @@ def install(args: argparse.Namespace) -> None:
         fail(f"evidence directory does not exist: {evidence}")
     if not github_env.is_file():
         fail(f"GITHUB_ENV file does not exist: {github_env}")
+    if expected_directory.name != "deps":
+        fail(f"expected strip directory is not Cargo's deps directory: {expected_directory}")
+    if expected_cargo_output.name != "stasis" or expected_cargo_output.parent != expected_directory.parent:
+        fail("expected Cargo output is not the stasis sibling of the hashed deps directory")
+    if expected_directory.exists() or expected_cargo_output.exists():
+        fail("production-stripped outputs already exist before the exact build")
     for path in (capture, invocation, lock, state_path):
         if path.exists():
             fail(f"capture path already exists: {path}")
@@ -189,9 +212,11 @@ def install(args: argparse.Namespace) -> None:
             "targetLibdir": os.fspath(target_libdir),
             "objcopy": os.fspath(objcopy),
             "realObjcopy": os.fspath(real),
-            "expectedTarget": os.fspath(expected),
+            "expectedStripDirectory": os.fspath(expected_directory),
+            "expectedCargoOutput": os.fspath(expected_cargo_output),
+            "hashedTargetPattern": HASHED_TARGET_PATTERN.pattern,
             "capture": os.fspath(capture),
-            "captureArgs": os.fspath(invocation),
+            "captureInvocation": os.fspath(invocation),
             "captureLock": os.fspath(lock),
             "originalObjcopySha256": original_sha,
             "wrapperSha256": wrapper_sha,
@@ -203,10 +228,11 @@ def install(args: argparse.Namespace) -> None:
         append_github_env(
             github_env,
             {
-                "STASIS_EXPECTED_STRIP_TARGET": os.fspath(expected),
+                "STASIS_EXPECTED_STRIP_DIRECTORY": os.fspath(expected_directory),
+                "STASIS_EXPECTED_CARGO_OUTPUT": os.fspath(expected_cargo_output),
                 "STASIS_PRESTRIP_CAPTURE": os.fspath(capture),
                 "STASIS_PRESTRIP_CAPTURE_LOCK": os.fspath(lock),
-                "STASIS_PRESTRIP_ARGS": os.fspath(invocation),
+                "STASIS_PRESTRIP_INVOCATION": os.fspath(invocation),
                 "STASIS_REAL_RUST_OBJCOPY": os.fspath(real),
                 "STASIS_RUST_OBJCOPY_STATE": os.fspath(state_path),
             },
@@ -243,7 +269,7 @@ def restore(args: argparse.Namespace) -> None:
     write_json(state_path, state)
 
 
-def decode_invocation(path: Path) -> list[str]:
+def decode_nul_record(path: Path) -> list[str]:
     raw = path.read_bytes()
     if not raw.endswith(b"\0"):
         fail(f"strip invocation record is not NUL terminated: {path}")
@@ -254,6 +280,38 @@ def decode_invocation(path: Path) -> list[str]:
         fail(f"strip invocation record is not UTF-8: {error}")
 
 
+def files_equal(left: Path, right: Path) -> bool:
+    if left.stat().st_size != right.stat().st_size:
+        return False
+    with left.open("rb") as left_handle, right.open("rb") as right_handle:
+        while True:
+            left_chunk = left_handle.read(1024 * 1024)
+            right_chunk = right_handle.read(1024 * 1024)
+            if left_chunk != right_chunk:
+                return False
+            if not left_chunk:
+                return True
+
+
+def hashed_targets(directory: Path) -> list[Path]:
+    if not directory.is_dir():
+        fail(f"hashed target directory is missing: {directory}")
+    matches: list[Path] = []
+    for candidate in directory.iterdir():
+        if HASHED_TARGET_PATTERN.fullmatch(candidate.name):
+            if candidate.is_symlink() or not candidate.is_file():
+                fail(f"hashed Stasis target is not a regular file: {candidate}")
+            matches.append(canonical(candidate))
+    return sorted(matches, key=os.fspath)
+
+
+def resolve_recorded_argument(argument: str, working_directory: Path) -> Path:
+    candidate = Path(argument)
+    if not candidate.is_absolute():
+        candidate = working_directory / candidate
+    return canonical(candidate)
+
+
 def verify(args: argparse.Namespace) -> None:
     state_path = canonical(args.state)
     result_path = canonical(args.output)
@@ -261,15 +319,37 @@ def verify(args: argparse.Namespace) -> None:
     if state.get("restored") is not True:
         fail("real rust-objcopy was not restored before capture verification")
     capture = canonical(Path(str(state["capture"])))
-    invocation = canonical(Path(str(state["captureArgs"])))
+    invocation = canonical(Path(str(state["captureInvocation"])))
     lock = canonical(Path(str(state["captureLock"])))
-    expected = canonical(Path(str(state["expectedTarget"])))
+    expected_directory = canonical(Path(str(state["expectedStripDirectory"])))
+    expected_cargo_output = canonical(Path(str(state["expectedCargoOutput"])))
+    built = canonical(args.built)
+    release_binary = canonical(args.release_binary)
+    if state.get("hashedTargetPattern") != HASHED_TARGET_PATTERN.pattern:
+        fail("capture state does not bind the exact hashed Stasis target pattern")
+    if built != expected_cargo_output or expected_directory != canonical(built.parent / "deps"):
+        fail("verification Cargo output does not match the installed capture state")
     if not capture.is_file() or capture.stat().st_size == 0:
         fail("pre-strip capture is missing or empty")
     if not invocation.is_file() or not lock.is_dir():
         fail("strip invocation record or atomic single-invocation lock is missing")
-    recorded = decode_invocation(invocation)
-    if recorded != ["--strip-all", os.fspath(expected)]:
+    matches = hashed_targets(expected_directory)
+    if len(matches) != 1:
+        fail(f"expected exactly one hashed Stasis target, got {matches!r}")
+    actual_target = matches[0]
+    recorded = decode_nul_record(invocation)
+    if len(recorded) != 4:
+        fail(f"unexpected rust-objcopy invocation record: {recorded!r}")
+    working_directory = canonical(Path(recorded[0]))
+    recorded_canonical_target = canonical(Path(recorded[1]))
+    argv = recorded[2:]
+    if (
+        recorded[0] != os.fspath(working_directory)
+        or recorded[1] != os.fspath(actual_target)
+        or recorded_canonical_target != actual_target
+        or argv[0] != "--strip-all"
+        or resolve_recorded_argument(argv[1], working_directory) != actual_target
+    ):
         fail(f"unexpected rust-objcopy invocation: {recorded!r}")
     capture_sha = sha256(capture)
     sidecar = Path(f"{capture}.sha256")
@@ -278,17 +358,60 @@ def verify(args: argparse.Namespace) -> None:
     sidecar_fields = sidecar.read_text(encoding="utf-8").strip().split()
     if sidecar_fields != [capture_sha, os.fspath(capture)]:
         fail("pre-strip capture hash sidecar does not match")
+    for path, label in (
+        (actual_target, "post-strip hashed target"),
+        (built, "Cargo output"),
+        (release_binary, "immutable release binary"),
+    ):
+        if not path.is_file() or path.stat().st_size == 0:
+            fail(f"{label} is missing or empty: {path}")
+    if release_binary.stat().st_size != RELEASE_BINARY_BYTES or sha256(release_binary) != RELEASE_BINARY_SHA256:
+        fail("immutable release binary identity changed")
+    if not files_equal(actual_target, built) or not files_equal(actual_target, release_binary):
+        fail("post-strip hashed target is not byte-identical to Cargo output and immutable release")
+    poststrip_sha = sha256(actual_target)
+    if capture_sha == poststrip_sha or files_equal(capture, actual_target):
+        fail("pre-strip capture is not distinct from the post-strip executable")
+    original_objcopy_sha = state.get("originalObjcopySha256")
+    restored_objcopy_sha = state.get("restoredObjcopySha256")
+    wrapper_sha = state.get("wrapperSha256")
+    if (
+        not isinstance(original_objcopy_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", original_objcopy_sha) is None
+        or restored_objcopy_sha != original_objcopy_sha
+        or not isinstance(wrapper_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", wrapper_sha) is None
+    ):
+        fail("restored rust-objcopy does not match the original executable")
     result = {
         "schema": RESULT_SCHEMA,
-        "expectedTarget": os.fspath(expected),
+        "expectedStripDirectory": os.fspath(expected_directory),
+        "expectedCargoOutput": os.fspath(expected_cargo_output),
+        "hashedTargetPattern": HASHED_TARGET_PATTERN.pattern,
+        "hashedTargetCount": 1,
+        "hashedTargets": [os.fspath(actual_target)],
+        "actualStripTarget": os.fspath(actual_target),
         "capture": os.fspath(capture),
         "captureBytes": capture.stat().st_size,
         "captureSha256": capture_sha,
-        "rustObjcopyArgs": recorded,
+        "rustObjcopyInvocation": {
+            "workingDirectory": os.fspath(working_directory),
+            "argv": argv,
+            "canonicalTarget": os.fspath(recorded_canonical_target),
+        },
         "singleTargetInvocation": True,
-        "originalObjcopySha256": state["originalObjcopySha256"],
-        "restoredObjcopySha256": state["restoredObjcopySha256"],
-        "wrapperSha256": state["wrapperSha256"],
+        "poststripHashedTargetBytes": actual_target.stat().st_size,
+        "poststripHashedTargetSha256": poststrip_sha,
+        "cargoOutputBytes": built.stat().st_size,
+        "cargoOutputSha256": sha256(built),
+        "immutableReleaseBytes": release_binary.stat().st_size,
+        "immutableReleaseSha256": sha256(release_binary),
+        "prestripDiffersFromPoststrip": True,
+        "poststripHashedTargetMatchesCargoOutput": True,
+        "poststripHashedTargetMatchesImmutableRelease": True,
+        "originalObjcopySha256": original_objcopy_sha,
+        "restoredObjcopySha256": restored_objcopy_sha,
+        "wrapperSha256": wrapper_sha,
         "releaseGateAuthority": False,
     }
     write_json(result_path, result)
@@ -300,9 +423,10 @@ def parser() -> argparse.ArgumentParser:
 
     install_parser = subparsers.add_parser("install")
     install_parser.add_argument("--rustc", default="rustc")
-    install_parser.add_argument("--expected", type=Path, required=True)
+    install_parser.add_argument("--expected-deps-directory", type=Path, required=True)
+    install_parser.add_argument("--expected-cargo-output", type=Path, required=True)
     install_parser.add_argument("--capture", type=Path, required=True)
-    install_parser.add_argument("--args-file", type=Path, required=True)
+    install_parser.add_argument("--invocation-file", type=Path, required=True)
     install_parser.add_argument("--lock", type=Path, required=True)
     install_parser.add_argument("--state", type=Path, required=True)
     install_parser.add_argument("--evidence", type=Path, required=True)
@@ -315,6 +439,8 @@ def parser() -> argparse.ArgumentParser:
 
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("--state", type=Path, required=True)
+    verify_parser.add_argument("--built", type=Path, required=True)
+    verify_parser.add_argument("--release-binary", type=Path, required=True)
     verify_parser.add_argument("--output", type=Path, required=True)
     verify_parser.set_defaults(handler=verify)
     return result

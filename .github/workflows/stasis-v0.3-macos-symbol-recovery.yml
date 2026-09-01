@@ -351,15 +351,17 @@ jobs:
           report_count=$(find "$DIAGNOSTIC_INPUT" -maxdepth 1 -type f -name '*.sample.txt' | wc -l | tr -d ' ')
           test "$report_count" = '9'
 
-      - name: Install the exact-target rust-objcopy capture wrapper
+      - name: Install the exact hashed-target rust-objcopy capture wrapper
         shell: bash
         run: |
           set -euo pipefail
+          test ! -e "$GITHUB_WORKSPACE/target/production-stripped"
           mkdir -p "$EVIDENCE/binaries"
           python3 "$CONTROL_DIR/capture_v032_macos_prestrip.py" install \
-            --expected "$GITHUB_WORKSPACE/target/production-stripped/stasis" \
+            --expected-deps-directory "$GITHUB_WORKSPACE/target/production-stripped/deps" \
+            --expected-cargo-output "$GITHUB_WORKSPACE/target/production-stripped/stasis" \
             --capture "$EVIDENCE/binaries/stasis-v0.3.2.prestrip" \
-            --args-file "$EVIDENCE/rust-objcopy.args0" \
+            --invocation-file "$EVIDENCE/rust-objcopy.invocation0" \
             --lock "$RUNNER_TEMP/stasis-v032-prestrip-capture.lock" \
             --state "$EVIDENCE/strip-capture-state.json" \
             --evidence "$EVIDENCE" \
@@ -379,7 +381,9 @@ jobs:
             '6e262edf0f8be11a1cece28f68f00d59fdac68b79b0a670ac891d36998720100'
           test "$STASIS_FROZEN_V2_PROFILE_SHA256" = \
             '9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a'
-          test "$STASIS_EXPECTED_STRIP_TARGET" = \
+          test "$STASIS_EXPECTED_STRIP_DIRECTORY" = \
+            "$GITHUB_WORKSPACE/target/production-stripped/deps"
+          test "$STASIS_EXPECTED_CARGO_OUTPUT" = \
             "$GITHUB_WORKSPACE/target/production-stripped/stasis"
           if ! changes=$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none); then
             echo 'could not inspect the checkout before the exact rebuild' >&2
@@ -399,12 +403,15 @@ jobs:
           python3 "$CONTROL_DIR/capture_v032_macos_prestrip.py" restore \
             --state "$EVIDENCE/strip-capture-state.json"
 
-      - name: Verify the single exact-target strip capture
+      - name: Verify the single exact hashed-target strip capture
         shell: bash
         run: |
           set -euo pipefail
+          release_binary="$RELEASE_ROOT/stasis-0.3.2-macos-aarch64/stasis"
           python3 "$CONTROL_DIR/capture_v032_macos_prestrip.py" verify \
             --state "$EVIDENCE/strip-capture-state.json" \
+            --built "$GITHUB_WORKSPACE/target/production-stripped/stasis" \
+            --release-binary "$release_binary" \
             --output "$EVIDENCE/strip-capture.json"
 
       - name: Symbolize all nine immutable stack reports fail closed

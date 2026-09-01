@@ -2,8 +2,9 @@
 """Bind and symbolize the nine immutable Stasis v0.3.2 macOS stack reports.
 
 The script deliberately has no release authority.  It fails closed unless the
-rebuilt post-strip executable is byte-identical to the immutable release and
-the captured pre-strip executable has the same Mach-O UUID.
+one recorded hashed rust-objcopy target, Cargo's surfaced post-strip
+executable, and the immutable release are byte-identical, and the captured
+pre-strip executable has the same Mach-O UUID.
 """
 
 from __future__ import annotations
@@ -20,7 +21,9 @@ import subprocess
 from typing import Iterable, NoReturn
 
 
-SCHEMA = "stasis-v0.3.2-macos-exact-symbolization-v1"
+SCHEMA = "stasis-v0.3.2-macos-exact-symbolization-v2"
+CAPTURE_SCHEMA = "stasis-v0.3.2-macos-rust-objcopy-capture-v2"
+HASHED_TARGET_PATTERN = re.compile(r"^stasis-[0-9a-f]{16}$")
 RELEASE_REVISION = "b3d1ac949d341dc6bbe1244162441d9bb8adb00a"
 DIAGNOSTIC_REVISION = "9bdf49f360089cd91ae257f0078b2dc3dde4e70e"
 RELEASE_TAG = "v0.3.2"
@@ -120,6 +123,106 @@ def mach_uuid(path: Path, dwarfdump: str) -> str:
     if len(matches) != 1:
         fail(f"expected one arm64 Mach-O UUID for {path}, got {matches!r}")
     return matches[0].upper()
+
+
+def canonical(path: Path) -> Path:
+    return Path(os.path.realpath(os.fspath(path)))
+
+
+def resolve_recorded_argument(argument: str, working_directory: Path) -> Path:
+    candidate = Path(argument)
+    if not candidate.is_absolute():
+        candidate = working_directory / candidate
+    return canonical(candidate)
+
+
+def validate_capture_result(
+    value: object,
+    prestrip: Path,
+    built: Path,
+    release_binary: Path,
+) -> dict[str, object]:
+    result = require_dict(value, "capture result")
+    prestrip = canonical(prestrip)
+    built = canonical(built)
+    release_binary = canonical(release_binary)
+    expected_directory = canonical(built.parent / "deps")
+    actual_value = result.get("actualStripTarget")
+    if not isinstance(actual_value, str):
+        fail("rust-objcopy capture result does not record the actual strip target")
+    actual_target = canonical(Path(actual_value))
+    if (
+        not expected_directory.is_dir()
+        or actual_value != os.fspath(actual_target)
+        or actual_target.parent != expected_directory
+        or HASHED_TARGET_PATTERN.fullmatch(actual_target.name) is None
+        or not actual_target.is_file()
+    ):
+        fail("rust-objcopy capture result does not bind a regular hashed deps target")
+    hashed_targets: list[Path] = []
+    for path in expected_directory.iterdir():
+        if HASHED_TARGET_PATTERN.fullmatch(path.name):
+            if path.is_symlink() or not path.is_file():
+                fail(f"hashed Stasis target is not a regular file: {path}")
+            hashed_targets.append(canonical(path))
+    hashed_targets.sort(key=os.fspath)
+    invocation = require_dict(result.get("rustObjcopyInvocation"), "rust-objcopy invocation")
+    working_directory_value = invocation.get("workingDirectory")
+    argv = invocation.get("argv")
+    canonical_target_value = invocation.get("canonicalTarget")
+    if not isinstance(working_directory_value, str) or not isinstance(canonical_target_value, str):
+        fail("rust-objcopy invocation paths are not strings")
+    working_directory = canonical(Path(working_directory_value))
+    if (
+        working_directory_value != os.fspath(working_directory)
+        or not isinstance(argv, list)
+        or len(argv) != 2
+        or argv[0] != "--strip-all"
+        or not isinstance(argv[1], str)
+        or resolve_recorded_argument(argv[1], working_directory) != actual_target
+        or canonical_target_value != os.fspath(actual_target)
+    ):
+        fail("rust-objcopy invocation does not bind the actual hashed target")
+    capture_sha = sha256(prestrip)
+    poststrip_sha = sha256(actual_target)
+    built_sha = sha256(built)
+    release_sha = sha256(release_binary)
+    original_objcopy_sha = result.get("originalObjcopySha256")
+    restored_objcopy_sha = result.get("restoredObjcopySha256")
+    wrapper_sha = result.get("wrapperSha256")
+    if (
+        result.get("schema") != CAPTURE_SCHEMA
+        or result.get("expectedStripDirectory") != os.fspath(expected_directory)
+        or result.get("expectedCargoOutput") != os.fspath(built)
+        or result.get("hashedTargetPattern") != HASHED_TARGET_PATTERN.pattern
+        or result.get("hashedTargetCount") != 1
+        or result.get("hashedTargets") != [os.fspath(actual_target)]
+        or hashed_targets != [actual_target]
+        or result.get("capture") != os.fspath(prestrip)
+        or result.get("captureSha256") != capture_sha
+        or result.get("captureBytes") != prestrip.stat().st_size
+        or result.get("singleTargetInvocation") is not True
+        or result.get("poststripHashedTargetSha256") != poststrip_sha
+        or result.get("poststripHashedTargetBytes") != actual_target.stat().st_size
+        or result.get("cargoOutputSha256") != built_sha
+        or result.get("cargoOutputBytes") != built.stat().st_size
+        or result.get("immutableReleaseSha256") != release_sha
+        or result.get("immutableReleaseBytes") != release_binary.stat().st_size
+        or result.get("prestripDiffersFromPoststrip") is not True
+        or result.get("poststripHashedTargetMatchesCargoOutput") is not True
+        or result.get("poststripHashedTargetMatchesImmutableRelease") is not True
+        or not isinstance(original_objcopy_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", original_objcopy_sha) is None
+        or restored_objcopy_sha != original_objcopy_sha
+        or not isinstance(wrapper_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", wrapper_sha) is None
+        or result.get("releaseGateAuthority") is not False
+        or capture_sha == poststrip_sha
+        or not files_equal(actual_target, built)
+        or not files_equal(actual_target, release_binary)
+    ):
+        fail("rust-objcopy capture result does not bind the exact hashed build target")
+    return result
 
 
 @dataclass(frozen=True)
@@ -652,17 +755,12 @@ def main() -> None:
     if set(uuids.values()) != {RELEASE_UUID}:
         fail(f"Mach-O UUIDs do not bind to the release: {uuids!r}")
 
-    capture_result = require_dict(load_json(args.capture_result), "capture result")
-    if (
-        capture_result.get("schema") != "stasis-v0.3.2-macos-rust-objcopy-capture-v1"
-        or capture_result.get("captureSha256") != sha256(args.prestrip)
-        or capture_result.get("captureBytes") != args.prestrip.stat().st_size
-        or capture_result.get("rustObjcopyArgs") != ["--strip-all", os.fspath(args.built.resolve())]
-        or capture_result.get("singleTargetInvocation") is not True
-        or capture_result.get("originalObjcopySha256") != capture_result.get("restoredObjcopySha256")
-        or capture_result.get("releaseGateAuthority") is not False
-    ):
-        fail("rust-objcopy capture result does not bind the exact build target")
+    capture_result = validate_capture_result(
+        load_json(args.capture_result),
+        args.prestrip,
+        args.built,
+        args.release_binary,
+    )
 
     nm_prestrip = run_command(
         [args.llvm_nm, "--numeric-sort", "--demangle", "--defined-only", os.fspath(args.prestrip)]

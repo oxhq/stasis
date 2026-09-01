@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -44,6 +45,58 @@ def synthetic_report(*, bad_absolute: bool = False) -> str:
         ]
     )
     return "\n".join(lines) + "\n"
+
+
+def synthetic_capture_result(root: Path) -> tuple[Path, Path, Path, dict[str, object]]:
+    profile = root / "target" / "production-stripped"
+    deps = profile / "deps"
+    deps.mkdir(parents=True)
+    actual = deps / "stasis-0123456789abcdef"
+    built = profile / "stasis"
+    release = root / "release" / "stasis"
+    release.parent.mkdir()
+    poststrip = b"post-strip executable"
+    for path in (actual, built, release):
+        path.write_bytes(poststrip)
+    prestrip = root / "stasis.prestrip"
+    prestrip.write_bytes(b"pre-strip executable with local symbols")
+    root = symbolize.canonical(root)
+    actual = symbolize.canonical(actual)
+    built = symbolize.canonical(built)
+    release = symbolize.canonical(release)
+    prestrip = symbolize.canonical(prestrip)
+    result: dict[str, object] = {
+        "schema": symbolize.CAPTURE_SCHEMA,
+        "expectedStripDirectory": os.fspath(symbolize.canonical(deps)),
+        "expectedCargoOutput": os.fspath(built),
+        "hashedTargetPattern": symbolize.HASHED_TARGET_PATTERN.pattern,
+        "hashedTargetCount": 1,
+        "hashedTargets": [os.fspath(actual)],
+        "actualStripTarget": os.fspath(actual),
+        "capture": os.fspath(prestrip),
+        "captureBytes": prestrip.stat().st_size,
+        "captureSha256": symbolize.sha256(prestrip),
+        "rustObjcopyInvocation": {
+            "workingDirectory": os.fspath(root),
+            "argv": ["--strip-all", os.fspath(actual)],
+            "canonicalTarget": os.fspath(actual),
+        },
+        "singleTargetInvocation": True,
+        "poststripHashedTargetBytes": actual.stat().st_size,
+        "poststripHashedTargetSha256": symbolize.sha256(actual),
+        "cargoOutputBytes": built.stat().st_size,
+        "cargoOutputSha256": symbolize.sha256(built),
+        "immutableReleaseBytes": release.stat().st_size,
+        "immutableReleaseSha256": symbolize.sha256(release),
+        "prestripDiffersFromPoststrip": True,
+        "poststripHashedTargetMatchesCargoOutput": True,
+        "poststripHashedTargetMatchesImmutableRelease": True,
+        "originalObjcopySha256": "a" * 64,
+        "restoredObjcopySha256": "a" * 64,
+        "wrapperSha256": "b" * 64,
+        "releaseGateAuthority": False,
+    }
+    return prestrip, built, release, result
 
 
 class SymbolizeV032MacosStacksTests(unittest.TestCase):
@@ -96,6 +149,37 @@ Load command 1
             path.write_text(report, encoding="utf-8")
             with self.assertRaises(SystemExit):
                 symbolize.parse_sample_report(path, 1)
+
+    def test_capture_result_binds_the_one_hashed_target_and_poststrip_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            prestrip, built, release, result = synthetic_capture_result(Path(directory).resolve())
+            validated = symbolize.validate_capture_result(result, prestrip, built, release)
+            self.assertEqual(validated["actualStripTarget"], result["actualStripTarget"])
+
+    def test_capture_result_rejects_a_second_hashed_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            prestrip, built, release, result = synthetic_capture_result(root)
+            (root / "target" / "production-stripped" / "deps" / "stasis-fedcba9876543210").write_bytes(
+                b"post-strip executable"
+            )
+            with self.assertRaises(SystemExit):
+                symbolize.validate_capture_result(result, prestrip, built, release)
+
+    def test_capture_result_rejects_the_old_top_level_cargo_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            prestrip, built, release, result = synthetic_capture_result(Path(directory).resolve())
+            result["actualStripTarget"] = os.fspath(built)
+            with self.assertRaises(SystemExit):
+                symbolize.validate_capture_result(result, prestrip, built, release)
+
+    def test_capture_result_rejects_poststrip_bytes_not_matching_the_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            prestrip, built, release, result = synthetic_capture_result(Path(directory).resolve())
+            actual = Path(str(result["actualStripTarget"]))
+            actual.write_bytes(b"different post-strip executable")
+            with self.assertRaises(SystemExit):
+                symbolize.validate_capture_result(result, prestrip, built, release)
 
 
 if __name__ == "__main__":
