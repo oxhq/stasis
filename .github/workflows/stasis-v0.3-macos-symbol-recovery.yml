@@ -1,0 +1,500 @@
+name: Diagnostic only - Stasis v0.3.2 macOS exact symbol recovery
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: stasis-v0.3-macos-exact-symbol-recovery
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: 0
+  EXACT_RELEASE_REVISION: b3d1ac949d341dc6bbe1244162441d9bb8adb00a
+  EXACT_RELEASE_TAG: v0.3.2
+  EXACT_RELEASE_ID: "380180986"
+  EXACT_RELEASE_ASSET_ID: "538843353"
+  EXACT_ARCHIVE_SHA256: 1bf3d640223f9352d773ee71a8333a22b5955a9230d66e2fde23f7d0e21e8c9b
+  EXACT_ARCHIVE_BYTES: "30547326"
+  EXACT_BINARY_SHA256: 42c30bacde31906457b11d0e64ddc4f57e20515016d4cae817d4e1cc8e016c1c
+  EXACT_BINARY_BYTES: "74639920"
+  EXACT_BINARY_UUID: 65B2AB64-84D0-3A7D-A121-D8055D51651D
+  EXACT_INPUT_DIAGNOSTIC_REVISION: 9bdf49f360089cd91ae257f0078b2dc3dde4e70e
+  EXACT_DIAGNOSTIC_RUN_ID: "33466775208"
+  EXACT_DIAGNOSTIC_RUN_ATTEMPT: "1"
+  EXACT_DIAGNOSTIC_ARTIFACT_ID: "9785268258"
+  EXACT_DIAGNOSTIC_ARTIFACT_NAME: stasis-v0.3.2-macos-release-event-diagnostic-33466775208-attempt-1
+  EXACT_DIAGNOSTIC_ARTIFACT_DIGEST: sha256:fb7014ed36f1ecb4e7a81ed1b1d323f389c9eed1fa9a1819e27b0540c6a61a47
+  EXACT_DIAGNOSTIC_ARTIFACT_BYTES: "466977"
+  EXACT_DIAGNOSTIC_SUMMARY_SHA256: 444f60a27dbb446459fff0ebe09fbb8958f20670140f8f9bf5598c651ca35ca1
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+  RUST_BACKTRACE: 1
+  STASIS_FROZEN_V1_PROFILE_SHA256: 6e262edf0f8be11a1cece28f68f00d59fdac68b79b0a670ac891d36998720100
+  STASIS_FROZEN_V2_PROFILE_SHA256: 9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a
+  STASIS_PLATFORM: macos-aarch64
+  STASIS_RELEASE_VERSION: 0.3.2
+  STASIS_REVISION: b3d1ac949d341dc6bbe1244162441d9bb8adb00a
+
+jobs:
+  recover-exact-symbols:
+    name: DIAGNOSTIC ONLY - exact v0.3.2 symbols and nine immutable stacks
+    runs-on: macos-15
+    timeout-minutes: 75
+    permissions:
+      actions: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Reject non-main diagnostic control
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'oxhq/stasis'
+          test "$GITHUB_REF" = 'refs/heads/main'
+          test "$GITHUB_REF_TYPE" = 'branch'
+          test "$GITHUB_REF_NAME" = 'main'
+
+      - name: Check out exact current-main diagnostic control
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Stage immutable diagnostic control outside the checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          control_dir="$RUNNER_TEMP/stasis-v032-symbol-recovery-control"
+          diagnostic_input="$RUNNER_TEMP/stasis-v032-symbol-recovery-input"
+          evidence="$RUNNER_TEMP/stasis-v032-symbol-recovery-evidence"
+          release_root="$RUNNER_TEMP/stasis-v032-symbol-recovery-release"
+          test ! -e "$control_dir"
+          test ! -e "$diagnostic_input"
+          test ! -e "$evidence"
+          test ! -e "$release_root"
+          mkdir -p "$control_dir" "$evidence/control"
+          {
+            echo "CONTROL_DIR=$control_dir"
+            echo "DIAGNOSTIC_INPUT=$diagnostic_input"
+            echo "EVIDENCE=$evidence"
+            echo "RELEASE_ROOT=$release_root"
+          } >> "$GITHUB_ENV"
+          for source in \
+            etc/ci/stasis/capture_v032_macos_prestrip.py \
+            etc/ci/stasis/capture_v032_macos_prestrip_test.py \
+            etc/ci/stasis/symbolize_v032_macos_stacks.py \
+            etc/ci/stasis/symbolize_v032_macos_stacks_test.py; do
+            test -f "$source"
+            cp "$source" "$control_dir/$(basename "$source")"
+          done
+          (
+            cd "$control_dir"
+            shasum -a 256 \
+              capture_v032_macos_prestrip.py \
+              capture_v032_macos_prestrip_test.py \
+              symbolize_v032_macos_stacks.py \
+              symbolize_v032_macos_stacks_test.py \
+              > "$evidence/control/SHA256SUMS"
+          )
+
+      - name: Check out the immutable v0.3.2 source at the producer path
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: b3d1ac949d341dc6bbe1244162441d9bb8adb00a
+
+      - name: Set up pinned Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+
+      - name: Test the staged diagnostic control
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            "$CONTROL_DIR/capture_v032_macos_prestrip.py" \
+            "$CONTROL_DIR/capture_v032_macos_prestrip_test.py" \
+            "$CONTROL_DIR/symbolize_v032_macos_stacks.py" \
+            "$CONTROL_DIR/symbolize_v032_macos_stacks_test.py"
+          python3 "$CONTROL_DIR/capture_v032_macos_prestrip_test.py"
+          python3 "$CONTROL_DIR/symbolize_v032_macos_stacks_test.py"
+          (
+            cd "$CONTROL_DIR"
+            shasum -a 256 -c "$EVIDENCE/control/SHA256SUMS"
+          )
+
+      - name: Verify the exact source path and native diagnostic host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_WORKSPACE" = '/Users/runner/work/stasis/stasis'
+          test "$(git rev-parse HEAD)" = "$EXACT_RELEASE_REVISION"
+          if ! changes=$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none); then
+            echo 'could not inspect the immutable checkout' >&2
+            exit 1
+          fi
+          test -z "$changes"
+          test "$(uname -s)" = 'Darwin'
+          test "$(uname -m)" = 'arm64'
+          test "$(sysctl -n hw.optional.arm64)" = '1'
+          test "$MACOSX_DEPLOYMENT_TARGET" = '13.0'
+
+      - name: Prepare and measure the ephemeral macOS runner
+        shell: bash
+        run: bash etc/ci/stasis/prepare_macos_runner.sh prepare 10485760
+
+      - name: Set up pinned uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.16"
+          enable-cache: false
+
+      - name: Bootstrap the exact macOS build dependencies
+        run: ./mach bootstrap --yes --skip-lints --skip-nextest
+
+      - name: Bind producer runner and pinned Rust toolchain identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_dir="$EVIDENCE/runner"
+          mkdir -p "$runner_dir"
+          sw_vers > "$runner_dir/sw_vers.txt"
+          xcodebuild -version > "$runner_dir/xcodebuild.txt"
+          xcode-select -p > "$runner_dir/xcode-select.txt"
+          xcrun --sdk macosx --show-sdk-version > "$runner_dir/macos-sdk-version.txt"
+          clang --version > "$runner_dir/clang-version.txt"
+          rustc -vV > "$runner_dir/rustc-vV.txt"
+          cargo -vV > "$runner_dir/cargo-vV.txt"
+
+          macos_version=$(sw_vers -productVersion)
+          macos_build=$(sw_vers -buildVersion)
+          xcode_version=$(sed -n '1p' "$runner_dir/xcodebuild.txt")
+          xcode_build=$(sed -n '2p' "$runner_dir/xcodebuild.txt")
+          xcode_path=$(cat "$runner_dir/xcode-select.txt")
+          sdk_version=$(cat "$runner_dir/macos-sdk-version.txt")
+          image_version=${ImageVersion:-}
+          test "$macos_version" = '15.7.7'
+          test "$macos_build" = '24G720'
+          test "$xcode_version" = 'Xcode 16.4'
+          test "$xcode_build" = 'Build version 16F6'
+          test "$xcode_path" = '/Applications/Xcode_16.4.app/Contents/Developer'
+          test "$sdk_version" = '15.5'
+          test "$image_version" = '20260727.0256.1'
+
+          rustc_release=$(sed -n 's/^release: //p' "$runner_dir/rustc-vV.txt")
+          rustc_commit=$(sed -n 's/^commit-hash: //p' "$runner_dir/rustc-vV.txt")
+          llvm_version=$(sed -n 's/^LLVM version: //p' "$runner_dir/rustc-vV.txt")
+          cargo_release=$(sed -n 's/^release: //p' "$runner_dir/cargo-vV.txt")
+          cargo_commit=$(sed -n 's/^commit-hash: //p' "$runner_dir/cargo-vV.txt")
+          test "$rustc_release" = '1.97.1'
+          test "$rustc_commit" = '8bab26f4f68e0e26f0bb7960be334d5b520ea452'
+          test "$llvm_version" = '22.1.6'
+          test "$cargo_release" = '1.97.1'
+          test "$cargo_commit" = 'c980f4866141969fab6254a680546a277789d6f0'
+
+          target_libdir=$(rustc --print target-libdir)
+          llvm_nm="$(dirname "$target_libdir")/bin/llvm-nm"
+          test -x "$llvm_nm"
+          echo "STASIS_LLVM_NM=$llvm_nm" >> "$GITHUB_ENV"
+
+          jq -n \
+            --arg kernel "$(uname -s)" \
+            --arg architecture "$(uname -m)" \
+            --arg arm64 "$(sysctl -n hw.optional.arm64)" \
+            --arg macosVersion "$macos_version" \
+            --arg macosBuild "$macos_build" \
+            --arg xcodeVersion "$xcode_version" \
+            --arg xcodeBuild "$xcode_build" \
+            --arg xcodePath "$xcode_path" \
+            --arg macosSdkVersion "$sdk_version" \
+            --arg macosDeploymentTarget "$MACOSX_DEPLOYMENT_TARGET" \
+            --arg imageVersion "$image_version" \
+            --arg imageOS "${ImageOS:-}" \
+            --arg clangVersion "$(cat "$runner_dir/clang-version.txt")" \
+            --arg workspace "$GITHUB_WORKSPACE" \
+            --arg harnessRevision "$GITHUB_SHA" \
+            --arg cargoIncremental "$CARGO_INCREMENTAL" \
+            --arg rustBacktrace "$RUST_BACKTRACE" \
+            --arg stasisRevision "$STASIS_REVISION" \
+            --arg stasisPlatform "$STASIS_PLATFORM" \
+            --arg stasisReleaseVersion "$STASIS_RELEASE_VERSION" \
+            '{kernel: $kernel, architecture: $architecture, arm64: $arm64,
+              macosVersion: $macosVersion, macosBuild: $macosBuild,
+              xcodeVersion: $xcodeVersion, xcodeBuild: $xcodeBuild,
+              xcodePath: $xcodePath, macosSdkVersion: $macosSdkVersion,
+              macosDeploymentTarget: $macosDeploymentTarget,
+              imageVersion: $imageVersion, imageOS: $imageOS,
+              clangVersion: $clangVersion, workspace: $workspace,
+              harnessRevision: $harnessRevision,
+              producerEnvironment: {cargoIncremental: $cargoIncremental,
+                rustBacktrace: $rustBacktrace, stasisRevision: $stasisRevision,
+                stasisPlatform: $stasisPlatform,
+                stasisReleaseVersion: $stasisReleaseVersion},
+              releaseGateAuthority: false}' > "$runner_dir/runner.json"
+          jq -n \
+            --arg rustcRelease "$rustc_release" \
+            --arg rustcCommit "$rustc_commit" \
+            --arg llvmVersion "$llvm_version" \
+            --arg cargoRelease "$cargo_release" \
+            --arg cargoCommit "$cargo_commit" \
+            '{rustcRelease: $rustcRelease, rustcCommit: $rustcCommit,
+              llvmVersion: $llvmVersion, cargoRelease: $cargoRelease,
+              cargoCommit: $cargoCommit,
+              releaseGateAuthority: false}' > "$runner_dir/toolchain.json"
+
+          if ! changes=$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none); then
+            echo 'could not inspect the checkout after native bootstrap' >&2
+            exit 1
+          fi
+          if [[ -n "$changes" ]]; then
+            git status --short --untracked-files=all --ignore-submodules=none >&2
+            echo 'the immutable checkout is dirty after native bootstrap' >&2
+            exit 1
+          fi
+
+      - name: Bind immutable release and diagnostic artifact bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e "$RELEASE_ROOT"
+          test ! -e "$DIAGNOSTIC_INPUT"
+          mkdir -p "$RELEASE_ROOT" "$DIAGNOSTIC_INPUT" "$EVIDENCE/hosted"
+          hosted="$EVIDENCE/hosted"
+
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$EXACT_RELEASE_TAG" \
+            > "$hosted/tag-ref.json"
+          jq -e --arg revision "$EXACT_RELEASE_REVISION" '
+            .ref == "refs/tags/v0.3.2"
+            and .object.type == "commit"
+            and .object.sha == $revision
+          ' "$hosted/tag-ref.json" > /dev/null
+          gh api "repos/$GITHUB_REPOSITORY/releases/$EXACT_RELEASE_ID" \
+            > "$hosted/release.json"
+          jq -e \
+            --arg revision "$EXACT_RELEASE_REVISION" \
+            --arg assetId "$EXACT_RELEASE_ASSET_ID" \
+            --arg archiveSha "$EXACT_ARCHIVE_SHA256" \
+            --arg archiveBytes "$EXACT_ARCHIVE_BYTES" '
+            .id == 380180986
+            and .tag_name == "v0.3.2"
+            and .target_commitish == $revision
+            and .draft == false
+            and .prerelease == false
+            and .immutable == true
+            and ([.assets[] | select((.id | tostring) == $assetId)] | length) == 1
+            and ([.assets[] | select((.id | tostring) == $assetId)][0]
+              | .name == "stasis-0.3.2-macos-aarch64.tar.gz"
+                and (.size | tostring) == $archiveBytes
+                and .digest == ("sha256:" + $archiveSha)
+                and .state == "uploaded")
+          ' "$hosted/release.json" > /dev/null
+          gh api -H 'Accept: application/octet-stream' \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$EXACT_RELEASE_ASSET_ID" \
+            > "$RELEASE_ROOT/stasis-0.3.2-macos-aarch64.tar.gz"
+          archive="$RELEASE_ROOT/stasis-0.3.2-macos-aarch64.tar.gz"
+          test "$(stat -f '%z' "$archive")" = "$EXACT_ARCHIVE_BYTES"
+          test "$(shasum -a 256 "$archive" | awk '{print $1}')" = "$EXACT_ARCHIVE_SHA256"
+          tar -xzf "$archive" -C "$RELEASE_ROOT"
+          release_binary="$RELEASE_ROOT/stasis-0.3.2-macos-aarch64/stasis"
+          test -x "$release_binary"
+          test "$(stat -f '%z' "$release_binary")" = "$EXACT_BINARY_BYTES"
+          test "$(shasum -a 256 "$release_binary" | awk '{print $1}')" = "$EXACT_BINARY_SHA256"
+          test "$(dwarfdump --uuid "$release_binary" | awk '{print $2}')" = "$EXACT_BINARY_UUID"
+
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$EXACT_DIAGNOSTIC_RUN_ID" \
+            > "$hosted/diagnostic-run.json"
+          jq -e \
+            --arg runId "$EXACT_DIAGNOSTIC_RUN_ID" \
+            --arg attempt "$EXACT_DIAGNOSTIC_RUN_ATTEMPT" \
+            --arg revision "$EXACT_INPUT_DIAGNOSTIC_REVISION" '
+            (.id | tostring) == $runId
+            and (.run_attempt | tostring) == $attempt
+            and .head_sha == $revision
+            and .head_branch == "main"
+            and .path == ".github/workflows/stasis-v0.3-macos-public-diagnostic.yml"
+            and .event == "workflow_dispatch"
+            and .status == "completed"
+            and .conclusion == "failure"
+          ' "$hosted/diagnostic-run.json" > /dev/null
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$EXACT_DIAGNOSTIC_ARTIFACT_ID" \
+            > "$hosted/diagnostic-artifact.json"
+          jq -e \
+            --arg artifactId "$EXACT_DIAGNOSTIC_ARTIFACT_ID" \
+            --arg artifactName "$EXACT_DIAGNOSTIC_ARTIFACT_NAME" \
+            --arg artifactDigest "$EXACT_DIAGNOSTIC_ARTIFACT_DIGEST" \
+            --arg artifactBytes "$EXACT_DIAGNOSTIC_ARTIFACT_BYTES" \
+            --arg runId "$EXACT_DIAGNOSTIC_RUN_ID" \
+            --arg revision "$EXACT_INPUT_DIAGNOSTIC_REVISION" '
+            (.id | tostring) == $artifactId
+            and .name == $artifactName
+            and .digest == $artifactDigest
+            and (.size_in_bytes | tostring) == $artifactBytes
+            and .expired == false
+            and (.workflow_run.id | tostring) == $runId
+            and .workflow_run.head_sha == $revision
+          ' "$hosted/diagnostic-artifact.json" > /dev/null
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$EXACT_DIAGNOSTIC_ARTIFACT_ID/zip" \
+            > "$hosted/diagnostic-artifact.zip"
+          test "$(stat -f '%z' "$hosted/diagnostic-artifact.zip")" = \
+            "$EXACT_DIAGNOSTIC_ARTIFACT_BYTES"
+          test "sha256:$(shasum -a 256 "$hosted/diagnostic-artifact.zip" | awk '{print $1}')" = \
+            "$EXACT_DIAGNOSTIC_ARTIFACT_DIGEST"
+          unzip -q "$hosted/diagnostic-artifact.zip" -d "$DIAGNOSTIC_INPUT"
+          test "$(shasum -a 256 "$DIAGNOSTIC_INPUT/summary.json" | awk '{print $1}')" = \
+            "$EXACT_DIAGNOSTIC_SUMMARY_SHA256"
+          report_count=$(find "$DIAGNOSTIC_INPUT" -maxdepth 1 -type f -name '*.sample.txt' | wc -l | tr -d ' ')
+          test "$report_count" = '9'
+
+      - name: Install the exact-target rust-objcopy capture wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE/binaries"
+          python3 "$CONTROL_DIR/capture_v032_macos_prestrip.py" install \
+            --expected "$GITHUB_WORKSPACE/target/production-stripped/stasis" \
+            --capture "$EVIDENCE/binaries/stasis-v0.3.2.prestrip" \
+            --args-file "$EVIDENCE/rust-objcopy.args0" \
+            --lock "$RUNNER_TEMP/stasis-v032-prestrip-capture.lock" \
+            --state "$EVIDENCE/strip-capture-state.json" \
+            --evidence "$EVIDENCE" \
+            --github-env "$GITHUB_ENV"
+
+      - name: Build the exact production-stripped v0.3.2 executable once
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXACT_RELEASE_REVISION"
+          test "$CARGO_INCREMENTAL" = '0'
+          test "$RUST_BACKTRACE" = '1'
+          test "$STASIS_REVISION" = "$EXACT_RELEASE_REVISION"
+          test "$STASIS_PLATFORM" = 'macos-aarch64'
+          test "$STASIS_RELEASE_VERSION" = '0.3.2'
+          test "$STASIS_FROZEN_V1_PROFILE_SHA256" = \
+            '6e262edf0f8be11a1cece28f68f00d59fdac68b79b0a670ac891d36998720100'
+          test "$STASIS_FROZEN_V2_PROFILE_SHA256" = \
+            '9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a'
+          test "$STASIS_EXPECTED_STRIP_TARGET" = \
+            "$GITHUB_WORKSPACE/target/production-stripped/stasis"
+          if ! changes=$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none); then
+            echo 'could not inspect the checkout before the exact rebuild' >&2
+            exit 1
+          fi
+          test -z "$changes"
+          cargo build --locked -p stasis-shell --profile production-stripped
+          bash etc/ci/stasis/prepare_macos_runner.sh check 4194304
+          test -x "$GITHUB_WORKSPACE/target/production-stripped/stasis"
+
+      - name: Restore the original pinned rust-objcopy
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$EVIDENCE/strip-capture-state.json"
+          python3 "$CONTROL_DIR/capture_v032_macos_prestrip.py" restore \
+            --state "$EVIDENCE/strip-capture-state.json"
+
+      - name: Verify the single exact-target strip capture
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$CONTROL_DIR/capture_v032_macos_prestrip.py" verify \
+            --state "$EVIDENCE/strip-capture-state.json" \
+            --output "$EVIDENCE/strip-capture.json"
+
+      - name: Symbolize all nine immutable stack reports fail closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_binary="$RELEASE_ROOT/stasis-0.3.2-macos-aarch64/stasis"
+          python3 "$CONTROL_DIR/symbolize_v032_macos_stacks.py" \
+            --input "$DIAGNOSTIC_INPUT" \
+            --artifact-zip "$EVIDENCE/hosted/diagnostic-artifact.zip" \
+            --prestrip "$EVIDENCE/binaries/stasis-v0.3.2.prestrip" \
+            --built "$GITHUB_WORKSPACE/target/production-stripped/stasis" \
+            --release-binary "$release_binary" \
+            --release-archive "$RELEASE_ROOT/stasis-0.3.2-macos-aarch64.tar.gz" \
+            --capture-result "$EVIDENCE/strip-capture.json" \
+            --tag-metadata "$EVIDENCE/hosted/tag-ref.json" \
+            --release-metadata "$EVIDENCE/hosted/release.json" \
+            --run-metadata "$EVIDENCE/hosted/diagnostic-run.json" \
+            --artifact-metadata "$EVIDENCE/hosted/diagnostic-artifact.json" \
+            --runner-metadata "$EVIDENCE/runner/runner.json" \
+            --toolchain-metadata "$EVIDENCE/runner/toolchain.json" \
+            --llvm-nm "$STASIS_LLVM_NM" \
+            --output "$EVIDENCE/symbolization" \
+            | tee "$EVIDENCE/symbolization.stdout.json"
+
+      - name: Seal diagnostic evidence manifest
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$EVIDENCE" <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1]).resolve()
+          manifest = root / "SHA256SUMS"
+          if manifest.exists():
+              raise SystemExit(f"manifest already exists: {manifest}")
+          lines = []
+          for path in sorted(item for item in root.rglob("*") if item.is_file()):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              lines.append(f"{digest.hexdigest()}  {path.relative_to(root).as_posix()}")
+          if not lines:
+              raise SystemExit("refusing an empty diagnostic manifest")
+          manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+          (
+            cd "$EVIDENCE"
+            shasum -a 256 -c SHA256SUMS
+          )
+
+      - id: upload
+        name: Preserve diagnostic-only exact symbolization evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stasis-v0.3.2-macos-exact-symbolization-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stasis-v032-symbol-recovery-evidence
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Report diagnostic artifact identity
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Stasis v0.3.2 exact symbol recovery (diagnostic only)'
+            echo
+            echo '- Release-gate authority: **false**'
+            echo '- Source release: `v0.3.2` / `b3d1ac949d341dc6bbe1244162441d9bb8adb00a`'
+            echo '- Diagnostic input: run `33466775208`, attempt `1`, artifact `9785268258`'
+            echo '- Output artifact ID: `${{ steps.upload.outputs.artifact-id }}`'
+            echo '- Output artifact digest: `${{ steps.upload.outputs.artifact-digest }}`'
+            if [[ -f "$EVIDENCE/symbolization/summary.json" ]]; then
+              echo '- Exact-release address authority: `true`'
+              echo '- Nine stable mappings equal: `true`'
+            else
+              echo '- Exact-release address authority: `not established`'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Refuse release-gate semantics
+        if: always()
+        shell: bash
+        run: |
+          echo 'DIAGNOSTIC_ONLY: exact symbol recovery can never satisfy a release gate.' >&2
+          exit 1
