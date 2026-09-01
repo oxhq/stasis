@@ -33,7 +33,7 @@ env:
 
 jobs:
   verify:
-    name: Verify native release and pre-gate exact SDK
+    name: Verify immutable release and exact prepublication SDK proof
     if: |
       github.repository == 'oxhq/stasis'
         && (
@@ -60,7 +60,8 @@ jobs:
       macos_run_attempt: ${{ steps.inputs.outputs.macos_run_attempt }}
       native_binary_sha256: ${{ steps.inputs.outputs.native_binary_sha256 }}
       package_run_id: ${{ steps.inputs.outputs.package_run_id }}
-      prepublish_run_attempt: ${{ steps.prepublish_gate.outputs.run_attempt }}
+      prepublish_run_attempt: ${{ steps.prepublish_receipt.outputs.run_attempt }}
+      prepublish_run_id: ${{ steps.prepublish_receipt.outputs.run_id }}
       publication_run_attempt: ${{ steps.release.outputs.publication_run_attempt }}
       publication_run_id: ${{ steps.release.outputs.publication_run_id }}
       release_id: ${{ steps.release.outputs.release_id }}
@@ -174,7 +175,10 @@ jobs:
                     ($archive | sub("\\.tar\\.gz$"; "-act-settle-inspect.json"))
                   ]
               )
-            | add + ["stasis-\($version)-runtime-manifest.json"]
+            | add + [
+                "stasis-\($version)-runtime-manifest.json",
+                "stasis-\($version)-typescript-prepublish-act-settle-inspect.json"
+              ]
             | sort
           ')
           jq -e --argjson expected "$expected_assets" '
@@ -205,7 +209,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-assets/macos-aarch64 release-assets/linux-x86_64 \
-            gate-proof/macos-aarch64 gate-proof/linux-x86_64 runtime-manifest
+            gate-proof/macos-aarch64 gate-proof/linux-x86_64 runtime-manifest \
+            prepublication-proof
           for platform in macos-aarch64 linux-x86_64; do
             bundle="stasis-${STASIS_VERSION}-${platform}"
             archive="${bundle}.tar.gz"
@@ -241,6 +246,9 @@ jobs:
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
             --dir runtime-manifest \
             --pattern "$(basename "$runtime_manifest")"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --dir prepublication-proof \
+            --pattern "stasis-${STASIS_VERSION}-typescript-prepublish-act-settle-inspect.json"
           node sdk/typescript/scripts/generate-runtime-manifest.mjs \
             --input "$runtime_manifest" \
             --output sdk/typescript/src/runtime-manifest.generated.ts
@@ -688,89 +696,311 @@ jobs:
           test "$(basename "${packages[0]}")" = "$expected_name"
           cmp "${packages[0]}" "$NPM_TARBALL"
 
-      - id: prepublish_gate
-        name: Non-skippable packed-SDK act-settle-inspect gate
+      - id: prepublish_receipt
+        name: Verify the exact prepublication gate preceded immutable publication
         shell: bash
         run: |
           set -euo pipefail
-          prepublish_run_attempt=$GITHUB_RUN_ATTEMPT
-          if [[ ! "$prepublish_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
-            echo 'prepublish producer run attempt is invalid' >&2
+          public_receipt="prepublication-proof/stasis-${STASIS_VERSION}-typescript-prepublish-act-settle-inspect.json"
+          read -r prepublish_run_id prepublish_run_attempt < <(
+            python3 - "$public_receipt" <<'PY'
+          import json
+          import math
+          import pathlib
+          import re
+          import sys
+
+          def strict_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate object key {key!r}")
+                  value[key] = item
+              return value
+
+          try:
+              proof = json.loads(
+                  pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"),
+                  object_pairs_hook=strict_object,
+                  parse_float=lambda value: (
+                      parsed
+                      if math.isfinite(parsed := float(value))
+                      else (_ for _ in ()).throw(ValueError(f"non-finite number {value!r}"))
+                  ),
+                  parse_constant=lambda value: (_ for _ in ()).throw(
+                      ValueError(f"non-finite number {value!r}")
+                  ),
+              )
+          except (OSError, UnicodeError, ValueError, RecursionError) as error:
+              raise SystemExit(f"cannot parse strict public prepublication receipt: {error}") from error
+          run_id = proof.get("workflowRunId") if isinstance(proof, dict) else None
+          run_attempt = proof.get("workflowRunAttempt") if isinstance(proof, dict) else None
+          if (
+              not isinstance(run_id, str)
+              or re.fullmatch(r"[1-9][0-9]*", run_id) is None
+              or run_attempt != "1"
+          ):
+              raise SystemExit("public prepublication receipt has an invalid producer identity")
+          print(run_id, run_attempt)
+          PY
+          )
+          if [[ ! "$prepublish_run_id" =~ ^[1-9][0-9]*$ \
+            || "$prepublish_run_attempt" != '1' \
+            || "$prepublish_run_id" == "$GITHUB_RUN_ID" ]]; then
+            echo 'prepublication receipt does not identify an independent first-attempt run' >&2
             exit 1
           fi
-          consumer="$RUNNER_TEMP/stasis-packed-sdk-consumer"
-          mkdir "$consumer"
-          (
-            cd "$consumer"
-            pnpm init
-            pnpm add --ignore-scripts "$NPM_TARBALL"
-          )
-          gate_log="$RUNNER_TEMP/stasis-prepublish-sdk-gate.log"
-          staged_gate_log="pregated-sdk/stasis-${STASIS_VERSION}-typescript-prepublish-act-settle-inspect.log"
-          staged_gate_proof="pregated-sdk/stasis-${STASIS_VERSION}-typescript-prepublish-act-settle-inspect.json"
-          node etc/ci/stasis/verify_registry_sdk.mjs \
-            --binary "$RUNNER_TEMP/stasis-published-release/$STASIS_BUNDLE/stasis" \
-            --fixture ports/stasis/tests/fixtures/timer_10s.html \
-            --session-v2-fixture ports/stasis/tests/fixtures/message_channel_buffered.html \
-            --session-v2-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_data_svg.html \
-            --session-v2-http-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_http.html \
-            --session-v2-inline-svg-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg.html \
-            --session-v2-inline-svg-shared-pending-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg_shared_pending.html \
-            --session-v2-settlement-url-fixture ports/stasis/tests/fixtures/controlled_v2_settlement_url.html \
-            --session-v2-interval-before-finite-fixture ports/stasis/tests/fixtures/controlled_v2_interval_before_finite.html \
-            --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
-            --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
-            --session-v2-css-animation-event-fixture ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html \
-            --session-v2-cookie-fixture sdk/typescript/test/fixtures/controlled-v2-cookie-login.html \
-            --consumer-root "$consumer" \
-            --package "$NPM_TARBALL" \
-            --revision "$STASIS_REVISION" \
-            --version "$STASIS_VERSION" \
-            2>&1 | tee "$gate_log"
-          cp sdk/typescript/test/fixtures/public-package-north-star.mjs \
-            "$consumer/public-package-north-star.mjs"
-          cp sdk/typescript/test/fixtures/north-star.html "$consumer/north-star.html"
-          cp sdk/typescript/test/fixtures/public-package-session-north-star.mjs \
-            "$consumer/public-package-session-north-star.mjs"
-          cp -R sdk/typescript/test/fixtures/session-north-star \
-            "$consumer/session-north-star"
-          v1_north_star_log="$RUNNER_TEMP/stasis-prepublish-v1-north-star.jsonl"
-          (
-            cd "$consumer"
-            unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_TOKEN \
-              STASIS_NORTH_STAR_BINARY STASIS_SESSION_NORTH_STAR_BINARY
-            node ./public-package-north-star.mjs
-          ) 2>&1 | tee "$v1_north_star_log"
-          grep -F '"proof":"stasis-v0.1-north-star"' "$v1_north_star_log"
-          grep -F '"runs":3' "$v1_north_star_log"
-          explicit_runtime_cache="$RUNNER_TEMP/stasis-prepublish-explicit-runtime-cache"
-          mkdir "$explicit_runtime_cache"
-          v2_north_star_log="$RUNNER_TEMP/stasis-prepublish-v2-session-north-star.jsonl"
-          (
-            cd "$consumer"
-            unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_TOKEN \
-              STASIS_NORTH_STAR_BINARY STASIS_SESSION_NORTH_STAR_RUNTIME_CACHE
-            export STASIS_SESSION_NORTH_STAR_BINARY="$RUNNER_TEMP/stasis-published-release/$STASIS_BUNDLE/stasis"
-            export STASIS_SESSION_NORTH_STAR_RUNTIME_CACHE="$explicit_runtime_cache"
-            node ./public-package-session-north-star.mjs
-          ) 2>&1 | tee "$v2_north_star_log"
-          grep -F '"proof":"stasis-v0.2-session-north-star"' "$v2_north_star_log"
-          grep -F '"runs":3' "$v2_north_star_log"
-          grep -F '"sessions":6' "$v2_north_star_log"
-          grep -F '"runtimeAcquisition":"explicit-executable-override-cache-bypassed"' \
-            "$v2_north_star_log"
-          cat "$v1_north_star_log" "$v2_north_star_log" >> "$gate_log"
-          cp "$gate_log" "$staged_gate_log"
+
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$prepublish_run_id/attempts/$prepublish_run_attempt" \
+            > prepublication-run.json
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$prepublish_run_id/attempts/$prepublish_run_attempt/jobs?per_page=100" \
+            > prepublication-job-pages.json
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$prepublish_run_id/artifacts?per_page=100" \
+            > prepublication-artifact-pages.json
+          promotion_head_sha=$(jq -er \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg default_branch "$DEFAULT_BRANCH" \
+            --argjson run_id "$prepublish_run_id" '
+              select(.id == $run_id)
+              | select(.run_attempt == 1)
+              | select(.repository.full_name == $repository)
+              | select(.head_repository.full_name == $repository)
+              | select(.name == "Stasis package and promote")
+              | select(.path == ".github/workflows/stasis-package.yml")
+              | select(.event == "workflow_dispatch")
+              | select(.status == "completed" and .conclusion == "success")
+              | select(.head_branch == $default_branch)
+              | .head_sha
+            ' prepublication-run.json)
+          if [[ ! "$promotion_head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'prepublication promotion run did not resolve to an exact commit' >&2
+            exit 1
+          fi
+
+          gh api "repos/$GITHUB_REPOSITORY/compare/$STASIS_REVISION...$promotion_head_sha" \
+            > prepublication-ancestry.json
+          jq -e --arg revision "$STASIS_REVISION" '
+            .merge_base_commit.sha == $revision
+            and (.status == "ahead" or .status == "identical")
+          ' prepublication-ancestry.json > /dev/null
+          workflow_tree_sha() {
+            local commit_sha=$1
+            local root_tree_sha dot_github_tree_sha
+            root_tree_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$commit_sha" \
+              --jq '.tree.sha')
+            dot_github_tree_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/trees/$root_tree_sha" \
+              --jq '.tree | map(select(.path == ".github" and .mode == "040000" and .type == "tree")) | if length == 1 then .[0].sha else error("missing .github tree") end')
+            gh api "repos/$GITHUB_REPOSITORY/git/trees/$dot_github_tree_sha" \
+              --jq '.tree | map(select(.path == "workflows" and .mode == "040000" and .type == "tree")) | if length == 1 then .[0].sha else error("missing .github/workflows tree") end'
+          }
+          packaged_workflow_tree=$(workflow_tree_sha "$STASIS_REVISION")
+          promotion_workflow_tree=$(workflow_tree_sha "$promotion_head_sha")
+          if [[ ! "$packaged_workflow_tree" =~ ^[0-9a-f]{40}$ \
+            || "$promotion_workflow_tree" != "$packaged_workflow_tree" ]]; then
+            echo 'promotion workflow tree differs from the immutable package revision' >&2
+            exit 1
+          fi
+
+          PREPUBLISH_RUN_ID="$prepublish_run_id" \
+            PREPUBLISH_RUN_ATTEMPT="$prepublish_run_attempt" \
+            PROMOTION_HEAD_SHA="$promotion_head_sha" \
+            python3 - <<'PY'
+          import datetime
+          import json
+          import math
+          import os
+
+          def strict_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate object key {key!r}")
+                  value[key] = item
+              return value
+
+          def load_strict(filename, context):
+              try:
+                  with open(filename, encoding="utf-8") as source:
+                      return json.load(
+                          source,
+                          object_pairs_hook=strict_object,
+                          parse_float=lambda value: (
+                              parsed
+                              if math.isfinite(parsed := float(value))
+                              else (_ for _ in ()).throw(ValueError(f"non-finite number {value!r}"))
+                          ),
+                          parse_constant=lambda value: (_ for _ in ()).throw(
+                              ValueError(f"non-finite number {value!r}")
+                          ),
+                      )
+              except (OSError, UnicodeError, ValueError, RecursionError) as error:
+                  raise SystemExit(f"{context} is invalid strict JSON: {error}") from error
+
+          def flatten_pages(filename, key):
+              pages = load_strict(filename, f"{key} pagination response")
+              if not isinstance(pages, list) or not pages:
+                  raise SystemExit(f"{key} pagination response is malformed")
+              entries = []
+              totals = set()
+              for page in pages:
+                  if not isinstance(page, dict) or type(page.get("total_count")) is not int:
+                      raise SystemExit(f"{key} pagination response is malformed")
+                  values = page.get(key)
+                  if not isinstance(values, list):
+                      raise SystemExit(f"{key} pagination response is malformed")
+                  totals.add(page["total_count"])
+                  entries.extend(values)
+              if len(totals) != 1 or totals.pop() != len(entries):
+                  raise SystemExit(f"{key} pagination response is incomplete")
+              identifiers = [entry.get("id") for entry in entries if isinstance(entry, dict)]
+              if (
+                  len(identifiers) != len(entries)
+                  or any(type(identifier) is not int for identifier in identifiers)
+                  or len(set(identifiers)) != len(identifiers)
+              ):
+                  raise SystemExit(f"{key} pagination identity is malformed or duplicated")
+              return entries
+
+          def timestamp(value, context):
+              if not isinstance(value, str):
+                  raise SystemExit(f"{context} timestamp is missing")
+              try:
+                  parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+              except ValueError as error:
+                  raise SystemExit(f"{context} timestamp is invalid") from error
+              if parsed.tzinfo is None:
+                  raise SystemExit(f"{context} timestamp is not timezone-aware")
+              return parsed
+
+          run_id = int(os.environ["PREPUBLISH_RUN_ID"])
+          run_attempt = int(os.environ["PREPUBLISH_RUN_ATTEMPT"])
+          head_sha = os.environ["PROMOTION_HEAD_SHA"]
+          release = load_strict("release.json", "immutable release")
+          if not isinstance(release, dict):
+              raise SystemExit("immutable release response is not an object")
+          published_at = timestamp(release.get("published_at"), "immutable release publication")
+
+          jobs = flatten_pages("prepublication-job-pages.json", "jobs")
+          expected_job_names = {
+              "Pre-gate exact packed SDK before immutable release",
+              "Create immutable draft stable release",
+          }
+          selected = {}
+          for job in jobs:
+              name = job.get("name")
+              if name not in expected_job_names:
+                  continue
+              if name in selected:
+                  raise SystemExit(f"prepublication job is ambiguous: {name}")
+              if (
+                  job.get("run_id") != run_id
+                  or job.get("run_attempt") != run_attempt
+                  or job.get("head_sha") != head_sha
+                  or job.get("status") != "completed"
+                  or job.get("conclusion") != "success"
+              ):
+                  raise SystemExit(f"prepublication job identity is invalid: {name}")
+              selected[name] = {
+                  "started": timestamp(job.get("started_at"), f"{name} start"),
+                  "completed": timestamp(job.get("completed_at"), f"{name} completion"),
+              }
+          if set(selected) != expected_job_names:
+              raise SystemExit("required prepublication or promotion job is missing")
+          gate = selected["Pre-gate exact packed SDK before immutable release"]
+          promote = selected["Create immutable draft stable release"]
+          if (
+              gate["completed"] > promote["started"]
+              or promote["completed"] > published_at
+          ):
+              raise SystemExit("prepublication, promotion, and immutable publication ordering changed")
+
+          artifacts = flatten_pages("prepublication-artifact-pages.json", "artifacts")
+          artifact_name = f"verified-stasis-prepublication-sdk-attempt-{run_attempt}"
+          matches = [artifact for artifact in artifacts if artifact.get("name") == artifact_name]
+          if len(matches) != 1:
+              raise SystemExit("exact prepublication evidence artifact is missing or ambiguous")
+          artifact = matches[0]
+          workflow_run = artifact.get("workflow_run")
+          if (
+              artifact.get("expired") is not False
+              or not isinstance(workflow_run, dict)
+              or workflow_run.get("id") != run_id
+              or workflow_run.get("head_sha") != head_sha
+              or workflow_run.get("head_branch") != os.environ["DEFAULT_BRANCH"]
+          ):
+              raise SystemExit("prepublication evidence artifact identity is invalid")
+          PY
+
+          mkdir prepublication-download
+          gh run download "$prepublish_run_id" --repo "$GITHUB_REPOSITORY" \
+            --name "verified-stasis-prepublication-sdk-attempt-$prepublish_run_attempt" \
+            --dir prepublication-download
+          python3 - <<'PY'
+          import os
+          import pathlib
+
+          version = os.environ["STASIS_VERSION"]
+          directory = pathlib.Path("prepublication-download")
+          expected = {
+              f"oxhq-stasis-{version}.tgz",
+              f"stasis-{version}-typescript-act-settle-inspect.json",
+              f"stasis-{version}-typescript-prepublish-act-settle-inspect.json",
+              f"stasis-{version}-typescript-prepublish-act-settle-inspect.log",
+          }
+          entries = list(directory.iterdir())
+          if (
+              any(entry.is_symlink() or not entry.is_file() for entry in entries)
+              or {entry.name for entry in entries} != expected
+          ):
+              raise SystemExit("prepublication evidence artifact inventory changed")
+          PY
+
+          staged_receipt="prepublication-download/stasis-${STASIS_VERSION}-typescript-prepublish-act-settle-inspect.json"
+          staged_log="prepublication-download/stasis-${STASIS_VERSION}-typescript-prepublish-act-settle-inspect.log"
+          cmp "prepublication-download/oxhq-stasis-${STASIS_VERSION}.tgz" "$NPM_TARBALL"
+          cmp "prepublication-download/stasis-${STASIS_VERSION}-typescript-act-settle-inspect.json" \
+            "pregated-sdk/stasis-${STASIS_VERSION}-typescript-act-settle-inspect.json"
+          cmp "$staged_receipt" "$public_receipt"
+          prepublication_provenance="$RUNNER_TEMP/stasis-prepublication-provenance.json"
+          gh attestation verify "$staged_receipt" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
+            --source-digest "$promotion_head_sha" \
+            --source-ref "refs/heads/$DEFAULT_BRANCH" \
+            --deny-self-hosted-runners \
+            --limit 100 \
+            --format json > "$prepublication_provenance"
+          python3 etc/ci/stasis/verify_build_provenance.py verify \
+            --verification-json "$prepublication_provenance" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow .github/workflows/stasis-package.yml \
+            --revision "$promotion_head_sha" \
+            --source-ref "refs/heads/$DEFAULT_BRANCH" \
+            --server-url "$GITHUB_SERVER_URL" \
+            --run-id "$prepublish_run_id" \
+            --run-attempt "$prepublish_run_attempt" \
+            --expected-subject-count 2 \
+            --subject "$staged_receipt" \
+            --subject "$staged_log"
+
           python3 etc/ci/stasis/npm_release.py create-proof \
             --package "$NPM_TARBALL" \
-            --gate-log "$gate_log" \
-            --output "$staged_gate_proof" \
+            --gate-log "$staged_log" \
+            --output "$RUNNER_TEMP/stasis-prepublication-recreated.json" \
             --version "$STASIS_VERSION" \
             --revision "$STASIS_REVISION" \
             --native-binary-sha256 "$STASIS_NATIVE_BINARY_SHA256" \
-            --run-id "$GITHUB_RUN_ID" \
+            --run-id "$prepublish_run_id" \
             --run-attempt "$prepublish_run_attempt"
-          echo "run_attempt=$prepublish_run_attempt" >> "$GITHUB_OUTPUT"
+          cmp "$RUNNER_TEMP/stasis-prepublication-recreated.json" "$staged_receipt"
+          cp "$staged_receipt" "$staged_log" pregated-sdk/
+          {
+            echo "run_id=$prepublish_run_id"
+            echo "run_attempt=$prepublish_run_attempt"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Stage only the exact attested and pre-gated npm inputs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -806,6 +1036,7 @@ jobs:
       NPM_CONFIG_PROVENANCE: "true"
       PACKAGE_RUN_ID: ${{ needs.verify.outputs.package_run_id }}
       PREPUBLISH_RUN_ATTEMPT: ${{ needs.verify.outputs.prepublish_run_attempt }}
+      PREPUBLISH_RUN_ID: ${{ needs.verify.outputs.prepublish_run_id }}
       RELEASE_ID: ${{ needs.verify.outputs.release_id }}
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
       STASIS_NATIVE_BINARY_SHA256: ${{ needs.verify.outputs.native_binary_sha256 }}
@@ -1585,9 +1816,8 @@ jobs:
               "sdk": os.environ["SDK_RUN_ATTEMPT"],
           }
           sdk_run_attempt = producer_attempts["sdk"]
-          prepublish_run_id = os.environ["GITHUB_RUN_ID"]
+          prepublish_run_id = os.environ["PREPUBLISH_RUN_ID"]
           prepublish_run_attempt = os.environ["PREPUBLISH_RUN_ATTEMPT"]
-          current_publish_attempt = os.environ["GITHUB_RUN_ATTEMPT"]
           binary_digest = os.environ["STASIS_NATIVE_BINARY_SHA256"]
           if version != "0.3.2":
               raise SystemExit("invalid staged SDK version")
@@ -1611,11 +1841,10 @@ jobs:
           if (
               re.fullmatch(r"[1-9][0-9]*", prepublish_run_id) is None
               or re.fullmatch(r"[1-9][0-9]*", prepublish_run_attempt) is None
-              or re.fullmatch(r"[1-9][0-9]*", current_publish_attempt) is None
+              or prepublish_run_attempt != "1"
+              or prepublish_run_id == os.environ["GITHUB_RUN_ID"]
           ):
               raise SystemExit("invalid staged prepublish run identity")
-          if int(prepublish_run_attempt) > int(current_publish_attempt):
-              raise SystemExit("staged prepublish proof claims a future workflow attempt")
           if re.fullmatch(r"[0-9a-f]{64}", binary_digest) is None:
               raise SystemExit("invalid staged native binary digest")
 

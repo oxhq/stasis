@@ -6038,6 +6038,8 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "Finite timer and animated-image deadlines must be strictly",
             "same-scheduler owner whose TimerId sequence follows the interval head",
             "lower-or-equal-order, foreign-scheduler, bare/unowned, equal finite-timer",
+            "separately attested packed-SDK prepublication receipt",
+            "bound to the exact tarball and macOS binary",
             "After successful controlled",
             "otherwise valid Strict/Lax/unspecified values are ignored",
             "normalization,\n          and time-range failures retain their existing typed outcomes",
@@ -6449,41 +6451,210 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
                 "credential-free package workflow must run each focused POSIX component gate "
                 "once in the Stasis release binary's bundled-FreeType feature graph"
             )
+
+    package_sdk_job_marker = "  package-sdk:\n"
+    verify_promotion_job_marker = "  verify-promotion:\n"
+    prepublish_promotion_job_marker = "  prepublish-promotion:\n"
+    promote_job_marker = "  promote:\n"
+    for marker, description in (
+        (package_sdk_job_marker, "package SDK job"),
+        (verify_promotion_job_marker, "promotion verifier job"),
+        (prepublish_promotion_job_marker, "prepublication SDK job"),
+        (promote_job_marker, "credentialed promotion job"),
+    ):
+        if public_release_workflow.count(marker) != 1:
+            raise ReleaseError(
+                f"credential-free package workflow must define exactly one {description}"
+            )
+    package_sdk_start = public_release_workflow.index(package_sdk_job_marker)
+    verify_promotion_start = public_release_workflow.index(
+        verify_promotion_job_marker, package_sdk_start
+    )
+    prepublish_promotion_start = public_release_workflow.index(
+        prepublish_promotion_job_marker, verify_promotion_start
+    )
+    promote_start = public_release_workflow.index(
+        promote_job_marker, prepublish_promotion_start
+    )
+    package_sdk_job = public_release_workflow[package_sdk_start:verify_promotion_start]
+    prepublish_promotion_job = public_release_workflow[
+        prepublish_promotion_start:promote_start
+    ]
+    promote_job = public_release_workflow[promote_start:]
+
+    publish_verify_job_marker = "  verify:\n"
+    publish_job_marker = "  publish:\n"
+    verify_registry_job_marker = "  verify-registry:\n"
+    for marker, description in (
+        (publish_verify_job_marker, "release-event verification job"),
+        (publish_job_marker, "npm mutation job"),
+        (verify_registry_job_marker, "anonymous registry verification job"),
+    ):
+        if public_npm_publish_workflow.count(marker) != 1:
+            raise ReleaseError(f"npm-publish workflow must define exactly one {description}")
+    publish_verify_start = public_npm_publish_workflow.index(publish_verify_job_marker)
+    publish_start = public_npm_publish_workflow.index(
+        publish_job_marker, publish_verify_start
+    )
+    verify_registry_start = public_npm_publish_workflow.index(
+        verify_registry_job_marker, publish_start
+    )
+    publish_verify_job = public_npm_publish_workflow[publish_verify_start:publish_start]
+    publish_job = public_npm_publish_workflow[publish_start:verify_registry_start]
+    verify_registry_job = public_npm_publish_workflow[verify_registry_start:]
+
+    require_source_fragments_in_order(
+        prepublish_promotion_job,
+        (
+            "    name: Pre-gate exact packed SDK before immutable release\n",
+            "      - verify-promotion\n",
+            "        && needs.verify-promotion.result == 'success'\n",
+            "    runs-on: macos-15\n",
+            "      attestations: write\n",
+            "      contents: read\n",
+            "      id-token: write\n",
+            "      prepublish_proof_sha256: ${{ steps.prepublish.outputs.proof_sha256 }}\n",
+            "      - name: Install, typecheck, test, build, and reproduce the SDK pack\n",
+            "          cmp \"${packages[0]}\" \"$NPM_TARBALL\"\n",
+            "      - id: prepublish\n",
+            "        name: Run the non-skippable pre-immutable packed-SDK gate\n",
+            "            STASIS_NORTH_STAR_BINARY=\"$binary\" node ./public-package-north-star.mjs\n",
+            "            STASIS_SESSION_NORTH_STAR_BINARY=\"$binary\" \\\n",
+            "          python3 etc/ci/stasis/npm_release.py create-proof \\\n",
+            "      - name: Attest the exact prepublication receipt and gate log\n",
+            "      - name: Stage the exact prepublication SDK evidence\n",
+        ),
+        "prepublication SDK gate topology",
+    )
+    if prepublish_promotion_job.count('          test "$GITHUB_RUN_ATTEMPT" = \'1\'\n') != 2:
+        raise ReleaseError(
+            "prepublication SDK job must reject reruns both before handoff use and before workload"
+        )
+    if (
+        "    environment:\n" in prepublish_promotion_job
+        or "npm publish " in prepublish_promotion_job
+        or "registry-url:" in prepublish_promotion_job
+        or "NPM_CONFIG_PROVENANCE" in prepublish_promotion_job
+    ):
+        raise ReleaseError(
+            "prepublication SDK job must remain credential-free and unable to mutate npm"
+        )
+
+    require_source_fragments_in_order(
+        promote_job,
+        (
+            "      - prepublish-promotion\n",
+            "        && needs.prepublish-promotion.result == 'success'\n",
+            "      PREPUBLISH_PROOF_SHA256: ${{ needs.prepublish-promotion.outputs.prepublish_proof_sha256 }}\n",
+            "      - name: Download prepublication evidence verified before release mutation\n",
+            "      - name: Recheck and stage the exact prepublication receipt\n",
+            "          cp \"$proof\" release-assets/\n",
+            "              f\"stasis-{version}-typescript-prepublish-act-settle-inspect.json\"\n",
+        ),
+        "prepublication-to-promotion dependency",
+    )
+    require_source_fragments_in_order(
+        publish_verify_job,
+        (
+            "    name: Verify immutable release and exact prepublication SDK proof\n",
+            "      prepublish_run_id: ${{ steps.prepublish_receipt.outputs.run_id }}\n",
+            "                \"stasis-\\($version)-typescript-prepublish-act-settle-inspect.json\"\n",
+            "      - id: prepublish_receipt\n",
+            "        name: Verify the exact prepublication gate preceded immutable publication\n",
+            "            \"Pre-gate exact packed SDK before immutable release\",\n",
+            "            \"Create immutable draft stable release\",\n",
+            '              gate["completed"] > promote["started"]\n',
+            '              or promote["completed"] > published_at\n',
+            "              raise SystemExit(\"prepublication, promotion, and immutable publication ordering changed\")\n",
+            "            --name \"verified-stasis-prepublication-sdk-attempt-$prepublish_run_attempt\" \\\n",
+            "          cmp \"$staged_receipt\" \"$public_receipt\"\n",
+            "            --expected-subject-count 2 \\\n",
+            "          cmp \"$RUNNER_TEMP/stasis-prepublication-recreated.json\" \"$staged_receipt\"\n",
+        ),
+        "release-event prepublication receipt verifier",
+    )
+    if "id-token: write" in publish_verify_job or "    environment:\n" in publish_verify_job:
+        raise ReleaseError(
+            "release-event receipt verifier must not receive npm environment or OIDC mutation authority"
+        )
+    require_source_fragments_in_order(
+        publish_job,
+        (
+            "    if: needs.verify.result == 'success' && github.event_name == 'release'\n",
+            "      name: npm\n",
+            "      id-token: write\n",
+            "      PREPUBLISH_RUN_ID: ${{ needs.verify.outputs.prepublish_run_id }}\n",
+            '          prepublish_run_id = os.environ["PREPUBLISH_RUN_ID"]\n',
+            '              or prepublish_run_attempt != "1"\n',
+            '              or prepublish_run_id == os.environ["GITHUB_RUN_ID"]\n',
+            '          npm publish "$NPM_TARBALL" --ignore-scripts --access public --tag latest --provenance \\\n',
+        ),
+        "release-event-only npm mutation job",
+    )
+    npm_publish_command = (
+        '          npm publish "$NPM_TARBALL" --ignore-scripts --access public --tag latest '
+        '--provenance \\\n'
+    )
+    if (
+        public_release_workflow.count(npm_publish_command) != 0
+        or public_npm_publish_workflow.count(npm_publish_command) != 1
+        or publish_job.count(npm_publish_command) != 1
+    ):
+        raise ReleaseError(
+            "npm mutation must exist exactly once and only in the release-event publish job"
+        )
+
+    verify_registry_sdk_durable_v2_fixture_invocations(
+        package_sdk_job, "credential-free package SDK job", 1
+    )
+    verify_registry_sdk_durable_v2_fixture_invocations(
+        prepublish_promotion_job, "prepublication package SDK job", 1
+    )
+    verify_registry_sdk_durable_v2_fixture_invocations(
+        publish_verify_job, "release-event receipt verifier", 0
+    )
+    verify_registry_sdk_durable_v2_fixture_invocations(
+        publish_job, "release-event npm mutation job", 0
+    )
+    verify_registry_sdk_durable_v2_fixture_invocations(
+        verify_registry_job, "anonymous registry verification job", 1
+    )
+
     packed_sdk_shared_pending_argument = (
         "--session-v2-inline-svg-shared-pending-fixture "
         "ports/stasis/tests/fixtures/controlled_v2_inline_svg_shared_pending.html"
     )
-    if public_release_workflow.count(packed_sdk_shared_pending_argument) != 1:
+    if public_release_workflow.count(packed_sdk_shared_pending_argument) != 2:
         raise ReleaseError(
-            "credential-free package workflow must invoke the shared-pending inline SVG proof once"
+            "credential-free package workflow must invoke the shared-pending inline SVG proof twice"
         )
-    if public_npm_publish_workflow.count(packed_sdk_shared_pending_argument) != 2:
+    if public_npm_publish_workflow.count(packed_sdk_shared_pending_argument) != 1:
         raise ReleaseError(
-            "npm-publish workflow must invoke the shared-pending inline SVG proof twice"
+            "npm-publish workflow must invoke the shared-pending inline SVG proof once"
         )
     packed_sdk_settlement_url_argument = (
         "--session-v2-settlement-url-fixture "
         "ports/stasis/tests/fixtures/controlled_v2_settlement_url.html"
     )
-    if public_release_workflow.count(packed_sdk_settlement_url_argument) != 1:
+    if public_release_workflow.count(packed_sdk_settlement_url_argument) != 2:
         raise ReleaseError(
-            "credential-free package workflow must invoke the settlement URL proof once"
+            "credential-free package workflow must invoke the settlement URL proof twice"
         )
-    if public_npm_publish_workflow.count(packed_sdk_settlement_url_argument) != 2:
+    if public_npm_publish_workflow.count(packed_sdk_settlement_url_argument) != 1:
         raise ReleaseError(
-            "npm-publish workflow must invoke the settlement URL proof twice"
+            "npm-publish workflow must invoke the settlement URL proof once"
         )
     packed_sdk_interval_before_finite_argument = (
         "--session-v2-interval-before-finite-fixture "
         "ports/stasis/tests/fixtures/controlled_v2_interval_before_finite.html"
     )
-    if public_release_workflow.count(packed_sdk_interval_before_finite_argument) != 1:
+    if public_release_workflow.count(packed_sdk_interval_before_finite_argument) != 2:
         raise ReleaseError(
-            "credential-free package workflow must invoke the persistent interval proof once"
+            "credential-free package workflow must invoke the persistent interval proof twice"
         )
-    if public_npm_publish_workflow.count(packed_sdk_interval_before_finite_argument) != 2:
+    if public_npm_publish_workflow.count(packed_sdk_interval_before_finite_argument) != 1:
         raise ReleaseError(
-            "npm-publish workflow must invoke the persistent interval proof twice"
+            "npm-publish workflow must invoke the persistent interval proof once"
         )
     packed_sdk_schema_marker = '"schema": 10,'
     if public_release_workflow.count(packed_sdk_schema_marker) != 1:
@@ -6493,12 +6664,12 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     verify_registry_sdk_durable_v2_fixture_invocations(
         public_release_workflow,
         "credential-free package workflow",
-        1,
+        2,
     )
     verify_registry_sdk_durable_v2_fixture_invocations(
         public_npm_publish_workflow,
         "npm-publish workflow",
-        2,
+        1,
     )
     verify_registry_sdk_import_proxy_source(registry_sdk_verifier_source)
     verify_registry_sdk_durable_v2_fixture_source(registry_sdk_verifier_source)
@@ -7638,7 +7809,8 @@ def self_test() -> None:
             PUBLIC_RELEASE_WORKFLOW,
             packed_sdk_shared_pending_argument,
             packed_sdk_shared_pending_argument.replace("shared_pending.html", "shared_pending_broken.html"),
-            "package shared-pending packed-SDK invocation",
+            "two package shared-pending packed-SDK invocations",
+            expected_count=2,
         )
         packed_sdk_settlement_url_argument = (
             "--session-v2-settlement-url-fixture "
@@ -7648,8 +7820,7 @@ def self_test() -> None:
             PUBLIC_NPM_PUBLISH_WORKFLOW,
             packed_sdk_settlement_url_argument,
             packed_sdk_settlement_url_argument.replace("settlement_url.html", "settlement_url_broken.html"),
-            "two npm settlement-URL packed-SDK invocations",
-            expected_count=2,
+            "npm settlement-URL packed-SDK invocation",
         )
         packed_sdk_interval_before_finite_argument = (
             "--session-v2-interval-before-finite-fixture "
@@ -7662,7 +7833,8 @@ def self_test() -> None:
                 "interval_before_finite.html",
                 "interval_before_finite_broken.html",
             ),
-            "package persistent-interval packed-SDK invocation",
+            "two package persistent-interval packed-SDK invocations",
+            expected_count=2,
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
@@ -7671,8 +7843,43 @@ def self_test() -> None:
                 "interval_before_finite.html",
                 "interval_before_finite_broken.html",
             ),
-            "two npm persistent-interval packed-SDK invocations",
-            expected_count=2,
+            "npm persistent-interval packed-SDK invocation",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "        && needs.prepublish-promotion.result == 'success'",
+            "        && needs.prepublish-promotion.result == 'failure'",
+            "prepublication result gate before release mutation",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            '          cp "$proof" release-assets/',
+            '          cp "$proof" "$RUNNER_TEMP/"',
+            "public prepublication receipt staging",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '              gate["completed"] > promote["started"]',
+            '              gate["completed"] < promote["started"]',
+            "prepublication timestamp ordering",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "            --expected-subject-count 2 \\",
+            "            --expected-subject-count 1 \\",
+            "prepublication proof and log provenance subject census",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '          prepublish_run_id = os.environ["PREPUBLISH_RUN_ID"]',
+            '          prepublish_run_id = os.environ["GITHUB_RUN_ID"]',
+            "independent prepublication producer run identity",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "    if: needs.verify.result == 'success' && github.event_name == 'release'",
+            "    if: needs.verify.result == 'success' && github.event_name == 'workflow_dispatch'",
+            "release-event-only npm mutation",
         )
         require_public_marker_mutation_rejected(
             REGISTRY_SDK_VERIFIER_SOURCE,

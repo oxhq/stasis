@@ -53,6 +53,10 @@ jobs:
             fi
             echo 'mode=package' >> "$GITHUB_OUTPUT"
           elif [[ -n "$PACKAGE_RUN_ID" && -n "$RELEASE_TAG" && "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
+            if [[ "$GITHUB_RUN_ATTEMPT" != '1' ]]; then
+              echo 'Stasis stable promotion requires a fresh workflow run at attempt 1' >&2
+              exit 1
+            fi
             echo 'mode=promote' >> "$GITHUB_OUTPUT"
           else
             echo 'package_run_id and release_tag must either both be empty or both be set for a manual promotion' >&2
@@ -4376,6 +4380,7 @@ jobs:
       sdk_run_attempt: ${{ steps.selected-run.outputs.sdk_run_attempt }}
       staged_gate_artifact_name: ${{ steps.stage-names.outputs.gate_artifact_name }}
       staged_release_artifact_name: ${{ steps.stage-names.outputs.release_artifact_name }}
+      staged_sdk_artifact_name: ${{ steps.stage-names.outputs.sdk_artifact_name }}
       version: ${{ steps.selected-run.outputs.version }}
       workflow_ref: ${{ steps.selected-run.outputs.workflow_ref }}
       workflow_sha: ${{ steps.selected-run.outputs.workflow_sha }}
@@ -4918,6 +4923,7 @@ jobs:
           {
             echo "release_artifact_name=verified-stasis-release-assets-attempt-$GITHUB_RUN_ATTEMPT"
             echo "gate_artifact_name=verified-stasis-gate-proof-attempt-$GITHUB_RUN_ATTEMPT"
+            echo "sdk_artifact_name=verified-stasis-sdk-proof-attempt-$GITHUB_RUN_ATTEMPT"
           } >> "$GITHUB_OUTPUT"
 
       - name: Stage verified release assets for the credentialed job
@@ -4938,14 +4944,343 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-  promote:
-    name: Create immutable draft stable release
+      - name: Stage verified SDK inputs for the prepublication gate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.stage-names.outputs.sdk_artifact_name }}
+          path: |
+            sdk-proof/*
+          if-no-files-found: error
+          retention-days: 90
+
+  prepublish-promotion:
+    name: Pre-gate exact packed SDK before immutable release
     needs:
       - validate-invocation
       - verify-promotion
     if: |
       needs.validate-invocation.outputs.mode == 'promote'
         && needs.verify-promotion.result == 'success'
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      prepublish_proof_sha256: ${{ steps.prepublish.outputs.proof_sha256 }}
+      prepublish_run_attempt: ${{ steps.prepublish.outputs.run_attempt }}
+      staged_artifact_name: ${{ steps.prepublish.outputs.staged_artifact_name }}
+    env:
+      HEAD_SHA: ${{ needs.verify-promotion.outputs.head_sha }}
+      MACOS_RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.macos_run_attempt }}
+      RUN_ID: ${{ inputs.package_run_id }}
+      SDK_RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.sdk_run_attempt }}
+      STASIS_VERSION: ${{ needs.verify-promotion.outputs.version }}
+    steps:
+      - name: Check out the exact packaged source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.verify-promotion.outputs.head_sha }}
+
+      - name: Require space for bounded native archive verification
+        shell: bash
+        run: bash etc/ci/stasis/prepare_macos_runner.sh check 4194304
+
+      - name: Set up Node without publication credentials
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Download verified release inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.verify-promotion.outputs.staged_release_artifact_name }}
+          path: verified-release-assets
+
+      - name: Download verified native gate proofs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.verify-promotion.outputs.staged_gate_artifact_name }}
+          path: verified-native-proofs
+
+      - name: Download verified SDK inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.verify-promotion.outputs.staged_sdk_artifact_name }}
+          path: verified-sdk
+
+      - name: Recheck the exact prepublication handoff and extract macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = '1'
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          python3 - <<'PY'
+          import os
+          import pathlib
+
+          version = os.environ["STASIS_VERSION"]
+          expected = {
+              pathlib.Path("verified-release-assets"): {
+                  f"stasis-{version}-macos-aarch64.tar.gz",
+                  f"stasis-{version}-macos-aarch64.tar.gz.sha256",
+                  f"stasis-{version}-macos-aarch64.binary.sha256",
+                  f"stasis-{version}-linux-x86_64.tar.gz",
+                  f"stasis-{version}-linux-x86_64.tar.gz.sha256",
+                  f"stasis-{version}-linux-x86_64.binary.sha256",
+                  f"stasis-{version}-runtime-manifest.json",
+              },
+              pathlib.Path("verified-native-proofs"): {
+                  f"stasis-{version}-macos-aarch64-act-settle-inspect.json",
+                  f"stasis-{version}-linux-x86_64-act-settle-inspect.json",
+              },
+              pathlib.Path("verified-sdk"): {
+                  f"oxhq-stasis-{version}.tgz",
+                  f"stasis-{version}-typescript-act-settle-inspect.json",
+              },
+          }
+          for directory, expected_names in expected.items():
+              entries = list(directory.iterdir())
+              if (
+                  any(entry.is_symlink() or not entry.is_file() for entry in entries)
+                  or {entry.name for entry in entries} != expected_names
+              ):
+                  raise SystemExit(f"prepublication handoff inventory changed: {directory}")
+          PY
+
+          mkdir -p native-inputs/macos-aarch64 native-proof/macos-aarch64
+          cp "verified-release-assets/stasis-${STASIS_VERSION}-macos-aarch64.tar.gz" \
+            "verified-release-assets/stasis-${STASIS_VERSION}-macos-aarch64.tar.gz.sha256" \
+            "verified-release-assets/stasis-${STASIS_VERSION}-macos-aarch64.binary.sha256" \
+            native-inputs/macos-aarch64/
+          cp "verified-native-proofs/stasis-${STASIS_VERSION}-macos-aarch64-act-settle-inspect.json" \
+            native-proof/macos-aarch64/
+          python3 etc/ci/stasis/release_archive.py verify \
+            --asset-directory native-inputs/macos-aarch64 \
+            --version "$STASIS_VERSION" \
+            --platform macos-aarch64 \
+            --revision "$HEAD_SHA" \
+            --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --source-root . \
+            --extract-to "$RUNNER_TEMP/stasis-prepublication-release"
+          python3 etc/ci/stasis/release_archive.py verify-gate-proof \
+            --proof-directory native-proof/macos-aarch64 \
+            --asset-directory native-inputs/macos-aarch64 \
+            --version "$STASIS_VERSION" \
+            --platform macos-aarch64 \
+            --revision "$HEAD_SHA" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$MACOS_RUN_ATTEMPT"
+          binary_sha256=$(awk '{print $1}' \
+            "native-inputs/macos-aarch64/stasis-${STASIS_VERSION}-macos-aarch64.binary.sha256")
+          python3 etc/ci/stasis/npm_release.py verify-proof \
+            --directory verified-sdk \
+            --version "$STASIS_VERSION" \
+            --revision "$HEAD_SHA" \
+            --native-binary-sha256 "$binary_sha256" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$SDK_RUN_ATTEMPT"
+          node sdk/typescript/scripts/generate-runtime-manifest.mjs \
+            --input "verified-release-assets/stasis-${STASIS_VERSION}-runtime-manifest.json" \
+            --output sdk/typescript/src/runtime-manifest.generated.ts
+          {
+            echo "NPM_TARBALL=$GITHUB_WORKSPACE/verified-sdk/oxhq-stasis-${STASIS_VERSION}.tgz"
+            echo "STASIS_BUNDLE=stasis-${STASIS_VERSION}-macos-aarch64"
+            echo "STASIS_NATIVE_BINARY_SHA256=$binary_sha256"
+          } >> "$GITHUB_ENV"
+
+      - name: Activate pinned npm and pnpm clients
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global npm@11.19.0 --registry=https://registry.npmjs.org/
+          test "$(npm --version)" = '11.19.0'
+          corepack enable pnpm
+          corepack prepare pnpm@9.12.3 --activate
+          test "$(pnpm --version)" = '9.12.3'
+
+      - name: Install, typecheck, test, build, and reproduce the SDK pack
+        shell: bash
+        working-directory: sdk/typescript
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm test
+          pnpm build
+          mkdir "$RUNNER_TEMP/stasis-prepublication-rebuild"
+          pnpm pack --pack-destination "$RUNNER_TEMP/stasis-prepublication-rebuild"
+          shopt -s nullglob
+          packages=("$RUNNER_TEMP"/stasis-prepublication-rebuild/*.tgz)
+          test ${#packages[@]} -eq 1
+          test "$(basename "${packages[0]}")" = "oxhq-stasis-${STASIS_VERSION}.tgz"
+          cmp "${packages[0]}" "$NPM_TARBALL"
+
+      - id: prepublish
+        name: Run the non-skippable pre-immutable packed-SDK gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = '1'
+          consumer="$RUNNER_TEMP/stasis-prepublication-sdk-consumer"
+          mkdir "$consumer"
+          (
+            cd "$consumer"
+            pnpm init
+            pnpm add --ignore-scripts "$NPM_TARBALL"
+          )
+          binary="$RUNNER_TEMP/stasis-prepublication-release/$STASIS_BUNDLE/stasis"
+          gate_log="$RUNNER_TEMP/stasis-prepublication-sdk-gate.log"
+          v1_log="$RUNNER_TEMP/stasis-prepublication-v1-north-star.jsonl"
+          v2_log="$RUNNER_TEMP/stasis-prepublication-v2-session-north-star.jsonl"
+          sanitize_failed_gate() {
+            local input=$1
+            local gate=$2
+            local exit_status=$3
+            local summary="${input}.failure-summary.log"
+            set +e
+            python3 etc/ci/stasis/sanitize_lifecycle_diagnostics.py sanitize \
+              --input "$input" \
+              --output "$summary" \
+              --failed-gate "$gate" \
+              --workspace "$GITHUB_WORKSPACE"
+            local sanitizer_status=$?
+            if [[ -f "$summary" && ! -L "$summary" ]]; then
+              cat "$summary"
+            fi
+            rm -f -- "$input" "$summary" "$gate_log" "$v1_log" "$v2_log"
+            echo "private_gate_sanitizer_status=$sanitizer_status"
+            exit "$exit_status"
+          }
+
+          set +e
+          node etc/ci/stasis/verify_registry_sdk.mjs \
+            --binary "$binary" \
+            --fixture ports/stasis/tests/fixtures/timer_10s.html \
+            --session-v2-fixture ports/stasis/tests/fixtures/message_channel_buffered.html \
+            --session-v2-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_data_svg.html \
+            --session-v2-http-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_http.html \
+            --session-v2-inline-svg-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg.html \
+            --session-v2-inline-svg-shared-pending-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg_shared_pending.html \
+            --session-v2-settlement-url-fixture ports/stasis/tests/fixtures/controlled_v2_settlement_url.html \
+            --session-v2-interval-before-finite-fixture ports/stasis/tests/fixtures/controlled_v2_interval_before_finite.html \
+            --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
+            --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
+            --session-v2-css-animation-event-fixture ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html \
+            --session-v2-cookie-fixture sdk/typescript/test/fixtures/controlled-v2-cookie-login.html \
+            --consumer-root "$consumer" \
+            --package "$NPM_TARBALL" \
+            --revision "$HEAD_SHA" \
+            --version "$STASIS_VERSION" \
+            > "$gate_log" 2>&1
+          gate_status=$?
+          set -e
+          if (( gate_status != 0 )); then
+            sanitize_failed_gate "$gate_log" sdk_registry_gate "$gate_status"
+          fi
+
+          cp sdk/typescript/test/fixtures/public-package-north-star.mjs \
+            "$consumer/public-package-north-star.mjs"
+          cp sdk/typescript/test/fixtures/north-star.html "$consumer/north-star.html"
+          set +e
+          (
+            cd "$consumer"
+            unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_TOKEN
+            STASIS_NORTH_STAR_BINARY="$binary" node ./public-package-north-star.mjs
+          ) > "$v1_log" 2>&1
+          v1_status=$?
+          set -e
+          if (( v1_status != 0 )); then
+            sanitize_failed_gate "$v1_log" v1_north_star "$v1_status"
+          fi
+          grep -Fq '"proof":"stasis-v0.1-north-star"' "$v1_log"
+          grep -Fq '"runs":3' "$v1_log"
+
+          cp sdk/typescript/test/fixtures/public-package-session-north-star.mjs \
+            "$consumer/public-package-session-north-star.mjs"
+          cp -R sdk/typescript/test/fixtures/session-north-star \
+            "$consumer/session-north-star"
+          explicit_runtime_cache="$RUNNER_TEMP/stasis-prepublication-explicit-runtime-cache"
+          mkdir "$explicit_runtime_cache"
+          set +e
+          (
+            cd "$consumer"
+            unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_TOKEN
+            STASIS_SESSION_NORTH_STAR_BINARY="$binary" \
+              STASIS_SESSION_NORTH_STAR_RUNTIME_CACHE="$explicit_runtime_cache" \
+              node ./public-package-session-north-star.mjs
+          ) > "$v2_log" 2>&1
+          v2_status=$?
+          set -e
+          if (( v2_status != 0 )); then
+            sanitize_failed_gate "$v2_log" session_north_star "$v2_status"
+          fi
+          grep -Fq '"proof":"stasis-v0.2-session-north-star"' "$v2_log"
+          grep -Fq '"runs":3' "$v2_log"
+          grep -Fq '"sessions":6' "$v2_log"
+          grep -Fq '"runtimeAcquisition":"explicit-executable-override-cache-bypassed"' "$v2_log"
+
+          cat "$v1_log" "$v2_log" >> "$gate_log"
+          mkdir prepublication-sdk
+          cp "$NPM_TARBALL" \
+            "prepublication-sdk/oxhq-stasis-${STASIS_VERSION}.tgz"
+          cp "verified-sdk/stasis-${STASIS_VERSION}-typescript-act-settle-inspect.json" \
+            "prepublication-sdk/stasis-${STASIS_VERSION}-typescript-act-settle-inspect.json"
+          staged_gate_log="prepublication-sdk/stasis-${STASIS_VERSION}-typescript-prepublish-act-settle-inspect.log"
+          staged_gate_proof="prepublication-sdk/stasis-${STASIS_VERSION}-typescript-prepublish-act-settle-inspect.json"
+          cp "$gate_log" "$staged_gate_log"
+          python3 etc/ci/stasis/npm_release.py create-proof \
+            --package "$NPM_TARBALL" \
+            --gate-log "$gate_log" \
+            --output "$staged_gate_proof" \
+            --version "$STASIS_VERSION" \
+            --revision "$HEAD_SHA" \
+            --native-binary-sha256 "$STASIS_NATIVE_BINARY_SHA256" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+          proof_sha256=$(shasum -a 256 "$staged_gate_proof" | awk '{print $1}')
+          test "$proof_sha256" != ''
+          {
+            echo "proof_sha256=$proof_sha256"
+            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "staged_artifact_name=verified-stasis-prepublication-sdk-attempt-$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_OUTPUT"
+          rm -f -- "$gate_log" "$v1_log" "$v2_log"
+
+      - name: Attest the exact prepublication receipt and gate log
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: |
+            prepublication-sdk/stasis-${{ env.STASIS_VERSION }}-typescript-prepublish-act-settle-inspect.json
+            prepublication-sdk/stasis-${{ env.STASIS_VERSION }}-typescript-prepublish-act-settle-inspect.log
+
+      - name: Stage the exact prepublication SDK evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.prepublish.outputs.staged_artifact_name }}
+          path: |
+            prepublication-sdk/oxhq-stasis-${{ env.STASIS_VERSION }}.tgz
+            prepublication-sdk/stasis-${{ env.STASIS_VERSION }}-typescript-act-settle-inspect.json
+            prepublication-sdk/stasis-${{ env.STASIS_VERSION }}-typescript-prepublish-act-settle-inspect.json
+            prepublication-sdk/stasis-${{ env.STASIS_VERSION }}-typescript-prepublish-act-settle-inspect.log
+          if-no-files-found: error
+          retention-days: 90
+
+  promote:
+    name: Create immutable draft stable release
+    needs:
+      - validate-invocation
+      - verify-promotion
+      - prepublish-promotion
+    if: |
+      needs.validate-invocation.outputs.mode == 'promote'
+        && needs.verify-promotion.result == 'success'
+        && needs.prepublish-promotion.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment:
@@ -4962,6 +5297,9 @@ jobs:
       LINUX_RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.linux_run_attempt }}
       MACOS_RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.macos_run_attempt }}
       OVERALL_RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.overall_run_attempt }}
+      PREPUBLISH_PROOF_SHA256: ${{ needs.prepublish-promotion.outputs.prepublish_proof_sha256 }}
+      PREPUBLISH_RUN_ATTEMPT: ${{ needs.prepublish-promotion.outputs.prepublish_run_attempt }}
+      PREPUBLISH_STAGED_ARTIFACT_NAME: ${{ needs.prepublish-promotion.outputs.staged_artifact_name }}
       SDK_RUN_ATTEMPT: ${{ needs.verify-promotion.outputs.sdk_run_attempt }}
       RUN_ID: ${{ inputs.package_run_id }}
       STASIS_VERSION: ${{ needs.verify-promotion.outputs.version }}
@@ -5038,6 +5376,12 @@ jobs:
         with:
           name: ${{ needs.verify-promotion.outputs.staged_gate_artifact_name }}
           path: gate-proof
+
+      - name: Download prepublication evidence verified before release mutation
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.prepublish-promotion.outputs.staged_artifact_name }}
+          path: prepublication-sdk
 
       - name: Recheck staged identities and provenance without source code
         shell: bash
@@ -5393,6 +5737,75 @@ jobs:
               raise SystemExit("staged release SLSA builder identity changed")
           PY
 
+      - name: Recheck and stage the exact prepublication receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_RUN_ATTEMPT" != '1' \
+            || "$PREPUBLISH_RUN_ATTEMPT" != '1' \
+            || ! "$PREPUBLISH_PROOF_SHA256" =~ ^[0-9a-f]{64}$ \
+            || "$PREPUBLISH_STAGED_ARTIFACT_NAME" != "verified-stasis-prepublication-sdk-attempt-$PREPUBLISH_RUN_ATTEMPT" ]]; then
+            echo 'prepublication evidence handoff identity changed' >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import os
+          import pathlib
+
+          version = os.environ["STASIS_VERSION"]
+          directory = pathlib.Path("prepublication-sdk")
+          expected = {
+              f"oxhq-stasis-{version}.tgz",
+              f"stasis-{version}-typescript-act-settle-inspect.json",
+              f"stasis-{version}-typescript-prepublish-act-settle-inspect.json",
+              f"stasis-{version}-typescript-prepublish-act-settle-inspect.log",
+          }
+          entries = list(directory.iterdir())
+          if (
+              any(entry.is_symlink() or not entry.is_file() for entry in entries)
+              or {entry.name for entry in entries} != expected
+          ):
+              raise SystemExit("prepublication SDK evidence inventory changed")
+          PY
+
+          binary_sha256=$(awk '{print $1}' \
+            "release-assets/stasis-${STASIS_VERSION}-macos-aarch64.binary.sha256")
+          proof="prepublication-sdk/stasis-${STASIS_VERSION}-typescript-prepublish-act-settle-inspect.json"
+          log="prepublication-sdk/stasis-${STASIS_VERSION}-typescript-prepublish-act-settle-inspect.log"
+          proof_sha256=$(sha256sum "$proof" | awk '{print $1}')
+          if [[ "$proof_sha256" != "$PREPUBLISH_PROOF_SHA256" ]]; then
+            echo 'prepublication receipt digest changed after the gate job' >&2
+            exit 1
+          fi
+          mkdir "$RUNNER_TEMP/stasis-prepublication-proof"
+          cp "prepublication-sdk/oxhq-stasis-${STASIS_VERSION}.tgz" \
+            "$RUNNER_TEMP/stasis-prepublication-proof/"
+          cp "$proof" \
+            "$RUNNER_TEMP/stasis-prepublication-proof/stasis-${STASIS_VERSION}-typescript-act-settle-inspect.json"
+          python3 etc/ci/stasis/npm_release.py verify-proof \
+            --directory "$RUNNER_TEMP/stasis-prepublication-proof" \
+            --version "$STASIS_VERSION" \
+            --revision "$HEAD_SHA" \
+            --native-binary-sha256 "$binary_sha256" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$PREPUBLISH_RUN_ATTEMPT"
+          python3 - "$proof" "$log" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          proof = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          log = pathlib.Path(sys.argv[2])
+          digest = hashlib.sha256()
+          with log.open("rb") as source:
+              for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                  digest.update(chunk)
+          if proof.get("gateLogSha256") != digest.hexdigest():
+              raise SystemExit("prepublication receipt does not bind the staged gate log")
+          PY
+          cp "$proof" release-assets/
+
       - name: Verify immutable tag and resumable draft state
         shell: bash
         run: |
@@ -5503,9 +5916,10 @@ jobs:
           It remains an unsigned CI-only artifact and is not a managed release asset in this tag.
 
           This draft contains both native archives, archive and binary SHA-256 sidecars,
-          artifact-bound native gate proofs, and the exact runtime distribution manifest
-          embedded in the npm package. GitHub build provenance is available through the
-          GitHub CLI attestation verifier for every asset.
+          artifact-bound native gate proofs, the exact runtime distribution manifest embedded
+          in the npm package, and the separately attested packed-SDK prepublication receipt
+          bound to the exact tarball and macOS binary. GitHub build provenance is available
+          through the GitHub CLI attestation verifier for every asset.
           EOF
 
           mkdir release-state
@@ -5522,6 +5936,9 @@ jobs:
           tag = os.environ["TAG"]
           title = f"Stasis {tag}"
           expected_names = {f"stasis-{version}-runtime-manifest.json"}
+          expected_names.add(
+              f"stasis-{version}-typescript-prepublish-act-settle-inspect.json"
+          )
           for platform in ("macos-aarch64", "linux-x86_64"):
               bundle = f"stasis-{version}-{platform}"
               archive = f"{bundle}.tar.gz"
