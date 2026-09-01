@@ -250,6 +250,8 @@ jobs:
                 --source-root .
             fi
           done
+          python3 etc/ci/stasis/verify_macos_signature.py verify \
+            --binary "$RUNNER_TEMP/stasis-published-release/stasis-${STASIS_VERSION}-macos-aarch64/stasis"
           runtime_manifest="runtime-manifest/stasis-${STASIS_VERSION}-runtime-manifest.json"
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
             --dir runtime-manifest \
@@ -3175,6 +3177,10 @@ jobs:
             --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --source-root . \
             --extract-to "$RUNNER_TEMP/stasis-registry-release"
+          if [[ "$STASIS_PLATFORM" == 'macos-aarch64' ]]; then
+            python3 etc/ci/stasis/verify_macos_signature.py verify \
+              --binary "$RUNNER_TEMP/stasis-registry-release/$bundle/stasis"
+          fi
           python3 etc/ci/stasis/release_archive.py verify-gate-proof \
             --proof-directory gate-proof \
             --asset-directory release-assets \

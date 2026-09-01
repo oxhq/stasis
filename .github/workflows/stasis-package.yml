@@ -101,6 +101,7 @@ jobs:
           python3 etc/ci/stasis/release_archive.py verify-candidate-v2-profile \
             --source-root .
           python3 etc/ci/stasis/release_archive.py self-test
+          python3 etc/ci/stasis/verify_macos_signature.py self-test
           python3 etc/ci/stasis/npm_release.py self-test
           python3 etc/ci/stasis/verify_build_provenance.py self-test
           python3 etc/ci/stasis/sanitize_lifecycle_diagnostics.py self-test
@@ -668,6 +669,8 @@ jobs:
           fi
           cargo build --locked -p stasis-shell --profile production-stripped
           if [[ "$STASIS_PLATFORM" == 'macos-aarch64' ]]; then
+            python3 etc/ci/stasis/verify_macos_signature.py verify \
+              --binary target/production-stripped/stasis
             bash etc/ci/stasis/prepare_macos_runner.sh check 4194304
           else
             test "$(LC_ALL=C getconf GNU_LIBC_VERSION)" = 'glibc 2.35'
@@ -1095,6 +1098,10 @@ jobs:
             --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --source-root . \
             --extract-to "$RUNNER_TEMP/stasis-release-gate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          if [[ "$STASIS_PLATFORM" == 'macos-aarch64' ]]; then
+            python3 etc/ci/stasis/verify_macos_signature.py verify \
+              --binary "$RUNNER_TEMP/stasis-release-gate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/$STASIS_BUNDLE/stasis"
+          fi
 
       - name: Gate the extracted artifact with act-settle-inspect
         shell: bash
@@ -5120,6 +5127,8 @@ jobs:
             --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --source-root . \
             --extract-to "$RUNNER_TEMP/stasis-prepublication-release"
+          python3 etc/ci/stasis/verify_macos_signature.py verify \
+            --binary "$RUNNER_TEMP/stasis-prepublication-release/stasis-${STASIS_VERSION}-macos-aarch64/stasis"
           python3 etc/ci/stasis/release_archive.py verify-gate-proof \
             --proof-directory native-proof/macos-aarch64 \
             --asset-directory native-inputs/macos-aarch64 \
@@ -5893,7 +5902,7 @@ jobs:
           - Producer attempts: macOS $MACOS_RUN_ATTEMPT, Linux $LINUX_RUN_ATTEMPT, SDK $SDK_RUN_ATTEMPT, provenance $ATTEST_RUN_ATTEMPT
           - Native platforms: macOS Apple Silicon and Linux x86_64
           - Linux compatibility floor: Ubuntu 22.04 / glibc 2.35
-          - macOS signing: unsigned and not Apple-notarized
+          - macOS signing: ad hoc linker signature only; not signed with Developer ID and not Apple-notarized
 
           Stasis 0.3.3 corrects a controlled replacement lifecycle race at Script's ordinary-input
           owner. A source-bound DriveOneTurn now defers a queued replacement SpawnPipeline to the

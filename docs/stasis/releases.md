@@ -373,10 +373,10 @@ The stable native matrix is deliberately small:
 
 | Release platform | GitHub runner | Compatibility contract |
 | --- | --- | --- |
-| `macos-aarch64` | `macos-15` | Native Apple Silicon; unsigned and not notarized |
+| `macos-aarch64` | `macos-15` | Native Apple Silicon; ad hoc linker signature only, not signed with Developer ID, and not notarized |
 | `linux-x86_64` | `ubuntu-22.04` | x86-64 GNU/Linux with glibc 2.35 or newer |
 
-Windows, macOS Intel, signing/notarization, and cross-compiler byte
+Windows, macOS Intel, Developer ID signing/notarization, and cross-compiler byte
 reproducibility are not 0.1 claims. Each release archive is deterministic in its
 container metadata, but its executable is bound by digest and provenance rather
 than by a claim that a second compiler invocation will reproduce identical

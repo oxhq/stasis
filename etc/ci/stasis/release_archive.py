@@ -150,7 +150,10 @@ PLATFORM_CONTRACTS: dict[str, dict[str, str]] = {
         "operating_system": "macOS",
         "architecture": "arm64",
         "abi": "macOS arm64",
-        "install_note": ("This macOS arm64 executable is unsigned and is not Apple-notarized."),
+        "install_note": (
+            "This macOS arm64 executable has only an ad hoc linker signature. "
+            "It is not signed with Developer ID and is not Apple-notarized."
+        ),
         "dependency_note": ("External runtime dependencies: Apple system libraries and frameworks supplied by macOS."),
     },
 }
@@ -11845,7 +11848,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
                 raise ReleaseError(f"self-test generated platform-neutral {name}")
         if b"glibc 2.35" not in linux_generated["NATIVE-LIBRARIES.txt"]:
             raise ReleaseError("self-test Linux metadata lost the glibc compatibility floor")
-        if b"unsigned and is not Apple-notarized" not in mac_generated["INSTALL.txt"]:
+        if (
+            b"only an ad hoc linker signature" not in mac_generated["INSTALL.txt"]
+            or b"not signed with Developer ID and is not Apple-notarized"
+            not in mac_generated["INSTALL.txt"]
+        ):
             raise ReleaseError("self-test macOS metadata lost its signing boundary")
 
         linux_bundle = release_cases["linux-x86_64"][3]
