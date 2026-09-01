@@ -5304,6 +5304,19 @@ jobs:
             --native-binary-sha256 "$STASIS_NATIVE_BINARY_SHA256" \
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT"
+          verification_directory="$RUNNER_TEMP/stasis-prepublication-proof"
+          mkdir "$verification_directory"
+          cp "$NPM_TARBALL" \
+            "$verification_directory/oxhq-stasis-${STASIS_VERSION}.tgz"
+          cp "$staged_gate_proof" \
+            "$verification_directory/stasis-${STASIS_VERSION}-typescript-act-settle-inspect.json"
+          python3 etc/ci/stasis/npm_release.py verify-proof \
+            --directory "$verification_directory" \
+            --version "$STASIS_VERSION" \
+            --revision "$HEAD_SHA" \
+            --native-binary-sha256 "$STASIS_NATIVE_BINARY_SHA256" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
           proof_sha256=$(shasum -a 256 "$staged_gate_proof" | awk '{print $1}')
           test "$proof_sha256" != ''
           {
@@ -5833,6 +5846,8 @@ jobs:
 
           binary_sha256=$(awk '{print $1}' \
             "release-assets/stasis-${STASIS_VERSION}-macos-aarch64.binary.sha256")
+          tarball="prepublication-sdk/oxhq-stasis-${STASIS_VERSION}.tgz"
+          original_proof="prepublication-sdk/stasis-${STASIS_VERSION}-typescript-act-settle-inspect.json"
           proof="prepublication-sdk/stasis-${STASIS_VERSION}-typescript-prepublish-act-settle-inspect.json"
           log="prepublication-sdk/stasis-${STASIS_VERSION}-typescript-prepublish-act-settle-inspect.log"
           proof_sha256=$(sha256sum "$proof" | awk '{print $1}')
@@ -5840,32 +5855,246 @@ jobs:
             echo 'prepublication receipt digest changed after the gate job' >&2
             exit 1
           fi
-          mkdir "$RUNNER_TEMP/stasis-prepublication-proof"
-          cp "prepublication-sdk/oxhq-stasis-${STASIS_VERSION}.tgz" \
-            "$RUNNER_TEMP/stasis-prepublication-proof/"
-          cp "$proof" \
-            "$RUNNER_TEMP/stasis-prepublication-proof/stasis-${STASIS_VERSION}-typescript-act-settle-inspect.json"
-          python3 etc/ci/stasis/npm_release.py verify-proof \
-            --directory "$RUNNER_TEMP/stasis-prepublication-proof" \
-            --version "$STASIS_VERSION" \
-            --revision "$HEAD_SHA" \
-            --native-binary-sha256 "$binary_sha256" \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$PREPUBLISH_RUN_ATTEMPT"
-          python3 - "$proof" "$log" <<'PY'
+          TARBALL="$tarball" \
+          ORIGINAL_PROOF="$original_proof" \
+          PROOF="$proof" \
+          GATE_LOG="$log" \
+          BINARY_SHA256="$binary_sha256" \
+          python3 - <<'PY'
+          import base64
+          import copy
           import hashlib
           import json
+          import os
           import pathlib
-          import sys
 
-          proof = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-          log = pathlib.Path(sys.argv[2])
-          digest = hashlib.sha256()
-          with log.open("rb") as source:
-              for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                  digest.update(chunk)
-          if proof.get("gateLogSha256") != digest.hexdigest():
-              raise SystemExit("prepublication receipt does not bind the staged gate log")
+          def reject_constant(value):
+              raise ValueError(f"non-finite JSON constant: {value}")
+
+          def reject_duplicates(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError(f"duplicate JSON key: {key}")
+                  result[key] = value
+              return result
+
+          def load_strict(filename):
+              try:
+                  return json.loads(
+                      pathlib.Path(filename).read_text(encoding="utf-8"),
+                      object_pairs_hook=reject_duplicates,
+                      parse_constant=reject_constant,
+                  )
+              except (OSError, UnicodeError, ValueError) as error:
+                  raise SystemExit(f"cannot strictly parse staged SDK receipt: {error}") from error
+
+          def hash_file(filename, algorithm):
+              digest = hashlib.new(algorithm)
+              with pathlib.Path(filename).open("rb") as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest
+
+          version = os.environ["STASIS_VERSION"]
+          revision = os.environ["HEAD_SHA"]
+          tarball = pathlib.Path(os.environ["TARBALL"])
+          original = load_strict(os.environ["ORIGINAL_PROOF"])
+          prepublication = load_strict(os.environ["PROOF"])
+          gate_log_sha256 = hash_file(os.environ["GATE_LOG"], "sha256").hexdigest()
+          tarball_sha256 = hash_file(tarball, "sha256").hexdigest()
+          tarball_integrity = "sha512-" + base64.b64encode(
+              hash_file(tarball, "sha512").digest()
+          ).decode("ascii")
+          expected_keys = {
+              "schema",
+              "gate",
+              "package",
+              "revision",
+              "workflowRunId",
+              "workflowRunAttempt",
+              "source",
+              "tarball",
+              "nativeBinarySha256",
+              "gateLogSha256",
+              "v2MessageChannel",
+              "v2DirectDataSvg",
+              "v2InlineSvgRendering",
+              "v2SettlementUrl",
+              "v2PersistentIntervalProgression",
+              "v2InputMethodFocus",
+              "v2AutomationEventTimestamps",
+              "v2CssAnimationEventTimestamps",
+              "v2CookieSession",
+          }
+          if (
+              type(original) is not dict
+              or type(prepublication) is not dict
+              or set(original) != expected_keys
+              or set(prepublication) != expected_keys
+          ):
+              raise SystemExit("staged SDK receipt schema changed")
+          expected_source = {
+              "servo_repository": "https://github.com/servo/servo.git",
+              "servo_revision": "0d579bd5aab6df3764fad805427254751632a6e4",
+              "pliego_repository": "https://github.com/oxhq/pliego.git",
+              "pliego_revision": "556c774242b272b11bc60999449c5debff1ad20f",
+              "pliego_servo_merge_base": "313b6d5ecc113b08010ce434140db3ca5abcc71c",
+              "stasis_repository": "https://github.com/oxhq/stasis.git",
+              "stasis_revision": revision,
+          }
+          expected_tarball = {
+              "name": f"oxhq-stasis-{version}.tgz",
+              "sha256": tarball_sha256,
+              "integrity": tarball_integrity,
+          }
+          expected_original_bindings = {
+              "schema": 10,
+              "gate": "sdk-act-settle-inspect",
+              "package": f"@oxhq/stasis@{version}",
+              "revision": revision,
+              "workflowRunId": os.environ["RUN_ID"],
+              "workflowRunAttempt": os.environ["SDK_RUN_ATTEMPT"],
+              "source": expected_source,
+              "tarball": expected_tarball,
+              "nativeBinarySha256": os.environ["BINARY_SHA256"],
+          }
+          if any(original.get(key) != value for key, value in expected_original_bindings.items()):
+              raise SystemExit("original SDK receipt binding changed before promotion")
+          if (
+              type(original.get("gateLogSha256")) is not str
+              or len(original["gateLogSha256"]) != 64
+              or any(character not in "0123456789abcdef" for character in original["gateLogSha256"])
+          ):
+              raise SystemExit("original SDK gate-log digest is malformed")
+          expected_prepublication = copy.deepcopy(original)
+          expected_prepublication.update(
+              {
+                  "workflowRunId": os.environ["GITHUB_RUN_ID"],
+                  "workflowRunAttempt": os.environ["PREPUBLISH_RUN_ATTEMPT"],
+                  "gateLogSha256": gate_log_sha256,
+              }
+          )
+          if prepublication != expected_prepublication:
+              raise SystemExit(
+                  "prepublication receipt differs from the verified SDK receipt outside its producer identity and gate log"
+              )
+          PY
+
+          prepublication_provenance="$RUNNER_TEMP/stasis-prepublication-provenance.json"
+          gh attestation verify "$proof" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml" \
+            --source-digest "$HEAD_SHA" \
+            --source-ref "refs/heads/$HEAD_BRANCH" \
+            --deny-self-hosted-runners \
+            --limit 100 \
+            --format json > "$prepublication_provenance"
+          PROVENANCE_JSON="$prepublication_provenance" \
+          PROOF="$proof" \
+          GATE_LOG="$log" \
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+
+          def nested(value, *keys):
+              for key in keys:
+                  if not isinstance(value, dict):
+                      return None
+                  value = value.get(key)
+              return value
+
+          def sha256(filename):
+              digest = hashlib.sha256()
+              with pathlib.Path(filename).open("rb") as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          document = json.loads(
+              pathlib.Path(os.environ["PROVENANCE_JSON"]).read_text(encoding="utf-8")
+          )
+          if not isinstance(document, list) or not document:
+              raise SystemExit("prepublication provenance verification returned no statements")
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          repository_uri = f"https://github.com/{repository}"
+          source_ref = f"refs/heads/{os.environ['HEAD_BRANCH']}"
+          signer_uri = (
+              f"{repository_uri}/.github/workflows/stasis-package.yml@{source_ref}"
+          )
+          invocation_uri = (
+              f"{repository_uri}/actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/"
+              f"{os.environ['PREPUBLISH_RUN_ATTEMPT']}"
+          )
+          candidates = []
+          for record in document:
+              certificate_invocation = nested(
+                  record, "verificationResult", "signature", "certificate", "runInvocationURI"
+              )
+              predicate_invocation = nested(
+                  record, "verificationResult", "statement", "predicate", "runDetails",
+                  "metadata", "invocationId",
+              )
+              if certificate_invocation == invocation_uri or predicate_invocation == invocation_uri:
+                  candidates.append(record)
+          if len(candidates) != 1:
+              raise SystemExit("prepublication receipt did not resolve to one exact attestation")
+
+          result = nested(candidates[0], "verificationResult")
+          certificate = nested(result, "signature", "certificate")
+          expected_certificate = {
+              "subjectAlternativeName": signer_uri,
+              "githubWorkflowSHA": os.environ["HEAD_SHA"],
+              "githubWorkflowRepository": repository,
+              "githubWorkflowRef": source_ref,
+              "runnerEnvironment": "github-hosted",
+              "sourceRepositoryURI": repository_uri,
+              "sourceRepositoryDigest": os.environ["HEAD_SHA"],
+              "sourceRepositoryRef": source_ref,
+              "buildSignerURI": signer_uri,
+              "runInvocationURI": invocation_uri,
+          }
+          if not isinstance(certificate, dict) or any(
+              certificate.get(key) != value for key, value in expected_certificate.items()
+          ):
+              raise SystemExit("prepublication receipt certificate identity changed")
+
+          statement = nested(result, "statement")
+          if (
+              not isinstance(statement, dict)
+              or statement.get("_type") != "https://in-toto.io/Statement/v1"
+              or statement.get("predicateType") != "https://slsa.dev/provenance/v1"
+          ):
+              raise SystemExit("prepublication receipt statement type changed")
+          expected_subjects = {
+              pathlib.Path(os.environ["PROOF"]).name: sha256(os.environ["PROOF"]),
+              pathlib.Path(os.environ["GATE_LOG"]).name: sha256(os.environ["GATE_LOG"]),
+          }
+          actual_subjects = {}
+          for subject in statement.get("subject", []):
+              if not isinstance(subject, dict) or set(subject) != {"name", "digest"}:
+                  raise SystemExit("prepublication receipt provenance subject shape changed")
+              name = subject.get("name")
+              digest = subject.get("digest")
+              if (
+                  not isinstance(name, str)
+                  or name in actual_subjects
+                  or not isinstance(digest, dict)
+                  or set(digest) != {"sha256"}
+                  or not isinstance(digest.get("sha256"), str)
+              ):
+                  raise SystemExit("prepublication receipt provenance subject is malformed")
+              actual_subjects[name] = digest["sha256"]
+          if actual_subjects != expected_subjects:
+              raise SystemExit("prepublication receipt provenance subject inventory changed")
+          predicate = statement.get("predicate")
+          if nested(predicate, "runDetails", "metadata") != {"invocationId": invocation_uri}:
+              raise SystemExit("prepublication receipt invocation identity changed")
+          if nested(predicate, "runDetails", "builder") != {"id": signer_uri}:
+              raise SystemExit("prepublication receipt builder identity changed")
           PY
           cp "$proof" release-assets/
 

@@ -6792,6 +6792,12 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "            STASIS_NORTH_STAR_BINARY=\"$binary\" node ./public-package-north-star.mjs\n",
             "            STASIS_SESSION_NORTH_STAR_BINARY=\"$binary\" \\\n",
             "          python3 etc/ci/stasis/npm_release.py create-proof \\\n",
+            "          verification_directory=\"$RUNNER_TEMP/stasis-prepublication-proof\"\n",
+            "          python3 etc/ci/stasis/npm_release.py verify-proof \\\n",
+            "            --directory \"$verification_directory\" \\\n",
+            "            --run-id \"$GITHUB_RUN_ID\" \\\n",
+            "            --run-attempt \"$GITHUB_RUN_ATTEMPT\"\n",
+            "          proof_sha256=$(shasum -a 256 \"$staged_gate_proof\" | awk '{print $1}')\n",
             "      - name: Attest the exact prepublication receipt and gate log\n",
             "      - name: Stage the exact prepublication SDK evidence\n",
         ),
@@ -6822,11 +6828,33 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "          test \"$OVERALL_RUN_ATTEMPT\" = '1'\n",
             "      - name: Download prepublication evidence verified before release mutation\n",
             "      - name: Recheck and stage the exact prepublication receipt\n",
+            "          original_proof=\"prepublication-sdk/stasis-${STASIS_VERSION}-typescript-act-settle-inspect.json\"\n",
+            "          expected_original_bindings = {\n",
+            '              "schema": 10,\n',
+            "          expected_prepublication = copy.deepcopy(original)\n",
+            '                  "workflowRunId": os.environ["GITHUB_RUN_ID"],\n',
+            '                  "gateLogSha256": gate_log_sha256,\n',
+            "          if prepublication != expected_prepublication:\n",
+            "          gh attestation verify \"$proof\" \\\n",
+            '              f"{repository_uri}/actions/runs/{os.environ[\'GITHUB_RUN_ID\']}/attempts/"\n',
+            '              f"{os.environ[\'PREPUBLISH_RUN_ATTEMPT\']}"\n',
+            "          if actual_subjects != expected_subjects:\n",
             "          cp \"$proof\" release-assets/\n",
             "              f\"stasis-{version}-typescript-prepublish-act-settle-inspect.json\"\n",
         ),
         "prepublication-to-promotion dependency",
     )
+    if "uses: actions/checkout@" in promote_job:
+        raise ReleaseError(
+            "credentialed promotion job must remain source-free and must not check out the repository"
+        )
+    executable_repository_path = re.compile(
+        r"(?m)^\s*(?:python3?|node|bash|sh)\s+(?:\./)?(?:etc|sdk|ports|components)/"
+    )
+    if executable_repository_path.search(promote_job) is not None:
+        raise ReleaseError(
+            "credentialed promotion job must not execute repository-relative source paths"
+        )
     require_source_fragments_in_order(
         publish_verify_job,
         (
@@ -6972,8 +7000,11 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "npm-publish workflow must invoke the persistent interval proof once"
         )
     packed_sdk_schema_marker = '"schema": 10,'
-    if public_release_workflow.count(packed_sdk_schema_marker) != 1:
-        raise ReleaseError("credential-free package workflow must require SDK proof schema 10")
+    if public_release_workflow.count(packed_sdk_schema_marker) != 2:
+        raise ReleaseError(
+            "credential-free package workflow must require SDK proof schema 10 in both "
+            "the package and source-free promotion verifiers"
+        )
     if public_npm_publish_workflow.count(packed_sdk_schema_marker) != 1:
         raise ReleaseError("npm-publish workflow must require SDK proof schema 10")
     verify_registry_sdk_durable_v2_fixture_invocations(
@@ -8035,8 +8066,8 @@ def self_test() -> None:
             ),
             (
                 PUBLIC_RELEASE_WORKFLOW,
-                '"schema": 10,',
-                '"schema": 9,',
+                '          expected_sdk = {\n              "schema": 10,',
+                '          expected_sdk = {\n              "schema": 9,',
                 "package durable SDK proof schema",
             ),
             (
@@ -8175,6 +8206,24 @@ def self_test() -> None:
             '          cp "$proof" release-assets/',
             '          cp "$proof" "$RUNNER_TEMP/"',
             "public prepublication receipt staging",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          expected_prepublication = copy.deepcopy(original)",
+            "          expected_prepublication = copy.deepcopy(prepublication)",
+            "source-free prepublication receipt equivalence binding",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          if actual_subjects != expected_subjects:",
+            "          if set(actual_subjects) != set(expected_subjects):",
+            "source-free prepublication attestation subject digest binding",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            '          verification_directory="$RUNNER_TEMP/stasis-prepublication-proof"',
+            '          verification_directory="$RUNNER_TEMP/stasis-unverified-prepublication-proof"',
+            "credential-free prepublication semantic verification handoff",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
