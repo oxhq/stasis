@@ -4960,6 +4960,7 @@ jobs:
             --workflow .github/workflows/stasis-package.yml
             --revision "$HEAD_SHA"
             --source-ref "refs/heads/$HEAD_BRANCH"
+            --expected-event push
             --server-url "$GITHUB_SERVER_URL"
             --run-id "$RUN_ID"
             --run-attempt "$ATTEST_RUN_ATTEMPT"

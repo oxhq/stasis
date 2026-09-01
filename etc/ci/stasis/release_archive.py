@@ -6760,6 +6760,199 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     ]
     verify_registry_job = public_npm_publish_workflow[verify_registry_start:]
 
+    if (
+        public_release_workflow.count("--expected-event ") != 1
+        or public_release_workflow.count("--expected-event push") != 1
+    ):
+        raise ReleaseError(
+            "credential-free package provenance verification must require the exact push event"
+        )
+    if (
+        public_npm_publish_workflow.count("--expected-event ") != 3
+        or public_npm_publish_workflow.count("--expected-event push") != 2
+        or public_npm_publish_workflow.count("--expected-event workflow_dispatch") != 1
+    ):
+        raise ReleaseError(
+            "npm-publish provenance verification must bind package attestations to push and "
+            "prepublication attestations to workflow_dispatch"
+        )
+
+    for fixed_recovery_identity, description in (
+        ("33517227843", "failed release-event publication run"),
+        ("48c5a718a9ddd63f496e45307e1484974ccf8587", "immutable v0.3.3 tag revision"),
+        ("380550511", "immutable v0.3.3 release"),
+    ):
+        if public_npm_publish_workflow.count(fixed_recovery_identity) != 1:
+            raise ReleaseError(
+                f"npm-publish recovery must bind exactly one fixed {description} identity"
+            )
+
+    require_source_fragments_in_order(
+        publish_verify_job,
+        (
+            "          RECOVERY_PUBLICATION_RUN_ATTEMPT: ${{ inputs.publication_run_attempt }}\n",
+            "          RECOVERY_PUBLICATION_RUN_ID: ${{ inputs.publication_run_id }}\n",
+            "          if [[ \"$GITHUB_EVENT_NAME\" == 'release' ]]; then\n",
+            "            publication_run_id=$GITHUB_RUN_ID\n",
+            "            publication_run_attempt=$GITHUB_RUN_ATTEMPT\n",
+            "            if [[ \"$GITHUB_REF_TYPE\" != 'branch' || \"$GITHUB_REF_NAME\" != \"$DEFAULT_BRANCH\" ]]; then\n",
+            "              || \"$RECOVERY_PUBLICATION_RUN_ATTEMPT\" != '1' ]]; then\n",
+            "            publication_run_id=$RECOVERY_PUBLICATION_RUN_ID\n",
+            "            publication_run_attempt=$RECOVERY_PUBLICATION_RUN_ATTEMPT\n",
+            "            if [[ \"$publication_run_id\" != '33517227843' \\\n",
+            "              || \"$publication_run_id\" == \"$GITHUB_RUN_ID\" \\\n",
+            "              || \"$tag_sha\" != '48c5a718a9ddd63f496e45307e1484974ccf8587' ]]; then\n",
+            "            if [[ \"$GITHUB_WORKFLOW_REF\" != \"$GITHUB_REPOSITORY/.github/workflows/stasis-publish-npm.yml@refs/heads/$DEFAULT_BRANCH\" \\\n",
+            "              || \"$GITHUB_WORKFLOW_SHA\" != \"$GITHUB_SHA\" ]]; then\n",
+            "              \"repos/$GITHUB_REPOSITORY/actions/runs/$publication_run_id/attempts/$publication_run_attempt\" \\\n",
+            "                and .run_attempt == 1\n",
+            '                and .event == "release"\n',
+            '                and .status == "completed"\n',
+            '                and .conclusion == "failure"\n',
+            '                and .head_branch == $tag\n',
+            '                and .head_sha == $revision\n',
+            '                and .path == ".github/workflows/stasis-publish-npm.yml"\n',
+            '                and .name == "Publish @oxhq/stasis stable"\n',
+            "              \"repos/$GITHUB_REPOSITORY/actions/runs/$publication_run_id/attempts/$publication_run_attempt/jobs?per_page=100\" \\\n",
+            "              \"repos/$GITHUB_REPOSITORY/actions/runs/$publication_run_id/artifacts?per_page=100\" \\\n",
+            "            if not isinstance(pages, list) or any(not isinstance(page, dict) for page in pages):\n",
+            '            jobs = [job for page in pages for job in page.get("jobs", [])]\n',
+            "            actual_steps = [\n",
+            '                (step.get("number"), step.get("name"), step.get("conclusion"))\n',
+            '                or actual_steps != expected_steps\n',
+            '                raise SystemExit("original publication failure boundary changed")\n',
+            "            for job in jobs:\n",
+            '                    job.get("status") != "completed"\n',
+            '                    or job.get("conclusion") != "skipped"\n',
+            '                    or job.get("steps") != []\n',
+            '                raise SystemExit("original publication crossed a skipped mutation boundary")\n',
+            '            if artifacts != {"total_count": 0, "artifacts": []}:\n',
+            "            current_default_sha=$(gh api \\\n",
+            "            if [[ \"$current_default_sha\" != \"$GITHUB_SHA\" ]]; then\n",
+            "            gh api \"repos/$GITHUB_REPOSITORY/compare/$tag_sha...$GITHUB_SHA\" \\\n",
+            '                comparison.get("status") != "ahead"\n',
+            '                or comparison.get("merge_base_commit", {}).get("sha")\n',
+            '                    != os.environ["RELEASE_REVISION"]\n',
+            '                or comparison.get("ahead_by") != 1\n',
+            '                or comparison.get("behind_by") != 0\n',
+            '                or comparison.get("total_commits") != 1\n',
+            "                or not isinstance(commits, list)\n",
+            "                or len(commits) != 1\n",
+            '                or commits[0].get("sha") != os.environ["RECOVERY_REVISION"]\n',
+            "                or not isinstance(files, list)\n",
+            '                or {item.get("filename") for item in files} != allowed\n',
+            '                or any(item.get("status") != "modified" for item in files)\n',
+            '                raise SystemExit("recovery authority is not one exact workflow-only commit")\n',
+            '          test "$(git rev-parse HEAD)" = "$tag_sha"\n',
+        ),
+        "exact failed-publication and current-main recovery authority",
+    )
+    original_failed_job_census = (
+        "            expected_names = {\n"
+        '                "Verify immutable release and exact prepublication SDK proof",\n'
+        '                "Publish the exact pre-gated SDK",\n'
+        '                "Recover verification of the exact published SDK",\n'
+        '                "Verify registry SDK on " + "$" + "{{ matrix.release_platform }}",\n'
+        "            }\n"
+        "            if (\n"
+        "                len(jobs) != 4\n"
+        '                or {job.get("name") for job in jobs} != expected_names\n'
+        '                or len({job.get("id") for job in jobs}) != 4\n'
+        "            ):\n"
+    )
+    if publish_verify_job.count(original_failed_job_census) != 1:
+        raise ReleaseError(
+            "npm-publish recovery must retain the exact original failed-run job census"
+        )
+    original_failed_step_census = (
+        "            expected_steps = [\n"
+        '                (1, "Set up job", "success"),\n'
+        '                (2, "Reject workflow reruns before release verification", "success"),\n'
+        '                (3, "Check out the exact published tag", "success"),\n'
+        '                (4, "Require space for bounded native archive verification", "success"),\n'
+        '                (5, "Set up Node without publication credentials", "success"),\n'
+        '                (6, "Verify exact release, tag, commit, and asset inventory", "success"),\n'
+        '                (7, "Download and verify native and SDK package-run inputs", "success"),\n'
+        '                (8, "Activate pinned npm and pnpm clients", "success"),\n'
+        '                (9, "Install, typecheck, test, build, and reproduce the SDK pack", "success"),\n'
+        '                (10, "Verify the exact prepublication gate preceded immutable publication", "failure"),\n'
+        '                (11, "Stage only the exact attested and pre-gated npm inputs", "skipped"),\n'
+        '                (21, "Post Set up Node without publication credentials", "skipped"),\n'
+        '                (22, "Post Check out the exact published tag", "success"),\n'
+        '                (23, "Complete job", "success"),\n'
+        "            ]\n"
+    )
+    if publish_verify_job.count(original_failed_step_census) != 1:
+        raise ReleaseError(
+            "npm-publish recovery must retain the exact original failed-run step census"
+        )
+    exact_recovery_allowlist = (
+        "            allowed = {\n"
+        '                ".github/workflows/stasis-package.yml",\n'
+        '                ".github/workflows/stasis-publish-npm.yml",\n'
+        '                "etc/ci/stasis/release_archive.py",\n'
+        '                "etc/ci/stasis/verify_build_provenance.py",\n'
+        "            }\n"
+    )
+    if publish_verify_job.count(exact_recovery_allowlist) != 1:
+        raise ReleaseError(
+            "npm-publish recovery must allow exactly the four verifier/workflow files"
+        )
+
+    exact_checkout_action = (
+        "        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6\n"
+    )
+    if publish_verify_job.count(exact_checkout_action) != 2:
+        raise ReleaseError(
+            "npm-publish verification must have exact tag and recovery-authority checkouts"
+        )
+    require_source_fragments_in_order(
+        publish_verify_job,
+        (
+            "      - name: Check out the exact published tag\n",
+            "          persist-credentials: false\n",
+            "          ref: ${{ env.STASIS_RELEASE_TAG }}\n",
+            '          test "$(git rev-parse HEAD)" = "$tag_sha"\n',
+            "      - name: Check out exact recovery workflow authority\n",
+            "        if: github.event_name == 'workflow_dispatch'\n",
+            "          persist-credentials: false\n",
+            "          ref: ${{ github.sha }}\n",
+            "          path: .stasis-recovery-authority\n",
+            "      - name: Resolve and self-test exact provenance verifier authority\n",
+            '          verifier="$GITHUB_WORKSPACE/etc/ci/stasis/verify_build_provenance.py"\n',
+            "          if [[ \"$GITHUB_EVENT_NAME\" == 'workflow_dispatch' ]]; then\n",
+            '            authority="$GITHUB_WORKSPACE/.stasis-recovery-authority"\n',
+            '            test "$(git -C "$authority" rev-parse HEAD)" = "$GITHUB_SHA"\n',
+            '            test "$(git -C "$authority" status --short)" = \'\'\n',
+            '            verifier="$authority/etc/ci/stasis/verify_build_provenance.py"\n',
+            '            python3 "$authority/etc/ci/stasis/release_archive.py" self-test\n',
+            "          fi\n",
+            '          python3 "$verifier" self-test\n',
+            '          echo "STASIS_PROVENANCE_VERIFIER=$verifier" >> "$GITHUB_ENV"\n',
+        ),
+        "tag-product and current-main verifier authority split",
+    )
+    require_source_fragments_in_order(
+        publish_verify_job,
+        (
+            '            python3 "$STASIS_PROVENANCE_VERIFIER" verify\n',
+            "            --workflow .github/workflows/stasis-package.yml\n",
+            "            --revision \"$STASIS_REVISION\"\n",
+            "            --source-ref \"refs/heads/$DEFAULT_BRANCH\"\n",
+            "            --expected-event push\n",
+            "            --run-id \"$package_run_id\"\n",
+            "            --run-attempt \"$attest_run_attempt\"\n",
+            '          python3 "$STASIS_PROVENANCE_VERIFIER" verify \\\n',
+            "            --workflow .github/workflows/stasis-package.yml \\\n",
+            "            --revision \"$promotion_head_sha\" \\\n",
+            "            --source-ref \"refs/heads/$DEFAULT_BRANCH\" \\\n",
+            "            --expected-event workflow_dispatch \\\n",
+            "            --run-id \"$prepublish_run_id\" \\\n",
+            "            --run-attempt \"$prepublish_run_attempt\" \\\n",
+        ),
+        "package-push and prepublication-workflow-dispatch provenance callers",
+    )
+
     require_source_fragments_in_order(
         verify_promotion_job,
         (
@@ -6770,6 +6963,13 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "          read -r head_sha head_branch overall_run_attempt < <(\n",
             "          if [[ \"$overall_run_attempt\" != '1' ]]; then\n",
             "            echo 'promotion requires a fresh successful package push run at attempt 1' >&2\n",
+            "            python3 etc/ci/stasis/verify_build_provenance.py verify\n",
+            "            --workflow .github/workflows/stasis-package.yml\n",
+            "            --revision \"$HEAD_SHA\"\n",
+            "            --source-ref \"refs/heads/$HEAD_BRANCH\"\n",
+            "            --expected-event push\n",
+            "            --run-id \"$RUN_ID\"\n",
+            "            --run-attempt \"$ATTEST_RUN_ATTEMPT\"\n",
         ),
         "promotion fresh-run authority",
     )
@@ -6889,33 +7089,82 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     require_source_fragments_in_order(
         publish_job,
         (
-            "    if: needs.verify.result == 'success' && github.event_name == 'release'\n",
+            "    name: Publish the exact pre-gated SDK\n",
+            "    needs: verify\n",
+            "    if: |\n",
+            "      needs.verify.result == 'success'\n",
+            "        && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')\n",
+            "    environment:\n",
             "      name: npm\n",
             "      id-token: write\n",
             "      PREPUBLISH_RUN_ID: ${{ needs.verify.outputs.prepublish_run_id }}\n",
             "      - name: Reject workflow reruns before npm authority\n",
             "          test \"$GITHUB_RUN_ATTEMPT\" = '1'\n",
+            "      - name: Recheck the exact published stable release and lightweight tag\n",
+            '                and .immutable == true\n',
+            '                and (.published_at | type == "string" and length > 0)\n',
+            "      - name: Set up supported trusted-publishing Node\n",
+            "          registry-url: https://registry.npmjs.org\n",
+            "      - name: Download the SDK staged by the credential-free gate\n",
+            "      - name: Recheck exact package identity without repository code\n",
             '          prepublish_run_id = os.environ["PREPUBLISH_RUN_ID"]\n',
+            '          if os.environ["GITHUB_EVENT_NAME"] == "release" and revision != os.environ["GITHUB_SHA"]:\n',
             '              or prepublish_run_attempt != "1"\n',
             '              or prepublish_run_id == os.environ["GITHUB_RUN_ID"]\n',
-            "        if: github.event_name == 'release' && github.run_attempt == 1 && steps.npm-state.outputs.publish_required == 'true'\n",
+            "      - id: npm-state\n",
+            "        name: Resolve immutable npm publication state\n",
+            "          set +e\n",
+            '          npm view "@oxhq/stasis@$STASIS_VERSION" dist.integrity --json \\\n',
+            "          view_status=$?\n",
+            "          set -e\n",
+            "            if [[ $view_status -eq 1 ]] && python3 - \"$view_json\" <<'PY'\n",
+            '                  and document["error"].get("code") == "E404"\n',
+            "              echo 'publish_required=true' >> \"$GITHUB_OUTPUT\"\n",
+            "      - name: Recheck immutable release identity immediately before npm mutation\n",
+            "        if: steps.npm-state.outputs.publish_required == 'true'\n",
+            '                and .immutable == true\n',
+            '                and (.published_at | type == "string" and length > 0)\n',
+            '          if [[ "$tag_type" != \'commit\' || "$tag_sha" != "$STASIS_REVISION" ]]; then\n',
+            "      - name: Publish with npm trusted publishing and provenance\n",
+            "        if: github.run_attempt == 1 && steps.npm-state.outputs.publish_required == 'true'\n",
+            "          test \"$GITHUB_RUN_ATTEMPT\" = '1'\n",
             '          npm publish "$NPM_TARBALL" --ignore-scripts --access public --tag latest --provenance \\\n',
         ),
-        "release-event-only npm mutation job",
+        "release-event or one-shot recovery npm mutation job",
     )
     if publish_job.count('          test "$GITHUB_RUN_ATTEMPT" = \'1\'\n') != 3:
         raise ReleaseError(
-            "release-event npm job must reject reruns both before verification and before mutation"
+            "npm mutation job must reject reruns before verification and immediately before mutation"
+        )
+    repository_source_path = re.compile(
+        r"(?<![A-Za-z0-9_.-])(?:\./)?(?:etc|sdk|ports|components|profiles)/"
+    )
+    if (
+        "uses: actions/checkout@" in publish_job
+        or ".stasis-recovery-authority" in publish_job
+        or executable_repository_path.search(publish_job) is not None
+        or repository_source_path.search(publish_job) is not None
+    ):
+        raise ReleaseError(
+            "credentialed npm mutation job must remain source-free and consume only staged inputs"
         )
     require_source_fragments_in_order(
         recover_published_job,
         (
             "    name: Recover verification of the exact published SDK\n",
-            "    if: needs.verify.result == 'success' && github.event_name == 'workflow_dispatch'\n",
+            "    needs:\n",
+            "      - verify\n",
+            "      - publish\n",
+            "    if: |\n",
+            "      needs.verify.result == 'success'\n",
+            "        && needs.publish.result == 'success'\n",
+            "        && github.event_name == 'workflow_dispatch'\n",
             "      - name: Reject workflow reruns before recovery verification\n",
             "          test \"$GITHUB_RUN_ATTEMPT\" = '1'\n",
+            "      - name: Download the exact SDK staged by recovery verification\n",
+            "      - name: Require exact public bytes and npm tag aliases without mutation\n",
         ),
-        "read-only recovery first-attempt authority",
+        "post-publish read-only recovery verification authority",
     )
     if recover_published_job.count('          test "$GITHUB_RUN_ATTEMPT" = \'1\'\n') != 1:
         raise ReleaseError("read-only recovery job must fail every workflow rerun")
@@ -6923,14 +7172,84 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         verify_registry_job,
         (
             "    name: Verify registry SDK on ${{ matrix.release_platform }}\n",
+            "    needs:\n",
+            "      - verify\n",
+            "      - publish\n",
+            "      - recover_published\n",
+            "      always()\n",
+            "        && needs.verify.result == 'success'\n",
+            "          (github.event_name == 'release' && needs.publish.result == 'success')\n",
+            "            github.event_name == 'workflow_dispatch'\n",
+            "              && needs.recover_published.result == 'success'\n",
+            "      PUBLICATION_RUN_ATTEMPT: ${{ github.run_attempt }}\n",
+            "      PUBLICATION_RUN_ID: ${{ github.run_id }}\n",
             "      - name: Reject workflow reruns before public-consumer verification\n",
             "          test \"$GITHUB_RUN_ATTEMPT\" = '1'\n",
             "      - name: Check out the exact published tag\n",
+            "          ref: ${{ env.STASIS_RELEASE_TAG }}\n",
+            "      - name: Check out exact recovery verifier authority\n",
+            "        if: github.event_name == 'workflow_dispatch'\n",
+            "          ref: ${{ github.sha }}\n",
+            "          path: .stasis-recovery-authority\n",
+            "      - name: Resolve exact provenance verifier authority\n",
+            '          verifier="$GITHUB_WORKSPACE/etc/ci/stasis/verify_build_provenance.py"\n',
+            "          if [[ \"$GITHUB_EVENT_NAME\" == 'workflow_dispatch' ]]; then\n",
+            '            authority="$GITHUB_WORKSPACE/.stasis-recovery-authority"\n',
+            '            verifier="$authority/etc/ci/stasis/verify_build_provenance.py"\n',
+            "          fi\n",
+            '          python3 "$verifier" self-test\n',
+            '          echo "STASIS_PROVENANCE_VERIFIER=$verifier" >> "$GITHUB_ENV"\n',
+            '            python3 "$STASIS_PROVENANCE_VERIFIER" verify\n',
+            "            --workflow .github/workflows/stasis-package.yml\n",
+            "            --revision \"$STASIS_REVISION\"\n",
+            "            --source-ref \"refs/heads/$DEFAULT_BRANCH\"\n",
+            "            --expected-event push\n",
+            "            --run-id \"$PACKAGE_RUN_ID\"\n",
+            "            --run-attempt \"$ATTEST_RUN_ATTEMPT\"\n",
         ),
-        "anonymous registry first-attempt authority",
+        "anonymous registry current-run and verifier authority",
     )
     if verify_registry_job.count('          test "$GITHUB_RUN_ATTEMPT" = \'1\'\n') != 1:
         raise ReleaseError("anonymous registry verification jobs must fail every workflow rerun")
+    if verify_registry_job.count(exact_checkout_action) != 2:
+        raise ReleaseError(
+            "anonymous registry verification must have exact tag and recovery-authority checkouts"
+        )
+
+    npm_provenance_identity_fragments = (
+        '          run_id = os.environ["PUBLICATION_RUN_ID"]\n',
+        '          expected_attempt = int(os.environ["PUBLICATION_RUN_ATTEMPT"])\n',
+        '          event_name = os.environ["GITHUB_EVENT_NAME"]\n',
+        '          if event_name == "release":\n',
+        '            expected_ref = f"refs/tags/v{version}"\n',
+        "            provenance_revision = revision\n",
+        '          elif event_name == "workflow_dispatch":\n',
+        '            expected_ref = f"refs/heads/{os.environ[\'DEFAULT_BRANCH\']}"\n',
+        '            provenance_revision = os.environ["GITHUB_SHA"]\n',
+        '            raise SystemExit("npm provenance has an unsupported publication event")\n',
+        '            "path": ".github/workflows/stasis-publish-npm.yml",\n',
+        '            "digest": {"gitCommit": provenance_revision},\n',
+        '          if build.get("resolvedDependencies") != expected_dependencies:\n',
+        '          if not isinstance(internal, dict) or internal.get("github", {}).get("event_name") != event_name:\n',
+        '          prefix = f"{server_url}/{repository}/actions/runs/{run_id}/attempts/"\n',
+        '          match = re.fullmatch(re.escape(prefix) + r"([1-9][0-9]*)", metadata["invocationId"])\n',
+        "          provenance_attempt = int(match.group(1))\n",
+        "          if provenance_attempt != expected_attempt:\n",
+    )
+    require_source_fragments_in_order(
+        publish_job,
+        (
+            '          PUBLICATION_RUN_ID="$GITHUB_RUN_ID" \\\n',
+            '            PUBLICATION_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \\\n',
+            *npm_provenance_identity_fragments,
+        ),
+        "credentialed publication current-run event-aware npm provenance",
+    )
+    require_source_fragments_in_order(
+        verify_registry_job,
+        npm_provenance_identity_fragments,
+        "anonymous registry current-run event-aware npm provenance",
+    )
     npm_publish_command = (
         '          npm publish "$NPM_TARBALL" --ignore-scripts --access public --tag latest '
         '--provenance \\\n'
@@ -6941,7 +7260,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         or publish_job.count(npm_publish_command) != 1
     ):
         raise ReleaseError(
-            "npm mutation must exist exactly once and only in the release-event publish job"
+            "npm mutation must exist exactly once and only in the source-free publish job"
         )
 
     verify_registry_sdk_durable_v2_fixture_invocations(
@@ -6951,10 +7270,10 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         prepublish_promotion_job, "prepublication package SDK job", 1
     )
     verify_registry_sdk_durable_v2_fixture_invocations(
-        publish_verify_job, "release-event receipt verifier", 0
+        publish_verify_job, "event-aware receipt verifier", 0
     )
     verify_registry_sdk_durable_v2_fixture_invocations(
-        publish_job, "release-event npm mutation job", 0
+        publish_job, "event-aware npm mutation job", 0
     )
     verify_registry_sdk_durable_v2_fixture_invocations(
         recover_published_job, "read-only recovery job", 0
@@ -8264,9 +8583,9 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
-            "    if: needs.verify.result == 'success' && github.event_name == 'release'",
-            "    if: needs.verify.result == 'success' && github.event_name == 'workflow_dispatch'",
-            "release-event-only npm mutation",
+            "        && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')",
+            "        && github.event_name == 'release'",
+            "release-event and one-shot recovery npm mutation authority",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
@@ -8277,9 +8596,9 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
-            "        if: github.event_name == 'release' && github.run_attempt == 1 && steps.npm-state.outputs.publish_required == 'true'",
-            "        if: github.event_name == 'release' && steps.npm-state.outputs.publish_required == 'true'",
-            "release-event first-attempt npm command gate",
+            "        if: github.run_attempt == 1 && steps.npm-state.outputs.publish_required == 'true'",
+            "        if: steps.npm-state.outputs.publish_required == 'true'",
+            "event-aware first-attempt npm command gate",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
@@ -8292,6 +8611,148 @@ def self_test() -> None:
             "                and .run_attempt == 1",
             "                and .run_attempt >= 1",
             "read-only recovery fetched-run attempt binding",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "--expected-event push",
+            "--expected-event workflow_dispatch",
+            "package provenance push-event binding",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "--expected-event push",
+            "--expected-event workflow_dispatch",
+            "npm package provenance push-event bindings",
+            expected_count=2,
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "--expected-event workflow_dispatch",
+            "--expected-event push",
+            "prepublication provenance workflow-dispatch binding",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "33517227843",
+            "33517227844",
+            "exact original failed publication run identity",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "48c5a718a9ddd63f496e45307e1484974ccf8587",
+            "48c5a718a9ddd63f496e45307e1484974ccf8588",
+            "exact immutable product tag revision",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "380550511",
+            "380550512",
+            "exact immutable recovery release identity",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "                len(jobs) != 4",
+            "                len(jobs) < 4",
+            "original failed publication job census",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '                (10, "Verify the exact prepublication gate preceded immutable publication", "failure"),',
+            '                (10, "Verify the exact prepublication gate preceded immutable publication", "success"),',
+            "original failed publication step census",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '            if artifacts != {"total_count": 0, "artifacts": []}:',
+            '            if artifacts.get("total_count") != 0:',
+            "original failed publication empty-artifact census",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '              || "$GITHUB_WORKFLOW_SHA" != "$GITHUB_SHA" ]]; then',
+            '              || "$GITHUB_WORKFLOW_SHA" == "$GITHUB_SHA" ]]; then',
+            "recovery workflow SHA authority",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '            if [[ "$current_default_sha" != "$GITHUB_SHA" ]]; then',
+            '            if [[ "$current_default_sha" == "$GITHUB_SHA" ]]; then',
+            "recovery current-default-tip authority",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '                ".github/workflows/stasis-package.yml",',
+            '                "ports/stasis/Cargo.toml",',
+            "recovery exact four-file allowlist",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '                or comparison.get("total_commits") != 1',
+            '                or comparison.get("total_commits") < 1',
+            "recovery exact one-commit ancestry",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '          test "$(git rev-parse HEAD)" = "$tag_sha"',
+            '          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+            "recovery product sources remain at immutable tag",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '            python3 "$authority/etc/ci/stasis/release_archive.py" self-test',
+            '            python3 "$authority/etc/ci/stasis/release_archive.py" verify',
+            "recovery release-verifier authority self-test",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "      - name: Reject workflow reruns before npm authority",
+            "      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10\n"
+            "      - name: Reject workflow reruns before npm authority",
+            "source-free credentialed npm mutation job",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '                  and document["error"].get("code") == "E404"',
+            '                  and document["error"].get("code") == "E500"',
+            "strict npm E404 absence precheck",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "      - name: Recheck immutable release identity immediately before npm mutation",
+            "      - name: Skip immutable release identity immediately before npm mutation",
+            "immutable release precheck immediately before npm mutation",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "        && needs.publish.result == 'success'",
+            "        && needs.publish.result == 'failure'",
+            "recovery waits for successful credentialed publication",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "      PUBLICATION_RUN_ATTEMPT: ${{ github.run_attempt }}",
+            "      PUBLICATION_RUN_ATTEMPT: ${{ needs.verify.outputs.publication_run_attempt }}",
+            "registry current workflow attempt identity",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "      PUBLICATION_RUN_ID: ${{ github.run_id }}",
+            "      PUBLICATION_RUN_ID: ${{ needs.verify.outputs.publication_run_id }}",
+            "registry current workflow run identity",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '            expected_ref = f"refs/tags/v{version}"',
+            '            expected_ref = f"refs/heads/{os.environ[\'DEFAULT_BRANCH\']}"',
+            "event-aware npm release-tag provenance identity",
+            expected_count=2,
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "          if provenance_attempt != expected_attempt:",
+            "          if provenance_attempt < expected_attempt:",
+            "exact npm provenance attempt identity",
+            expected_count=2,
         )
         require_public_marker_mutation_rejected(
             REGISTRY_SDK_VERIFIER_SOURCE,

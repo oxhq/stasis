@@ -18,6 +18,7 @@ POSITIVE_INTEGER = re.compile(r"[1-9][0-9]*")
 PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
 STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
 BUILD_TYPE = "https://actions.github.io/buildtypes/workflow/v1"
+ALLOWED_GITHUB_EVENTS = ("push", "workflow_dispatch")
 
 
 class VerificationError(ValueError):
@@ -105,6 +106,7 @@ def verify_document(
     workflow: str,
     revision: str,
     source_ref: str,
+    expected_event: str,
     server_url: str,
     run_id: str,
     run_attempt: str,
@@ -122,6 +124,8 @@ def verify_document(
         reject("source revision is not a lowercase 40-character commit")
     if not source_ref.startswith("refs/heads/") or source_ref == "refs/heads/":
         reject("source ref is not an exact branch ref")
+    if expected_event not in ALLOWED_GITHUB_EVENTS:
+        reject("expected GitHub event is not an allowed provenance event")
     if POSITIVE_INTEGER.fullmatch(run_id) is None or POSITIVE_INTEGER.fullmatch(run_attempt) is None:
         reject("provenance run identity is invalid")
     if not isinstance(document, list) or not document:
@@ -248,7 +252,7 @@ def verify_document(
     internal_github = nested(build_definition, "internalParameters", "github")
     if (
         not isinstance(internal_github, dict)
-        or internal_github.get("event_name") != "push"
+        or internal_github.get("event_name") != expected_event
         or internal_github.get("runner_environment") != "github-hosted"
     ):
         reject("verified SLSA internal GitHub identity changed")
@@ -268,6 +272,7 @@ def verify_command(args: argparse.Namespace) -> None:
         workflow=args.workflow,
         revision=args.revision,
         source_ref=args.source_ref,
+        expected_event=args.expected_event,
         server_url=args.server_url,
         run_id=args.run_id,
         run_attempt=args.run_attempt,
@@ -353,8 +358,7 @@ def self_test() -> None:
                 },
             }
         ]
-        verify_document(
-            document,
+        verification_identity = dict(
             repository=repository,
             workflow=workflow,
             revision=revision,
@@ -364,20 +368,35 @@ def self_test() -> None:
             run_attempt=run_attempt,
             subjects=subjects,
         )
+        verify_document(document, expected_event="push", **verification_identity)
+        statement["predicate"]["buildDefinition"]["internalParameters"]["github"][
+            "event_name"
+        ] = "workflow_dispatch"
+        verify_document(
+            document,
+            expected_event="workflow_dispatch",
+            **verification_identity,
+        )
+        try:
+            verify_document(document, expected_event="push", **verification_identity)
+        except VerificationError:
+            pass
+        else:
+            reject("self-test accepted mismatched GitHub event identity")
+        try:
+            verify_document(document, expected_event="schedule", **verification_identity)
+        except VerificationError:
+            pass
+        else:
+            reject("self-test accepted an invalid expected GitHub event")
         document[0]["verificationResult"]["signature"]["certificate"][
             "runInvocationURI"
         ] = f"{repository_uri}/actions/runs/{run_id}/attempts/5"
         try:
             verify_document(
                 document,
-                repository=repository,
-                workflow=workflow,
-                revision=revision,
-                source_ref=source_ref,
-                server_url="https://github.com",
-                run_id=run_id,
-                run_attempt=run_attempt,
-                subjects=subjects,
+                expected_event="workflow_dispatch",
+                **verification_identity,
             )
         except VerificationError:
             pass
@@ -395,6 +414,9 @@ def parser() -> argparse.ArgumentParser:
     verify.add_argument("--workflow", required=True)
     verify.add_argument("--revision", required=True)
     verify.add_argument("--source-ref", required=True)
+    verify.add_argument(
+        "--expected-event", required=True, choices=ALLOWED_GITHUB_EVENTS
+    )
     verify.add_argument("--server-url", required=True)
     verify.add_argument("--run-id", required=True)
     verify.add_argument("--run-attempt", required=True)
