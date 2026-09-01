@@ -27,7 +27,7 @@ Release identity and immutable boundaries:
 
 - Servo base and Pliego donor revisions are pinned in `STASIS_UPSTREAM.toml`.
 - `v0.2.1` is the last fully qualified stable predecessor. The source tree's native crate
-  and TypeScript package are versioned `0.3.2` for the corrective release train
+  and TypeScript package are versioned `0.3.3` for the corrective release train
   and retain the frozen `controlled-webapp-v1` surface. The separately named
   `controlled-web-session-v1` profile adds document/navigation token authority,
   checked top-level replacement and history changes, semantic forms, practical
@@ -43,7 +43,7 @@ Release identity and immutable boundaries:
   open-ended work is reported as a typed outcome instead of silently falling
   back to uncontrolled progress.
 - The published `@oxhq/stasis@0.2.1` remains immutable release history. The
-  `sdk/typescript` source is the matching `0.3.2` corrective train plus process-isolated
+  `sdk/typescript` source is the matching `0.3.3` corrective train plus process-isolated
   session pooling and crawling helpers. The release
   workflows bind the SDK and both native archives to one source revision, retain
   the frozen v0.1 fixture gate, and add the multi-navigation/session-state North
@@ -53,10 +53,13 @@ Release identity and immutable boundaries:
   disqualified: the credential-free package workflow and GitHub promotion passed, but full release
   qualification did not because automatic npm prepublication failed in the packed SDK's
   cookie-replacement settlement, so `@oxhq/stasis@0.3.1` was never published.
-  Source version `0.3.2` is not a publication claim. Before promotion, `v0.3.2`
-  becomes released only after the macOS arm64 and Linux x86-64 provenance gates,
-  immutable GitHub release, npm trusted publication, anonymous managed-runtime
-  verification, and all public and candidate protocol gates pass. After promotion,
+  The immutable `v0.3.2` GitHub release is likewise disqualified because its release-event macOS
+  public-package verifier timed out during cookie-replacement settlement before npm publication;
+  `@oxhq/stasis@0.3.2` was never published. Source version `0.3.3` is not a publication claim.
+  Before promotion, the exact candidate must pass the macOS arm64 and Linux x86-64 package,
+  provenance, protocol, and pre-immutable packed-SDK gates. Promotion may create the exact draft
+  tag and release. `v0.3.3` becomes fully qualified only after immutable GitHub release
+  publication, npm trusted publication, and anonymous managed-runtime verification also pass;
   status is established by those immutable public artifacts rather than this source copy.
 - The immutable `v0.2.0` and `v0.2.1` artifacts remain release history. `v0.2.1` corrects
   a redirect-evidence ordering race in which a successor request could begin

@@ -1,16 +1,19 @@
-# Stasis 0.3.2 corrective release train
+# Stasis 0.3.3 corrective release train
 
 The source tree, native `stasis-shell` crate, TypeScript package metadata, and
-release validators are aligned to exact version `0.3.2`. Source version is not
+release validators are aligned to exact version `0.3.3`. Source version is not
 a publication claim. `v0.2.1` and `@oxhq/stasis@0.2.1` remain the last fully
 qualified predecessor. Public `v0.3.0` is immutable disqualified release evidence after its
 macOS anonymous-consumer failure. The immutable `v0.3.1` GitHub release is also disqualified:
 its credential-free package workflow and GitHub promotion passed, but full release qualification
 did not because automatic npm prepublication failed in the packed SDK's cookie-replacement
-settlement, so `@oxhq/stasis@0.3.1` was never published. Promote
-`v0.3.2` only after its exact tag, immutable release,
-npm provenance, and anonymous managed-runtime verification all pass. After promotion, verify
-those public artifacts; do not infer current registry state from this checked-in text.
+settlement, so `@oxhq/stasis@0.3.1` was never published. The immutable `v0.3.2` GitHub release is
+also disqualified: its release-event macOS public-package verifier timed out during
+cookie-replacement settlement before npm publication, so `@oxhq/stasis@0.3.2` was never
+published. Promote the `v0.3.3` candidate only after its exact package, provenance, and
+pre-immutable packed-SDK gates pass. The version becomes fully qualified only after the draft is
+published immutably, npm provenance exists, and anonymous managed-runtime verification passes.
+Verify those public artifacts; do not infer current registry state from this checked-in text.
 
 Version 0.3 adds the explicitly selected `controlled-web-session-v2` profile
 for bounded same-global, untransferred `MessageChannel` work, a bounded direct top-level
@@ -113,9 +116,9 @@ After finite work drains, settlement does not fire another interval cycle and re
 `quiescent_with_persistent_work`. Strict policy and both frozen predecessor profiles still stop at
 the interval head as `blocked_on_open_ended_work`.
 
-The checked-out release and npm workflows accept only exact `v0.3.2` for new
-promotion/publication work. They do not authorize rebuilding or replacing the public `v0.3.1`
-release, public `v0.3.0`, or any
+The checked-out release and npm workflows accept only exact `v0.3.3` for new
+promotion/publication work. They do not authorize rebuilding or replacing the public `v0.3.2`,
+`v0.3.1`, or `v0.3.0` releases, or any
 published `0.2.x` bytes. Checked-in version text is not release evidence: verify the immutable tag, hosted promotion,
 npm provenance, and anonymous public-consumer result.
 
@@ -141,8 +144,8 @@ every other stable or prerelease identity. The native matrix remains deliberatel
 bounded to Linux x86-64 and macOS arm64, with the same compatibility,
 ten-member archive, checksum, source-identity, and provenance contracts used by
 the first stable train. The helper at the `v0.2.1` tag accepted only `0.2.1`;
-the current main helper accepts only `0.3.2` and cannot alter or
-re-authorize historical `v0.3.1`, `v0.3.0`, `v0.2.1`, `v0.2.0`, or `0.1.x` bytes.
+the current main helper accepts only `0.3.3` and cannot alter or
+re-authorize historical `v0.3.2`, `v0.3.1`, `v0.3.0`, `v0.2.1`, `v0.2.0`, or `0.1.x` bytes.
 
 ## Windows x86-64 CI-only proof artifact
 
@@ -201,7 +204,7 @@ not GitHub release assets. Build provenance covers all release assets and the
 SDK package/proof. The SDK's checked-in generated runtime-manifest module is an
 intentionally mismatched historical alpha placeholder: local `prepack` fails
 closed until the credential-free package job generates the exact 0.3
-`v0.3.2` manifest from both verified native archives.
+`v0.3.3` manifest from both verified native archives.
 
 ## 0.3 package and product gates
 
@@ -286,8 +289,10 @@ source-binary ordering oracle: WebRender's synchronous shutdown acknowledgement
 must precede joins of its backend/scene threads and custom Rayon workers, and
 those joins must precede renderer deinitialization and rendering-context
 destruction. A successful rerun cannot substitute for these first-attempt gates.
-Package-mode invocation itself rejects `GITHUB_RUN_ATTEMPT` values other than
-`1`; after any package-run failure, qualification requires a fresh push run.
+A full package-workflow rerun fails validation, and promotion independently
+requires the selected package run's overall attempt to be `1`. Therefore,
+partial-job reruns have no release authority; after any package failure,
+qualification requires a fresh push run.
 
 Both fixture runners and the entire session fixture directory are copied beside
 the installed tarball before execution. Credential-free package gating uses the
@@ -307,24 +312,24 @@ gh workflow run stasis-package.yml \
   --repo oxhq/stasis \
   --ref main \
   -f package_run_id=REPLACE_WITH_SUCCESSFUL_MAIN_PUSH_RUN_ID \
-  -f release_tag=v0.3.2
+  -f release_tag=v0.3.3
 ```
 
 Run that promotion only after the exact source's hosted package gates pass. After
 the exact draft is inspected and published as an immutable,
 non-prerelease GitHub release, the release event may publish only
-`@oxhq/stasis@0.3.2` with npm trusted publishing and provenance. The expected
+`@oxhq/stasis@0.3.3` with npm trusted publishing and provenance. The expected
 post-publication dist-tag map would then be:
 
 ```json
 {
   "alpha": "0.1.0-alpha.0",
-  "latest": "0.3.2"
+  "latest": "0.3.3"
 }
 ```
 
 The workflow fails if the immutable historical `alpha` tag moves, `latest`
-does not point to `0.3.2` after publication, any unexpected dist-tag appears, public registry
+does not point to `0.3.3` after publication, any unexpected dist-tag appears, public registry
 bytes differ from the staged tarball, provenance/signature verification fails,
 or either anonymous North Star fails. Manual npm-workflow dispatch remains
 read-only recovery tied to the original release-event run and attempt; it may
@@ -496,9 +501,10 @@ The protected `release` environment receives only those staged files. Its job
 does not check out or execute source code. It rechecks inventories, hashes,
 proofs, source/run identities, runtime-manifest bindings, and provenance before
 creating a lightweight `v0.1.0` tag and a draft stable release. It refuses to
-mutate a published or mismatched release, or a tag at another object. A retry
-may resume only the exact matching draft by ID, remove its starter placeholders,
-and upload any missing verified assets before revalidating the full inventory.
+mutate a published or mismatched release, or a tag at another object. The historical v0.1 workflow
+could resume only an exact matching draft by ID. The current v0.3.3 workflow rejects GitHub reruns;
+only a fresh first-attempt promotion run may resume the exact draft and upload missing verified
+assets before revalidating the full inventory.
 
 Inspect the draft once, then publish that same draft as a non-prerelease. Do not
 replace assets, retarget the tag, or recreate the release. Repository immutable
@@ -510,19 +516,20 @@ report `immutable: true`.
 Publishing the stable GitHub release triggers
 `.github/workflows/stasis-publish-npm.yml`. At the immutable `v0.1.0` tag, its
 mutating path accepted only the published, immutable, non-prerelease `v0.1.0`
-release in `oxhq/stasis`; the current main workflow accepts only `v0.3.2` and
-cannot mutate the public `v0.3.1` release, public `v0.3.0`, or that historical package.
+release in `oxhq/stasis`; the current main workflow accepts only `v0.3.3` and
+cannot mutate the public `v0.3.2`, `v0.3.1`, or `v0.3.0` releases or that historical package.
 
-The workflow first runs without npm credentials. It verifies all nine release
-assets and attestations and requires both native proofs to identify the same
+The workflow first runs without npm credentials and only on run attempt 1. It verifies all ten
+release assets and attestations and requires both native proofs to identify the same
 successful package run. Their platform-specific attempts and the SDK attempt
 are resolved independently from the latest exact successful producer jobs, with
 the same no-stale-fallback and ordering checks used by promotion. It compares
 the release runtime manifest with the SDK attempt's original attested manifest,
-regenerates the SDK module, and reproduces the SDK attempt's exact npm tarball.
-It then runs the packed-SDK gate against the explicitly verified extracted
-binary and runs the three-run North Star through managed runtime acquisition.
-The staged proof binds the combined gate log.
+regenerates the SDK module, reproduces the SDK attempt's exact npm tarball, and verifies the
+attested prepublication receipt and log from the promotion run's first-attempt macOS
+`prepublish-promotion` job.
+The release-event path does not rerun that native gate. Manual recovery is read-only, binds only
+the original release-event run at attempt 1, and cannot publish or retag npm.
 
 Only the minimal `publish` job enters the protected `npm` environment and
 receives `id-token: write`. It has no checkout and executes no package lifecycle
@@ -570,16 +577,19 @@ launch, controlled automation, evidence, and clean shutdown from public bytes.
   separately, then require each selected job's unique artifact pair and the
   native-before-SDK ordering.
 - Historical 0.1/0.2 package trains could use **Re-run all jobs** or **Re-run
-  failed jobs** with attempt-qualified producer selection. Stasis 0.3 package
-  mode rejects every rerun attempt; it requires a fresh push run at attempt 1.
-  Promotion still rejects a failed, incomplete, missing, duplicated, or expired
-  producer and never falls back to an older run.
-- Existing version bytes are immutable. A publish retry may skip `npm publish`
-  only when the registry's SHA-512 integrity equals the staged tarball exactly.
+  failed jobs** with attempt-qualified producer selection. For Stasis 0.3, a
+  full package-workflow rerun fails validation, and promotion independently
+  requires the selected package run's overall attempt to be `1`. Partial-job
+  reruns therefore have no release authority; after any package failure, use a
+  fresh push run. Promotion also rejects a failed, incomplete, missing,
+  duplicated, or expired producer and never falls back to an older run.
+- Existing version bytes are immutable. The v0.3.3 release event has one mutating attempt; a rerun
+  cannot skip or repeat `npm publish`. Read-only recovery may accept existing registry bytes only
+  when their SHA-512 integrity equals the staged tarball exactly.
 - A failure after npm accepts bytes is a verification incident, not permission to
   republish the version.
-- Manual dispatch of the npm workflow is read-only recovery. It must run from the
-  default branch and identify the original release-event run and attempt.
+- Manual dispatch of the npm workflow is read-only recovery. It must itself be attempt 1, run from
+  the default branch, and identify the original release-event run at attempt 1.
 - Recovery never enters the `npm` environment and performs no registry mutation.
 
 ## Hosted controls required before promotion
@@ -599,4 +609,4 @@ launch, controlled automation, evidence, and clean shutdown from public bytes.
   workflow inventory after the final push.
 
 These hosted controls are release gates. If any live setting differs, stop before
-creating `v0.1.0`; do not weaken source checks to compensate.
+creating `v0.3.3`; do not weaken source checks to compensate.

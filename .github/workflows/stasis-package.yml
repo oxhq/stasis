@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       release_tag:
-        description: Exact Stasis release tag; v0.3.2 is the only accepted value
+        description: Exact Stasis release tag; v0.3.3 is the only accepted value
         required: false
         type: string
   push:
@@ -28,7 +28,7 @@ env:
   RUST_BACKTRACE: 1
   STASIS_FROZEN_V1_PROFILE_SHA256: 6e262edf0f8be11a1cece28f68f00d59fdac68b79b0a670ac891d36998720100
   STASIS_FROZEN_V2_PROFILE_SHA256: 9b62b9245b2c6a6f9620b117da6787a18df9298be1115cbce2e6c3d5439cc41a
-  STASIS_RELEASE_VERSION: 0.3.2
+  STASIS_RELEASE_VERSION: 0.3.3
 
 jobs:
   validate-invocation:
@@ -2443,7 +2443,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RUN_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      STASIS_VERSION: 0.3.2
+      STASIS_VERSION: 0.3.3
       STASIS_REVISION: ${{ github.sha }}
     steps:
       - name: Check out the exact event commit
@@ -2765,7 +2765,7 @@ jobs:
               "linux-x86_64": os.environ["LINUX_RUN_ATTEMPT"],
           }
           repository = os.environ["GITHUB_REPOSITORY"]
-          if version != "0.3.2" or not re.fullmatch(r"[0-9a-f]{40}", revision):
+          if version != "0.3.3" or not re.fullmatch(r"[0-9a-f]{40}", revision):
               raise SystemExit("runtime manifest release identity is invalid")
           upstream = tomllib.loads(pathlib.Path("STASIS_UPSTREAM.toml").read_text(encoding="utf-8"))
           expected_upstream_keys = {
@@ -3146,7 +3146,7 @@ jobs:
       - name: Recheck exact identities and digests without repository code
         shell: bash
         env:
-          STASIS_VERSION: 0.3.2
+          STASIS_VERSION: 0.3.3
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -4348,17 +4348,17 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: |
-            release-assets/macos-aarch64/stasis-0.3.2-macos-aarch64.tar.gz
-            release-assets/macos-aarch64/stasis-0.3.2-macos-aarch64.tar.gz.sha256
-            release-assets/macos-aarch64/stasis-0.3.2-macos-aarch64.binary.sha256
-            gate-proof/macos-aarch64/stasis-0.3.2-macos-aarch64-act-settle-inspect.json
-            release-assets/linux-x86_64/stasis-0.3.2-linux-x86_64.tar.gz
-            release-assets/linux-x86_64/stasis-0.3.2-linux-x86_64.tar.gz.sha256
-            release-assets/linux-x86_64/stasis-0.3.2-linux-x86_64.binary.sha256
-            gate-proof/linux-x86_64/stasis-0.3.2-linux-x86_64-act-settle-inspect.json
-            runtime-manifest/stasis-0.3.2-runtime-manifest.json
-            sdk-proof/oxhq-stasis-0.3.2.tgz
-            sdk-proof/stasis-0.3.2-typescript-act-settle-inspect.json
+            release-assets/macos-aarch64/stasis-0.3.3-macos-aarch64.tar.gz
+            release-assets/macos-aarch64/stasis-0.3.3-macos-aarch64.tar.gz.sha256
+            release-assets/macos-aarch64/stasis-0.3.3-macos-aarch64.binary.sha256
+            gate-proof/macos-aarch64/stasis-0.3.3-macos-aarch64-act-settle-inspect.json
+            release-assets/linux-x86_64/stasis-0.3.3-linux-x86_64.tar.gz
+            release-assets/linux-x86_64/stasis-0.3.3-linux-x86_64.tar.gz.sha256
+            release-assets/linux-x86_64/stasis-0.3.3-linux-x86_64.binary.sha256
+            gate-proof/linux-x86_64/stasis-0.3.3-linux-x86_64-act-settle-inspect.json
+            runtime-manifest/stasis-0.3.3-runtime-manifest.json
+            sdk-proof/oxhq-stasis-0.3.3.tgz
+            sdk-proof/stasis-0.3.3-typescript-act-settle-inspect.json
 
   verify-promotion:
     name: Verify immutable promotion inputs
@@ -4395,6 +4395,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = '1'
           if [[ "$GITHUB_REPOSITORY" != 'oxhq/stasis' ]]; then
             echo 'promotion is restricted to oxhq/stasis' >&2
             exit 1
@@ -4433,6 +4434,10 @@ jobs:
           )
           if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ || ! "$overall_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
             echo 'selected package run did not resolve to an exact commit and attempt' >&2
+            exit 1
+          fi
+          if [[ "$overall_run_attempt" != '1' ]]; then
+            echo 'promotion requires a fresh successful package push run at attempt 1' >&2
             exit 1
           fi
 
@@ -5311,6 +5316,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = '1'
+          test "$OVERALL_RUN_ATTEMPT" = '1'
           expected_workflow_ref="$GITHUB_REPOSITORY/.github/workflows/stasis-package.yml@refs/heads/$HEAD_BRANCH"
           if [[ ! "$VERIFIED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ \
             || "$GITHUB_WORKFLOW_SHA" != "$VERIFIED_WORKFLOW_SHA" \

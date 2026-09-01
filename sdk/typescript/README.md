@@ -7,20 +7,23 @@ single FIFO protocol lane.
 ## Install
 
 ```sh
-# Last fully qualified public package while the 0.3.2 gates are pending:
+# Last fully qualified public package while the 0.3.3 gates are pending:
 pnpm add @oxhq/stasis@0.2.1
 
-# Use only after the 0.3.2 registry and anonymous-consumer gates pass:
-pnpm add @oxhq/stasis@0.3.2
+# Use only after the 0.3.3 registry and anonymous-consumer gates pass:
+pnpm add @oxhq/stasis@0.3.3
 ```
 
-This corrective source/package train is versioned `0.3.2`; install those immutable bytes explicitly
-with `pnpm add @oxhq/stasis@0.3.2` after the registry, release, provenance, and anonymous-consumer
+This corrective source/package train is versioned `0.3.3`; install those immutable bytes explicitly
+with `pnpm add @oxhq/stasis@0.3.3` after the registry, release, provenance, and anonymous-consumer
 gates have published them. Untagged source alone does not prove that publication occurred.
 `@oxhq/stasis@0.2.1` remains the last fully qualified predecessor; public `0.3.0` is immutable
 disqualified release evidence after its macOS anonymous-consumer failure. The immutable `v0.3.1`
 GitHub release is also disqualified because automatic npm prepublication failed in the packed
 SDK's cookie-replacement settlement; `@oxhq/stasis@0.3.1` was never published.
+The immutable `v0.3.2` GitHub release is also disqualified because its release-event macOS
+public-package verifier timed out during cookie-replacement settlement before npm publication;
+`@oxhq/stasis@0.3.2` was never published.
 
 An exact stable package pairs the TypeScript package with the same-version native
 `stasis-shell`, sourced from `https://github.com/oxhq/stasis.git`. Node.js 20 or newer is required. The
@@ -33,8 +36,10 @@ explicit compatible executable. The SDK always starts it directly with
 `shell: false`.
 
 The source identity is never a registry or release claim by itself. Before promotion, the exact
-tag, package, provenance, publication, and anonymous-consumer gates must complete; after
-promotion, verify the immutable tag and registry bytes rather than inferring status from this text.
+candidate package, provenance, and pre-immutable packed-SDK gates must complete. Promotion may
+create the exact draft tag and release; only after immutable release publication, npm publication,
+and anonymous-consumer verification all pass is the version fully qualified. Verify those public
+bytes rather than inferring status from this text.
 
 ## Use: controlled web sessions (v0.2)
 

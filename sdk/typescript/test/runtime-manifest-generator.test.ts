@@ -30,7 +30,7 @@ const archiveFiles = [
 ];
 
 function manifest(): Record<string, unknown> {
-  const version = "0.3.2";
+  const version = "0.3.3";
   const artifact = (nodePlatform: string, nodeArch: string, releasePlatform: string) => {
     const root = `stasis-${version}-${releasePlatform}`;
     return {
@@ -103,7 +103,7 @@ test("prepack validator binds the canonical manifest to the exact release packag
   await execFileAsync(process.execPath, [generator, "--input", input, "--output", generated]);
   await writeFile(
     packageFile,
-    `${JSON.stringify({ name: "@oxhq/stasis", version: "0.3.2" }, null, 2)}\n`,
+    `${JSON.stringify({ name: "@oxhq/stasis", version: "0.3.3" }, null, 2)}\n`,
     "utf8",
   );
 
@@ -114,7 +114,7 @@ test("prepack validator binds the canonical manifest to the exact release packag
     "--manifest",
     generated,
   ]);
-  assert.equal(result.stdout, "validated @oxhq/stasis@0.3.2 runtime manifest\n");
+  assert.equal(result.stdout, "validated @oxhq/stasis@0.3.3 runtime manifest\n");
 
   await writeFile(
     packageFile,
@@ -134,7 +134,7 @@ test("prepack validator binds the canonical manifest to the exact release packag
 
   await writeFile(
     packageFile,
-    `${JSON.stringify({ name: "@oxhq/stasis", version: "0.3.2-alpha.1" }, null, 2)}\n`,
+    `${JSON.stringify({ name: "@oxhq/stasis", version: "0.3.3-alpha.1" }, null, 2)}\n`,
     "utf8",
   );
   await assert.rejects(
@@ -156,7 +156,7 @@ test("prepack validator requires both release artifacts and the twelve-file inve
   const generated = join(directory, "runtime-manifest.generated.ts");
   await writeFile(
     packageFile,
-    `${JSON.stringify({ name: "@oxhq/stasis", version: "0.3.2" }, null, 2)}\n`,
+    `${JSON.stringify({ name: "@oxhq/stasis", version: "0.3.3" }, null, 2)}\n`,
     "utf8",
   );
 

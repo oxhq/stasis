@@ -451,7 +451,7 @@ const packageRoot = join(consumerRoot, "node_modules", "@oxhq", "stasis");
 const expectedRevision = values.revision.toLowerCase();
 const expectedVersion = values.version;
 assert.match(expectedRevision, /^[0-9a-f]{40}$/, "--revision must be a full Git commit");
-assert.equal(expectedVersion, "0.3.2", "--version must name the exact release candidate");
+assert.equal(expectedVersion, "0.3.3", "--version must name the exact release candidate");
 const expectedTarballName = `oxhq-stasis-${expectedVersion}.tgz`;
 const packageStatus = await lstat(packageTarball);
 assert.ok(packageStatus.isFile() && !packageStatus.isSymbolicLink(), "--package must be a regular file");

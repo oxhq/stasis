@@ -94,7 +94,7 @@ test("launch, open, native DOM operations, runtime control, and close use the li
   };
   assert.deepEqual(initializeParams.client, {
     name: "@oxhq/stasis",
-    version: "0.3.2",
+    version: "0.3.3",
   });
 
   const openParams = (await app.evaluate("__openParams")) as {

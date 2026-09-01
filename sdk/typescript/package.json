@@ -1,6 +1,6 @@
 {
   "name": "@oxhq/stasis",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Linear TypeScript client for the Stasis controlled-time Servo runtime",
   "repository": {
     "type": "git",

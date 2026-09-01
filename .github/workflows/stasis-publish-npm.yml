@@ -9,7 +9,7 @@ on:
       release_tag:
         description: Immutable stable release tag to verify
         required: true
-        default: v0.3.2
+        default: v0.3.3
         type: string
       publication_run_id:
         description: Release-event workflow run that published the npm package
@@ -41,11 +41,11 @@ jobs:
             github.event_name == 'release'
               && github.event.release.draft == false
               && github.event.release.prerelease == false
-              && github.event.release.tag_name == 'v0.3.2'
+              && github.event.release.tag_name == 'v0.3.3'
           )
           || (
             github.event_name == 'workflow_dispatch'
-              && inputs.release_tag == 'v0.3.2'
+              && inputs.release_tag == 'v0.3.3'
           )
         )
     runs-on: macos-15
@@ -73,6 +73,12 @@ jobs:
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Reject workflow reruns before release verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = '1'
+
       - name: Check out the exact published tag
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -99,6 +105,7 @@ jobs:
           TAG: ${{ env.STASIS_RELEASE_TAG }}
         run: |
           set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = '1'
           test "$(uname -s)" = 'Darwin'
           test "$(uname -m)" = 'arm64'
           test "$(sysctl -n hw.optional.arm64)" = '1'
@@ -127,8 +134,8 @@ jobs:
               exit 1
             fi
             if [[ ! "$RECOVERY_PUBLICATION_RUN_ID" =~ ^[1-9][0-9]*$ \
-              || ! "$RECOVERY_PUBLICATION_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
-              echo 'recovery publication run identity is invalid' >&2
+              || "$RECOVERY_PUBLICATION_RUN_ATTEMPT" != '1' ]]; then
+              echo 'recovery must bind the original release-event run at attempt 1' >&2
               exit 1
             fi
             publication_run_id=$RECOVERY_PUBLICATION_RUN_ID
@@ -143,6 +150,7 @@ jobs:
               --argjson run_attempt "$publication_run_attempt" '
                 .id == $run_id
                 and .run_attempt == $run_attempt
+                and .run_attempt == 1
                 and .event == "release"
                 and .status == "completed"
                 and (.conclusion == "success" or .conclusion == "failure")
@@ -159,8 +167,8 @@ jobs:
           cargo_version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("ports/stasis/Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')
           sdk_version=$(node -p 'JSON.parse(require("node:fs").readFileSync("sdk/typescript/package.json", "utf8")).version')
           version=${TAG#v}
-          if [[ "$version" != '0.3.2' || "$cargo_version" != "$version" || "$sdk_version" != "$version" ]]; then
-            echo 'native, SDK, and release tag versions do not match exact 0.3.2' >&2
+          if [[ "$version" != '0.3.3' || "$cargo_version" != "$version" || "$sdk_version" != "$version" ]]; then
+            echo 'native, SDK, and release tag versions do not match exact 0.3.3' >&2
             exit 1
           fi
           bundle="stasis-${version}-${STASIS_PLATFORM}"
@@ -1044,10 +1052,17 @@ jobs:
       STASIS_VERSION: ${{ needs.verify.outputs.version }}
       SDK_RUN_ATTEMPT: ${{ needs.verify.outputs.sdk_run_attempt }}
     steps:
+      - name: Reject workflow reruns before npm authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = '1'
+
       - name: Recheck the exact published stable release and lightweight tag
         shell: bash
         run: |
           set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = '1'
           if [[ ! "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
             echo 'release event has no valid immutable release ID' >&2
             exit 1
@@ -1819,7 +1834,7 @@ jobs:
           prepublish_run_id = os.environ["PREPUBLISH_RUN_ID"]
           prepublish_run_attempt = os.environ["PREPUBLISH_RUN_ATTEMPT"]
           binary_digest = os.environ["STASIS_NATIVE_BINARY_SHA256"]
-          if version != "0.3.2":
+          if version != "0.3.3":
               raise SystemExit("invalid staged SDK version")
           if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
               raise SystemExit("invalid staged SDK revision")
@@ -2599,10 +2614,11 @@ jobs:
           fi
 
       - name: Publish with npm trusted publishing and provenance
-        if: github.event_name == 'release' && steps.npm-state.outputs.publish_required == 'true'
+        if: github.event_name == 'release' && github.run_attempt == 1 && steps.npm-state.outputs.publish_required == 'true'
         shell: bash
         run: |
           set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = '1'
           npm publish "$NPM_TARBALL" --ignore-scripts --access public --tag latest --provenance \
             --registry="$NPM_CONFIG_REGISTRY"
 
@@ -2940,6 +2956,12 @@ jobs:
     env:
       STASIS_VERSION: ${{ needs.verify.outputs.version }}
     steps:
+      - name: Reject workflow reruns before recovery verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = '1'
+
       - name: Set up Node without publication credentials
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -3040,6 +3062,12 @@ jobs:
       STASIS_VERSION: ${{ needs.verify.outputs.version }}
       SDK_RUN_ATTEMPT: ${{ needs.verify.outputs.sdk_run_attempt }}
     steps:
+      - name: Reject workflow reruns before public-consumer verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = '1'
+
       - name: Check out the exact published tag
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:

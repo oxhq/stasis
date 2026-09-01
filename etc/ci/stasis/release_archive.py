@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and verify the exact Stasis 0.3.2 native release archives."""
+"""Build and verify the exact Stasis 0.3.3 native release archives."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import BinaryIO, Iterable
 
 
-RELEASE_VERSION = "0.3.2"
+RELEASE_VERSION = "0.3.3"
 VERSION_RE = re.compile(re.escape(RELEASE_VERSION))
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -5818,11 +5818,11 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         public_top_level_readme,
         "top-level public README",
         (
-            "target the 0.3.2 corrective train",
+            "target the 0.3.3 corrective train",
             "`controlled-web-session-v1` still the default",
             "[`controlled-web-session-v2` contract](docs/stasis/session-v0.3-candidate.md)",
             "Source version and package CI are not publication proof",
-            "Version 0.3.2 is the\n"
+            "Version 0.3.3 is the\n"
             "stable successor only when its",
             "automatic npm prepublication failed in the packed SDK's\n"
             "cookie-replacement settlement, and `@oxhq/stasis@0.3.1` was never published",
@@ -5837,7 +5837,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         public_stasis_boundary,
         "public Stasis product boundary",
         (
-            "Source version `0.3.2` is not a publication claim",
+            "Source version `0.3.3` is not a publication claim",
             "canonical HTTP(S) URL no larger than 65,536 bytes",
             "without inventing an asynchronous `Image` producer lease",
             "Finite\n  asynchronous cache/decode completion is fenced by an `Image` producer",
@@ -6477,6 +6477,9 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         promote_job_marker, prepublish_promotion_start
     )
     package_sdk_job = public_release_workflow[package_sdk_start:verify_promotion_start]
+    verify_promotion_job = public_release_workflow[
+        verify_promotion_start:prepublish_promotion_start
+    ]
     prepublish_promotion_job = public_release_workflow[
         prepublish_promotion_start:promote_start
     ]
@@ -6484,10 +6487,12 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
 
     publish_verify_job_marker = "  verify:\n"
     publish_job_marker = "  publish:\n"
+    recover_published_job_marker = "  recover_published:\n"
     verify_registry_job_marker = "  verify-registry:\n"
     for marker, description in (
         (publish_verify_job_marker, "release-event verification job"),
         (publish_job_marker, "npm mutation job"),
+        (recover_published_job_marker, "read-only recovery job"),
         (verify_registry_job_marker, "anonymous registry verification job"),
     ):
         if public_npm_publish_workflow.count(marker) != 1:
@@ -6496,12 +6501,32 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     publish_start = public_npm_publish_workflow.index(
         publish_job_marker, publish_verify_start
     )
+    recover_published_start = public_npm_publish_workflow.index(
+        recover_published_job_marker, publish_start
+    )
     verify_registry_start = public_npm_publish_workflow.index(
-        verify_registry_job_marker, publish_start
+        verify_registry_job_marker, recover_published_start
     )
     publish_verify_job = public_npm_publish_workflow[publish_verify_start:publish_start]
-    publish_job = public_npm_publish_workflow[publish_start:verify_registry_start]
+    publish_job = public_npm_publish_workflow[publish_start:recover_published_start]
+    recover_published_job = public_npm_publish_workflow[
+        recover_published_start:verify_registry_start
+    ]
     verify_registry_job = public_npm_publish_workflow[verify_registry_start:]
+
+    require_source_fragments_in_order(
+        verify_promotion_job,
+        (
+            "    name: Verify immutable promotion inputs\n",
+            "      - id: selected-run\n",
+            "        name: Verify the selected successful package run\n",
+            "          test \"$GITHUB_RUN_ATTEMPT\" = '1'\n",
+            "          read -r head_sha head_branch overall_run_attempt < <(\n",
+            "          if [[ \"$overall_run_attempt\" != '1' ]]; then\n",
+            "            echo 'promotion requires a fresh successful package push run at attempt 1' >&2\n",
+        ),
+        "promotion fresh-run authority",
+    )
 
     require_source_fragments_in_order(
         prepublish_promotion_job,
@@ -6546,6 +6571,9 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "      - prepublish-promotion\n",
             "        && needs.prepublish-promotion.result == 'success'\n",
             "      PREPUBLISH_PROOF_SHA256: ${{ needs.prepublish-promotion.outputs.prepublish_proof_sha256 }}\n",
+            "      - name: Recheck selected commit is on the current default branch\n",
+            "          test \"$GITHUB_RUN_ATTEMPT\" = '1'\n",
+            "          test \"$OVERALL_RUN_ATTEMPT\" = '1'\n",
             "      - name: Download prepublication evidence verified before release mutation\n",
             "      - name: Recheck and stage the exact prepublication receipt\n",
             "          cp \"$proof\" release-assets/\n",
@@ -6558,6 +6586,9 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         (
             "    name: Verify immutable release and exact prepublication SDK proof\n",
             "      prepublish_run_id: ${{ steps.prepublish_receipt.outputs.run_id }}\n",
+            "          test \"$GITHUB_RUN_ATTEMPT\" = '1'\n",
+            "              || \"$RECOVERY_PUBLICATION_RUN_ATTEMPT\" != '1' ]]; then\n",
+            "                and .run_attempt == 1\n",
             "                \"stasis-\\($version)-typescript-prepublish-act-settle-inspect.json\"\n",
             "      - id: prepublish_receipt\n",
             "        name: Verify the exact prepublication gate preceded immutable publication\n",
@@ -6577,6 +6608,10 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         raise ReleaseError(
             "release-event receipt verifier must not receive npm environment or OIDC mutation authority"
         )
+    if publish_verify_job.count('          test "$GITHUB_RUN_ATTEMPT" = \'1\'\n') != 2:
+        raise ReleaseError(
+            "release-event and recovery verifier must fail reruns instead of skipping them"
+        )
     require_source_fragments_in_order(
         publish_job,
         (
@@ -6584,13 +6619,44 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "      name: npm\n",
             "      id-token: write\n",
             "      PREPUBLISH_RUN_ID: ${{ needs.verify.outputs.prepublish_run_id }}\n",
+            "      - name: Reject workflow reruns before npm authority\n",
+            "          test \"$GITHUB_RUN_ATTEMPT\" = '1'\n",
             '          prepublish_run_id = os.environ["PREPUBLISH_RUN_ID"]\n',
             '              or prepublish_run_attempt != "1"\n',
             '              or prepublish_run_id == os.environ["GITHUB_RUN_ID"]\n',
+            "        if: github.event_name == 'release' && github.run_attempt == 1 && steps.npm-state.outputs.publish_required == 'true'\n",
             '          npm publish "$NPM_TARBALL" --ignore-scripts --access public --tag latest --provenance \\\n',
         ),
         "release-event-only npm mutation job",
     )
+    if publish_job.count('          test "$GITHUB_RUN_ATTEMPT" = \'1\'\n') != 3:
+        raise ReleaseError(
+            "release-event npm job must reject reruns both before verification and before mutation"
+        )
+    require_source_fragments_in_order(
+        recover_published_job,
+        (
+            "    name: Recover verification of the exact published SDK\n",
+            "    if: needs.verify.result == 'success' && github.event_name == 'workflow_dispatch'\n",
+            "      - name: Reject workflow reruns before recovery verification\n",
+            "          test \"$GITHUB_RUN_ATTEMPT\" = '1'\n",
+        ),
+        "read-only recovery first-attempt authority",
+    )
+    if recover_published_job.count('          test "$GITHUB_RUN_ATTEMPT" = \'1\'\n') != 1:
+        raise ReleaseError("read-only recovery job must fail every workflow rerun")
+    require_source_fragments_in_order(
+        verify_registry_job,
+        (
+            "    name: Verify registry SDK on ${{ matrix.release_platform }}\n",
+            "      - name: Reject workflow reruns before public-consumer verification\n",
+            "          test \"$GITHUB_RUN_ATTEMPT\" = '1'\n",
+            "      - name: Check out the exact published tag\n",
+        ),
+        "anonymous registry first-attempt authority",
+    )
+    if verify_registry_job.count('          test "$GITHUB_RUN_ATTEMPT" = \'1\'\n') != 1:
+        raise ReleaseError("anonymous registry verification jobs must fail every workflow rerun")
     npm_publish_command = (
         '          npm publish "$NPM_TARBALL" --ignore-scripts --access public --tag latest '
         '--provenance \\\n'
@@ -6615,6 +6681,9 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     )
     verify_registry_sdk_durable_v2_fixture_invocations(
         publish_job, "release-event npm mutation job", 0
+    )
+    verify_registry_sdk_durable_v2_fixture_invocations(
+        recover_published_job, "read-only recovery job", 0
     )
     verify_registry_sdk_durable_v2_fixture_invocations(
         verify_registry_job, "anonymous registry verification job", 1
@@ -7554,8 +7623,8 @@ def self_test() -> None:
             ),
             (
                 PUBLIC_TOP_LEVEL_README,
-                "Version 0.3.2 is the\nstable successor only when its",
-                "Version 0.3.2 is the\nstable successor even before its",
+                "Version 0.3.3 is the\nstable successor only when its",
+                "Version 0.3.3 is the\nstable successor even before its",
                 "top-level immutable public-successor evidence boundary",
             ),
             (
@@ -7566,8 +7635,8 @@ def self_test() -> None:
             ),
             (
                 PUBLIC_STASIS_BOUNDARY,
-                "Source version `0.3.2` is not a publication claim",
-                "Source version `0.3.2` is a publication claim",
+                "Source version `0.3.3` is not a publication claim",
+                "Source version `0.3.3` is a publication claim",
                 "STASIS source-versus-publication boundary",
             ),
             (
@@ -7858,6 +7927,25 @@ def self_test() -> None:
             "public prepublication receipt staging",
         )
         require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            '          test "$GITHUB_RUN_ATTEMPT" = \'1\'',
+            '          test "$GITHUB_RUN_ATTEMPT" -ge \'1\'',
+            "package promotion and prepublication first-attempt hard failures",
+            expected_count=4,
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            '          if [[ "$overall_run_attempt" != \'1\' ]]; then',
+            '          if [[ "$overall_run_attempt" -lt \'1\' ]]; then',
+            "selected package overall first-attempt authority",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            '          test "$OVERALL_RUN_ATTEMPT" = \'1\'',
+            '          test "$OVERALL_RUN_ATTEMPT" -ge \'1\'',
+            "credentialed promotion overall first-attempt recheck",
+        )
+        require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
             '              gate["completed"] > promote["started"]',
             '              gate["completed"] < promote["started"]',
@@ -7880,6 +7968,31 @@ def self_test() -> None:
             "    if: needs.verify.result == 'success' && github.event_name == 'release'",
             "    if: needs.verify.result == 'success' && github.event_name == 'workflow_dispatch'",
             "release-event-only npm mutation",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '          test "$GITHUB_RUN_ATTEMPT" = \'1\'',
+            '          test "$GITHUB_RUN_ATTEMPT" -ge \'1\'',
+            "release-event and recovery first-attempt hard failure",
+            expected_count=7,
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "        if: github.event_name == 'release' && github.run_attempt == 1 && steps.npm-state.outputs.publish_required == 'true'",
+            "        if: github.event_name == 'release' && steps.npm-state.outputs.publish_required == 'true'",
+            "release-event first-attempt npm command gate",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "              || \"$RECOVERY_PUBLICATION_RUN_ATTEMPT\" != '1' ]]; then",
+            "              || ! \"$RECOVERY_PUBLICATION_RUN_ATTEMPT\" =~ ^[1-9][0-9]*$ ]]; then",
+            "read-only recovery original-attempt binding",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "                and .run_attempt == 1",
+            "                and .run_attempt >= 1",
+            "read-only recovery fetched-run attempt binding",
         )
         require_public_marker_mutation_rejected(
             REGISTRY_SDK_VERIFIER_SOURCE,
@@ -11400,9 +11513,11 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
             "0.2.1",
             "0.3.0",
             "0.3.1",
+            "0.3.2",
             "v0.3.0",
             "v0.3.1",
             "v0.3.2",
+            "v0.3.3",
         ):
             try:
                 validate_identity(invalid_version, "macos-aarch64", revision, repository)
