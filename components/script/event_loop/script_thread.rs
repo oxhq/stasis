@@ -311,6 +311,11 @@ enum ReplacementPipelineBootstrapQueueState {
     Unavailable,
 }
 
+enum ControlledDriveEventDisposition<'a> {
+    PipelineBootstrapRequired,
+    Ready(Option<&'a MixedMessage>),
+}
+
 #[derive(Clone, Copy)]
 enum ProducerCapture {
     Passive,
@@ -549,6 +554,34 @@ fn replacement_pipeline_bootstrap_queued_event(
             ReplacementPipelineBootstrapQueuedEvent::ImmediateBarrier
         },
         _ => ReplacementPipelineBootstrapQueuedEvent::Ordinary,
+    }
+}
+
+/// Keep every `SpawnPipeline` behind its explicit initial/replacement bootstrap authority.
+///
+/// A source-bound `DriveOneTurn` can race a Constellation navigation observation: Script may
+/// still exactly match the source target while the replacement's sole `SpawnPipeline` is already
+/// queued. Treating that event as an ordinary turn would consume it, report the resulting target
+/// drift as indeterminate, and leave the subsequent replacement bootstrap waiting for an event
+/// which no longer exists.
+fn controlled_drive_may_consume_classified_event(
+    event: ReplacementPipelineBootstrapQueuedEvent,
+) -> bool {
+    !matches!(event, ReplacementPipelineBootstrapQueuedEvent::Spawn(_))
+}
+
+fn controlled_drive_event_disposition(
+    pending_events: &VecDeque<MixedMessage>,
+) -> ControlledDriveEventDisposition<'_> {
+    let event = next_controlled_turn_event(pending_events);
+    if event.is_some_and(|event| {
+        !controlled_drive_may_consume_classified_event(replacement_pipeline_bootstrap_queued_event(
+            event,
+        ))
+    }) {
+        ControlledDriveEventDisposition::PipelineBootstrapRequired
+    } else {
+        ControlledDriveEventDisposition::Ready(event)
     }
 }
 
@@ -3122,8 +3155,14 @@ impl ScriptThread {
                         .as_ref()
                         .expect("the controlled loop requires an owner input queue")
                         .borrow();
-                    match next_controlled_turn_event(&input.ready) {
-                        Some(event) => {
+                    match controlled_drive_event_disposition(&input.ready) {
+                        ControlledDriveEventDisposition::PipelineBootstrapRequired => (
+                            Err(DocumentControlError::PendingFactUnavailable(
+                                DocumentPendingFact::TargetMembership,
+                            )),
+                            None,
+                        ),
+                        ControlledDriveEventDisposition::Ready(Some(event)) => {
                             let validation =
                                 self.validate_controlled_target_for_event(&target, event);
                             let activation = validation
@@ -3132,7 +3171,9 @@ impl ScriptThread {
                                 .flatten();
                             (validation, activation)
                         },
-                        None => (self.validate_controlled_target(&target), None),
+                        ControlledDriveEventDisposition::Ready(None) => {
+                            (self.validate_controlled_target(&target), None)
+                        },
                     }
                 };
                 if target_validation.is_err() {
@@ -9184,27 +9225,32 @@ mod controlled_input_tests {
         PendingLogicalTimerTerminalObservation, PendingNavigationRevision,
         PendingPipelineMembershipRevision, PendingRuntimeTerminals, PendingTargetObservation,
     };
-    use script_traits::{DiscardBrowsingContext, ScriptThreadControlMessage, ScriptThreadMessage};
+    use embedder_traits::{Theme, ViewportDetails};
+    use script_traits::{
+        DiscardBrowsingContext, NewPipelineInfo, ScriptThreadControlMessage, ScriptThreadMessage,
+    };
     use servo_base::Epoch;
     use servo_base::id::{
         BrowsingContextId, Index, PipelineId, ScriptEventLoopId, TEST_BROWSING_CONTEXT_ID,
         TEST_NAMESPACE, TEST_PIPELINE_ID, TEST_WEBVIEW_ID,
     };
+    use servo_constellation_traits::{LoadData, TargetSnapshotParams};
+    use servo_url::ServoUrl;
     use timers::{
         DocumentClock, DocumentClockConfiguration, DocumentClockError, DocumentUnixTime,
         TimerScheduler,
     };
 
     use super::{
-        CONTROLLED_INPUT_BATCH_LIMIT, ControlledInputBatch, ControlledInputState,
-        ControlledLogicalTimerOwnerObservation, InitialPipelineActivationFacts,
-        InitialPipelineActivationWaitInterruption, InitialPipelineBootstrapFacts,
-        MainThreadScriptMsg, MixedMessage, ReplacementPipelineBootstrapFacts,
-        ReplacementPipelineBootstrapQueueState, ReplacementPipelineBootstrapQueuedEvent,
-        ScriptThread, controlled_event_consumes_ordinary_task_budget,
-        controlled_input_state_for_clock, initial_pipeline_activation_pipeline,
-        initial_pipeline_activation_wait_interrupted, initial_pipeline_bootstrap_pipeline,
-        replacement_pipeline_bootstrap_classified_position,
+        CONTROLLED_INPUT_BATCH_LIMIT, ControlledDriveEventDisposition, ControlledInputBatch,
+        ControlledInputState, ControlledLogicalTimerOwnerObservation,
+        InitialPipelineActivationFacts, InitialPipelineActivationWaitInterruption,
+        InitialPipelineBootstrapFacts, MainThreadScriptMsg, MixedMessage,
+        ReplacementPipelineBootstrapFacts, ReplacementPipelineBootstrapQueueState,
+        ReplacementPipelineBootstrapQueuedEvent, ScriptThread, controlled_drive_event_disposition,
+        controlled_event_consumes_ordinary_task_budget, controlled_input_state_for_clock,
+        initial_pipeline_activation_pipeline, initial_pipeline_activation_wait_interrupted,
+        initial_pipeline_bootstrap_pipeline, replacement_pipeline_bootstrap_classified_position,
         replacement_pipeline_bootstrap_pipeline, replacement_pipeline_bootstrap_queued_event,
         take_controlled_lifecycle_event, take_controlled_turn,
     };
@@ -9369,6 +9415,62 @@ mod controlled_input_tests {
         assert_eq!(ready.len(), 2);
         assert!(matches!(ready.pop_front(), Some(MixedMessage::TimerFired)));
         assert!(matches!(ready.pop_front(), Some(MixedMessage::TimerFired)));
+    }
+
+    #[test]
+    fn stale_source_drive_defers_spawn_for_exact_replacement_bootstrap() {
+        let replacement = second_pipeline_id();
+        let spawn =
+            MixedMessage::FromConstellation(ScriptThreadMessage::SpawnPipeline(NewPipelineInfo {
+                parent_info: None,
+                new_pipeline_id: replacement,
+                browsing_context_id: TEST_BROWSING_CONTEXT_ID,
+                webview_id: TEST_WEBVIEW_ID,
+                opener: None,
+                load_data: LoadData::new_for_new_unrelated_webview(
+                    ServoUrl::parse("https://replacement.example.test/").unwrap(),
+                ),
+                viewport_details: ViewportDetails::default(),
+                user_content_manager_id: None,
+                embedder_theme: Theme::Light,
+                target_snapshot_params: TargetSnapshotParams::default(),
+                frame_name: None,
+            }));
+        let mut owner_queue = std::collections::VecDeque::from([spawn]);
+
+        assert!(matches!(
+            controlled_drive_event_disposition(&owner_queue),
+            ControlledDriveEventDisposition::PipelineBootstrapRequired
+        ));
+        assert_eq!(owner_queue.len(), 1);
+        assert_eq!(
+            replacement_pipeline_bootstrap_classified_position(
+                owner_queue
+                    .iter()
+                    .map(replacement_pipeline_bootstrap_queued_event),
+                false,
+                replacement,
+            ),
+            ReplacementPipelineBootstrapQueueState::Ready { event_index: 0 }
+        );
+        owner_queue.push_back(MixedMessage::FromConstellation(
+            ScriptThreadMessage::ExitScriptThread,
+        ));
+        assert!(matches!(
+            controlled_drive_event_disposition(&owner_queue),
+            ControlledDriveEventDisposition::Ready(Some(MixedMessage::FromConstellation(
+                ScriptThreadMessage::ExitScriptThread
+            )))
+        ));
+        for event in [
+            MixedMessage::TimerFired,
+            MixedMessage::FromConstellation(ScriptThreadMessage::ExitFullScreen(TEST_PIPELINE_ID)),
+        ] {
+            assert!(matches!(
+                controlled_drive_event_disposition(&std::collections::VecDeque::from([event])),
+                ControlledDriveEventDisposition::Ready(Some(_))
+            ));
+        }
     }
 
     #[test]
