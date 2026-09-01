@@ -311,6 +311,37 @@ jobs:
           cat "$ownership_log"
           rm -f -- "$ownership_log"
 
+          bootstrap_ownership_log="$RUNNER_TEMP/stasis-lifecycle-${{ matrix.lane }}-script-bootstrap-ownership.log"
+          : > "$bootstrap_ownership_log"
+          bootstrap_ownership_status=0
+          set +e
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell -p servo-script --lib \
+            event_loop::script_thread::controlled_input_tests::stale_source_drive_defers_spawn_for_exact_replacement_bootstrap \
+            -- --exact --test-threads=1 --show-output >> "$bootstrap_ownership_log" 2>&1 || bootstrap_ownership_status=$?
+          cargo test --locked --profile production-stripped \
+            -p stasis-shell --bin stasis \
+            tests::indeterminate_drive_with_exact_replacement_still_bootstraps \
+            -- --exact --test-threads=1 --show-output >> "$bootstrap_ownership_log" 2>&1 || bootstrap_ownership_status=$?
+          set -e
+          if (( bootstrap_ownership_status != 0 )); then
+            cat "$bootstrap_ownership_log"
+            rm -f -- "$bootstrap_ownership_log"
+            exit "$bootstrap_ownership_status"
+          fi
+          expected_bootstrap_ownership_records=(
+            'test event_loop::script_thread::controlled_input_tests::stale_source_drive_defers_spawn_for_exact_replacement_bootstrap ... ok'
+            'test tests::indeterminate_drive_with_exact_replacement_still_bootstraps ... ok'
+          )
+          test "${#expected_bootstrap_ownership_records[@]}" = '2'
+          test "$(printf '%s\n' "${expected_bootstrap_ownership_records[@]}" | LC_ALL=C sort -u | awk 'END { print NR }')" = '2'
+          test "$(grep -Ec '^test .* \.\.\. ok$' "$bootstrap_ownership_log")" = '2'
+          for test_record in "${expected_bootstrap_ownership_records[@]}"; do
+            test "$(grep -Fxc "$test_record" "$bootstrap_ownership_log")" = '1'
+          done
+          cat "$bootstrap_ownership_log"
+          rm -f -- "$bootstrap_ownership_log"
+
           retirement_log="$RUNNER_TEMP/stasis-lifecycle-${{ matrix.lane }}-paint-retirement.log"
           : > "$retirement_log"
           retirement_status=0
@@ -1463,6 +1494,22 @@ jobs:
               $mozjsFeatureLines[0] -cne $expectedMozjsFeatures) {
             throw "the Windows component tests resolved outside the Stasis MozJS feature graph"
           }
+          $controlledBootstrapOwnershipTestCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib ' +
+            'event_loop::script_thread::controlled_input_tests::stale_source_drive_defers_spawn_for_exact_replacement_bootstrap ' +
+            '-- --exact --test-threads=1 --show-output; exit $LASTEXITCODE'
+          Invoke-WindowsCargoTestGate -Name 'controlled-bootstrap-ownership' `
+            -Command $controlledBootstrapOwnershipTestCommand `
+            -ExpectedPassCount 1 `
+            -ExpectedRecordPattern '^test event_loop::script_thread::controlled_input_tests::stale_source_drive_defers_spawn_for_exact_replacement_bootstrap \.\.\. ok$'
+          $indeterminateReplacementBootstrapTestCommand = '$ErrorActionPreference = ''Stop''; ' +
+            '& cargo test --locked --profile production-stripped -p stasis-shell --bin stasis ' +
+            'tests::indeterminate_drive_with_exact_replacement_still_bootstraps ' +
+            '-- --exact --test-threads=1 --show-output; exit $LASTEXITCODE'
+          Invoke-WindowsCargoTestGate -Name 'indeterminate-replacement-bootstrap' `
+            -Command $indeterminateReplacementBootstrapTestCommand `
+            -ExpectedPassCount 1 `
+            -ExpectedRecordPattern '^test tests::indeterminate_drive_with_exact_replacement_still_bootstraps \.\.\. ok$'
           $controlledImageCapacityTestCommand = '$ErrorActionPreference = ''Stop''; ' +
             '& cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib ' +
             'pending_nonanimated_image_observation_tests -- --test-threads=1 --show-output; ' +
@@ -5847,6 +5894,13 @@ jobs:
           - Native platforms: macOS Apple Silicon and Linux x86_64
           - Linux compatibility floor: Ubuntu 22.04 / glibc 2.35
           - macOS signing: unsigned and not Apple-notarized
+
+          Stasis 0.3.3 corrects a controlled replacement lifecycle race at Script's ordinary-input
+          owner. A source-bound DriveOneTurn now defers a queued replacement SpawnPipeline to the
+          exact BootstrapReplacementPipeline authority instead of consuming its sole bootstrap event.
+          Each native Jammy lane and the Windows package CI job bind the exact Script
+          queue-ownership and shell recovery regressions. The unchanged 22-record Paint/WebRender retirement
+          census remains downstream guard evidence; it is not root-cause evidence for this correction.
 
           Stasis 0.3 preserves the frozen controlled-webapp-v1 and
           controlled-web-session-v1 contracts. The explicitly selected

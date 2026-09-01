@@ -1044,6 +1044,112 @@ def rust_braced_block_end(source: str, opening_brace: int, description: str) -> 
     raise ReleaseError(f"unterminated braced block for {description}")
 
 
+def verify_controlled_replacement_bootstrap_ownership_source(
+    script_thread_source: str,
+    shell_source: str,
+) -> None:
+    def unique_rust_block(source: str, marker: str, description: str) -> str:
+        if source.count(marker) != 1:
+            raise ReleaseError(f"{description} must have exactly one source definition")
+        start = source.index(marker)
+        opening_brace = source.find("{", start)
+        end = rust_braced_block_end(source, opening_brace, description)
+        return source[start:end]
+
+    drive_classifier = unique_rust_block(
+        script_thread_source,
+        "fn controlled_drive_may_consume_classified_event(",
+        "controlled Script drive event classifier",
+    )
+    require_source_fragments_in_order(
+        drive_classifier,
+        (
+            "event: ReplacementPipelineBootstrapQueuedEvent",
+            "!matches!(event, ReplacementPipelineBootstrapQueuedEvent::Spawn(_))",
+        ),
+        "replacement SpawnPipeline exclusion from source-bound drives",
+    )
+
+    drive_disposition = unique_rust_block(
+        script_thread_source,
+        "fn controlled_drive_event_disposition(",
+        "controlled Script drive disposition",
+    )
+    require_source_fragments_in_order(
+        drive_disposition,
+        (
+            "let event = next_controlled_turn_event(pending_events);",
+            "!controlled_drive_may_consume_classified_event(",
+            "replacement_pipeline_bootstrap_queued_event(",
+            "ControlledDriveEventDisposition::PipelineBootstrapRequired",
+            "ControlledDriveEventDisposition::Ready(event)",
+        ),
+        "controlled Script replacement-bootstrap disposition",
+    )
+
+    drive_arm = unique_rust_block(
+        script_thread_source,
+        "DocumentControlCommand::DriveOneTurn => {",
+        "production controlled Script DriveOneTurn arm",
+    )
+    require_source_fragments_in_order(
+        drive_arm,
+        (
+            "match controlled_drive_event_disposition(&input.ready)",
+            "ControlledDriveEventDisposition::PipelineBootstrapRequired => (",
+            "Err(DocumentControlError::PendingFactUnavailable(",
+            "DocumentPendingFact::TargetMembership,",
+            "if target_validation.is_err()",
+            "DocumentControlOutcome::DriveOneTurnOutcomeIndeterminate",
+            "return true;",
+            "take_controlled_turn(&mut input.ready)",
+        ),
+        "production Script SpawnPipeline preservation before turn removal",
+    )
+
+    script_regression = unique_rust_block(
+        script_thread_source,
+        "    #[test]\n"
+        "    fn stale_source_drive_defers_spawn_for_exact_replacement_bootstrap() {",
+        "Script replacement-bootstrap ownership regression",
+    )
+    require_source_fragments_in_order(
+        script_regression,
+        (
+            "ScriptThreadMessage::SpawnPipeline(NewPipelineInfo {",
+            "let mut owner_queue = std::collections::VecDeque::from([spawn]);",
+            "controlled_drive_event_disposition(&owner_queue),",
+            "ControlledDriveEventDisposition::PipelineBootstrapRequired",
+            "assert_eq!(owner_queue.len(), 1);",
+            "replacement_pipeline_bootstrap_classified_position(",
+            "ReplacementPipelineBootstrapQueueState::Ready { event_index: 0 }",
+        ),
+        "Script replacement SpawnPipeline preservation regression",
+    )
+
+    shell_regression = unique_rust_block(
+        shell_source,
+        "    #[test]\n"
+        "    fn indeterminate_drive_with_exact_replacement_still_bootstraps() {",
+        "shell exact-replacement bootstrap recovery regression",
+    )
+    require_source_fragments_in_order(
+        shell_regression,
+        (
+            "let source = session_authority(1, 0, 0, 0);",
+            "let admitted = replacement_admission_authority(&source);",
+            "let bootstrap = DocumentControlCommand::BootstrapReplacementPipeline {",
+            "transition_from_navigation_completion(",
+            "NavigationOperationCompletion::test_response(",
+            "Ok(admitted.clone()),",
+            "ActiveTransition::Submit(command) if command == bootstrap",
+            "Some(SettleReplacementPhase::Bootstrapping {",
+            "command == &bootstrap",
+        ),
+        "shell indeterminate-drive exact-replacement bootstrap recovery",
+    )
+
+
 def input_method_initializer_spans(source: str, description: str) -> list[tuple[int, int]]:
     spans = []
     for match in INPUT_METHOD_REQUEST_INITIALIZER_RE.finditer(source):
@@ -6017,6 +6123,13 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         public_release_workflow,
         "public GitHub release-note template",
         (
+            "corrects a controlled replacement lifecycle race at Script's ordinary-input",
+            "DriveOneTurn now defers a queued replacement SpawnPipeline",
+            "exact BootstrapReplacementPipeline authority instead of consuming its sole bootstrap event",
+            "Windows package CI job bind the exact Script",
+            "unchanged 22-record Paint/WebRender retirement",
+            "census remains downstream guard evidence",
+            "not root-cause evidence for this correction",
             "An admitted synchronous cache hit is owned in the current",
             "without an invented asynchronous Image producer lease; finite asynchronous",
             "A final\n          redirect URL is not rechecked against that initial selected-URL limit",
@@ -6127,7 +6240,82 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "and results-gate the complete two-lane Jammy lifecycle job"
         )
 
-    paint_retirement_command_blocks = (
+    bootstrap_ownership_command_blocks = (
+        (
+            "          cargo test --locked --profile production-stripped \\\n"
+            "            -p stasis-shell -p servo-script --lib \\\n"
+            "            event_loop::script_thread::controlled_input_tests::stale_source_drive_defers_spawn_for_exact_replacement_bootstrap \\\n"
+            "            -- --exact --test-threads=1 --show-output >> \"$bootstrap_ownership_log\" 2>&1 || bootstrap_ownership_status=$?\n"
+        ),
+        (
+            "          cargo test --locked --profile production-stripped \\\n"
+            "            -p stasis-shell --bin stasis \\\n"
+            "            tests::indeterminate_drive_with_exact_replacement_still_bootstraps \\\n"
+            "            -- --exact --test-threads=1 --show-output >> \"$bootstrap_ownership_log\" 2>&1 || bootstrap_ownership_status=$?\n"
+        ),
+    )
+    for command_block in bootstrap_ownership_command_blocks:
+        if linux_lifecycle_job.count(command_block) != 1:
+            raise ReleaseError(
+                "credential-free package workflow must run both exact causal Script/bootstrap "
+                "regression commands once in each native Jammy lifecycle lane"
+            )
+    bootstrap_ownership_status_initialization = (
+        "          bootstrap_ownership_status=0\n"
+        "          set +e\n"
+    )
+    if linux_lifecycle_job.count(bootstrap_ownership_status_initialization) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must collect both causal Script/bootstrap command "
+            "statuses before evaluating their exact result census"
+        )
+    bootstrap_ownership_failure_control = (
+        "          set -e\n"
+        "          if (( bootstrap_ownership_status != 0 )); then\n"
+        "            cat \"$bootstrap_ownership_log\"\n"
+        "            rm -f -- \"$bootstrap_ownership_log\"\n"
+        "            exit \"$bootstrap_ownership_status\"\n"
+        "          fi\n"
+    )
+    if linux_lifecycle_job.count(bootstrap_ownership_failure_control) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must reject either causal Script/bootstrap "
+            "regression failure before the result census"
+        )
+    bootstrap_ownership_log_marker = (
+        '          bootstrap_ownership_log="$RUNNER_TEMP/stasis-lifecycle-${{ matrix.lane }}-script-bootstrap-ownership.log"\n'
+    )
+    if linux_lifecycle_job.count(bootstrap_ownership_log_marker) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must retain one lane-local causal "
+            "Script/bootstrap ownership log"
+        )
+    bootstrap_ownership_expected_record_block = (
+        "          expected_bootstrap_ownership_records=(\n"
+        "            'test event_loop::script_thread::controlled_input_tests::stale_source_drive_defers_spawn_for_exact_replacement_bootstrap ... ok'\n"
+        "            'test tests::indeterminate_drive_with_exact_replacement_still_bootstraps ... ok'\n"
+        "          )\n"
+    )
+    if linux_lifecycle_job.count(bootstrap_ownership_expected_record_block) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must bind the exact two distinct causal "
+            "Script/bootstrap ownership regression records"
+        )
+    bootstrap_ownership_population_gate = (
+        "          test \"${#expected_bootstrap_ownership_records[@]}\" = '2'\n"
+        "          test \"$(printf '%s\\n' \"${expected_bootstrap_ownership_records[@]}\" | LC_ALL=C sort -u | awk 'END { print NR }')\" = '2'\n"
+        "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$bootstrap_ownership_log\")\" = '2'\n"
+        "          for test_record in \"${expected_bootstrap_ownership_records[@]}\"; do\n"
+        "            test \"$(grep -Fxc \"$test_record\" \"$bootstrap_ownership_log\")\" = '1'\n"
+        "          done\n"
+    )
+    if linux_lifecycle_job.count(bootstrap_ownership_population_gate) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must prove exactly the two named causal "
+            "Script/bootstrap records and no additional passing test record"
+        )
+
+    downstream_retirement_command_blocks = (
         (
             "          cargo test --locked --profile production-stripped \\\n"
             "            -p stasis-shell -p servo-paint-api --lib \\\n"
@@ -6165,22 +6353,22 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "            -- --test-threads=1 --show-output >> \"$retirement_log\" 2>&1 || retirement_status=$?\n"
         ),
     )
-    for command_block in paint_retirement_command_blocks:
+    for command_block in downstream_retirement_command_blocks:
         if linux_lifecycle_job.count(command_block) != 1:
             raise ReleaseError(
-                "credential-free package workflow must run every causal Paint-retirement "
-                "regression command exactly once in each native Jammy lifecycle lane"
+                "credential-free package workflow must run every downstream Paint/WebRender "
+                "guard command exactly once in each native Jammy lifecycle lane"
             )
-    paint_retirement_status_initialization = (
+    downstream_retirement_status_initialization = (
         "          retirement_status=0\n"
         "          set +e\n"
     )
-    if linux_lifecycle_job.count(paint_retirement_status_initialization) != 1:
+    if linux_lifecycle_job.count(downstream_retirement_status_initialization) != 1:
         raise ReleaseError(
-            "credential-free package workflow must collect every causal Paint-retirement "
-            "command status before evaluating the exact result census"
+            "credential-free package workflow must collect every downstream Paint/WebRender "
+            "guard status before evaluating the exact result census"
         )
-    paint_retirement_failure_control = (
+    downstream_retirement_failure_control = (
         "          set -e\n"
         "          if (( retirement_status != 0 )); then\n"
         "            cat \"$retirement_log\"\n"
@@ -6188,20 +6376,20 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "            exit \"$retirement_status\"\n"
         "          fi\n"
     )
-    if linux_lifecycle_job.count(paint_retirement_failure_control) != 1:
+    if linux_lifecycle_job.count(downstream_retirement_failure_control) != 1:
         raise ReleaseError(
             "credential-free package workflow must restore fail-fast behavior and reject a "
-            "nonzero causal Paint-retirement command status before the result census"
+            "nonzero downstream Paint/WebRender guard status before the result census"
         )
-    paint_retirement_log_marker = (
+    downstream_retirement_log_marker = (
         '          retirement_log="$RUNNER_TEMP/stasis-lifecycle-${{ matrix.lane }}-paint-retirement.log"\n'
     )
-    if linux_lifecycle_job.count(paint_retirement_log_marker) != 1:
+    if linux_lifecycle_job.count(downstream_retirement_log_marker) != 1:
         raise ReleaseError(
-            "credential-free package workflow must retain one lane-local causal "
-            "Paint-retirement log"
+            "credential-free package workflow must retain one lane-local downstream "
+            "Paint/WebRender guard log"
         )
-    paint_retirement_expected_record_block = (
+    downstream_retirement_expected_record_block = (
         "          expected_retirement_records=(\n"
         "            'test paint_proxy_tests::checked_send_reports_a_closed_paint_queue ... ok'\n"
         "            'test constellation::deferred_replacement_activation_tests::classifies_only_the_correlated_source_and_replacement_exits ... ok'\n"
@@ -6227,12 +6415,12 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "            'test event_loop::script_thread::pipeline_exit_paint_marker_tests::script_marker_is_published_before_logical_pipeline_exit ... ok'\n"
         "          )\n"
     )
-    if linux_lifecycle_job.count(paint_retirement_expected_record_block) != 1:
+    if linux_lifecycle_job.count(downstream_retirement_expected_record_block) != 1:
         raise ReleaseError(
-            "credential-free package workflow must bind the exact 22 distinct causal "
-            "Paint-retirement and vendored WebRender regression records"
+            "credential-free package workflow must bind the exact 22 distinct downstream "
+            "Paint-retirement and vendored WebRender guard records"
         )
-    paint_retirement_population_gate = (
+    downstream_retirement_population_gate = (
         "          test \"${#expected_retirement_records[@]}\" = '22'\n"
         "          test \"$(printf '%s\\n' \"${expected_retirement_records[@]}\" | LC_ALL=C sort -u | awk 'END { print NR }')\" = '22'\n"
         "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$retirement_log\")\" = '22'\n"
@@ -6240,10 +6428,10 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         "            test \"$(grep -Fxc \"$test_record\" \"$retirement_log\")\" = '1'\n"
         "          done\n"
     )
-    if linux_lifecycle_job.count(paint_retirement_population_gate) != 1:
+    if linux_lifecycle_job.count(downstream_retirement_population_gate) != 1:
         raise ReleaseError(
-            "credential-free package workflow must prove exactly the 22 named causal "
-            "Paint-retirement regression records and no additional passing test record"
+            "credential-free package workflow must prove exactly the 22 named downstream "
+            "Paint/WebRender guard records and no additional passing test record"
         )
     linux_pkg_config_isolation = (
         "          unset PKG_CONFIG_PATH\n"
@@ -6301,6 +6489,14 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         )
     windows_cargo_test_gate_invocations = (
         ("stasis-library-invariants", "stasisLibTestCommand"),
+        (
+            "controlled-bootstrap-ownership",
+            "controlledBootstrapOwnershipTestCommand",
+        ),
+        (
+            "indeterminate-replacement-bootstrap",
+            "indeterminateReplacementBootstrapTestCommand",
+        ),
         ("controlled-image-capacity", "controlledImageCapacityTestCommand"),
         (
             "controlled-document-control-disconnect",
@@ -6336,6 +6532,53 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         raise ReleaseError(
             "credential-free package workflow must contain exactly the shared Windows invariant "
             "gate definition and its named invocations"
+        )
+    windows_controlled_bootstrap_ownership_gate = (
+        "& cargo test --locked --profile production-stripped -p stasis-shell "
+        "-p servo-script --lib ' +\n"
+        "            'event_loop::script_thread::controlled_input_tests::"
+        "stale_source_drive_defers_spawn_for_exact_replacement_bootstrap ' +\n"
+        "            '-- --exact --test-threads=1 --show-output; exit $LASTEXITCODE'\n"
+    )
+    if public_release_workflow.count(windows_controlled_bootstrap_ownership_gate) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must run the exact Script SpawnPipeline ownership "
+            "regression once in the Stasis release feature graph on Windows"
+        )
+    windows_controlled_bootstrap_ownership_result_gate = (
+        "          Invoke-WindowsCargoTestGate -Name 'controlled-bootstrap-ownership' `\n"
+        "            -Command $controlledBootstrapOwnershipTestCommand `\n"
+        "            -ExpectedPassCount 1 `\n"
+        "            -ExpectedRecordPattern '^test event_loop::script_thread::"
+        "controlled_input_tests::stale_source_drive_defers_spawn_for_exact_replacement_bootstrap "
+        "\\.\\.\\. ok$'\n"
+    )
+    if public_release_workflow.count(windows_controlled_bootstrap_ownership_result_gate) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must require the exact one-test Windows Script "
+            "SpawnPipeline ownership result"
+        )
+    windows_indeterminate_replacement_bootstrap_gate = (
+        "& cargo test --locked --profile production-stripped -p stasis-shell --bin stasis ' +\n"
+        "            'tests::indeterminate_drive_with_exact_replacement_still_bootstraps ' +\n"
+        "            '-- --exact --test-threads=1 --show-output; exit $LASTEXITCODE'\n"
+    )
+    if public_release_workflow.count(windows_indeterminate_replacement_bootstrap_gate) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must run the exact shell replacement-bootstrap "
+            "recovery regression once on Windows"
+        )
+    windows_indeterminate_replacement_bootstrap_result_gate = (
+        "          Invoke-WindowsCargoTestGate -Name 'indeterminate-replacement-bootstrap' `\n"
+        "            -Command $indeterminateReplacementBootstrapTestCommand `\n"
+        "            -ExpectedPassCount 1 `\n"
+        "            -ExpectedRecordPattern '^test "
+        "tests::indeterminate_drive_with_exact_replacement_still_bootstraps \\.\\.\\. ok$'\n"
+    )
+    if public_release_workflow.count(windows_indeterminate_replacement_bootstrap_result_gate) != 1:
+        raise ReleaseError(
+            "credential-free package workflow must require the exact one-test Windows shell "
+            "replacement-bootstrap recovery result"
         )
     windows_stasis_lib_gate = (
         "& cargo test --locked --profile production-stripped -p stasis-shell --lib ' +\n"
@@ -6772,6 +7015,10 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     )
     if package_v2_css_verifier != publish_v2_css_verifier:
         raise ReleaseError("credential-free package and npm-publish v2 CSS verifiers diverged")
+    verify_controlled_replacement_bootstrap_ownership_source(
+        controlled_image_script_thread_source,
+        controlled_session_shell_source,
+    )
     verify_message_port_router_source(message_limits_source)
     verify_controlled_local_pending_projection_source(message_limits_source)
     verify_controlled_local_fifo_source(message_limits_source)
@@ -8196,6 +8443,78 @@ def self_test() -> None:
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
             "          cargo test --locked --profile production-stripped \\\n"
+            "            -p stasis-shell -p servo-script --lib \\\n"
+            "            event_loop::script_thread::controlled_input_tests::stale_source_drive_defers_spawn_for_exact_replacement_bootstrap \\\n"
+            "            -- --exact --test-threads=1 --show-output >> \"$bootstrap_ownership_log\" 2>&1 || bootstrap_ownership_status=$?\n",
+            "          cargo test --locked --profile production-stripped \\\n"
+            "            -p servo-script --lib \\\n"
+            "            event_loop::script_thread::controlled_input_tests::stale_source_drive_defers_spawn_for_exact_replacement_bootstrap \\\n"
+            "            -- --exact --test-threads=1 --show-output >> \"$bootstrap_ownership_log\" 2>&1 || bootstrap_ownership_status=$?\n",
+            "native Jammy exact Script SpawnPipeline ownership command and feature graph",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          cargo test --locked --profile production-stripped \\\n"
+            "            -p stasis-shell --bin stasis \\\n"
+            "            tests::indeterminate_drive_with_exact_replacement_still_bootstraps \\\n"
+            "            -- --exact --test-threads=1 --show-output >> \"$bootstrap_ownership_log\" 2>&1 || bootstrap_ownership_status=$?\n",
+            "          cargo test --locked --profile production-stripped \\\n"
+            "            -p stasis-shell --bin stasis \\\n"
+            "            tests::indeterminate_drive_with_exact_replacement_bootstraps \\\n"
+            "            -- --exact --test-threads=1 --show-output >> \"$bootstrap_ownership_log\" 2>&1 || bootstrap_ownership_status=$?\n",
+            "native Jammy exact shell replacement-bootstrap recovery command",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "            'test event_loop::script_thread::controlled_input_tests::stale_source_drive_defers_spawn_for_exact_replacement_bootstrap ... ok'\n",
+            "            'test event_loop::script_thread::controlled_input_tests::replacement_bootstrap_selects_exact_spawn_through_ordinary_backlog ... ok'\n",
+            "native Jammy exact Script SpawnPipeline ownership record",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "            'test tests::indeterminate_drive_with_exact_replacement_still_bootstraps ... ok'\n",
+            "            'test tests::indeterminate_drive_authority_near_miss_remains_fatal ... ok'\n",
+            "native Jammy exact shell replacement-bootstrap recovery record",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$bootstrap_ownership_log\")\" = '2'\n",
+            "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$bootstrap_ownership_log\")\" = '1'\n",
+            "native Jammy causal Script/bootstrap exact two-record census",
+        )
+        require_public_marker_mutation_rejected(
+            CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE,
+            "!matches!(event, ReplacementPipelineBootstrapQueuedEvent::Spawn(_))",
+            "matches!(event, ReplacementPipelineBootstrapQueuedEvent::Spawn(_))",
+            "production Script SpawnPipeline drive exclusion",
+        )
+        require_public_marker_mutation_rejected(
+            CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE,
+            "match controlled_drive_event_disposition(&input.ready)",
+            "match ControlledDriveEventDisposition::Ready(next_controlled_turn_event(&input.ready))",
+            "production Script controlled-drive disposition seam",
+        )
+        require_public_marker_mutation_rejected(
+            CONTROLLED_IMAGE_SCRIPT_THREAD_SOURCE,
+            "fn stale_source_drive_defers_spawn_for_exact_replacement_bootstrap() {",
+            "fn stale_source_drive_consumes_spawn_before_replacement_bootstrap() {",
+            "Script SpawnPipeline ownership regression definition",
+        )
+        require_public_marker_mutation_rejected(
+            CONTROLLED_SESSION_SHELL_SOURCE,
+            "fn indeterminate_drive_with_exact_replacement_still_bootstraps() {",
+            "fn indeterminate_drive_with_exact_replacement_stays_indeterminate() {",
+            "shell exact-replacement bootstrap recovery regression definition",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "census remains downstream guard evidence; it is not root-cause evidence",
+            "census remains downstream guard evidence; it is the root-cause evidence",
+            "generated release body causal Script versus downstream Paint boundary",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          cargo test --locked --profile production-stripped \\\n"
             "            -p stasis-shell -p servo-paint --lib \\\n"
             "            pipeline_retirement_transaction_tests \\\n"
             "            -- --test-threads=1 --show-output >> \"$retirement_log\" 2>&1 || retirement_status=$?\n",
@@ -8203,7 +8522,7 @@ def self_test() -> None:
             "            -p stasis-shell -p servo-paint --lib \\\n"
             "            pipeline_retirement_transaction_test \\\n"
             "            -- --test-threads=1 --show-output >> \"$retirement_log\" 2>&1 || retirement_status=$?\n",
-            "native Jammy causal WebRender-retirement transaction-test command",
+            "native Jammy downstream WebRender-retirement transaction-test command",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
@@ -8215,7 +8534,7 @@ def self_test() -> None:
             PUBLIC_RELEASE_WORKFLOW,
             "            'test painter::pipeline_retirement_transaction_tests::frame_built_only_queues_paint_and_success_waits_for_exact_renderer_removal ... ok'\n",
             "            'test painter::pipeline_retirement_transaction_tests::dropped_or_unexpected_notification_is_a_paint_local_typed_failure ... ok'\n",
-            "native Jammy causal WebRender-retirement distinct named records",
+            "native Jammy downstream WebRender-retirement distinct named records",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
@@ -8223,19 +8542,19 @@ def self_test() -> None:
             "          if (( retirement_status != 0 )); then\n",
             "          set +e\n"
             "          if (( retirement_status != 0 )); then\n",
-            "native Jammy causal Paint-retirement fail-fast restoration",
+            "native Jammy downstream Paint-retirement fail-fast restoration",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
             "            'test constellation::deferred_replacement_activation_tests::paint_retirement_delivery_failure_is_a_one_shot_terminal_action ... ok'\n",
             "            'test constellation::deferred_replacement_activation_tests::classifies_only_the_correlated_source_and_replacement_exits ... ok'\n",
-            "native Jammy causal Paint-retirement distinct named records",
+            "native Jammy downstream Paint-retirement distinct named records",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
             "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$retirement_log\")\" = '22'\n",
             "          test \"$(grep -Ec '^test .* \\.\\.\\. ok$' \"$retirement_log\")\" = '21'\n",
-            "native Jammy causal Paint-retirement exact test population",
+            "native Jammy downstream Paint-retirement exact test population",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,
@@ -8259,6 +8578,46 @@ def self_test() -> None:
             "& cargo test --locked --profile production-stripped -p stasis-shell --lib ' +\n"
             "            'stdio::platform::tests -- --test-threads=1 --show-output; exit $LASTEXITCODE'",
             "Windows complete Stasis library invariant gate",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "& cargo test --locked --profile production-stripped -p stasis-shell -p servo-script --lib ' +\n"
+            "            'event_loop::script_thread::controlled_input_tests::stale_source_drive_defers_spawn_for_exact_replacement_bootstrap ' +",
+            "& cargo test --locked --profile production-stripped -p servo-script --lib ' +\n"
+            "            'event_loop::script_thread::controlled_input_tests::stale_source_drive_defers_spawn_for_exact_replacement_bootstrap ' +",
+            "Windows Script SpawnPipeline ownership command feature graph",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          Invoke-WindowsCargoTestGate -Name 'controlled-bootstrap-ownership' `\n"
+            "            -Command $controlledBootstrapOwnershipTestCommand `\n"
+            "            -ExpectedPassCount 1 `\n"
+            "            -ExpectedRecordPattern '^test event_loop::script_thread::controlled_input_tests::stale_source_drive_defers_spawn_for_exact_replacement_bootstrap \\.\\.\\. ok$'",
+            "          Invoke-WindowsCargoTestGate -Name 'controlled-bootstrap-ownership' `\n"
+            "            -Command $controlledBootstrapOwnershipTestCommand `\n"
+            "            -ExpectedPassCount 2 `\n"
+            "            -ExpectedRecordPattern '^test event_loop::script_thread::controlled_input_tests::stale_source_drive_defers_spawn_for_exact_replacement_bootstrap \\.\\.\\. ok$'",
+            "Windows Script SpawnPipeline ownership exact one-record result gate",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "& cargo test --locked --profile production-stripped -p stasis-shell --bin stasis ' +\n"
+            "            'tests::indeterminate_drive_with_exact_replacement_still_bootstraps ' +",
+            "& cargo test --locked --profile production-stripped -p stasis-shell --bin stasis ' +\n"
+            "            'tests::indeterminate_drive_authority_near_miss_remains_fatal ' +",
+            "Windows shell replacement-bootstrap recovery command",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_RELEASE_WORKFLOW,
+            "          Invoke-WindowsCargoTestGate -Name 'indeterminate-replacement-bootstrap' `\n"
+            "            -Command $indeterminateReplacementBootstrapTestCommand `\n"
+            "            -ExpectedPassCount 1 `\n"
+            "            -ExpectedRecordPattern '^test tests::indeterminate_drive_with_exact_replacement_still_bootstraps \\.\\.\\. ok$'",
+            "          Invoke-WindowsCargoTestGate -Name 'indeterminate-replacement-bootstrap' `\n"
+            "            -Command $indeterminateReplacementBootstrapTestCommand `\n"
+            "            -ExpectedPassCount 1 `\n"
+            "            -ExpectedRecordPattern '^test tests::indeterminate_drive_authority_near_miss_remains_fatal \\.\\.\\. ok$'",
+            "Windows shell replacement-bootstrap recovery exact record gate",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_RELEASE_WORKFLOW,

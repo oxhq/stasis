@@ -278,17 +278,30 @@ Linux-only failure.
 
 On package runs, the independent Windows CI-only job must also succeed before
 the main-push package outputs can be attested. Its ZIP and logs remain
-diagnostic CI artifacts and are not inputs to the stable release attestation.
+diagnostic CI artifacts and are not inputs to the stable release attestation. It
+nevertheless runs the same exact Script queue-ownership and shell recovery
+regressions through the shipped Stasis cfg/feature graph.
 
 Two independent native Ubuntu 22.04 lanes build the exact event revision and
 each require 150 fresh single-close Stasis processes without retries. One lane
 enables the fixed-vocabulary lifecycle trace and the other explicitly removes
 it, so tracing cannot mask or create the result. Before stressing the product,
-both lanes run the deterministic physical-ownership regressions and the real
-source-binary ordering oracle: WebRender's synchronous shutdown acknowledgement
-must precede joins of its backend/scene threads and custom Rayon workers, and
-those joins must precede renderer deinitialization and rendering-context
-destruction. A successful rerun cannot substitute for these first-attempt gates.
+both lanes run an exact two-record causal census. The Script regression proves a
+source-bound `DriveOneTurn` cannot consume the replacement's sole queued
+`SpawnPipeline`; that event remains owned by the exact
+`BootstrapReplacementPipeline` command. The shell regression proves an
+indeterminate source drive reobserves an admitted exact replacement and submits
+that bootstrap command. This is the v0.3.3 correction for the hosted lifecycle
+failure: the race was at Script's ordinary-input ownership boundary, before
+Paint or WebRender retirement began.
+
+The existing exact 22-record Paint/WebRender retirement census remains unchanged
+in each lane as downstream guard evidence. The real source-binary ordering oracle
+still requires WebRender's synchronous shutdown acknowledgement to precede joins
+of its backend/scene threads and custom Rayon workers, and those joins to precede
+renderer deinitialization and rendering-context destruction. Neither the
+downstream census nor a successful rerun substitutes for the causal two-record
+proof and fresh first-attempt stress gates.
 A full package-workflow rerun fails validation, and promotion independently
 requires the selected package run's overall attempt to be `1`. Therefore,
 partial-job reruns have no release authority; after any package failure,
