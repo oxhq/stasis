@@ -11,7 +11,7 @@ import { parseArgs } from "node:util";
 export const SCHEMA = "stasis-v0.3.2-macos-phase-probe-patch-v1";
 export const EXACT_BASE_REVISION = "b3d1ac949d341dc6bbe1244162441d9bb8adb00a";
 export const EXACT_PATCH_SHA256 =
-  "1849dd1424bdbc22bdd37cb36c5511f168c9529fb522b091b3f9cdbff0588163";
+  "d0a60c71c4a714f0d533f251c4ea1134f938c8cdf1e7e3d4e44c70a3dc93530a";
 
 const EXACT_PHASES = Object.freeze([
   "script_paint_exit_marker_enqueued",

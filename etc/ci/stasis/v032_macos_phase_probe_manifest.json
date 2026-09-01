@@ -2,8 +2,8 @@
   "schema": "stasis-v0.3.2-macos-phase-probe-patch-v1",
   "baseRevision": "b3d1ac949d341dc6bbe1244162441d9bb8adb00a",
   "baseTree": "a9143388d4269c5d3849be739454b55c313e534e",
-  "patchedTree": "978d649c8508ddf595c3c9c15f819100555e4cdf",
-  "patchSha256": "1849dd1424bdbc22bdd37cb36c5511f168c9529fb522b091b3f9cdbff0588163",
+  "patchedTree": "6a7dc5319118ba69646fcab0cb582443d01aa260",
+  "patchSha256": "d0a60c71c4a714f0d533f251c4ea1134f938c8cdf1e7e3d4e44c70a3dc93530a",
   "rustToolchainBlob": "45cf18f72c6e52e7faa6d40ec4127da83cfabc05",
   "cargoLockBlob": "95c72117c8f6e5e681c477cac21e65b6d4efa28e",
   "files": [
@@ -15,7 +15,7 @@
     {
       "path": "components/paint/paint.rs",
       "baseBlob": "33e01c634753c5ecc695f3a5ba8cc97c1c43e952",
-      "patchedBlob": "b28f8e59b6119220bb2e334614e297e43406708b"
+      "patchedBlob": "42cd2206c78ea41b1d8b1da5abf7125b7ace195b"
     },
     {
       "path": "components/servo/servo.rs",

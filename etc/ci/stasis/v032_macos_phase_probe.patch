@@ -13,9 +13,20 @@ index 63b7d1b4e816b54742f27f276ecbcb8b5f0145d6..83fc3e5f7daed5924b9c0331a94ebb99
          // Clean up any registered interests for this pipeline.
          self.pipeline_interests.retain(|_, set| {
 diff --git a/components/paint/paint.rs b/components/paint/paint.rs
-index 33e01c634753c5ecc695f3a5ba8cc97c1c43e952..b28f8e59b6119220bb2e334614e297e43406708b 100644
+index 33e01c634753c5ecc695f3a5ba8cc97c1c43e952..42cd2206c78ea41b1d8b1da5abf7125b7ace195b 100644
 --- a/components/paint/paint.rs
 +++ b/components/paint/paint.rs
+@@ -26,8 +26,8 @@ use log::warn;
+ use paint_api::rendering_context::RenderingContext;
+ use paint_api::{
+     PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
+-    PipelineExitMarkerStatus, PipelineRetirementStatus, WebRenderExternalImageIdManager,
+-    WebViewTrait,
++    PipelineExitMarkerStatus, PipelineExitSource, PipelineRetirementStatus,
++    WebRenderExternalImageIdManager, WebViewTrait,
+ };
+ use profile_traits::mem::{
+     ProcessReports, ProfilerRegistration, Report, ReportKind, perform_memory_report,
 @@ -517,6 +517,25 @@ impl Paint {
      fn handle_browser_message(&self, msg: PaintMessage) {
          trace_msg_from_constellation!(msg, "{msg:?}");
