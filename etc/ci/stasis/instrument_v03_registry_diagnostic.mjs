@@ -39,6 +39,38 @@ const STASIS_V03_DIAGNOSTIC_STACK_SAMPLE_DURATION_SECONDS =
   ${DIAGNOSTIC_STACK_SAMPLE_DURATION_LITERAL};
 const STASIS_V03_DIAGNOSTIC_STACK_SAMPLE_TIMEOUT_MS =
   ${DIAGNOSTIC_STACK_SAMPLE_TIMEOUT_LITERAL};
+const STASIS_V03_PHASE_PROBE_PHASES = new Set([
+  "script_paint_exit_marker_enqueued",
+  "constellation_paint_exit_marker_enqueued",
+  "paint_script_exit_marker_received",
+  "paint_constellation_exit_marker_received",
+  "paint_pipeline_retirement_checkpoint_received",
+  "shell_servo_pump_suppressed_authority_bracket",
+  "shell_servo_pump_suppressed_other",
+  "paint_pipeline_retirement_owners_observed",
+  "painter_webrender_retirement_send_begin",
+  "painter_webrender_retirement_frame_built_queued",
+  "painter_renderer_retirement_removal_consumed",
+  "painter_webrender_retirement_transaction_failed",
+  "constellation_paint_retirement_callback_observed",
+  "controlled_replacement_reroute_begin",
+]);
+
+function stasisV03DiagnosticLifecycleEvidence(runtime) {
+  const stderrTail = runtime.stderrTail;
+  assert.equal(typeof stderrTail, "string");
+  const phases = [];
+  for (const line of stderrTail.split(/\\r?\\n/u)) {
+    if (!line.startsWith("stasis_lifecycle_v1 ")) continue;
+    const match = /^stasis_lifecycle_v1 phase=([a-z_]+)$/u.exec(line);
+    assert.ok(match !== null, "native lifecycle trace contains a malformed phase line");
+    if (STASIS_V03_PHASE_PROBE_PHASES.has(match[1])) phases.push(match[1]);
+  }
+  return {
+    nativeLifecyclePhases: phases,
+    nativeLifecyclePhaseCount: phases.length,
+  };
+}
 
 function stasisV03DiagnosticRecord(
   kind,
@@ -238,6 +270,12 @@ async function stasisV03DiagnosticSettle(
     const result = await settle();
     clearTimeout(stackSampleTimer);
     if (stackSamplePromise !== undefined) await stackSamplePromise;
+    stasisV03DiagnosticRecord("settle-complete", phase, processOrdinal, {
+      processPid,
+      expectedMethod: "runtime.settle",
+      expectedRequestId: "5",
+      ...stasisV03DiagnosticLifecycleEvidence(runtime),
+    });
     return result;
   } catch (error) {
     clearTimeout(stackSampleTimer);
@@ -250,6 +288,7 @@ async function stasisV03DiagnosticSettle(
         processPid,
         expectedMethod: "runtime.settle",
         expectedRequestId: "5",
+        ...stasisV03DiagnosticLifecycleEvidence(runtime),
       },
       error,
     );
@@ -390,6 +429,14 @@ export function instrumentExactV03Verifier(source) {
     1,
   );
   assert.equal((instrumented.match(/commandTimeoutMs:/gu) ?? []).length, 0);
+  assert.equal(
+    (instrumented.match(/stasisV03DiagnosticLifecycleEvidence\(/gu) ?? []).length,
+    3,
+  );
+  assert.equal(
+    (instrumented.match(/"settle-complete"/gu) ?? []).length,
+    1,
+  );
   return instrumented;
 }
 
@@ -426,6 +473,7 @@ async function main() {
       closeTimeoutMs: 30_000,
       exactVerifierTimeoutsPreserved: true,
       nativeLifecycleTrace: true,
+      nativePhaseCensus: true,
       stackSampleDelayMs: DIAGNOSTIC_STACK_SAMPLE_DELAY_MS,
       stackSampleDurationSeconds: DIAGNOSTIC_STACK_SAMPLE_DURATION_SECONDS,
       stackSampleIntervalMilliseconds: 1,

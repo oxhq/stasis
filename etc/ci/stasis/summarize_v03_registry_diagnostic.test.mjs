@@ -102,6 +102,19 @@ test("classifies completed and both request-5 timeout candidates without gate au
       requestId: "5",
       reasonName: "TimeoutError",
       stderrTailBytes: 0,
+      nativeLifecyclePhases: [
+        "script_paint_exit_marker_enqueued",
+        "constellation_paint_exit_marker_enqueued",
+        "shell_servo_pump_suppressed_authority_bracket",
+      ],
+      nativeLifecyclePhaseCount: 3,
+    });
+    const complete = (processPid, phases = []) => ({
+      processPid,
+      expectedMethod: "runtime.settle",
+      expectedRequestId: "5",
+      nativeLifecyclePhases: phases,
+      nativeLifecyclePhaseCount: phases.length,
     });
     const cssCapture = await writeStackCapture(
       directory,
@@ -120,7 +133,23 @@ test("classifies completed and both request-5 timeout candidates without gate au
     await Promise.all([
       writeFile(
         join(directory, "sample-001.log"),
-        "",
+        [
+          record(1, "settle-complete", "css-post-start-settle", 3, complete(301)),
+          record(
+            1,
+            "settle-complete",
+            "cookie-post-submit-settle",
+            4,
+            complete(401, [
+              "script_paint_exit_marker_enqueued",
+              "constellation_paint_exit_marker_enqueued",
+              "paint_script_exit_marker_received",
+              "paint_constellation_exit_marker_received",
+              "paint_pipeline_retirement_owners_observed",
+              "paint_pipeline_retirement_checkpoint_received",
+            ]),
+          ),
+        ].join("\n"),
       ),
       writeFile(join(directory, "sample-001.status"), "0\n"),
       writeFile(
@@ -141,6 +170,7 @@ test("classifies completed and both request-5 timeout candidates without gate au
       writeFile(
         join(directory, "sample-003.log"),
         [
+          record(3, "settle-complete", "css-post-start-settle", 3, complete(303)),
           record(3, "stack-sample-begin", "cookie-post-submit-settle", 4, cookieCapture.begin),
           record(3, "stack-sample-end", "cookie-post-submit-settle", 4, cookieCapture.end),
           record(
@@ -172,7 +202,15 @@ test("classifies completed and both request-5 timeout candidates without gate au
       summary.samples.map(({ classification }) => classification),
       ["completed", "css_request_5_timeout", "cookie_request_5_timeout"],
     );
-    assert.deepEqual(summary.samples[0].phaseRecords, []);
+    assert.equal(summary.samples[0].phaseRecords.length, 2);
+    assert.deepEqual(
+      summary.samples.map(({ nativeBoundaryClassification }) => nativeBoundaryClassification),
+      [
+        "retirement_checkpoint_received",
+        "paint_queue_starved_under_authority_suppression",
+        "paint_queue_starved_under_authority_suppression",
+      ],
+    );
     assert.deepEqual(
       summary.samples.slice(1).map(({ phaseRecords }) =>
         phaseRecords.filter(({ kind }) => kind === "error").length,
@@ -209,6 +247,8 @@ test("refuses timeout attribution without exact successful hash-bound stack evid
       requestId: "5",
       reasonName: "TimeoutError",
       stderrTailBytes: 0,
+      nativeLifecyclePhases: ["shell_servo_pump_suppressed_other"],
+      nativeLifecyclePhaseCount: 1,
     });
     const missingNames = stackArtifactNames(1, "cookie-post-submit-settle", 4);
     const validCapture = await writeStackCapture(

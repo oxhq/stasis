@@ -1,0 +1,215 @@
+diff --git a/components/constellation/constellation.rs b/components/constellation/constellation.rs
+index 63b7d1b4e816b54742f27f276ecbcb8b5f0145d6..83fc3e5f7daed5924b9c0331a94ebb99fb854887 100644
+--- a/components/constellation/constellation.rs
++++ b/components/constellation/constellation.rs
+@@ -5235,6 +5235,9 @@ where
+                 retirement_callback,
+                 None,
+             ));
++        if paint_retirement_enqueued {
++            emit_lifecycle_phase(LifecyclePhase::ConstellationPaintExitMarkerEnqueued);
++        }
+ 
+         // Clean up any registered interests for this pipeline.
+         self.pipeline_interests.retain(|_, set| {
+diff --git a/components/paint/paint.rs b/components/paint/paint.rs
+index 33e01c634753c5ecc695f3a5ba8cc97c1c43e952..b28f8e59b6119220bb2e334614e297e43406708b 100644
+--- a/components/paint/paint.rs
++++ b/components/paint/paint.rs
+@@ -517,6 +517,25 @@ impl Paint {
+     fn handle_browser_message(&self, msg: PaintMessage) {
+         trace_msg_from_constellation!(msg, "{msg:?}");
+ 
++        match &msg {
++            PaintMessage::PipelineExited(_, _, source, _, _)
++                if *source == PipelineExitSource::Script =>
++            {
++                emit_lifecycle_phase(LifecyclePhase::PaintScriptExitMarkerReceived);
++            },
++            PaintMessage::PipelineExited(_, _, source, _, _)
++                if *source == PipelineExitSource::Constellation =>
++            {
++                emit_lifecycle_phase(LifecyclePhase::PaintConstellationExitMarkerReceived);
++            },
++            PaintMessage::PipelineRetirementCheckpoint(..) => {
++                emit_lifecycle_phase(
++                    LifecyclePhase::PaintPipelineRetirementCheckpointReceived,
++                );
++            },
++            _ => {},
++        }
++
+         match self.shutdown_state() {
+             ShutdownState::NotShuttingDown => {},
+             ShutdownState::ShuttingDown => {
+diff --git a/components/servo/servo.rs b/components/servo/servo.rs
+index b9d4d3ca33e71fd2117ef9b09f31e1d5c813a067..17b90f169c3ac8fc829f1425e8df42f975d42d29 100644
+--- a/components/servo/servo.rs
++++ b/components/servo/servo.rs
+@@ -36,7 +36,7 @@ use net_traits::{FetchThread, ResourceThreads};
+ use paint::{InitialPaintState, Paint};
+ pub use paint_api::rendering_context::RenderingContext;
+ use paint_api::{
+-    CrossProcessPaintApi, PaintMessage, PaintProxy, PipelineExitMarkerStatus,
++    CrossProcessPaintApi, PaintMessage, PaintProxy, PipelineExitMarkerStatus, PipelineExitSource,
+ };
+ use profile::mem::MemoryProfilerThreadOwner;
+ use profile::{mem as profile_mem, system_reporter, time as profile_time};
+@@ -1796,13 +1796,25 @@ fn create_paint_channel(
+     let event_loop_waker_clone = event_loop_waker.clone();
+     // This callback is equivalent to `PaintProxy::send`
+     let result_callback = move |msg: Result<PaintMessage, ipc_channel::IpcError>| {
+-        if let Err(err) = sender_clone.send(msg) {
+-            if let Ok(message) = &err.0 {
+-                message.send_pipeline_exit_marker_status(
+-                    PipelineExitMarkerStatus::LocalQueueRejected,
+-                );
+-            }
+-            warn!("Failed to send response ({:?}).", err);
++        let is_script_exit_marker = matches!(
++            &msg,
++            Ok(PaintMessage::PipelineExited(_, _, source, _, _))
++                if *source == PipelineExitSource::Script
++        );
++        match sender_clone.send(msg) {
++            Ok(()) => {
++                if is_script_exit_marker {
++                    emit_lifecycle_phase(LifecyclePhase::ScriptPaintExitMarkerEnqueued);
++                }
++            },
++            Err(err) => {
++                if let Ok(message) = &err.0 {
++                    message.send_pipeline_exit_marker_status(
++                        PipelineExitMarkerStatus::LocalQueueRejected,
++                    );
++                }
++                warn!("Failed to send response ({:?}).", err);
++            },
+         }
+         event_loop_waker_clone.wake();
+     };
+diff --git a/components/shared/base/lifecycle_trace.rs b/components/shared/base/lifecycle_trace.rs
+index 3c844301e0f5c664be073234e988adab6e600fb2..7ec21a0fb7961ea7693007ccdec4d6504bc84fcf 100644
+--- a/components/shared/base/lifecycle_trace.rs
++++ b/components/shared/base/lifecycle_trace.rs
+@@ -18,6 +18,13 @@ static LIFECYCLE_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+ /// A fixed phase in the normal Stasis browser-session shutdown lifecycle.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum LifecyclePhase {
++    ScriptPaintExitMarkerEnqueued,
++    ConstellationPaintExitMarkerEnqueued,
++    PaintScriptExitMarkerReceived,
++    PaintConstellationExitMarkerReceived,
++    PaintPipelineRetirementCheckpointReceived,
++    ShellServoPumpSuppressedAuthorityBracket,
++    ShellServoPumpSuppressedOther,
+     PaintPipelineRetirementOwnersObserved,
+     PainterWebRenderRetirementSendBegin,
+     PainterWebRenderRetirementFrameBuiltQueued,
+@@ -119,6 +126,13 @@ pub enum LifecyclePhase {
+ impl LifecyclePhase {
+     /// All v1 phases in their stable vocabulary order.
+     pub const ALL: &'static [Self] = &[
++        Self::ScriptPaintExitMarkerEnqueued,
++        Self::ConstellationPaintExitMarkerEnqueued,
++        Self::PaintScriptExitMarkerReceived,
++        Self::PaintConstellationExitMarkerReceived,
++        Self::PaintPipelineRetirementCheckpointReceived,
++        Self::ShellServoPumpSuppressedAuthorityBracket,
++        Self::ShellServoPumpSuppressedOther,
+         Self::PaintPipelineRetirementOwnersObserved,
+         Self::PainterWebRenderRetirementSendBegin,
+         Self::PainterWebRenderRetirementFrameBuiltQueued,
+@@ -220,6 +234,21 @@ impl LifecyclePhase {
+     /// Return the stable ASCII wire name used by the release diagnostic sanitizer.
+     pub const fn as_str(self) -> &'static str {
+         match self {
++            Self::ScriptPaintExitMarkerEnqueued => "script_paint_exit_marker_enqueued",
++            Self::ConstellationPaintExitMarkerEnqueued => {
++                "constellation_paint_exit_marker_enqueued"
++            },
++            Self::PaintScriptExitMarkerReceived => "paint_script_exit_marker_received",
++            Self::PaintConstellationExitMarkerReceived => {
++                "paint_constellation_exit_marker_received"
++            },
++            Self::PaintPipelineRetirementCheckpointReceived => {
++                "paint_pipeline_retirement_checkpoint_received"
++            },
++            Self::ShellServoPumpSuppressedAuthorityBracket => {
++                "shell_servo_pump_suppressed_authority_bracket"
++            },
++            Self::ShellServoPumpSuppressedOther => "shell_servo_pump_suppressed_other",
+             Self::PaintPipelineRetirementOwnersObserved => {
+                 "paint_pipeline_retirement_owners_observed"
+             },
+@@ -383,6 +412,34 @@ mod tests {
+     #[test]
+     fn physical_pipeline_retirement_phases_have_stable_wire_names() {
+         for (phase, expected) in [
++            (
++                LifecyclePhase::ScriptPaintExitMarkerEnqueued,
++                "script_paint_exit_marker_enqueued",
++            ),
++            (
++                LifecyclePhase::ConstellationPaintExitMarkerEnqueued,
++                "constellation_paint_exit_marker_enqueued",
++            ),
++            (
++                LifecyclePhase::PaintScriptExitMarkerReceived,
++                "paint_script_exit_marker_received",
++            ),
++            (
++                LifecyclePhase::PaintConstellationExitMarkerReceived,
++                "paint_constellation_exit_marker_received",
++            ),
++            (
++                LifecyclePhase::PaintPipelineRetirementCheckpointReceived,
++                "paint_pipeline_retirement_checkpoint_received",
++            ),
++            (
++                LifecyclePhase::ShellServoPumpSuppressedAuthorityBracket,
++                "shell_servo_pump_suppressed_authority_bracket",
++            ),
++            (
++                LifecyclePhase::ShellServoPumpSuppressedOther,
++                "shell_servo_pump_suppressed_other",
++            ),
+             (
+                 LifecyclePhase::PaintPipelineRetirementOwnersObserved,
+                 "paint_pipeline_retirement_owners_observed",
+diff --git a/ports/stasis/src/main.rs b/ports/stasis/src/main.rs
+index 26c4ec5e75c7a78764b07e39bebbe9125545ea04..fcb4d5756a688cb7a7ef86e246d6dab5353b698d 100644
+--- a/ports/stasis/src/main.rs
++++ b/ports/stasis/src/main.rs
+@@ -6119,8 +6119,29 @@ fn should_pump_servo(
+     force_initial_pump: bool,
+     servo_changed: bool,
+ ) -> bool {
+-    !active.is_some_and(|active| active_operation_suppresses_servo_pump(&active.operation)) &&
+-        (force_initial_pump || servo_changed)
++    let pending_pump = force_initial_pump || servo_changed;
++    let suppressed = active
++        .is_some_and(|active| active_operation_suppresses_servo_pump(&active.operation));
++    if pending_pump && suppressed {
++        let phase = if active.is_some_and(|active| {
++            matches!(
++                &active.operation,
++                ActiveOperation::Settle(SettleState {
++                    authority_bound_command: Some(_),
++                    ..
++                }) | ActiveOperation::Settle(SettleState {
++                    authorizing_document_state: Some(_),
++                    ..
++                })
++            )
++        }) {
++            LifecyclePhase::ShellServoPumpSuppressedAuthorityBracket
++        } else {
++            LifecyclePhase::ShellServoPumpSuppressedOther
++        };
++        emit_lifecycle_phase(phase);
++    }
++    !suppressed && pending_pump
+ }
+ 
+ fn active_operation_suppresses_servo_pump(operation: &ActiveOperation) -> bool {

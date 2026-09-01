@@ -22,6 +22,23 @@ const STACK_SAMPLE_DELAY_MS = 10_000;
 const STACK_SAMPLE_DURATION_SECONDS = 5;
 const STACK_SAMPLE_INTERVAL_MILLISECONDS = 1;
 const STACK_SAMPLE_TIMEOUT_MS = 15_000;
+const NATIVE_PHASES = Object.freeze([
+  "script_paint_exit_marker_enqueued",
+  "constellation_paint_exit_marker_enqueued",
+  "paint_script_exit_marker_received",
+  "paint_constellation_exit_marker_received",
+  "paint_pipeline_retirement_checkpoint_received",
+  "shell_servo_pump_suppressed_authority_bracket",
+  "shell_servo_pump_suppressed_other",
+  "paint_pipeline_retirement_owners_observed",
+  "painter_webrender_retirement_send_begin",
+  "painter_webrender_retirement_frame_built_queued",
+  "painter_renderer_retirement_removal_consumed",
+  "painter_webrender_retirement_transaction_failed",
+  "constellation_paint_retirement_callback_observed",
+  "controlled_replacement_reroute_begin",
+]);
+const NATIVE_PHASE_SET = new Set(NATIVE_PHASES);
 
 function phaseRecords(log) {
   const records = [];
@@ -51,6 +68,45 @@ function isCandidateTimeout(record) {
     record.requestId === "5" &&
     record.reasonName === "TimeoutError"
   );
+}
+
+function hasValidNativePhaseEvidence(record, requireNonempty = false) {
+  return (
+    Array.isArray(record?.nativeLifecyclePhases) &&
+    record.nativeLifecyclePhaseCount === record.nativeLifecyclePhases.length &&
+    (!requireNonempty || record.nativeLifecyclePhases.length > 0) &&
+    record.nativeLifecyclePhases.every((phase) => NATIVE_PHASE_SET.has(phase))
+  );
+}
+
+function nativeBoundaryClassification(phases) {
+  const has = (phase) => phases.includes(phase);
+  const bothEnqueued =
+    has("script_paint_exit_marker_enqueued") &&
+    has("constellation_paint_exit_marker_enqueued");
+  const scriptReceived = has("paint_script_exit_marker_received");
+  const constellationReceived = has("paint_constellation_exit_marker_received");
+  const ownersObserved = has("paint_pipeline_retirement_owners_observed");
+  const checkpointReceived = has("paint_pipeline_retirement_checkpoint_received");
+  if (
+    bothEnqueued &&
+    has("shell_servo_pump_suppressed_authority_bracket") &&
+    !scriptReceived &&
+    !constellationReceived &&
+    !ownersObserved &&
+    !checkpointReceived
+  ) {
+    return "paint_queue_starved_under_authority_suppression";
+  }
+  if (bothEnqueued && scriptReceived !== constellationReceived && !ownersObserved) {
+    return "one_paint_owner_marker_received";
+  }
+  if (bothEnqueued && scriptReceived && constellationReceived && !ownersObserved) {
+    return "both_markers_received_without_owner_retirement";
+  }
+  if (ownersObserved && !checkpointReceived) return "retirement_started_before_checkpoint";
+  if (checkpointReceived) return "retirement_checkpoint_received";
+  return "unclassified";
 }
 
 function validProcessPid(value) {
@@ -203,6 +259,8 @@ function compactRecord(record) {
     "samplerErrorCode",
     "stackArtifactBytes",
     "stackArtifactSha256",
+    "nativeLifecyclePhases",
+    "nativeLifecyclePhaseCount",
   ]) {
     if (Object.hasOwn(record, key)) compact[key] = record[key];
   }
@@ -224,6 +282,7 @@ export async function summarizeDiagnosticEvidence(directory, sampleCount) {
     error: 0,
   };
   let validatedTimeoutStackCaptures = 0;
+  const nativePhaseTotals = Object.fromEntries(NATIVE_PHASES.map((phase) => [phase, 0]));
   for (let sample = 1; sample <= sampleCount; sample += 1) {
     const sampleId = String(sample).padStart(3, "0");
     const [log, statusText] = await Promise.all([
@@ -233,6 +292,10 @@ export async function summarizeDiagnosticEvidence(directory, sampleCount) {
     const exitCode = Number(statusText.trim());
     assert.ok(Number.isSafeInteger(exitCode) && exitCode >= 0 && exitCode <= 255);
     const records = phaseRecords(log);
+    for (const record of records) {
+      if (!hasValidNativePhaseEvidence(record)) continue;
+      for (const phase of record.nativeLifecyclePhases) nativePhaseTotals[phase] += 1;
+    }
     const compactRecords = records.map(compactRecord);
     const stackSampleBegins = records.filter(
       (record) => record.kind === "stack-sample-begin",
@@ -252,13 +315,25 @@ export async function summarizeDiagnosticEvidence(directory, sampleCount) {
     stackSampleRecords.end += stackSampleEnds.length;
     stackSampleRecords.error += stackSampleErrors.length;
     const error = records.find((record) => isCandidateTimeout(record));
+    const targetRecords =
+      error === undefined ? [] : records.filter((record) => record.phase === error.phase);
     const attributedTimeout =
       exitCode !== 0 &&
       error !== undefined &&
-      (await hasValidatedStackCapture(directory, sample, records, error));
+      hasValidNativePhaseEvidence(error, true) &&
+      (await hasValidatedStackCapture(directory, sample, targetRecords, error));
     if (attributedTimeout) validatedTimeoutStackCaptures += 1;
     let classification;
-    if (exitCode === 0 && records.length === 0) {
+    const completedSettles = records.filter((record) => record.kind === "settle-complete");
+    const completedSample =
+      exitCode === 0 &&
+      records.length === 2 &&
+      completedSettles.length === 2 &&
+      completedSettles.every((record) =>
+        isProcessIdentified(record) && hasValidNativePhaseEvidence(record)
+      ) &&
+      new Set(completedSettles.map((record) => record.phase)).size === 2;
+    if (completedSample) {
       classification = "completed";
       counts.completed += 1;
     } else if (
@@ -277,7 +352,18 @@ export async function summarizeDiagnosticEvidence(directory, sampleCount) {
       classification = "other_failure";
       counts.otherFailure += 1;
     }
-    samples.push({ sample, exitCode, classification, phaseRecords: compactRecords });
+    const nativeRecord =
+      error ?? completedSettles.find((record) => record.phase === "cookie-post-submit-settle");
+    samples.push({
+      sample,
+      exitCode,
+      classification,
+      nativeBoundaryClassification:
+        nativeRecord === undefined
+          ? "unclassified"
+          : nativeBoundaryClassification(nativeRecord.nativeLifecyclePhases),
+      phaseRecords: compactRecords,
+    });
   }
   return {
     schema: "stasis-v0.3.2-macos-release-event-diagnostic-summary-v2",
@@ -286,6 +372,7 @@ export async function summarizeDiagnosticEvidence(directory, sampleCount) {
     counts,
     stackSampleRecords,
     validatedTimeoutStackCaptures,
+    nativePhaseTotals,
     samples,
   };
 }

@@ -1,0 +1,359 @@
+name: Diagnostic only - Stasis v0.3.2 macOS lifecycle phase probe
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: stasis-v0.3-macos-phase-probe
+  cancel-in-progress: false
+
+env:
+  DIAGNOSTIC_SAMPLE_COUNT: "20"
+  DIAGNOSTIC_STACK_SAMPLE_DELAY_MS: "10000"
+  DIAGNOSTIC_STACK_SAMPLE_DURATION_SECONDS: "5"
+  DIAGNOSTIC_STACK_SAMPLE_TIMEOUT_MS: "15000"
+  EXACT_RELEASE_REVISION: b3d1ac949d341dc6bbe1244162441d9bb8adb00a
+  EXACT_RELEASE_TAG: v0.3.2
+  EXACT_PATCH_SHA256: 1849dd1424bdbc22bdd37cb36c5511f168c9529fb522b091b3f9cdbff0588163
+  EXACT_MANIFEST_SHA256: 0c98ec0a99daa97a241e5a28f72dbf3fa80456d6bcba52565475e4bf2bd3f8e1
+  EXACT_PACKAGE_RUN_ID: "33453628725"
+  EXACT_PACKAGE_RUN_ATTEMPT: "1"
+  EXACT_SDK_ARTIFACT_ID: "9783016642"
+  EXACT_SDK_ARTIFACT_NAME: stasis-typescript-attempt-1
+  EXACT_SDK_ARTIFACT_DIGEST: sha256:721bccacae83e4a415291b5d30a841c839255aeb24d50591ba7b0f3f0ef39637
+  EXACT_SDK_INTEGRITY: sha512-lskKR0p4ME2gClVvf0zYh+Bgz7Q431pIdC/Zf6VChOS4Q3AX33PZTU7S7TJU5tPm1lzIwdSmqcGhAYtqfI26Cw==
+  EXACT_SDK_PROOF_SHA256: afe3a2c5401d04ae8a21fcc2d9adf1344374d02c016f3bcbce1e399b805d2fba
+  EXACT_SDK_SHA256: d7208ca5c6751f16f077a7dd9fc95a6d48d49e9a873b3afbeb205c46b2f5d5c4
+  STASIS_REPOSITORY: https://github.com/oxhq/stasis.git
+  STASIS_REVISION: b3d1ac949d341dc6bbe1244162441d9bb8adb00a
+
+jobs:
+  phase-probe:
+    name: DIAGNOSTIC ONLY - exact-source 20-sample phase census
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      actions: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Reject non-main diagnostic control
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'oxhq/stasis'
+          test "$GITHUB_REF" = 'refs/heads/main'
+          test "$GITHUB_REF_TYPE" = 'branch'
+          test "$GITHUB_REF_NAME" = 'main'
+
+      - name: Check out current-main diagnostic control
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+          path: diagnostic-control
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Check out immutable v0.3.2 source separately
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+          path: release-source
+          persist-credentials: false
+          ref: v0.3.2
+
+      - name: Set up pinned Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: release-source/.python-version
+
+      - name: Set up pinned uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.16"
+          enable-cache: false
+
+      - name: Set up Node without publication credentials
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Bind exact source, patch, tag, and package SDK
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$GITHUB_WORKSPACE/phase-probe-evidence"
+          sdk_root="$RUNNER_TEMP/stasis-v032-package-sdk"
+          patch="$GITHUB_WORKSPACE/diagnostic-control/etc/ci/stasis/v032_macos_phase_probe.patch"
+          manifest="$GITHUB_WORKSPACE/diagnostic-control/etc/ci/stasis/v032_macos_phase_probe_manifest.json"
+          mkdir -p "$evidence" "$sdk_root"
+          test "$(git -C diagnostic-control rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C release-source rev-parse HEAD)" = "$EXACT_RELEASE_REVISION"
+          test "$(shasum -a 256 "$patch" | awk '{print $1}')" = "$EXACT_PATCH_SHA256"
+          test "$(shasum -a 256 "$manifest" | awk '{print $1}')" = "$EXACT_MANIFEST_SHA256"
+          node diagnostic-control/etc/ci/stasis/verify_v032_macos_phase_probe.mjs \
+            --source release-source --patch "$patch" --manifest "$manifest" --state base \
+            | tee "$evidence/source-base.json"
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$EXACT_RELEASE_TAG" \
+            > "$evidence/tag-ref.json"
+          jq -e --arg revision "$EXACT_RELEASE_REVISION" '
+            .object.type == "commit" and .object.sha == $revision
+          ' "$evidence/tag-ref.json" > /dev/null
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$EXACT_PACKAGE_RUN_ID" \
+            > "$evidence/package-run.json"
+          jq -e \
+            --arg runId "$EXACT_PACKAGE_RUN_ID" \
+            --arg runAttempt "$EXACT_PACKAGE_RUN_ATTEMPT" \
+            --arg revision "$EXACT_RELEASE_REVISION" '
+            (.id | tostring) == $runId
+            and (.run_attempt | tostring) == $runAttempt
+            and .head_sha == $revision
+            and .head_branch == "main"
+            and .path == ".github/workflows/stasis-package.yml"
+            and .event == "push"
+            and .status == "completed"
+            and .conclusion == "success"
+          ' "$evidence/package-run.json" > /dev/null
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$EXACT_PACKAGE_RUN_ID/artifacts?per_page=100" \
+            > "$evidence/package-artifacts.json"
+          jq -e \
+            --arg artifactName "$EXACT_SDK_ARTIFACT_NAME" \
+            --arg artifactId "$EXACT_SDK_ARTIFACT_ID" \
+            --arg artifactDigest "$EXACT_SDK_ARTIFACT_DIGEST" \
+            --arg runId "$EXACT_PACKAGE_RUN_ID" \
+            --arg revision "$EXACT_RELEASE_REVISION" '
+            [.artifacts[] | select(.name == $artifactName)] as $matches
+            | ($matches | length) == 1
+              and ($matches[0].id | tostring) == $artifactId
+              and $matches[0].digest == $artifactDigest
+              and $matches[0].expired == false
+              and ($matches[0].workflow_run.id | tostring) == $runId
+              and $matches[0].workflow_run.head_sha == $revision
+          ' "$evidence/package-artifacts.json" > /dev/null
+          gh run download "$EXACT_PACKAGE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$EXACT_SDK_ARTIFACT_NAME" --dir "$sdk_root"
+          expected_sdk_files=$(printf '%s\n' \
+            'oxhq-stasis-0.3.2.tgz' \
+            'stasis-0.3.2-typescript-act-settle-inspect.json' | LC_ALL=C sort)
+          actual_sdk_files=$(find "$sdk_root" -mindepth 1 -maxdepth 1 -type f \
+            -exec basename {} \; | LC_ALL=C sort)
+          test "$actual_sdk_files" = "$expected_sdk_files"
+          sdk_tarball="$sdk_root/oxhq-stasis-0.3.2.tgz"
+          sdk_proof="$sdk_root/stasis-0.3.2-typescript-act-settle-inspect.json"
+          test "$(shasum -a 256 "$sdk_tarball" | awk '{print $1}')" = "$EXACT_SDK_SHA256"
+          test "$(shasum -a 256 "$sdk_proof" | awk '{print $1}')" = "$EXACT_SDK_PROOF_SHA256"
+          sdk_integrity=$(node -e '
+            const crypto = require("node:crypto");
+            const fs = require("node:fs");
+            process.stdout.write("sha512-" + crypto.createHash("sha512")
+              .update(fs.readFileSync(process.argv[1])).digest("base64"));
+          ' "$sdk_tarball")
+          test "$sdk_integrity" = "$EXACT_SDK_INTEGRITY"
+          cp "$patch" "$evidence/v032_macos_phase_probe.patch"
+          cp "$manifest" "$evidence/v032_macos_phase_probe_manifest.json"
+          cp "$sdk_tarball" "$evidence/oxhq-stasis-0.3.2.tgz"
+          cp "$sdk_proof" "$evidence/stasis-0.3.2-typescript-act-settle-inspect.json"
+          {
+            echo "evidence=$evidence"
+            echo "manifest=$manifest"
+            echo "patch=$patch"
+            echo "sdk_tarball=$sdk_tarball"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Apply only the bound diagnostic patch
+        shell: bash
+        env:
+          EVIDENCE: ${{ steps.identity.outputs.evidence }}
+          MANIFEST: ${{ steps.identity.outputs.manifest }}
+          PATCH: ${{ steps.identity.outputs.patch }}
+        run: |
+          set -euo pipefail
+          git -C release-source apply --index --whitespace=error-all "$PATCH"
+          node diagnostic-control/etc/ci/stasis/verify_v032_macos_phase_probe.mjs \
+            --source release-source --patch "$PATCH" --manifest "$MANIFEST" --state patched \
+            | tee "$EVIDENCE/source-patched.json"
+
+      - name: Prepare and measure the ephemeral macOS runner
+        shell: bash
+        working-directory: release-source
+        run: bash etc/ci/stasis/prepare_macos_runner.sh prepare 10485760
+
+      - name: Bootstrap exact-source macOS build dependencies
+        working-directory: release-source
+        run: ./mach bootstrap --yes --skip-lints --skip-nextest
+
+      - name: Bind the native build toolchain
+        shell: bash
+        env:
+          EVIDENCE: ${{ steps.identity.outputs.evidence }}
+          MANIFEST: ${{ steps.identity.outputs.manifest }}
+          PATCH: ${{ steps.identity.outputs.patch }}
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = 'Darwin'
+          test "$(uname -m)" = 'arm64'
+          test "$(sysctl -n hw.optional.arm64)" = '1'
+          rustc_vv=$(rustc -Vv)
+          cargo_vv=$(cargo -Vv)
+          grep -Fx 'rustc 1.97.1 (8bab26f4f 2026-07-14)' <<<"$rustc_vv"
+          grep -Fx 'commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452' <<<"$rustc_vv"
+          grep -Fx 'host: aarch64-apple-darwin' <<<"$rustc_vv"
+          grep -Fx 'release: 1.97.1' <<<"$rustc_vv"
+          grep -Fx 'LLVM version: 22.1.6' <<<"$rustc_vv"
+          grep -Fx 'cargo 1.97.1 (c980f4866 2026-06-30)' <<<"$cargo_vv"
+          grep -Fx 'commit-hash: c980f4866141969fab6254a680546a277789d6f0' <<<"$cargo_vv"
+          grep -Fx 'host: aarch64-apple-darwin' <<<"$cargo_vv"
+          node diagnostic-control/etc/ci/stasis/verify_v032_macos_phase_probe.mjs \
+            --source release-source --patch "$PATCH" --manifest "$MANIFEST" --state patched \
+            > "$EVIDENCE/source-after-bootstrap.json"
+          jq -n \
+            --arg schema 'stasis-v0.3.2-macos-phase-probe-toolchain-v1' \
+            --arg rustc "$rustc_vv" \
+            --arg cargo "$cargo_vv" \
+            --arg rustup "$(rustup show active-toolchain)" \
+            --arg xcode "$(xcodebuild -version)" \
+            --arg clang "$(xcrun clang --version)" \
+            --arg swVers "$(sw_vers)" \
+            --arg uname "$(uname -a)" \
+            '{schema: $schema, rustcVv: $rustc, cargoVv: $cargo,
+              activeToolchain: $rustup, xcode: $xcode, clang: $clang,
+              swVers: $swVers, uname: $uname, releaseGateAuthority: false}' \
+            > "$EVIDENCE/toolchain.json"
+
+      - name: Build the exact-source diagnostic executable once
+        id: build
+        shell: bash
+        working-directory: release-source
+        env:
+          EVIDENCE: ${{ steps.identity.outputs.evidence }}
+        run: |
+          set -euo pipefail
+          cargo test --locked -p servo-base lifecycle_trace::tests -- --test-threads=1
+          cargo build --locked -p stasis-shell --profile production-stripped
+          bash etc/ci/stasis/prepare_macos_runner.sh check 4194304
+          binary="$GITHUB_WORKSPACE/release-source/target/production-stripped/stasis"
+          test -x "$binary"
+          file "$binary" | grep -F 'Mach-O 64-bit executable arm64'
+          binary_sha256=$(shasum -a 256 "$binary" | awk '{print $1}')
+          binary_bytes=$(stat -f '%z' "$binary")
+          binary_uuid=$(dwarfdump --uuid "$binary")
+          jq -n \
+            --arg schema 'stasis-v0.3.2-macos-phase-probe-binary-v1' \
+            --arg sourceRevision "$EXACT_RELEASE_REVISION" \
+            --arg patchSha256 "$EXACT_PATCH_SHA256" \
+            --arg binarySha256 "$binary_sha256" \
+            --argjson binaryBytes "$binary_bytes" \
+            --arg binaryUuid "$binary_uuid" \
+            '{schema: $schema, sourceRevision: $sourceRevision,
+              patchSha256: $patchSha256, binarySha256: $binarySha256,
+              binaryBytes: $binaryBytes, binaryUuid: $binaryUuid,
+              buildCount: 1, releaseGateAuthority: false}' \
+            > "$EVIDENCE/binary.json"
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+
+      - name: Create a diagnostic copy of only the exact tagged verifier
+        id: instrument
+        shell: bash
+        env:
+          EVIDENCE: ${{ steps.identity.outputs.evidence }}
+        run: |
+          set -euo pipefail
+          verifier="$RUNNER_TEMP/verify_registry_sdk.v032-phase-probe.mjs"
+          node diagnostic-control/etc/ci/stasis/instrument_v03_registry_diagnostic.mjs \
+            --input release-source/etc/ci/stasis/verify_registry_sdk.mjs \
+            --output "$verifier" | tee "$EVIDENCE/transform.json"
+          node --check "$verifier"
+          echo "verifier=$verifier" >> "$GITHUB_OUTPUT"
+
+      - name: Run the one predeclared 20-sample phase census
+        shell: bash
+        env:
+          BINARY: ${{ steps.build.outputs.binary }}
+          EVIDENCE: ${{ steps.identity.outputs.evidence }}
+          SDK_TARBALL: ${{ steps.identity.outputs.sdk_tarball }}
+          VERIFIER: ${{ steps.instrument.outputs.verifier }}
+        run: |
+          set -euo pipefail
+          for sample in $(seq 1 "$DIAGNOSTIC_SAMPLE_COUNT"); do
+            sample_id=$(printf '%03d' "$sample")
+            consumer="$RUNNER_TEMP/stasis-v032-phase-consumer-$sample_id"
+            log="$EVIDENCE/sample-$sample_id.log"
+            mkdir "$consumer"
+            set +e
+            (
+              unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_TOKEN
+              cd "$consumer"
+              npm init --yes > /dev/null
+              npm install --ignore-scripts --offline --no-audit --no-fund \
+                "$SDK_TARBALL" > /dev/null
+              cd "$GITHUB_WORKSPACE/release-source"
+              STASIS_V03_DIAGNOSTIC_SAMPLE="$sample" \
+              STASIS_V03_DIAGNOSTIC_EVIDENCE="$EVIDENCE" \
+                node "$VERIFIER" \
+                --binary "$BINARY" \
+                --fixture ports/stasis/tests/fixtures/timer_10s.html \
+                --session-v2-fixture ports/stasis/tests/fixtures/message_channel_buffered.html \
+                --session-v2-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_data_svg.html \
+                --session-v2-http-image-fixture ports/stasis/tests/fixtures/controlled_v2_image_http.html \
+                --session-v2-inline-svg-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg.html \
+                --session-v2-inline-svg-shared-pending-fixture ports/stasis/tests/fixtures/controlled_v2_inline_svg_shared_pending.html \
+                --session-v2-settlement-url-fixture ports/stasis/tests/fixtures/controlled_v2_settlement_url.html \
+                --session-v2-interval-before-finite-fixture ports/stasis/tests/fixtures/controlled_v2_interval_before_finite.html \
+                --session-v2-focus-fixture ports/stasis/tests/fixtures/input_method_focus_timestamp.html \
+                --session-v2-automation-event-fixture ports/stasis/tests/fixtures/controlled_v2_form_event_timestamp.html \
+                --session-v2-css-animation-event-fixture ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html \
+                --session-v2-cookie-fixture sdk/typescript/test/fixtures/controlled-v2-cookie-login.html \
+                --consumer-root "$consumer" \
+                --package "$SDK_TARBALL" \
+                --revision "$EXACT_RELEASE_REVISION" \
+                --version '0.3.2'
+            ) > "$log" 2>&1
+            status=$?
+            set -e
+            printf '%s\n' "$status" > "$EVIDENCE/sample-$sample_id.status"
+            printf 'phase probe sample %s/%s exit=%s\n' \
+              "$sample" "$DIAGNOSTIC_SAMPLE_COUNT" "$status"
+          done
+
+      - name: Summarize fail-closed diagnostic-only phase evidence
+        if: always()
+        shell: bash
+        env:
+          EVIDENCE: ${{ steps.identity.outputs.evidence }}
+        run: |
+          set -euo pipefail
+          test -d "$EVIDENCE"
+          node diagnostic-control/etc/ci/stasis/summarize_v03_registry_diagnostic.mjs \
+            --directory "$EVIDENCE" --samples "$DIAGNOSTIC_SAMPLE_COUNT" \
+            | tee "$EVIDENCE/summary.json"
+          jq -e --argjson samples "$DIAGNOSTIC_SAMPLE_COUNT" '
+            .releaseGateAuthority == false
+            and .predeclaredSampleCount == $samples
+            and ((.counts.completed + .counts.cssRequest5Timeout
+              + .counts.cookieRequest5Timeout + .counts.otherFailure) == $samples)
+            and .counts.otherFailure == 0
+            and (.validatedTimeoutStackCaptures
+              == (.counts.cssRequest5Timeout + .counts.cookieRequest5Timeout))
+            and all(.samples[]; .nativeBoundaryClassification != "unclassified")
+          ' "$EVIDENCE/summary.json" > /dev/null
+
+      - name: Preserve diagnostic-only phase evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stasis-v0.3.2-macos-phase-probe-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: phase-probe-evidence
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Refuse release-gate semantics
+        if: always()
+        shell: bash
+        run: |
+          echo 'DIAGNOSTIC_ONLY: the phase probe can never satisfy a release gate.' >&2
+          exit 1

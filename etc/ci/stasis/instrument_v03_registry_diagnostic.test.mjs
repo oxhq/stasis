@@ -40,7 +40,7 @@ test("binds v0.3.2 without perturbing the successful 30-second command path", as
   assert.equal(instrumented.includes("AbortSignal.timeout(60_000)"), false);
   assert.equal(
     (instrumented.match(/expectedRequestId: "5"/gu) ?? []).length,
-    1,
+    2,
   );
   assert.equal(
     (instrumented.match(/stasisV03DiagnosticLaunch\(/gu) ?? []).length,
@@ -50,6 +50,25 @@ test("binds v0.3.2 without perturbing the successful 30-second command path", as
     (instrumented.match(/stasisV03DiagnosticSettle\(/gu) ?? []).length,
     3,
   );
+  assert.equal(
+    (instrumented.match(/stasisV03DiagnosticLifecycleEvidence\(/gu) ?? []).length,
+    3,
+  );
+  assert.equal(
+    (instrumented.match(/"settle-complete"/gu) ?? []).length,
+    1,
+  );
+  for (const phase of [
+    "script_paint_exit_marker_enqueued",
+    "constellation_paint_exit_marker_enqueued",
+    "paint_script_exit_marker_received",
+    "paint_constellation_exit_marker_received",
+    "paint_pipeline_retirement_checkpoint_received",
+    "shell_servo_pump_suppressed_authority_bracket",
+    "shell_servo_pump_suppressed_other",
+  ]) {
+    assert.equal((instrumented.match(new RegExp(`"${phase}"`, "gu")) ?? []).length, 1);
+  }
   assert.equal(
     (instrumented.match(/\/usr\/bin\/sample/gu) ?? []).length,
     1,
