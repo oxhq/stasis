@@ -29,6 +29,9 @@ concurrency:
 env:
   NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
   STASIS_PLATFORM: macos-aarch64
+  STASIS_RECOVERY_NPM_PROVENANCE_RUN_ATTEMPT: "1"
+  STASIS_RECOVERY_NPM_PROVENANCE_RUN_ID: "33523312229"
+  STASIS_RECOVERY_NPM_PROVENANCE_SHA: 5eeb51560068566d5035e9e262f9fa7bf4ed33f8
   STASIS_RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
 
 jobs:
@@ -267,7 +270,8 @@ jobs:
           authority = json.loads(
               pathlib.Path("recovery-authority-commit.json").read_text(encoding="utf-8")
           )
-          prior_recovery_revision = "d152bf718d86b9c3938d71eee9dafcac8b12872d"
+          first_recovery_revision = "d152bf718d86b9c3938d71eee9dafcac8b12872d"
+          second_recovery_revision = os.environ["STASIS_RECOVERY_NPM_PROVENANCE_SHA"]
           allowed = {
               ".github/workflows/stasis-package.yml",
               ".github/workflows/stasis-publish-npm.yml",
@@ -284,19 +288,23 @@ jobs:
               comparison.get("status") != "ahead"
               or comparison.get("merge_base_commit", {}).get("sha")
                   != os.environ["RELEASE_REVISION"]
-              or comparison.get("ahead_by") != 2
+              or comparison.get("ahead_by") != 3
               or comparison.get("behind_by") != 0
-              or comparison.get("total_commits") != 2
+              or comparison.get("total_commits") != 3
               or not isinstance(commits, list)
-              or len(commits) != 2
+              or len(commits) != 3
               or [commit.get("sha") for commit in commits]
-                  != [prior_recovery_revision, os.environ["RECOVERY_REVISION"]]
+                  != [
+                      first_recovery_revision,
+                      second_recovery_revision,
+                      os.environ["RECOVERY_REVISION"],
+                  ]
               or not isinstance(files, list)
               or {item.get("filename") for item in files} != allowed
               or any(item.get("status") != "modified" for item in files)
               or authority.get("sha") != os.environ["RECOVERY_REVISION"]
               or [parent.get("sha") for parent in authority.get("parents", [])]
-                  != [prior_recovery_revision]
+                  != [second_recovery_revision]
               or {item.get("filename") for item in authority.get("files", [])}
                   != correction_files
               or any(
@@ -304,7 +312,7 @@ jobs:
                   for item in authority.get("files", [])
               )
           ):
-              raise SystemExit("recovery authority is not the exact two-commit CI-only chain")
+              raise SystemExit("recovery authority is not the exact three-commit CI-only chain")
           PY
           fi
           test "$(git rev-parse HEAD)" = "$tag_sha"
@@ -1215,6 +1223,10 @@ jobs:
       attestations: read
       contents: read
       id-token: write
+    outputs:
+      npm_provenance_run_attempt: ${{ steps.npm-provenance-authority.outputs.run_attempt }}
+      npm_provenance_run_id: ${{ steps.npm-provenance-authority.outputs.run_id }}
+      npm_provenance_workflow_sha: ${{ steps.npm-provenance-authority.outputs.workflow_sha }}
     env:
       ATTEST_RUN_ATTEMPT: ${{ needs.verify.outputs.attest_run_attempt }}
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -2685,6 +2697,7 @@ jobs:
               exit 1
             fi
             echo 'publish_required=false' >> "$GITHUB_OUTPUT"
+            echo 'existing_exact=true' >> "$GITHUB_OUTPUT"
           else
             if [[ $view_status -eq 1 ]] && python3 - "$view_json" <<'PY'
           import json
@@ -2758,12 +2771,53 @@ jobs:
           PY
             then
               echo 'publish_required=true' >> "$GITHUB_OUTPUT"
+              echo 'existing_exact=false' >> "$GITHUB_OUTPUT"
             else
               cat "$view_stderr" >&2
               echo "npm view failed without a confirmed public-registry E404 (exit $view_status); refusing to publish" >&2
               exit 1
             fi
           fi
+
+      - id: npm-provenance-authority
+        name: Resolve exact npm provenance producer
+        env:
+          EXISTING_EXACT: ${{ steps.npm-state.outputs.existing_exact }}
+          PUBLISH_REQUIRED: ${{ steps.npm-state.outputs.publish_required }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$PUBLISH_REQUIRED" == 'true' && "$EXISTING_EXACT" == 'false' ]]; then
+            publication_run_id=$GITHUB_RUN_ID
+            publication_run_attempt=$GITHUB_RUN_ATTEMPT
+            publication_workflow_sha=$GITHUB_SHA
+          elif [[ "$PUBLISH_REQUIRED" == 'false' && "$EXISTING_EXACT" == 'true' \
+            && "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
+            publication_run_id=$STASIS_RECOVERY_NPM_PROVENANCE_RUN_ID
+            publication_run_attempt=$STASIS_RECOVERY_NPM_PROVENANCE_RUN_ATTEMPT
+            publication_workflow_sha=$STASIS_RECOVERY_NPM_PROVENANCE_SHA
+          else
+            echo 'npm provenance authority is not an actual publish or the exact-existing recovery' >&2
+            exit 1
+          fi
+          if [[ ! "$publication_run_id" =~ ^[1-9][0-9]*$ \
+            || "$publication_run_attempt" != '1' \
+            || ! "$publication_workflow_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'npm provenance authority identity is invalid' >&2
+            exit 1
+          fi
+          {
+            echo "NPM_EXISTING_EXACT=$EXISTING_EXACT"
+            echo "NPM_PROVENANCE_RUN_ATTEMPT=$publication_run_attempt"
+            echo "NPM_PROVENANCE_RUN_ID=$publication_run_id"
+            echo "NPM_PROVENANCE_WORKFLOW_SHA=$publication_workflow_sha"
+            echo "NPM_PUBLISH_REQUIRED=$PUBLISH_REQUIRED"
+          } >> "$GITHUB_ENV"
+          {
+            echo "run_attempt=$publication_run_attempt"
+            echo "run_id=$publication_run_id"
+            echo "workflow_sha=$publication_workflow_sha"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Recheck immutable release identity immediately before npm mutation
         if: steps.npm-state.outputs.publish_required == 'true'
@@ -2911,8 +2965,9 @@ jobs:
             echo 'npm registry did not converge to one verified publish attestation and one SLSA provenance bundle' >&2
             exit 1
           fi
-          PUBLICATION_RUN_ID="$GITHUB_RUN_ID" \
-            PUBLICATION_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+          PUBLICATION_RUN_ID="$NPM_PROVENANCE_RUN_ID" \
+            PUBLICATION_RUN_ATTEMPT="$NPM_PROVENANCE_RUN_ATTEMPT" \
+            PUBLICATION_WORKFLOW_SHA="$NPM_PROVENANCE_WORKFLOW_SHA" \
             python3 - "$audit_json" "$NPM_TARBALL" <<'PY'
           import base64
           import hashlib
@@ -2964,6 +3019,33 @@ jobs:
           server_url = os.environ["GITHUB_SERVER_URL"]
           run_id = os.environ["PUBLICATION_RUN_ID"]
           expected_attempt = int(os.environ["PUBLICATION_RUN_ATTEMPT"])
+          publication_workflow_sha = os.environ["PUBLICATION_WORKFLOW_SHA"]
+          publish_required = os.environ["NPM_PUBLISH_REQUIRED"]
+          existing_exact = os.environ["NPM_EXISTING_EXACT"]
+          event_name = os.environ["GITHUB_EVENT_NAME"]
+          selected_identity = (run_id, str(expected_attempt), publication_workflow_sha)
+          if publish_required == "true":
+              current_identity = (
+                  os.environ["GITHUB_RUN_ID"],
+                  os.environ["GITHUB_RUN_ATTEMPT"],
+                  os.environ["GITHUB_SHA"],
+              )
+              if existing_exact != "false" or selected_identity != current_identity:
+                  raise SystemExit("actual npm publish provenance is not the current workflow run")
+          elif publish_required == "false":
+              recovery_identity = (
+                  os.environ["STASIS_RECOVERY_NPM_PROVENANCE_RUN_ID"],
+                  os.environ["STASIS_RECOVERY_NPM_PROVENANCE_RUN_ATTEMPT"],
+                  os.environ["STASIS_RECOVERY_NPM_PROVENANCE_SHA"],
+              )
+              if (
+                  event_name != "workflow_dispatch"
+                  or existing_exact != "true"
+                  or selected_identity != recovery_identity
+              ):
+                  raise SystemExit("exact-existing npm provenance is not the immutable recovery producer")
+          else:
+              raise SystemExit("npm provenance publication state is invalid")
 
           verified = audit.get("verified")
           if not isinstance(verified, list) or len(verified) != 1:
@@ -3081,15 +3163,13 @@ jobs:
           if not isinstance(predicate, dict) or set(predicate) != {"buildDefinition", "runDetails"}:
               raise SystemExit("npm provenance predicate schema changed")
           build = predicate.get("buildDefinition")
-          event_name = os.environ["GITHUB_EVENT_NAME"]
           if event_name == "release":
               expected_ref = f"refs/tags/v{version}"
-              provenance_revision = revision
           elif event_name == "workflow_dispatch":
               expected_ref = f"refs/heads/{os.environ['DEFAULT_BRANCH']}"
-              provenance_revision = os.environ["GITHUB_SHA"]
           else:
               raise SystemExit("npm provenance has an unsupported publication event")
+          provenance_revision = publication_workflow_sha
           expected_workflow = {
               "ref": expected_ref,
               "repository": f"{server_url}/{repository}",
@@ -3247,8 +3327,9 @@ jobs:
       LINUX_RUN_ATTEMPT: ${{ needs.verify.outputs.linux_run_attempt }}
       MACOS_RUN_ATTEMPT: ${{ needs.verify.outputs.macos_run_attempt }}
       PACKAGE_RUN_ID: ${{ needs.verify.outputs.package_run_id }}
-      PUBLICATION_RUN_ATTEMPT: ${{ github.run_attempt }}
-      PUBLICATION_RUN_ID: ${{ github.run_id }}
+      PUBLICATION_RUN_ATTEMPT: ${{ needs.publish.outputs.npm_provenance_run_attempt }}
+      PUBLICATION_RUN_ID: ${{ needs.publish.outputs.npm_provenance_run_id }}
+      PUBLICATION_WORKFLOW_SHA: ${{ needs.publish.outputs.npm_provenance_workflow_sha }}
       STASIS_NATIVE_BINARY_SHA256: ${{ needs.verify.outputs.native_binary_sha256 }}
       STASIS_PLATFORM: ${{ matrix.release_platform }}
       STASIS_REVISION: ${{ needs.verify.outputs.revision }}
@@ -3375,7 +3456,15 @@ jobs:
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir runtime-manifest \
             --pattern "stasis-${STASIS_VERSION}-runtime-manifest.json"
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir provenance-subjects \
-            --pattern "stasis-${STASIS_VERSION}-*"
+            --pattern "stasis-${STASIS_VERSION}-macos-aarch64.tar.gz" \
+            --pattern "stasis-${STASIS_VERSION}-macos-aarch64.tar.gz.sha256" \
+            --pattern "stasis-${STASIS_VERSION}-macos-aarch64.binary.sha256" \
+            --pattern "stasis-${STASIS_VERSION}-macos-aarch64-act-settle-inspect.json" \
+            --pattern "stasis-${STASIS_VERSION}-linux-x86_64.tar.gz" \
+            --pattern "stasis-${STASIS_VERSION}-linux-x86_64.tar.gz.sha256" \
+            --pattern "stasis-${STASIS_VERSION}-linux-x86_64.binary.sha256" \
+            --pattern "stasis-${STASIS_VERSION}-linux-x86_64-act-settle-inspect.json" \
+            --pattern "stasis-${STASIS_VERSION}-runtime-manifest.json"
           shopt -s nullglob
           provenance_release_subjects=(provenance-subjects/*)
           test "${#provenance_release_subjects[@]}" -eq 9
@@ -3599,6 +3688,25 @@ jobs:
           server_url = os.environ["GITHUB_SERVER_URL"]
           run_id = os.environ["PUBLICATION_RUN_ID"]
           expected_attempt = int(os.environ["PUBLICATION_RUN_ATTEMPT"])
+          publication_workflow_sha = os.environ["PUBLICATION_WORKFLOW_SHA"]
+          event_name = os.environ["GITHUB_EVENT_NAME"]
+          selected_identity = (run_id, str(expected_attempt), publication_workflow_sha)
+          if event_name == "release":
+              expected_identity = (
+                  os.environ["GITHUB_RUN_ID"],
+                  os.environ["GITHUB_RUN_ATTEMPT"],
+                  os.environ["GITHUB_SHA"],
+              )
+          elif event_name == "workflow_dispatch":
+              expected_identity = (
+                  os.environ["STASIS_RECOVERY_NPM_PROVENANCE_RUN_ID"],
+                  os.environ["STASIS_RECOVERY_NPM_PROVENANCE_RUN_ATTEMPT"],
+                  os.environ["STASIS_RECOVERY_NPM_PROVENANCE_SHA"],
+              )
+          else:
+              raise SystemExit("npm provenance has an unsupported publication event")
+          if selected_identity != expected_identity:
+              raise SystemExit("anonymous npm provenance producer identity changed")
 
           verified = audit.get("verified")
           if not isinstance(verified, list) or len(verified) != 1:
@@ -3716,15 +3824,13 @@ jobs:
           if not isinstance(predicate, dict) or set(predicate) != {"buildDefinition", "runDetails"}:
               raise SystemExit("npm provenance predicate schema changed")
           build = predicate.get("buildDefinition")
-          event_name = os.environ["GITHUB_EVENT_NAME"]
           if event_name == "release":
               expected_ref = f"refs/tags/v{version}"
-              provenance_revision = revision
           elif event_name == "workflow_dispatch":
               expected_ref = f"refs/heads/{os.environ['DEFAULT_BRANCH']}"
-              provenance_revision = os.environ["GITHUB_SHA"]
           else:
               raise SystemExit("npm provenance has an unsupported publication event")
+          provenance_revision = publication_workflow_sha
           expected_workflow = {
               "ref": expected_ref,
               "repository": f"{server_url}/{repository}",

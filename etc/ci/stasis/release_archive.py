@@ -6779,14 +6779,26 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
 
     for fixed_recovery_identity, description in (
         ("33517227843", "failed release-event publication run"),
+        ("33523312229", "successful recovery npm provenance producer run"),
         ("48c5a718a9ddd63f496e45307e1484974ccf8587", "immutable v0.3.3 tag revision"),
         ("380550511", "immutable v0.3.3 release"),
         ("d152bf718d86b9c3938d71eee9dafcac8b12872d", "first recovery authority revision"),
+        ("5eeb51560068566d5035e9e262f9fa7bf4ed33f8", "second recovery authority revision"),
     ):
         if public_npm_publish_workflow.count(fixed_recovery_identity) != 1:
             raise ReleaseError(
                 f"npm-publish recovery must bind exactly one fixed {description} identity"
             )
+    exact_recovery_npm_provenance_identity = (
+        '  STASIS_RECOVERY_NPM_PROVENANCE_RUN_ATTEMPT: "1"\n'
+        '  STASIS_RECOVERY_NPM_PROVENANCE_RUN_ID: "33523312229"\n'
+        "  STASIS_RECOVERY_NPM_PROVENANCE_SHA: "
+        "5eeb51560068566d5035e9e262f9fa7bf4ed33f8\n"
+    )
+    if public_npm_publish_workflow.count(exact_recovery_npm_provenance_identity) != 1:
+        raise ReleaseError(
+            "npm-publish recovery must bind the exact immutable npm provenance producer identity"
+        )
 
     recovery_heredoc_boundaries = (
         (
@@ -6812,7 +6824,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "recovery ancestry heredoc opening",
         ),
         (
-            '              raise SystemExit("recovery authority is not the exact two-commit CI-only chain")\n'
+            '              raise SystemExit("recovery authority is not the exact three-commit CI-only chain")\n'
             "          PY\n"
             "          fi\n"
             '          test "$(git rev-parse HEAD)" = "$tag_sha"\n',
@@ -6874,26 +6886,30 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "            gh api \"repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA\" \\\n",
             "            RECOVERY_REVISION=\"$GITHUB_SHA\" RELEASE_REVISION=\"$tag_sha\" python3 - <<'PY'\n",
             "          import json\n",
-            '          prior_recovery_revision = "d152bf718d86b9c3938d71eee9dafcac8b12872d"\n',
+            '          first_recovery_revision = "d152bf718d86b9c3938d71eee9dafcac8b12872d"\n',
+            '          second_recovery_revision = os.environ["STASIS_RECOVERY_NPM_PROVENANCE_SHA"]\n',
             '              comparison.get("status") != "ahead"\n',
             '              or comparison.get("merge_base_commit", {}).get("sha")\n',
             '                  != os.environ["RELEASE_REVISION"]\n',
-            '              or comparison.get("ahead_by") != 2\n',
+            '              or comparison.get("ahead_by") != 3\n',
             '              or comparison.get("behind_by") != 0\n',
-            '              or comparison.get("total_commits") != 2\n',
+            '              or comparison.get("total_commits") != 3\n',
             "              or not isinstance(commits, list)\n",
-            "              or len(commits) != 2\n",
+            "              or len(commits) != 3\n",
             '              or [commit.get("sha") for commit in commits]\n',
-            '                  != [prior_recovery_revision, os.environ["RECOVERY_REVISION"]]\n',
+            "                  != [\n",
+            "                      first_recovery_revision,\n",
+            "                      second_recovery_revision,\n",
+            '                      os.environ["RECOVERY_REVISION"],\n',
             "              or not isinstance(files, list)\n",
             '              or {item.get("filename") for item in files} != allowed\n',
             '              or any(item.get("status") != "modified" for item in files)\n',
             '              or authority.get("sha") != os.environ["RECOVERY_REVISION"]\n',
             '              or [parent.get("sha") for parent in authority.get("parents", [])]\n',
-            '                  != [prior_recovery_revision]\n',
+            '                  != [second_recovery_revision]\n',
             '              or {item.get("filename") for item in authority.get("files", [])}\n',
             '                  != correction_files\n',
-            '              raise SystemExit("recovery authority is not the exact two-commit CI-only chain")\n',
+            '              raise SystemExit("recovery authority is not the exact three-commit CI-only chain")\n',
             "          PY\n",
             '          test "$(git rev-parse HEAD)" = "$tag_sha"\n',
         ),
@@ -7159,6 +7175,9 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "    environment:\n",
             "      name: npm\n",
             "      id-token: write\n",
+            "      npm_provenance_run_attempt: ${{ steps.npm-provenance-authority.outputs.run_attempt }}\n",
+            "      npm_provenance_run_id: ${{ steps.npm-provenance-authority.outputs.run_id }}\n",
+            "      npm_provenance_workflow_sha: ${{ steps.npm-provenance-authority.outputs.workflow_sha }}\n",
             "      PREPUBLISH_RUN_ID: ${{ needs.verify.outputs.prepublish_run_id }}\n",
             "      - name: Reject workflow reruns before npm authority\n",
             "          test \"$GITHUB_RUN_ATTEMPT\" = '1'\n",
@@ -7179,9 +7198,33 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             '          npm view "@oxhq/stasis@$STASIS_VERSION" dist.integrity --json \\\n',
             "          view_status=$?\n",
             "          set -e\n",
+            "            echo 'publish_required=false' >> \"$GITHUB_OUTPUT\"\n",
+            "            echo 'existing_exact=true' >> \"$GITHUB_OUTPUT\"\n",
             "            if [[ $view_status -eq 1 ]] && python3 - \"$view_json\" <<'PY'\n",
             '                  and document["error"].get("code") == "E404"\n',
             "              echo 'publish_required=true' >> \"$GITHUB_OUTPUT\"\n",
+            "              echo 'existing_exact=false' >> \"$GITHUB_OUTPUT\"\n",
+            "      - id: npm-provenance-authority\n",
+            "        name: Resolve exact npm provenance producer\n",
+            "          EXISTING_EXACT: ${{ steps.npm-state.outputs.existing_exact }}\n",
+            "          PUBLISH_REQUIRED: ${{ steps.npm-state.outputs.publish_required }}\n",
+            "          if [[ \"$PUBLISH_REQUIRED\" == 'true' && \"$EXISTING_EXACT\" == 'false' ]]; then\n",
+            "            publication_run_id=$GITHUB_RUN_ID\n",
+            "            publication_run_attempt=$GITHUB_RUN_ATTEMPT\n",
+            "            publication_workflow_sha=$GITHUB_SHA\n",
+            "          elif [[ \"$PUBLISH_REQUIRED\" == 'false' && \"$EXISTING_EXACT\" == 'true' \\\n",
+            "            && \"$GITHUB_EVENT_NAME\" == 'workflow_dispatch' ]]; then\n",
+            "            publication_run_id=$STASIS_RECOVERY_NPM_PROVENANCE_RUN_ID\n",
+            "            publication_run_attempt=$STASIS_RECOVERY_NPM_PROVENANCE_RUN_ATTEMPT\n",
+            "            publication_workflow_sha=$STASIS_RECOVERY_NPM_PROVENANCE_SHA\n",
+            "            echo \"NPM_EXISTING_EXACT=$EXISTING_EXACT\"\n",
+            "            echo \"NPM_PROVENANCE_RUN_ATTEMPT=$publication_run_attempt\"\n",
+            "            echo \"NPM_PROVENANCE_RUN_ID=$publication_run_id\"\n",
+            "            echo \"NPM_PROVENANCE_WORKFLOW_SHA=$publication_workflow_sha\"\n",
+            "            echo \"NPM_PUBLISH_REQUIRED=$PUBLISH_REQUIRED\"\n",
+            "            echo \"run_attempt=$publication_run_attempt\"\n",
+            "            echo \"run_id=$publication_run_id\"\n",
+            "            echo \"workflow_sha=$publication_workflow_sha\"\n",
             "      - name: Recheck immutable release identity immediately before npm mutation\n",
             "        if: steps.npm-state.outputs.publish_required == 'true'\n",
             '                and .immutable == true\n',
@@ -7194,6 +7237,25 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         ),
         "release-event or one-shot recovery npm mutation job",
     )
+    exact_npm_provenance_handoff = (
+        "          {\n"
+        '            echo "NPM_EXISTING_EXACT=$EXISTING_EXACT"\n'
+        '            echo "NPM_PROVENANCE_RUN_ATTEMPT=$publication_run_attempt"\n'
+        '            echo "NPM_PROVENANCE_RUN_ID=$publication_run_id"\n'
+        '            echo "NPM_PROVENANCE_WORKFLOW_SHA=$publication_workflow_sha"\n'
+        '            echo "NPM_PUBLISH_REQUIRED=$PUBLISH_REQUIRED"\n'
+        '          } >> "$GITHUB_ENV"\n'
+        "          {\n"
+        '            echo "run_attempt=$publication_run_attempt"\n'
+        '            echo "run_id=$publication_run_id"\n'
+        '            echo "workflow_sha=$publication_workflow_sha"\n'
+        '          } >> "$GITHUB_OUTPUT"\n'
+    )
+    if publish_job.count(exact_npm_provenance_handoff) != 1:
+        raise ReleaseError(
+            "npm provenance authority must hand the same selected identity to its verifier and "
+            "anonymous registry jobs"
+        )
     if publish_job.count('          test "$GITHUB_RUN_ATTEMPT" = \'1\'\n') != 3:
         raise ReleaseError(
             "npm mutation job must reject reruns before verification and immediately before mutation"
@@ -7243,8 +7305,9 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "          (github.event_name == 'release' && needs.publish.result == 'success')\n",
             "            github.event_name == 'workflow_dispatch'\n",
             "              && needs.recover_published.result == 'success'\n",
-            "      PUBLICATION_RUN_ATTEMPT: ${{ github.run_attempt }}\n",
-            "      PUBLICATION_RUN_ID: ${{ github.run_id }}\n",
+            "      PUBLICATION_RUN_ATTEMPT: ${{ needs.publish.outputs.npm_provenance_run_attempt }}\n",
+            "      PUBLICATION_RUN_ID: ${{ needs.publish.outputs.npm_provenance_run_id }}\n",
+            "      PUBLICATION_WORKFLOW_SHA: ${{ needs.publish.outputs.npm_provenance_workflow_sha }}\n",
             "      - name: Reject workflow reruns before public-consumer verification\n",
             "          test \"$GITHUB_RUN_ATTEMPT\" = '1'\n",
             "      - name: Check out the exact published tag\n",
@@ -7269,7 +7332,7 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             "            --run-id \"$PACKAGE_RUN_ID\"\n",
             "            --run-attempt \"$ATTEST_RUN_ATTEMPT\"\n",
         ),
-        "anonymous registry current-run and verifier authority",
+        "anonymous registry event-aware publication and verifier authority",
     )
     if verify_registry_job.count('          test "$GITHUB_RUN_ATTEMPT" = \'1\'\n') != 1:
         raise ReleaseError("anonymous registry verification jobs must fail every workflow rerun")
@@ -7277,18 +7340,43 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         raise ReleaseError(
             "anonymous registry verification must have exact tag and recovery-authority checkouts"
         )
+    exact_registry_package_run_subject_download = (
+        '          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" '
+        "--dir provenance-subjects \\\n"
+        '            --pattern "stasis-${STASIS_VERSION}-macos-aarch64.tar.gz" \\\n'
+        '            --pattern "stasis-${STASIS_VERSION}-macos-aarch64.tar.gz.sha256" \\\n'
+        '            --pattern "stasis-${STASIS_VERSION}-macos-aarch64.binary.sha256" \\\n'
+        '            --pattern "stasis-${STASIS_VERSION}-macos-aarch64-act-settle-inspect.json" \\\n'
+        '            --pattern "stasis-${STASIS_VERSION}-linux-x86_64.tar.gz" \\\n'
+        '            --pattern "stasis-${STASIS_VERSION}-linux-x86_64.tar.gz.sha256" \\\n'
+        '            --pattern "stasis-${STASIS_VERSION}-linux-x86_64.binary.sha256" \\\n'
+        '            --pattern "stasis-${STASIS_VERSION}-linux-x86_64-act-settle-inspect.json" \\\n'
+        '            --pattern "stasis-${STASIS_VERSION}-runtime-manifest.json"\n'
+    )
+    if verify_registry_job.count(exact_registry_package_run_subject_download) != 1:
+        raise ReleaseError(
+            "anonymous registry verification must download exactly the nine package-run "
+            "provenance subjects"
+        )
+    if (
+        '            --pattern "stasis-${STASIS_VERSION}-*"\n' in verify_registry_job
+        or verify_registry_job.count(
+            '          test "${#provenance_release_subjects[@]}" -eq 9\n'
+        )
+        != 1
+    ):
+        raise ReleaseError(
+            "anonymous registry verification must reject the ten-asset release wildcard and "
+            "retain the nine-subject census"
+        )
 
-    npm_provenance_identity_fragments = (
-        '          run_id = os.environ["PUBLICATION_RUN_ID"]\n',
-        '          expected_attempt = int(os.environ["PUBLICATION_RUN_ATTEMPT"])\n',
-        '          event_name = os.environ["GITHUB_EVENT_NAME"]\n',
+    npm_provenance_statement_fragments = (
         '          if event_name == "release":\n',
         '            expected_ref = f"refs/tags/v{version}"\n',
-        "            provenance_revision = revision\n",
         '          elif event_name == "workflow_dispatch":\n',
         '            expected_ref = f"refs/heads/{os.environ[\'DEFAULT_BRANCH\']}"\n',
-        '            provenance_revision = os.environ["GITHUB_SHA"]\n',
         '            raise SystemExit("npm provenance has an unsupported publication event")\n',
+        "          provenance_revision = publication_workflow_sha\n",
         '            "path": ".github/workflows/stasis-publish-npm.yml",\n',
         '            "digest": {"gitCommit": provenance_revision},\n',
         '          if build.get("resolvedDependencies") != expected_dependencies:\n',
@@ -7301,16 +7389,52 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
     require_source_fragments_in_order(
         publish_job,
         (
-            '          PUBLICATION_RUN_ID="$GITHUB_RUN_ID" \\\n',
-            '            PUBLICATION_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \\\n',
-            *npm_provenance_identity_fragments,
+            '          PUBLICATION_RUN_ID="$NPM_PROVENANCE_RUN_ID" \\\n',
+            '            PUBLICATION_RUN_ATTEMPT="$NPM_PROVENANCE_RUN_ATTEMPT" \\\n',
+            '            PUBLICATION_WORKFLOW_SHA="$NPM_PROVENANCE_WORKFLOW_SHA" \\\n',
+            '          run_id = os.environ["PUBLICATION_RUN_ID"]\n',
+            '          expected_attempt = int(os.environ["PUBLICATION_RUN_ATTEMPT"])\n',
+            '          publication_workflow_sha = os.environ["PUBLICATION_WORKFLOW_SHA"]\n',
+            '          publish_required = os.environ["NPM_PUBLISH_REQUIRED"]\n',
+            '          existing_exact = os.environ["NPM_EXISTING_EXACT"]\n',
+            '          event_name = os.environ["GITHUB_EVENT_NAME"]\n',
+            "          selected_identity = (run_id, str(expected_attempt), publication_workflow_sha)\n",
+            '          if publish_required == "true":\n',
+            '                  os.environ["GITHUB_RUN_ID"],\n',
+            '                  os.environ["GITHUB_RUN_ATTEMPT"],\n',
+            '                  os.environ["GITHUB_SHA"],\n',
+            '              if existing_exact != "false" or selected_identity != current_identity:\n',
+            '          elif publish_required == "false":\n',
+            '                  os.environ["STASIS_RECOVERY_NPM_PROVENANCE_RUN_ID"],\n',
+            '                  os.environ["STASIS_RECOVERY_NPM_PROVENANCE_RUN_ATTEMPT"],\n',
+            '                  os.environ["STASIS_RECOVERY_NPM_PROVENANCE_SHA"],\n',
+            '                  event_name != "workflow_dispatch"\n',
+            '                  or existing_exact != "true"\n',
+            '                  or selected_identity != recovery_identity\n',
+            *npm_provenance_statement_fragments,
         ),
-        "credentialed publication current-run event-aware npm provenance",
+        "credentialed publication exact-producer event-aware npm provenance",
     )
     require_source_fragments_in_order(
         verify_registry_job,
-        npm_provenance_identity_fragments,
-        "anonymous registry current-run event-aware npm provenance",
+        (
+            '          run_id = os.environ["PUBLICATION_RUN_ID"]\n',
+            '          expected_attempt = int(os.environ["PUBLICATION_RUN_ATTEMPT"])\n',
+            '          publication_workflow_sha = os.environ["PUBLICATION_WORKFLOW_SHA"]\n',
+            '          event_name = os.environ["GITHUB_EVENT_NAME"]\n',
+            "          selected_identity = (run_id, str(expected_attempt), publication_workflow_sha)\n",
+            '          if event_name == "release":\n',
+            '                  os.environ["GITHUB_RUN_ID"],\n',
+            '                  os.environ["GITHUB_RUN_ATTEMPT"],\n',
+            '                  os.environ["GITHUB_SHA"],\n',
+            '          elif event_name == "workflow_dispatch":\n',
+            '                  os.environ["STASIS_RECOVERY_NPM_PROVENANCE_RUN_ID"],\n',
+            '                  os.environ["STASIS_RECOVERY_NPM_PROVENANCE_RUN_ATTEMPT"],\n',
+            '                  os.environ["STASIS_RECOVERY_NPM_PROVENANCE_SHA"],\n',
+            "          if selected_identity != expected_identity:\n",
+            *npm_provenance_statement_fragments,
+        ),
+        "anonymous registry exact-producer event-aware npm provenance",
     )
     npm_publish_command = (
         '          npm publish "$NPM_TARBALL" --ignore-scripts --access public --tag latest '
@@ -8761,9 +8885,9 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
-            '              or comparison.get("total_commits") != 2',
-            '              or comparison.get("total_commits") < 2',
-            "recovery exact two-commit ancestry",
+            '              or comparison.get("total_commits") != 3',
+            '              or comparison.get("total_commits") < 3',
+            "recovery exact three-commit ancestry",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
@@ -8773,9 +8897,53 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "5eeb51560068566d5035e9e262f9fa7bf4ed33f8",
+            "5eeb51560068566d5035e9e262f9fa7bf4ed33f9",
+            "second recovery authority revision",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "33523312229",
+            "33523312230",
+            "immutable recovery npm provenance producer run",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '  STASIS_RECOVERY_NPM_PROVENANCE_RUN_ATTEMPT: "1"',
+            '  STASIS_RECOVERY_NPM_PROVENANCE_RUN_ATTEMPT: "2"',
+            "immutable recovery npm provenance producer attempt",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '                  != [second_recovery_revision]',
+            '                  != [first_recovery_revision]',
+            "recovery correction parent identity",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
             '              or {item.get("filename") for item in authority.get("files", [])}',
             '              or {item.get("filename") for item in comparison.get("files", [])}',
             "recovery correction commit exact file inventory",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '            --pattern "stasis-${STASIS_VERSION}-macos-aarch64.tar.gz" \\',
+            '            --pattern "stasis-${STASIS_VERSION}-typescript-prepublish-act-settle-inspect.json" \\',
+            "registry exact package-run provenance subject names",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '            --pattern "stasis-${STASIS_VERSION}-linux-x86_64-act-settle-inspect.json" \\\n'
+            '            --pattern "stasis-${STASIS_VERSION}-runtime-manifest.json"',
+            '            --pattern "stasis-${STASIS_VERSION}-linux-x86_64-act-settle-inspect.json" \\\n'
+            '            --pattern "stasis-${STASIS_VERSION}-*"',
+            "registry release wildcard exclusion",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '          test "${#provenance_release_subjects[@]}" -eq 9',
+            '          test "${#provenance_release_subjects[@]}" -eq 10',
+            "registry package-run provenance subject census",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
@@ -8804,6 +8972,46 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "            echo 'existing_exact=true' >> \"$GITHUB_OUTPUT\"",
+            "            echo 'existing_exact=false' >> \"$GITHUB_OUTPUT\"",
+            "exact-existing npm package state",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "          elif [[ \"$PUBLISH_REQUIRED\" == 'false' && \"$EXISTING_EXACT\" == 'true' \\\n"
+            "            && \"$GITHUB_EVENT_NAME\" == 'workflow_dispatch' ]]; then",
+            "          elif [[ \"$PUBLISH_REQUIRED\" == 'false' && \"$EXISTING_EXACT\" == 'true' \\\n"
+            "            && \"$GITHUB_EVENT_NAME\" == 'release' ]]; then",
+            "workflow-dispatch-only prior npm provenance authority",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '                  or selected_identity != recovery_identity',
+            '                  or selected_identity != current_identity',
+            "credentialed exact-existing immutable producer identity",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '            echo "workflow_sha=$publication_workflow_sha"\n'
+            '          } >> "$GITHUB_OUTPUT"',
+            '            echo "workflow_sha=$publication_workflow_sha"\n'
+            '          } >> "$GITHUB_ENV"',
+            "selected npm provenance identity job-output handoff",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '          PUBLICATION_RUN_ID="$NPM_PROVENANCE_RUN_ID" \\',
+            '          PUBLICATION_RUN_ID="$GITHUB_RUN_ID" \\',
+            "post-publish selected provenance producer identity",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "        if: github.run_attempt == 1 && steps.npm-state.outputs.publish_required == 'true'",
+            "        if: github.run_attempt == 1 && steps.npm-state.outputs.publish_required != 'invalid'",
+            "exact-existing path skips npm publish",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
             "      - name: Recheck immutable release identity immediately before npm mutation",
             "      - name: Skip immutable release identity immediately before npm mutation",
             "immutable release precheck immediately before npm mutation",
@@ -8816,15 +9024,34 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
-            "      PUBLICATION_RUN_ATTEMPT: ${{ github.run_attempt }}",
+            "      PUBLICATION_RUN_ATTEMPT: ${{ needs.publish.outputs.npm_provenance_run_attempt }}",
             "      PUBLICATION_RUN_ATTEMPT: ${{ needs.verify.outputs.publication_run_attempt }}",
-            "registry current workflow attempt identity",
+            "registry selected publication attempt identity",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
-            "      PUBLICATION_RUN_ID: ${{ github.run_id }}",
+            "      PUBLICATION_RUN_ID: ${{ needs.publish.outputs.npm_provenance_run_id }}",
             "      PUBLICATION_RUN_ID: ${{ needs.verify.outputs.publication_run_id }}",
-            "registry current workflow run identity",
+            "registry selected publication run identity",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "      PUBLICATION_WORKFLOW_SHA: ${{ needs.publish.outputs.npm_provenance_workflow_sha }}",
+            "      PUBLICATION_WORKFLOW_SHA: ${{ github.sha }}",
+            "registry selected publication workflow SHA identity",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "          if selected_identity != expected_identity:",
+            "          if selected_identity == expected_identity:",
+            "anonymous exact publication producer identity",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "          provenance_revision = publication_workflow_sha",
+            '          provenance_revision = os.environ["GITHUB_SHA"]',
+            "signed npm provenance selected workflow SHA identity",
+            expected_count=2,
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
