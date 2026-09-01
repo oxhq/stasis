@@ -2,9 +2,10 @@
 """Bind and symbolize the nine immutable Stasis v0.3.2 macOS stack reports.
 
 The script deliberately has no release authority.  It fails closed unless the
-one recorded hashed rust-objcopy target, Cargo's surfaced post-strip
-executable, and the immutable release are byte-identical, and the captured
-pre-strip executable has the same Mach-O UUID.
+one recorded hashed rust-objcopy target preserves the pre-strip code image,
+matches Cargo's surfaced post-strip executable, and has the immutable
+release's complete function-address layout.  Whole-file rebuild equality is
+not assumed.
 """
 
 from __future__ import annotations
@@ -17,13 +18,21 @@ import json
 import os
 from pathlib import Path
 import re
+import struct
 import subprocess
 from typing import Iterable, NoReturn
+import uuid as uuid_module
 
 
-SCHEMA = "stasis-v0.3.2-macos-exact-symbolization-v2"
-CAPTURE_SCHEMA = "stasis-v0.3.2-macos-rust-objcopy-capture-v2"
+SCHEMA = "stasis-v0.3.2-macos-exact-symbolization-v3"
+CAPTURE_SCHEMA = "stasis-v0.3.2-macos-rust-objcopy-capture-v3"
 HASHED_TARGET_PATTERN = re.compile(r"^stasis-[0-9a-f]{16}$")
+MACHO_MAGIC_64 = 0xFEEDFACF
+CPU_TYPE_ARM64 = 0x0100000C
+MH_EXECUTE = 2
+LC_SEGMENT_64 = 0x19
+LC_UUID = 0x1B
+LC_FUNCTION_STARTS = 0x26
 RELEASE_REVISION = "b3d1ac949d341dc6bbe1244162441d9bb8adb00a"
 DIAGNOSTIC_REVISION = "9bdf49f360089cd91ae257f0078b2dc3dde4e70e"
 RELEASE_TAG = "v0.3.2"
@@ -136,14 +145,339 @@ def resolve_recorded_argument(argument: str, working_directory: Path) -> Path:
     return canonical(candidate)
 
 
+@dataclass(frozen=True)
+class MachOTextSection:
+    address: int
+    size: int
+    offset: int
+    flags: int
+    sha256: str
+
+    def layout(self) -> tuple[int, int, int, int]:
+        return (self.address, self.size, self.offset, self.flags)
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "address": f"0x{self.address:x}",
+            "size": self.size,
+            "offset": self.offset,
+            "flags": f"0x{self.flags:x}",
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True)
+class MachOIdentity:
+    uuid: str
+    text_segment_vmaddr: int
+    text: MachOTextSection
+    function_starts: tuple[int, ...]
+    function_starts_sha256: str
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "uuid": self.uuid,
+            "textSegmentVmaddr": f"0x{self.text_segment_vmaddr:x}",
+            "textSection": self.text.as_json(),
+            "functionStartsCount": len(self.function_starts),
+            "functionStartsSha256": self.function_starts_sha256,
+        }
+
+
+def fixed_name(raw: bytes, label: str) -> str:
+    try:
+        return raw.split(b"\0", 1)[0].decode("ascii")
+    except UnicodeDecodeError as error:
+        fail(f"non-ASCII Mach-O {label}: {error}")
+
+
+def decode_function_starts(data: bytes, start: int, size: int, image_base: int) -> tuple[int, ...]:
+    end = start + size
+    if size == 0 or start < 0 or end > len(data):
+        fail("Mach-O LC_FUNCTION_STARTS payload escaped the file")
+    cursor = start
+    address = image_base
+    values: list[int] = []
+    terminated = False
+    while cursor < end:
+        delta = 0
+        shift = 0
+        while True:
+            if cursor >= end or shift >= 64:
+                fail("invalid ULEB128 in Mach-O LC_FUNCTION_STARTS")
+            byte = data[cursor]
+            cursor += 1
+            payload = byte & 0x7F
+            if shift == 63 and payload > 1:
+                fail("overflowing ULEB128 in Mach-O LC_FUNCTION_STARTS")
+            delta |= payload << shift
+            if byte & 0x80 == 0:
+                break
+            shift += 7
+        if delta == 0:
+            terminated = True
+            break
+        if address > 0xFFFFFFFFFFFFFFFF - delta:
+            fail("Mach-O function-start address overflowed uint64")
+        address += delta
+        if values and address <= values[-1]:
+            fail("Mach-O function starts are not strictly increasing")
+        values.append(address)
+    if not terminated or any(data[cursor:end]):
+        fail("Mach-O LC_FUNCTION_STARTS is not zero terminated and padded")
+    if not values:
+        fail("Mach-O LC_FUNCTION_STARTS is empty")
+    return tuple(values)
+
+
+def parse_macho_identity(path: Path) -> MachOIdentity:
+    path = canonical(path)
+    data = path.read_bytes()
+    if len(data) < 32:
+        fail(f"Mach-O file is too small: {path}")
+    magic, cpu_type, _cpu_subtype, file_type, command_count, command_bytes, _flags, _reserved = struct.unpack_from(
+        "<8I", data, 0
+    )
+    if magic != MACHO_MAGIC_64 or cpu_type != CPU_TYPE_ARM64 or file_type != MH_EXECUTE:
+        fail(f"not a thin arm64 Mach-O executable: {path}")
+    commands_end = 32 + command_bytes
+    if command_count == 0 or command_count > 4096 or commands_end > len(data):
+        fail(f"invalid Mach-O load-command table: {path}")
+
+    cursor = 32
+    uuid_values: list[bytes] = []
+    text_segment_vmaddrs: list[int] = []
+    text_sections: list[tuple[int, int, int, int]] = []
+    function_start_commands: list[tuple[int, int]] = []
+    for _ in range(command_count):
+        if cursor + 8 > commands_end:
+            fail(f"truncated Mach-O load command: {path}")
+        command, command_size = struct.unpack_from("<2I", data, cursor)
+        if command_size < 8 or command_size % 8 != 0 or cursor + command_size > commands_end:
+            fail(f"invalid Mach-O load command size: {path}")
+        if command == LC_UUID:
+            if command_size != 24:
+                fail(f"invalid LC_UUID size: {path}")
+            uuid_values.append(data[cursor + 8 : cursor + 24])
+        elif command == LC_FUNCTION_STARTS:
+            if command_size != 16:
+                fail(f"invalid LC_FUNCTION_STARTS size: {path}")
+            function_start_commands.append(struct.unpack_from("<2I", data, cursor + 8))
+        elif command == LC_SEGMENT_64:
+            if command_size < 72:
+                fail(f"truncated LC_SEGMENT_64: {path}")
+            segment_name = fixed_name(data[cursor + 8 : cursor + 24], "segment name")
+            segment_vmaddr = struct.unpack_from("<Q", data, cursor + 24)[0]
+            section_count = struct.unpack_from("<I", data, cursor + 64)[0]
+            if 72 + section_count * 80 > command_size:
+                fail(f"LC_SEGMENT_64 sections exceed their command: {path}")
+            if segment_name == "__TEXT":
+                text_segment_vmaddrs.append(segment_vmaddr)
+            section_cursor = cursor + 72
+            for _section in range(section_count):
+                section_name = fixed_name(data[section_cursor : section_cursor + 16], "section name")
+                section_segment = fixed_name(data[section_cursor + 16 : section_cursor + 32], "section segment")
+                section_address, section_size = struct.unpack_from("<2Q", data, section_cursor + 32)
+                section_offset = struct.unpack_from("<I", data, section_cursor + 48)[0]
+                section_flags = struct.unpack_from("<I", data, section_cursor + 64)[0]
+                if section_segment == "__TEXT" and section_name == "__text":
+                    text_sections.append((section_address, section_size, section_offset, section_flags))
+                section_cursor += 80
+        cursor += command_size
+    if cursor != commands_end:
+        fail(f"Mach-O load commands do not consume sizeofcmds: {path}")
+    if len(uuid_values) != 1 or len(text_segment_vmaddrs) != 1 or len(text_sections) != 1:
+        fail(f"Mach-O UUID or __TEXT/__text identity is not unique: {path}")
+    if len(function_start_commands) != 1:
+        fail(f"Mach-O LC_FUNCTION_STARTS is not unique: {path}")
+
+    text_address, text_size, text_offset, text_flags = text_sections[0]
+    if text_size == 0 or text_offset + text_size > len(data):
+        fail(f"Mach-O __TEXT,__text bytes escaped the file: {path}")
+    function_starts = decode_function_starts(
+        data,
+        function_start_commands[0][0],
+        function_start_commands[0][1],
+        text_segment_vmaddrs[0],
+    )
+    text_end = text_address + text_size
+    if any(address < text_address or address >= text_end for address in function_starts):
+        fail(f"Mach-O function start escaped __TEXT,__text: {path}")
+    function_start_bytes = b"".join(struct.pack("<Q", address) for address in function_starts)
+    text_bytes = data[text_offset : text_offset + text_size]
+    return MachOIdentity(
+        uuid=str(uuid_module.UUID(bytes=uuid_values[0])).upper(),
+        text_segment_vmaddr=text_segment_vmaddrs[0],
+        text=MachOTextSection(
+            address=text_address,
+            size=text_size,
+            offset=text_offset,
+            flags=text_flags,
+            sha256=hashlib.sha256(text_bytes).hexdigest(),
+        ),
+        function_starts=function_starts,
+        function_starts_sha256=hashlib.sha256(function_start_bytes).hexdigest(),
+    )
+
+
+def require_same_link_code(prestrip: MachOIdentity, poststrip: MachOIdentity) -> None:
+    if (
+        prestrip.uuid != poststrip.uuid
+        or prestrip.text_segment_vmaddr != poststrip.text_segment_vmaddr
+        or prestrip.text != poststrip.text
+        or prestrip.function_starts != poststrip.function_starts
+    ):
+        fail("pre-strip and post-strip captures do not preserve one linked Mach-O code image")
+
+
+def release_symbol_layout_anchors(
+    rebuilt: MachOIdentity,
+    release: MachOIdentity,
+    stable_offsets: Iterable[int],
+) -> list[dict[str, object]]:
+    if release.uuid != RELEASE_UUID:
+        fail(f"immutable release Mach-O UUID changed: {release.uuid}")
+    if (
+        rebuilt.text_segment_vmaddr != release.text_segment_vmaddr
+        or rebuilt.text.layout() != release.text.layout()
+        or rebuilt.function_starts != release.function_starts
+    ):
+        fail("rebuilt and immutable Mach-O function-address layouts are not symbol-equivalent")
+    anchors: list[dict[str, object]] = []
+    for offset in stable_offsets:
+        target = release.text_segment_vmaddr + offset
+        index = bisect.bisect_right(release.function_starts, target) - 1
+        if index < 0:
+            fail(f"stable offset 0x{offset:x} precedes the first Mach-O function")
+        start = release.function_starts[index]
+        end = (
+            release.function_starts[index + 1]
+            if index + 1 < len(release.function_starts)
+            else release.text.address + release.text.size
+        )
+        if target >= end:
+            fail(f"stable offset 0x{offset:x} escaped its Mach-O function interval")
+        anchors.append(
+            {
+                "offset": f"0x{offset:x}",
+                "absolute": f"0x{target:x}",
+                "functionStart": f"0x{start:x}",
+                "functionEnd": f"0x{end:x}",
+            }
+        )
+    return anchors
+
+
+def is_adrp(word: int) -> bool:
+    # Keep op=ADRP and the fixed opcode bits exact; only immlo/immhi may vary.
+    return word & 0x9F000000 == 0x90000000
+
+
+def is_unshifted_add_immediate_64(word: int) -> bool:
+    # Pointer materialization uses 64-bit ADD (immediate), without LSL #12.
+    return word & 0xFFC00000 == 0x91000000
+
+
+def is_adrp_add_pair(words: tuple[int, ...], index: int) -> bool:
+    if index < 0 or index + 1 >= len(words):
+        return False
+    adrp = words[index]
+    add = words[index + 1]
+    return is_adrp(adrp) and is_unshifted_add_immediate_64(add) and ((add >> 5) & 0x1F) == (adrp & 0x1F)
+
+
+def normalize_aarch64_address_materialization(words: tuple[int, ...]) -> tuple[int, ...]:
+    """Mask only relocation-bearing immediates in an adjacent ADRP/ADD pair."""
+
+    normalized = list(words)
+    for index in range(len(words) - 1):
+        if is_adrp_add_pair(words, index):
+            normalized[index] &= ~0x60FFFFE0
+            normalized[index + 1] &= ~0x003FFC00
+    return tuple(normalized)
+
+
+def address_materialization_word_kind(words: tuple[int, ...], index: int) -> str | None:
+    if is_adrp_add_pair(words, index):
+        return "ADRP"
+    if is_adrp_add_pair(words, index - 1):
+        return "ADD"
+    return None
+
+
+def release_target_code_equivalence(
+    rebuilt_path: Path,
+    release_path: Path,
+    rebuilt: MachOIdentity,
+    release: MachOIdentity,
+    anchors: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    rebuilt_data = canonical(rebuilt_path).read_bytes()
+    release_data = canonical(release_path).read_bytes()
+    results: list[dict[str, object]] = []
+    seen: set[tuple[int, int]] = set()
+    for anchor in anchors:
+        start = int(str(anchor["functionStart"]), 16)
+        end = int(str(anchor["functionEnd"]), 16)
+        if (start, end) in seen:
+            continue
+        seen.add((start, end))
+        size = end - start
+        if size <= 0 or size % 4 != 0:
+            fail(f"target Mach-O function has invalid arm64 size at 0x{start:x}")
+        rebuilt_start = rebuilt.text.offset + start - rebuilt.text.address
+        release_start = release.text.offset + start - release.text.address
+        rebuilt_code = rebuilt_data[rebuilt_start : rebuilt_start + size]
+        release_code = release_data[release_start : release_start + size]
+        if len(rebuilt_code) != size or len(release_code) != size:
+            fail(f"target Mach-O function bytes escaped __TEXT,__text at 0x{start:x}")
+        rebuilt_words = struct.unpack(f"<{size // 4}I", rebuilt_code)
+        release_words = struct.unpack(f"<{size // 4}I", release_code)
+        normalized_rebuilt = normalize_aarch64_address_materialization(rebuilt_words)
+        normalized_release = normalize_aarch64_address_materialization(release_words)
+        if normalized_rebuilt != normalized_release:
+            fail(f"target Mach-O function instruction shape changed at 0x{start:x}")
+        difference_kinds: list[str] = []
+        for index, (left, right) in enumerate(zip(rebuilt_words, release_words, strict=True)):
+            if left == right:
+                continue
+            rebuilt_kind = address_materialization_word_kind(rebuilt_words, index)
+            release_kind = address_materialization_word_kind(release_words, index)
+            if rebuilt_kind is None or rebuilt_kind != release_kind:
+                fail(f"target Mach-O function has an unbound instruction difference at 0x{start + index * 4:x}")
+            difference_kinds.append(rebuilt_kind)
+        normalized_bytes = struct.pack(f"<{len(normalized_rebuilt)}I", *normalized_rebuilt)
+        results.append(
+            {
+                "functionStart": f"0x{start:x}",
+                "functionEnd": f"0x{end:x}",
+                "bytes": size,
+                "rebuiltSha256": hashlib.sha256(rebuilt_code).hexdigest(),
+                "releaseSha256": hashlib.sha256(release_code).hexdigest(),
+                "rawBytesEqual": rebuilt_code == release_code,
+                "allowedAddressImmediateDifferenceWords": sum(
+                    left != right for left, right in zip(rebuilt_words, release_words, strict=True)
+                ),
+                "allowedAdrpImmediateDifferenceWords": difference_kinds.count("ADRP"),
+                "allowedAddImmediateDifferenceWords": difference_kinds.count("ADD"),
+                "normalizedInstructionSha256": hashlib.sha256(normalized_bytes).hexdigest(),
+            }
+        )
+    if not results:
+        fail("no target Mach-O functions were bound")
+    return results
+
+
 def validate_capture_result(
     value: object,
     prestrip: Path,
+    poststrip: Path,
     built: Path,
     release_binary: Path,
 ) -> dict[str, object]:
     result = require_dict(value, "capture result")
     prestrip = canonical(prestrip)
+    poststrip = canonical(poststrip)
     built = canonical(built)
     release_binary = canonical(release_binary)
     expected_directory = canonical(built.parent / "deps")
@@ -184,6 +518,7 @@ def validate_capture_result(
     ):
         fail("rust-objcopy invocation does not bind the actual hashed target")
     capture_sha = sha256(prestrip)
+    poststrip_capture_sha = sha256(poststrip)
     poststrip_sha = sha256(actual_target)
     built_sha = sha256(built)
     release_sha = sha256(release_binary)
@@ -201,6 +536,9 @@ def validate_capture_result(
         or result.get("capture") != os.fspath(prestrip)
         or result.get("captureSha256") != capture_sha
         or result.get("captureBytes") != prestrip.stat().st_size
+        or result.get("poststripCapture") != os.fspath(poststrip)
+        or result.get("poststripCaptureSha256") != poststrip_capture_sha
+        or result.get("poststripCaptureBytes") != poststrip.stat().st_size
         or result.get("singleTargetInvocation") is not True
         or result.get("poststripHashedTargetSha256") != poststrip_sha
         or result.get("poststripHashedTargetBytes") != actual_target.stat().st_size
@@ -209,17 +547,18 @@ def validate_capture_result(
         or result.get("immutableReleaseSha256") != release_sha
         or result.get("immutableReleaseBytes") != release_binary.stat().st_size
         or result.get("prestripDiffersFromPoststrip") is not True
+        or result.get("poststripCaptureMatchesHashedTarget") is not True
         or result.get("poststripHashedTargetMatchesCargoOutput") is not True
-        or result.get("poststripHashedTargetMatchesImmutableRelease") is not True
+        or result.get("rebuiltPoststripWholeFileMatchesImmutableRelease") != files_equal(poststrip, release_binary)
         or not isinstance(original_objcopy_sha, str)
         or re.fullmatch(r"[0-9a-f]{64}", original_objcopy_sha) is None
         or restored_objcopy_sha != original_objcopy_sha
         or not isinstance(wrapper_sha, str)
         or re.fullmatch(r"[0-9a-f]{64}", wrapper_sha) is None
         or result.get("releaseGateAuthority") is not False
-        or capture_sha == poststrip_sha
+        or capture_sha == poststrip_capture_sha
+        or not files_equal(poststrip, actual_target)
         or not files_equal(actual_target, built)
-        or not files_equal(actual_target, release_binary)
     ):
         fail("rust-objcopy capture result does not bind the exact hashed build target")
     return result
@@ -549,6 +888,28 @@ def parse_nm(output: str) -> list[tuple[int, str, str]]:
     return symbols
 
 
+def bind_layout_anchors_to_symbols(
+    anchors: list[dict[str, object]],
+    symbols: list[tuple[int, str, str]],
+) -> list[dict[str, object]]:
+    text_symbols: dict[int, list[tuple[str, str]]] = {}
+    for address, kind, name in symbols:
+        if kind in ("t", "T"):
+            text_symbols.setdefault(address, []).append((kind, name))
+    bound: list[dict[str, object]] = []
+    for anchor in anchors:
+        start = int(str(anchor["functionStart"]), 16)
+        absolute = int(str(anchor["absolute"]), 16)
+        candidates = text_symbols.get(start, [])
+        if len(candidates) != 1:
+            fail(f"Mach-O function start 0x{start:x} has {len(candidates)} exact text symbols")
+        kind, name = candidates[0]
+        delta = absolute - start
+        expected_nm = name if delta == 0 else f"{name} + 0x{delta:x}"
+        bound.append({**anchor, "symbolKind": kind, "symbol": name, "expectedLlvmNm": expected_nm})
+    return bound
+
+
 def text_vmaddr(otool_output: str) -> int:
     lines = otool_output.splitlines()
     for index, line in enumerate(lines):
@@ -708,6 +1069,7 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--artifact-zip", type=Path, required=True)
     parser.add_argument("--prestrip", type=Path, required=True)
+    parser.add_argument("--poststrip", type=Path, required=True)
     parser.add_argument("--built", type=Path, required=True)
     parser.add_argument("--release-binary", type=Path, required=True)
     parser.add_argument("--release-archive", type=Path, required=True)
@@ -734,33 +1096,53 @@ def main() -> None:
         fail("release archive size changed")
     for path, label in (
         (args.prestrip, "pre-strip capture"),
+        (args.poststrip, "post-strip invocation capture"),
         (args.built, "rebuilt post-strip binary"),
         (args.release_binary, "release binary"),
     ):
         if not path.is_file() or path.stat().st_size == 0:
             fail(f"{label} is missing or empty: {path}")
     if (
-        args.built.stat().st_size != RELEASE_BINARY_BYTES
-        or args.release_binary.stat().st_size != RELEASE_BINARY_BYTES
-        or sha256(args.built) != RELEASE_BINARY_SHA256
+        args.release_binary.stat().st_size != RELEASE_BINARY_BYTES
         or sha256(args.release_binary) != RELEASE_BINARY_SHA256
-        or not files_equal(args.built, args.release_binary)
     ):
-        fail("rebuilt post-strip executable is not byte-identical to the release")
-    uuids = {
-        "prestrip": mach_uuid(args.prestrip, args.dwarfdump),
-        "built": mach_uuid(args.built, args.dwarfdump),
-        "release": mach_uuid(args.release_binary, args.dwarfdump),
-    }
-    if set(uuids.values()) != {RELEASE_UUID}:
-        fail(f"Mach-O UUIDs do not bind to the release: {uuids!r}")
+        fail("immutable release binary identity changed")
+    if not files_equal(args.poststrip, args.built):
+        fail("post-strip invocation capture is not byte-identical to Cargo output")
 
     capture_result = validate_capture_result(
         load_json(args.capture_result),
         args.prestrip,
+        args.poststrip,
         args.built,
         args.release_binary,
     )
+
+    macho = {
+        "prestrip": parse_macho_identity(args.prestrip),
+        "poststrip": parse_macho_identity(args.poststrip),
+        "built": parse_macho_identity(args.built),
+        "release": parse_macho_identity(args.release_binary),
+    }
+    require_same_link_code(macho["prestrip"], macho["poststrip"])
+    require_same_link_code(macho["poststrip"], macho["built"])
+    stable_offsets = MAIN_STABLE_OFFSETS + SCRIPT_STABLE_OFFSETS
+    layout_anchors = release_symbol_layout_anchors(macho["poststrip"], macho["release"], stable_offsets)
+    target_code_equivalence = release_target_code_equivalence(
+        args.poststrip,
+        args.release_binary,
+        macho["poststrip"],
+        macho["release"],
+        layout_anchors,
+    )
+    dwarfdump_uuids = {
+        "prestrip": mach_uuid(args.prestrip, args.dwarfdump),
+        "poststrip": mach_uuid(args.poststrip, args.dwarfdump),
+        "built": mach_uuid(args.built, args.dwarfdump),
+        "release": mach_uuid(args.release_binary, args.dwarfdump),
+    }
+    if any(dwarfdump_uuids[name] != identity.uuid for name, identity in macho.items()):
+        fail("dwarfdump and structural Mach-O UUID parsing disagree")
 
     nm_prestrip = run_command(
         [args.llvm_nm, "--numeric-sort", "--demangle", "--defined-only", os.fspath(args.prestrip)]
@@ -771,6 +1153,7 @@ def main() -> None:
     local_symbols = [item for item in symbols if item[1].islower()]
     if not symbols or not local_symbols:
         fail("pre-strip capture does not contain defined local symbols")
+    layout_anchors = bind_layout_anchors_to_symbols(layout_anchors, symbols)
     (args.output / "llvm-nm.demangled.txt").write_text(nm_prestrip.stdout, encoding="utf-8")
     nm_release = run_command(
         [args.llvm_nm, "--numeric-sort", "--demangle", "--defined-only", os.fspath(args.release_binary)],
@@ -788,6 +1171,8 @@ def main() -> None:
     otool = run_command([args.otool, "-l", os.fspath(args.prestrip)])
     (args.output / "prestrip-otool-load-commands.txt").write_text(otool.stdout, encoding="utf-8")
     text_base = text_vmaddr(otool.stdout)
+    if text_base != macho["prestrip"].text_segment_vmaddr:
+        fail("otool and structural Mach-O __TEXT vmaddr parsing disagree")
 
     summary_records = validate_summary(args.input)
     samples = validate_artifact_files(args.input, summary_records)
@@ -802,6 +1187,16 @@ def main() -> None:
         )
         for sample in samples
     ]
+    first_frames = {
+        str(frame["offset"]): frame
+        for key in ("mainFrames", "scriptFrames")
+        for frame in symbolized[0][key]
+        if isinstance(frame, dict)
+    }
+    for anchor in layout_anchors:
+        frame = first_frames.get(str(anchor["offset"]))
+        if frame is None or frame.get("llvmNm") != anchor["expectedLlvmNm"]:
+            fail(f"stable symbol mapping did not bind Mach-O function anchor {anchor['offset']}")
 
     def mapping(record: dict[str, object], key: str) -> tuple[tuple[str, str], ...]:
         frames = record[key]
@@ -855,9 +1250,24 @@ def main() -> None:
             "rustObjcopy": capture_result,
             "prestripSha256": sha256(args.prestrip),
             "prestripBytes": args.prestrip.stat().st_size,
-            "poststripSha256": sha256(args.built),
-            "poststripMatchesRelease": True,
-            "uuids": uuids,
+            "poststripAtInvocationSha256": sha256(args.poststrip),
+            "poststripAtInvocationBytes": args.poststrip.stat().st_size,
+            "cargoOutputSha256": sha256(args.built),
+            "cargoOutputBytes": args.built.stat().st_size,
+            "rebuiltWholeFileMatchesRelease": files_equal(args.poststrip, args.release_binary),
+            "macho": {name: identity.as_json() for name, identity in macho.items()},
+            "dwarfdumpUuids": dwarfdump_uuids,
+            "releaseSymbolLayoutAnchors": layout_anchors,
+            "releaseTargetCodeEquivalence": target_code_equivalence,
+            "targetCodeNormalization": {
+                "architecture": "arm64",
+                "maskedFields": ["adjacent ADRP address immediate", "paired unshifted ADD x-register imm12"],
+                "pairConstraint": "ADD base register equals preceding ADRP destination register",
+                "allOtherInstructionBitsExact": True,
+            },
+            "prestripPoststripCodeIdentity": True,
+            "releaseFunctionAddressLayoutEquivalent": True,
+            "releaseTargetInstructionShapeEquivalent": True,
             "definedSymbolCount": len(symbols),
             "localSymbolCount": len(local_symbols),
             "releaseLocalSymbolCount": len(release_local_symbols),
@@ -877,8 +1287,12 @@ def main() -> None:
             "script": dict(script_mappings[0]),
         },
         "claims": {
-            "exactReleaseAddressAuthority": True,
-            "poststripWholeFileEquality": True,
+            "exactReleaseStableOffsetAddressAuthority": True,
+            "poststripSameBuildWholeFileEquality": True,
+            "prestripPoststripTextBytesAndLayoutEqual": True,
+            "releaseFunctionStartTableEqual": True,
+            "releaseTargetInstructionShapeEqual": True,
+            "releaseWholeFileEqualityRequired": False,
             "allNineStableMappingsEqual": True,
             "allStasisFrameArithmeticValidated": True,
             "shellWaitBound": shell_wait_bound,

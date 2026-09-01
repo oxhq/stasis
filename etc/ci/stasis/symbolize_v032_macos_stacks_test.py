@@ -5,9 +5,11 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
+import uuid
 
 
 MODULE_PATH = Path(__file__).with_name("symbolize_v032_macos_stacks.py")
@@ -47,21 +49,24 @@ def synthetic_report(*, bad_absolute: bool = False) -> str:
     return "\n".join(lines) + "\n"
 
 
-def synthetic_capture_result(root: Path) -> tuple[Path, Path, Path, dict[str, object]]:
+def synthetic_capture_result(root: Path) -> tuple[Path, Path, Path, Path, dict[str, object]]:
     profile = root / "target" / "production-stripped"
     deps = profile / "deps"
     deps.mkdir(parents=True)
     actual = deps / "stasis-0123456789abcdef"
+    poststrip_capture = root / "stasis.poststrip-at-invocation"
     built = profile / "stasis"
     release = root / "release" / "stasis"
     release.parent.mkdir()
     poststrip = b"post-strip executable"
-    for path in (actual, built, release):
+    for path in (actual, poststrip_capture, built):
         path.write_bytes(poststrip)
+    release.write_bytes(b"immutable release with expected whole-file differences")
     prestrip = root / "stasis.prestrip"
     prestrip.write_bytes(b"pre-strip executable with local symbols")
     root = symbolize.canonical(root)
     actual = symbolize.canonical(actual)
+    poststrip_capture = symbolize.canonical(poststrip_capture)
     built = symbolize.canonical(built)
     release = symbolize.canonical(release)
     prestrip = symbolize.canonical(prestrip)
@@ -76,6 +81,9 @@ def synthetic_capture_result(root: Path) -> tuple[Path, Path, Path, dict[str, ob
         "capture": os.fspath(prestrip),
         "captureBytes": prestrip.stat().st_size,
         "captureSha256": symbolize.sha256(prestrip),
+        "poststripCapture": os.fspath(poststrip_capture),
+        "poststripCaptureBytes": poststrip_capture.stat().st_size,
+        "poststripCaptureSha256": symbolize.sha256(poststrip_capture),
         "rustObjcopyInvocation": {
             "workingDirectory": os.fspath(root),
             "argv": ["--strip-all", os.fspath(actual)],
@@ -89,14 +97,97 @@ def synthetic_capture_result(root: Path) -> tuple[Path, Path, Path, dict[str, ob
         "immutableReleaseBytes": release.stat().st_size,
         "immutableReleaseSha256": symbolize.sha256(release),
         "prestripDiffersFromPoststrip": True,
+        "poststripCaptureMatchesHashedTarget": True,
         "poststripHashedTargetMatchesCargoOutput": True,
-        "poststripHashedTargetMatchesImmutableRelease": True,
+        "rebuiltPoststripWholeFileMatchesImmutableRelease": False,
         "originalObjcopySha256": "a" * 64,
         "restoredObjcopySha256": "a" * 64,
         "wrapperSha256": "b" * 64,
         "releaseGateAuthority": False,
     }
-    return prestrip, built, release, result
+    return prestrip, poststrip_capture, built, release, result
+
+
+def encode_uleb(value: int) -> bytes:
+    result = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            byte |= 0x80
+        result.append(byte)
+        if not value:
+            return bytes(result)
+
+
+def synthetic_macho(
+    path: Path,
+    *,
+    uuid_value: str,
+    text_bytes: bytes = b"0123456789abcdef",
+    text_delta: int = 0x200,
+) -> Path:
+    if len(text_bytes) != 16:
+        raise ValueError("synthetic __text must contain exactly 16 bytes")
+    image_base = 0x100000000
+    text_offset = 0x200
+    function_data = encode_uleb(text_delta) + encode_uleb(8) + b"\0"
+    function_data += b"\0" * (8 - len(function_data))
+    function_offset = text_offset + len(text_bytes)
+    segment = struct.pack(
+        "<II16sQQQQiiII",
+        symbolize.LC_SEGMENT_64,
+        152,
+        b"__TEXT\0".ljust(16, b"\0"),
+        image_base,
+        0x1000,
+        0,
+        function_offset + len(function_data),
+        5,
+        5,
+        1,
+        0,
+    )
+    section = struct.pack(
+        "<16s16sQQ8I",
+        b"__text\0".ljust(16, b"\0"),
+        b"__TEXT\0".ljust(16, b"\0"),
+        image_base + text_delta,
+        len(text_bytes),
+        text_offset,
+        2,
+        0,
+        0,
+        0x80000400,
+        0,
+        0,
+        0,
+    )
+    uuid_command = struct.pack("<II16s", symbolize.LC_UUID, 24, uuid.UUID(uuid_value).bytes)
+    function_command = struct.pack(
+        "<4I",
+        symbolize.LC_FUNCTION_STARTS,
+        16,
+        function_offset,
+        len(function_data),
+    )
+    commands = segment + section + uuid_command + function_command
+    header = struct.pack(
+        "<8I",
+        symbolize.MACHO_MAGIC_64,
+        symbolize.CPU_TYPE_ARM64,
+        0,
+        symbolize.MH_EXECUTE,
+        3,
+        len(commands),
+        0,
+        0,
+    )
+    content = header + commands
+    content += b"\0" * (text_offset - len(content))
+    content += text_bytes + function_data
+    path.write_bytes(content)
+    return path
 
 
 class SymbolizeV032MacosStacksTests(unittest.TestCase):
@@ -152,34 +243,185 @@ Load command 1
 
     def test_capture_result_binds_the_one_hashed_target_and_poststrip_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            prestrip, built, release, result = synthetic_capture_result(Path(directory).resolve())
-            validated = symbolize.validate_capture_result(result, prestrip, built, release)
+            prestrip, poststrip, built, release, result = synthetic_capture_result(Path(directory).resolve())
+            validated = symbolize.validate_capture_result(result, prestrip, poststrip, built, release)
             self.assertEqual(validated["actualStripTarget"], result["actualStripTarget"])
+            self.assertFalse(validated["rebuiltPoststripWholeFileMatchesImmutableRelease"])
 
     def test_capture_result_rejects_a_second_hashed_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            prestrip, built, release, result = synthetic_capture_result(root)
+            prestrip, poststrip, built, release, result = synthetic_capture_result(root)
             (root / "target" / "production-stripped" / "deps" / "stasis-fedcba9876543210").write_bytes(
                 b"post-strip executable"
             )
             with self.assertRaises(SystemExit):
-                symbolize.validate_capture_result(result, prestrip, built, release)
+                symbolize.validate_capture_result(result, prestrip, poststrip, built, release)
 
     def test_capture_result_rejects_the_old_top_level_cargo_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            prestrip, built, release, result = synthetic_capture_result(Path(directory).resolve())
+            prestrip, poststrip, built, release, result = synthetic_capture_result(Path(directory).resolve())
             result["actualStripTarget"] = os.fspath(built)
             with self.assertRaises(SystemExit):
-                symbolize.validate_capture_result(result, prestrip, built, release)
+                symbolize.validate_capture_result(result, prestrip, poststrip, built, release)
 
-    def test_capture_result_rejects_poststrip_bytes_not_matching_the_release(self) -> None:
+    def test_capture_result_rejects_poststrip_bytes_not_matching_cargo(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            prestrip, built, release, result = synthetic_capture_result(Path(directory).resolve())
+            prestrip, poststrip, built, release, result = synthetic_capture_result(Path(directory).resolve())
             actual = Path(str(result["actualStripTarget"]))
             actual.write_bytes(b"different post-strip executable")
             with self.assertRaises(SystemExit):
-                symbolize.validate_capture_result(result, prestrip, built, release)
+                symbolize.validate_capture_result(result, prestrip, poststrip, built, release)
+
+    def test_macho_parser_binds_uuid_text_and_function_starts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = synthetic_macho(
+                Path(directory) / "stasis",
+                uuid_value=symbolize.RELEASE_UUID,
+            )
+            identity = symbolize.parse_macho_identity(path)
+            self.assertEqual(identity.uuid, symbolize.RELEASE_UUID)
+            self.assertEqual(identity.text.address, 0x100000200)
+            self.assertEqual(identity.function_starts, (0x100000200, 0x100000208))
+
+    def test_same_uuid_with_altered_text_bytes_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            left = symbolize.parse_macho_identity(synthetic_macho(root / "left", uuid_value=symbolize.RELEASE_UUID))
+            right = symbolize.parse_macho_identity(
+                synthetic_macho(
+                    root / "right",
+                    uuid_value=symbolize.RELEASE_UUID,
+                    text_bytes=b"0123456789abcdeX",
+                )
+            )
+            with self.assertRaises(SystemExit):
+                symbolize.require_same_link_code(left, right)
+
+    def test_same_uuid_with_altered_text_layout_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            left = symbolize.parse_macho_identity(synthetic_macho(root / "left", uuid_value=symbolize.RELEASE_UUID))
+            right = symbolize.parse_macho_identity(
+                synthetic_macho(
+                    root / "right",
+                    uuid_value=symbolize.RELEASE_UUID,
+                    text_delta=0x204,
+                )
+            )
+            with self.assertRaises(SystemExit):
+                symbolize.require_same_link_code(left, right)
+
+    def test_release_symbol_equivalence_accepts_expected_whole_file_differences(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rebuilt_text = struct.pack("<4I", 0x9001A560, 0x91025800, 0xD65F03C0, 0xD503201F)
+            release_text = struct.pack("<4I", 0xF001A540, 0x913E5800, 0xD65F03C0, 0xD503201F)
+            rebuilt_path = synthetic_macho(
+                root / "rebuilt",
+                uuid_value="04B66398-4FDD-39C3-BFD8-7646E34040E9",
+                text_bytes=rebuilt_text,
+            )
+            release_path = synthetic_macho(
+                root / "release",
+                uuid_value=symbolize.RELEASE_UUID,
+                text_bytes=release_text,
+            )
+            rebuilt = symbolize.parse_macho_identity(rebuilt_path)
+            release = symbolize.parse_macho_identity(release_path)
+            anchors = symbolize.release_symbol_layout_anchors(rebuilt, release, (0x204,))
+            self.assertEqual(anchors[0]["functionStart"], "0x100000200")
+            code = symbolize.release_target_code_equivalence(
+                rebuilt_path,
+                release_path,
+                rebuilt,
+                release,
+                anchors,
+            )
+            self.assertFalse(code[0]["rawBytesEqual"])
+            self.assertEqual(code[0]["allowedAddressImmediateDifferenceWords"], 2)
+
+    def test_release_symbol_equivalence_rejects_changed_function_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rebuilt = symbolize.parse_macho_identity(
+                synthetic_macho(root / "rebuilt", uuid_value="04B66398-4FDD-39C3-BFD8-7646E34040E9")
+            )
+            release = symbolize.parse_macho_identity(
+                synthetic_macho(root / "release", uuid_value=symbolize.RELEASE_UUID, text_delta=0x204)
+            )
+            with self.assertRaises(SystemExit):
+                symbolize.release_symbol_layout_anchors(rebuilt, release, (0x204,))
+
+    def test_same_uuid_with_altered_target_opcode_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rebuilt_path = synthetic_macho(
+                root / "rebuilt",
+                uuid_value=symbolize.RELEASE_UUID,
+                text_bytes=struct.pack("<4I", 0x9001A560, 0x910EA821, 0xD65F03C0, 0xD503201F),
+            )
+            release_path = synthetic_macho(
+                root / "release",
+                uuid_value=symbolize.RELEASE_UUID,
+                text_bytes=struct.pack("<4I", 0x9001A560, 0xD503201F, 0xD65F03C0, 0xD503201F),
+            )
+            rebuilt = symbolize.parse_macho_identity(rebuilt_path)
+            release = symbolize.parse_macho_identity(release_path)
+            anchors = symbolize.release_symbol_layout_anchors(rebuilt, release, (0x204,))
+            with self.assertRaises(SystemExit):
+                symbolize.release_target_code_equivalence(
+                    rebuilt_path,
+                    release_path,
+                    rebuilt,
+                    release,
+                    anchors,
+                )
+
+    def test_altered_standalone_add_immediate_is_not_treated_as_an_address_relocation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rebuilt_path = synthetic_macho(
+                root / "rebuilt",
+                uuid_value=symbolize.RELEASE_UUID,
+                text_bytes=struct.pack("<4I", 0x91000400, 0xD503201F, 0xD65F03C0, 0xD503201F),
+            )
+            release_path = synthetic_macho(
+                root / "release",
+                uuid_value=symbolize.RELEASE_UUID,
+                text_bytes=struct.pack("<4I", 0x91000800, 0xD503201F, 0xD65F03C0, 0xD503201F),
+            )
+            rebuilt = symbolize.parse_macho_identity(rebuilt_path)
+            release = symbolize.parse_macho_identity(release_path)
+            anchors = symbolize.release_symbol_layout_anchors(rebuilt, release, (0x204,))
+            with self.assertRaises(SystemExit):
+                symbolize.release_target_code_equivalence(
+                    rebuilt_path,
+                    release_path,
+                    rebuilt,
+                    release,
+                    anchors,
+                )
+
+    def test_function_start_decoder_rejects_uint64_uleb_overflow(self) -> None:
+        overflowing = b"\x81" * 9 + b"\x02\x00"
+        with self.assertRaises(SystemExit):
+            symbolize.decode_function_starts(overflowing, 0, len(overflowing), 0)
+
+    def test_release_layout_anchor_requires_one_exact_text_symbol(self) -> None:
+        anchor = {
+            "offset": "0x204",
+            "absolute": "0x100000204",
+            "functionStart": "0x100000200",
+            "functionEnd": "0x100000208",
+        }
+        bound = symbolize.bind_layout_anchors_to_symbols(
+            [anchor],
+            [(0x100000200, "t", "stasis::bound_function")],
+        )
+        self.assertEqual(bound[0]["expectedLlvmNm"], "stasis::bound_function + 0x4")
+        with self.assertRaises(SystemExit):
+            symbolize.bind_layout_anchors_to_symbols([anchor], [])
 
 
 if __name__ == "__main__":

@@ -3,8 +3,9 @@
 
 This utility is diagnostic-only.  It replaces the pinned Rust toolchain's
 ``rust-objcopy`` with a narrowly scoped forwarding wrapper, records the one
-``--strip-all`` invocation for Cargo's hashed Stasis executable, and restores
-the original tool byte-for-byte after the build.
+``--strip-all`` invocation plus its before/after bytes for Cargo's hashed
+Stasis executable, and restores the original tool byte-for-byte after the
+build.
 """
 
 from __future__ import annotations
@@ -20,8 +21,8 @@ import subprocess
 from typing import NoReturn
 
 
-STATE_SCHEMA = "stasis-v0.3.2-macos-rust-objcopy-capture-state-v2"
-RESULT_SCHEMA = "stasis-v0.3.2-macos-rust-objcopy-capture-v2"
+STATE_SCHEMA = "stasis-v0.3.2-macos-rust-objcopy-capture-state-v3"
+RESULT_SCHEMA = "stasis-v0.3.2-macos-rust-objcopy-capture-v3"
 # The pinned Darwin linker strips this hashed output before Cargo surfaces the
 # sibling ``production-stripped/stasis`` executable.
 HASHED_TARGET_PATTERN = re.compile(r"^stasis-[0-9a-f]{16}$")
@@ -62,6 +63,7 @@ set -euo pipefail
 
 : "${STASIS_EXPECTED_STRIP_DIRECTORY:?}"
 : "${STASIS_PRESTRIP_CAPTURE:?}"
+: "${STASIS_POSTSTRIP_CAPTURE:?}"
 : "${STASIS_PRESTRIP_CAPTURE_LOCK:?}"
 : "${STASIS_PRESTRIP_INVOCATION:?}"
 : "${STASIS_REAL_RUST_OBJCOPY:?}"
@@ -104,6 +106,15 @@ if [[ "$target_argument_count" -ne 0 ]]; then
   /usr/bin/shasum -a 256 "$STASIS_PRESTRIP_CAPTURE" \
     > "${STASIS_PRESTRIP_CAPTURE}.sha256"
   trap - EXIT
+  "$STASIS_REAL_RUST_OBJCOPY" "$@"
+  poststrip_temporary="${STASIS_POSTSTRIP_CAPTURE}.tmp.$$"
+  trap '/bin/rm -f -- "$poststrip_temporary"' EXIT
+  /bin/cp -p -- "$2" "$poststrip_temporary"
+  /bin/mv -- "$poststrip_temporary" "$STASIS_POSTSTRIP_CAPTURE"
+  /usr/bin/shasum -a 256 "$STASIS_POSTSTRIP_CAPTURE" \
+    > "${STASIS_POSTSTRIP_CAPTURE}.sha256"
+  trap - EXIT
+  exit 0
 fi
 
 exec "$STASIS_REAL_RUST_OBJCOPY" "$@"
@@ -152,6 +163,7 @@ def install(args: argparse.Namespace) -> None:
     expected_directory = canonical(args.expected_deps_directory)
     expected_cargo_output = canonical(args.expected_cargo_output)
     capture = canonical(args.capture)
+    poststrip_capture = canonical(args.poststrip_capture)
     invocation = canonical(args.invocation_file)
     lock = canonical(args.lock)
     state_path = canonical(args.state)
@@ -168,10 +180,11 @@ def install(args: argparse.Namespace) -> None:
         fail("expected Cargo output is not the stasis sibling of the hashed deps directory")
     if expected_directory.exists() or expected_cargo_output.exists():
         fail("production-stripped outputs already exist before the exact build")
-    for path in (capture, invocation, lock, state_path):
+    for path in (capture, poststrip_capture, invocation, lock, state_path):
         if path.exists():
             fail(f"capture path already exists: {path}")
     capture.parent.mkdir(parents=True, exist_ok=True)
+    poststrip_capture.parent.mkdir(parents=True, exist_ok=True)
     invocation.parent.mkdir(parents=True, exist_ok=True)
 
     sysroot, target_libdir, objcopy = locate_objcopy(args.rustc)
@@ -216,6 +229,7 @@ def install(args: argparse.Namespace) -> None:
             "expectedCargoOutput": os.fspath(expected_cargo_output),
             "hashedTargetPattern": HASHED_TARGET_PATTERN.pattern,
             "capture": os.fspath(capture),
+            "poststripCapture": os.fspath(poststrip_capture),
             "captureInvocation": os.fspath(invocation),
             "captureLock": os.fspath(lock),
             "originalObjcopySha256": original_sha,
@@ -231,6 +245,7 @@ def install(args: argparse.Namespace) -> None:
                 "STASIS_EXPECTED_STRIP_DIRECTORY": os.fspath(expected_directory),
                 "STASIS_EXPECTED_CARGO_OUTPUT": os.fspath(expected_cargo_output),
                 "STASIS_PRESTRIP_CAPTURE": os.fspath(capture),
+                "STASIS_POSTSTRIP_CAPTURE": os.fspath(poststrip_capture),
                 "STASIS_PRESTRIP_CAPTURE_LOCK": os.fspath(lock),
                 "STASIS_PRESTRIP_INVOCATION": os.fspath(invocation),
                 "STASIS_REAL_RUST_OBJCOPY": os.fspath(real),
@@ -318,7 +333,10 @@ def verify(args: argparse.Namespace) -> None:
     state = load_state(state_path)
     if state.get("restored") is not True:
         fail("real rust-objcopy was not restored before capture verification")
+    if state.get("releaseGateAuthority") is not False:
+        fail("capture state incorrectly asserts release-gate authority")
     capture = canonical(Path(str(state["capture"])))
+    poststrip_capture = canonical(Path(str(state["poststripCapture"])))
     invocation = canonical(Path(str(state["captureInvocation"])))
     lock = canonical(Path(str(state["captureLock"])))
     expected_directory = canonical(Path(str(state["expectedStripDirectory"])))
@@ -329,8 +347,9 @@ def verify(args: argparse.Namespace) -> None:
         fail("capture state does not bind the exact hashed Stasis target pattern")
     if built != expected_cargo_output or expected_directory != canonical(built.parent / "deps"):
         fail("verification Cargo output does not match the installed capture state")
-    if not capture.is_file() or capture.stat().st_size == 0:
-        fail("pre-strip capture is missing or empty")
+    for path, label in ((capture, "pre-strip capture"), (poststrip_capture, "post-strip invocation capture")):
+        if not path.is_file() or path.stat().st_size == 0:
+            fail(f"{label} is missing or empty")
     if not invocation.is_file() or not lock.is_dir():
         fail("strip invocation record or atomic single-invocation lock is missing")
     matches = hashed_targets(expected_directory)
@@ -358,6 +377,13 @@ def verify(args: argparse.Namespace) -> None:
     sidecar_fields = sidecar.read_text(encoding="utf-8").strip().split()
     if sidecar_fields != [capture_sha, os.fspath(capture)]:
         fail("pre-strip capture hash sidecar does not match")
+    poststrip_capture_sha = sha256(poststrip_capture)
+    poststrip_sidecar = Path(f"{poststrip_capture}.sha256")
+    if not poststrip_sidecar.is_file():
+        fail("post-strip invocation capture hash sidecar is missing")
+    poststrip_sidecar_fields = poststrip_sidecar.read_text(encoding="utf-8").strip().split()
+    if poststrip_sidecar_fields != [poststrip_capture_sha, os.fspath(poststrip_capture)]:
+        fail("post-strip invocation capture hash sidecar does not match")
     for path, label in (
         (actual_target, "post-strip hashed target"),
         (built, "Cargo output"),
@@ -367,11 +393,12 @@ def verify(args: argparse.Namespace) -> None:
             fail(f"{label} is missing or empty: {path}")
     if release_binary.stat().st_size != RELEASE_BINARY_BYTES or sha256(release_binary) != RELEASE_BINARY_SHA256:
         fail("immutable release binary identity changed")
-    if not files_equal(actual_target, built) or not files_equal(actual_target, release_binary):
-        fail("post-strip hashed target is not byte-identical to Cargo output and immutable release")
+    if not files_equal(poststrip_capture, actual_target) or not files_equal(actual_target, built):
+        fail("captured post-strip target is not byte-identical to the hashed target and Cargo output")
     poststrip_sha = sha256(actual_target)
-    if capture_sha == poststrip_sha or files_equal(capture, actual_target):
+    if capture_sha == poststrip_capture_sha or files_equal(capture, poststrip_capture):
         fail("pre-strip capture is not distinct from the post-strip executable")
+    whole_file_matches_release = files_equal(poststrip_capture, release_binary)
     original_objcopy_sha = state.get("originalObjcopySha256")
     restored_objcopy_sha = state.get("restoredObjcopySha256")
     wrapper_sha = state.get("wrapperSha256")
@@ -394,6 +421,9 @@ def verify(args: argparse.Namespace) -> None:
         "capture": os.fspath(capture),
         "captureBytes": capture.stat().st_size,
         "captureSha256": capture_sha,
+        "poststripCapture": os.fspath(poststrip_capture),
+        "poststripCaptureBytes": poststrip_capture.stat().st_size,
+        "poststripCaptureSha256": poststrip_capture_sha,
         "rustObjcopyInvocation": {
             "workingDirectory": os.fspath(working_directory),
             "argv": argv,
@@ -407,8 +437,9 @@ def verify(args: argparse.Namespace) -> None:
         "immutableReleaseBytes": release_binary.stat().st_size,
         "immutableReleaseSha256": sha256(release_binary),
         "prestripDiffersFromPoststrip": True,
+        "poststripCaptureMatchesHashedTarget": True,
         "poststripHashedTargetMatchesCargoOutput": True,
-        "poststripHashedTargetMatchesImmutableRelease": True,
+        "rebuiltPoststripWholeFileMatchesImmutableRelease": whole_file_matches_release,
         "originalObjcopySha256": original_objcopy_sha,
         "restoredObjcopySha256": restored_objcopy_sha,
         "wrapperSha256": wrapper_sha,
@@ -426,6 +457,7 @@ def parser() -> argparse.ArgumentParser:
     install_parser.add_argument("--expected-deps-directory", type=Path, required=True)
     install_parser.add_argument("--expected-cargo-output", type=Path, required=True)
     install_parser.add_argument("--capture", type=Path, required=True)
+    install_parser.add_argument("--poststrip-capture", type=Path, required=True)
     install_parser.add_argument("--invocation-file", type=Path, required=True)
     install_parser.add_argument("--lock", type=Path, required=True)
     install_parser.add_argument("--state", type=Path, required=True)

@@ -361,6 +361,7 @@ jobs:
             --expected-deps-directory "$GITHUB_WORKSPACE/target/production-stripped/deps" \
             --expected-cargo-output "$GITHUB_WORKSPACE/target/production-stripped/stasis" \
             --capture "$EVIDENCE/binaries/stasis-v0.3.2.prestrip" \
+            --poststrip-capture "$EVIDENCE/binaries/stasis-v0.3.2.poststrip-at-invocation" \
             --invocation-file "$EVIDENCE/rust-objcopy.invocation0" \
             --lock "$RUNNER_TEMP/stasis-v032-prestrip-capture.lock" \
             --state "$EVIDENCE/strip-capture-state.json" \
@@ -385,6 +386,8 @@ jobs:
             "$GITHUB_WORKSPACE/target/production-stripped/deps"
           test "$STASIS_EXPECTED_CARGO_OUTPUT" = \
             "$GITHUB_WORKSPACE/target/production-stripped/stasis"
+          test "$STASIS_POSTSTRIP_CAPTURE" = \
+            "$EVIDENCE/binaries/stasis-v0.3.2.poststrip-at-invocation"
           if ! changes=$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none); then
             echo 'could not inspect the checkout before the exact rebuild' >&2
             exit 1
@@ -423,6 +426,7 @@ jobs:
             --input "$DIAGNOSTIC_INPUT" \
             --artifact-zip "$EVIDENCE/hosted/diagnostic-artifact.zip" \
             --prestrip "$EVIDENCE/binaries/stasis-v0.3.2.prestrip" \
+            --poststrip "$EVIDENCE/binaries/stasis-v0.3.2.poststrip-at-invocation" \
             --built "$GITHUB_WORKSPACE/target/production-stripped/stasis" \
             --release-binary "$release_binary" \
             --release-archive "$RELEASE_ROOT/stasis-0.3.2-macos-aarch64.tar.gz" \
@@ -492,10 +496,12 @@ jobs:
             echo '- Output artifact ID: `${{ steps.upload.outputs.artifact-id }}`'
             echo '- Output artifact digest: `${{ steps.upload.outputs.artifact-digest }}`'
             if [[ -f "$EVIDENCE/symbolization/summary.json" ]]; then
-              echo '- Exact-release address authority: `true`'
+              echo '- Exact-release stable-offset address authority: `true`'
+              echo '- Complete function-start table equality: `true`'
+              echo '- Target-function normalized instruction equality: `true`'
               echo '- Nine stable mappings equal: `true`'
             else
-              echo '- Exact-release address authority: `not established`'
+              echo '- Exact-release stable-offset address authority: `not established`'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
