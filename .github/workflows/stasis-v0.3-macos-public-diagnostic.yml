@@ -1,4 +1,4 @@
-name: Diagnostic only - Stasis v0.3.0 macOS public verifier
+name: Diagnostic only - Stasis v0.3.2 macOS release-event verifier
 
 on:
   workflow_dispatch:
@@ -11,15 +11,21 @@ concurrency:
 
 env:
   DIAGNOSTIC_SAMPLE_COUNT: "20"
-  DIAGNOSTIC_OUTER_SIGNAL_TIMEOUT_MS: "60000"
-  DIAGNOSTIC_SDK_TIMEOUT_MS: "45000"
-  EXACT_ARCHIVE_SHA256: 7a3a16c78670b31e1610fe49f8c5f49041054433db21dde201eca9164b90fbea
-  EXACT_BINARY_SHA256: 5ffe929adee3f6c4b113ab4f9763ec2d9e1e85539e3dbd3cc7274f23961a9591
-  EXACT_NPM_INTEGRITY: sha512-I6Sfsh669FmJHas5ALAMGy2AzTtfZJwOAmTW+TtsT5qksOhaj5eRLs4HOQAW2nXsD9qtoopS6x8pa91s6jjhdA==
-  EXACT_NPM_SHA256: fc54afe844ab72e0c6b04876c4858762d5f0f58ad4fb2565cec2a8277e3b3d85
-  EXACT_RELEASE_REVISION: d4d5d1a99f5b95fd921632852deebe7b10aba147
-  EXACT_RELEASE_TAG: v0.3.0
-  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+  DIAGNOSTIC_STACK_SAMPLE_DELAY_MS: "10000"
+  DIAGNOSTIC_STACK_SAMPLE_DURATION_SECONDS: "5"
+  DIAGNOSTIC_STACK_SAMPLE_TIMEOUT_MS: "15000"
+  EXACT_ARCHIVE_SHA256: 1bf3d640223f9352d773ee71a8333a22b5955a9230d66e2fde23f7d0e21e8c9b
+  EXACT_BINARY_SHA256: 42c30bacde31906457b11d0e64ddc4f57e20515016d4cae817d4e1cc8e016c1c
+  EXACT_PACKAGE_RUN_ID: "33453628725"
+  EXACT_PACKAGE_RUN_ATTEMPT: "1"
+  EXACT_SDK_ARTIFACT_ID: "9783016642"
+  EXACT_SDK_ARTIFACT_NAME: stasis-typescript-attempt-1
+  EXACT_SDK_ARTIFACT_DIGEST: sha256:721bccacae83e4a415291b5d30a841c839255aeb24d50591ba7b0f3f0ef39637
+  EXACT_SDK_INTEGRITY: sha512-lskKR0p4ME2gClVvf0zYh+Bgz7Q431pIdC/Zf6VChOS4Q3AX33PZTU7S7TJU5tPm1lzIwdSmqcGhAYtqfI26Cw==
+  EXACT_SDK_PROOF_SHA256: afe3a2c5401d04ae8a21fcc2d9adf1344374d02c016f3bcbce1e399b805d2fba
+  EXACT_SDK_SHA256: d7208ca5c6751f16f077a7dd9fc95a6d48d49e9a873b3afbeb205c46b2f5d5c4
+  EXACT_RELEASE_REVISION: b3d1ac949d341dc6bbe1244162441d9bb8adb00a
+  EXACT_RELEASE_TAG: v0.3.2
 
 jobs:
   diagnose:
@@ -27,6 +33,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 35
     permissions:
+      actions: read
       contents: read
     env:
       GH_TOKEN: ${{ github.token }}
@@ -48,13 +55,13 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
 
-      - name: Check out immutable v0.3.0 source separately
+      - name: Check out immutable v0.3.2 source separately
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 1
           path: release-source
           persist-credentials: false
-          ref: v0.3.0
+          ref: v0.3.2
 
       - name: Verify native diagnostic host and bounded workspace capacity
         shell: bash
@@ -71,24 +78,25 @@ jobs:
           node-version: "24"
           package-manager-cache: false
 
-      - name: Bind immutable tag, release assets, and public npm bytes
+      - name: Bind immutable tag, release assets, and exact package-run SDK bytes
         id: identity
         shell: bash
         run: |
           set -euo pipefail
           evidence="$GITHUB_WORKSPACE/diagnostic-evidence"
           release_root="$RUNNER_TEMP/stasis-v03-release"
-          registry_root="$RUNNER_TEMP/stasis-v03-registry"
-          mkdir -p "$evidence" "$release_root" "$registry_root"
+          sdk_root="$RUNNER_TEMP/stasis-v032-package-sdk"
+          mkdir -p "$evidence" "$release_root" "$sdk_root"
           test "$(git -C diagnostic-control rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(git -C release-source rev-parse HEAD)" = "$EXACT_RELEASE_REVISION"
-          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$EXACT_RELEASE_TAG" > "$evidence/tag-ref.json"
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$EXACT_RELEASE_TAG" \
+            > "$evidence/tag-ref.json"
           jq -e --arg revision "$EXACT_RELEASE_REVISION" '
             .object.type == "commit" and .object.sha == $revision
           ' "$evidence/tag-ref.json" > /dev/null
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$EXACT_RELEASE_TAG" > "$evidence/release.json"
           jq -e --arg revision "$EXACT_RELEASE_REVISION" '
-            .tag_name == "v0.3.0"
+            .tag_name == "v0.3.2"
             and .draft == false
             and .prerelease == false
             and .immutable == true
@@ -96,59 +104,110 @@ jobs:
           ' "$evidence/release.json" > /dev/null
           gh release download "$EXACT_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --dir "$release_root" \
-            --pattern 'stasis-0.3.0-macos-aarch64.tar.gz' \
-            --pattern 'stasis-0.3.0-macos-aarch64.tar.gz.sha256' \
-            --pattern 'stasis-0.3.0-macos-aarch64.binary.sha256'
-          archive="$release_root/stasis-0.3.0-macos-aarch64.tar.gz"
+            --pattern 'stasis-0.3.2-macos-aarch64.tar.gz' \
+            --pattern 'stasis-0.3.2-macos-aarch64.tar.gz.sha256' \
+            --pattern 'stasis-0.3.2-macos-aarch64.binary.sha256'
+          archive="$release_root/stasis-0.3.2-macos-aarch64.tar.gz"
           test "$(shasum -a 256 "$archive" | awk '{print $1}')" = "$EXACT_ARCHIVE_SHA256"
-          grep -Fx "$EXACT_ARCHIVE_SHA256  stasis-0.3.0-macos-aarch64.tar.gz" \
+          grep -Fx "$EXACT_ARCHIVE_SHA256  stasis-0.3.2-macos-aarch64.tar.gz" \
             "$archive.sha256"
           tar -xzf "$archive" -C "$release_root"
-          binary="$release_root/stasis-0.3.0-macos-aarch64/stasis"
+          binary="$release_root/stasis-0.3.2-macos-aarch64/stasis"
           test -x "$binary"
           test "$(shasum -a 256 "$binary" | awk '{print $1}')" = "$EXACT_BINARY_SHA256"
-          grep -Fx "$EXACT_BINARY_SHA256  stasis-0.3.0-macos-aarch64/stasis" \
-            "$release_root/stasis-0.3.0-macos-aarch64.binary.sha256"
-          (
-            unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_TOKEN
-            npm install --global npm@11.19.0 --registry="$NPM_CONFIG_REGISTRY"
-            test "$(npm --version)" = '11.19.0'
-            npm pack '@oxhq/stasis@0.3.0' --ignore-scripts \
-              --pack-destination "$registry_root" --registry="$NPM_CONFIG_REGISTRY"
-          )
-          npm_tarball="$registry_root/oxhq-stasis-0.3.0.tgz"
-          test "$(shasum -a 256 "$npm_tarball" | awk '{print $1}')" = "$EXACT_NPM_SHA256"
-          npm_integrity=$(node -e '
+          grep -Fx "$EXACT_BINARY_SHA256  stasis-0.3.2-macos-aarch64/stasis" \
+            "$release_root/stasis-0.3.2-macos-aarch64.binary.sha256"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$EXACT_PACKAGE_RUN_ID" \
+            > "$evidence/package-run.json"
+          jq -e \
+            --arg runId "$EXACT_PACKAGE_RUN_ID" \
+            --arg runAttempt "$EXACT_PACKAGE_RUN_ATTEMPT" \
+            --arg revision "$EXACT_RELEASE_REVISION" '
+            (.id | tostring) == $runId
+            and (.run_attempt | tostring) == $runAttempt
+            and .head_sha == $revision
+            and .head_branch == "main"
+            and .path == ".github/workflows/stasis-package.yml"
+            and .event == "push"
+            and .status == "completed"
+            and .conclusion == "success"
+          ' "$evidence/package-run.json" > /dev/null
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$EXACT_PACKAGE_RUN_ID/artifacts?per_page=100" \
+            > "$evidence/package-artifacts.json"
+          jq -e \
+            --arg artifactName "$EXACT_SDK_ARTIFACT_NAME" \
+            --arg artifactId "$EXACT_SDK_ARTIFACT_ID" \
+            --arg artifactDigest "$EXACT_SDK_ARTIFACT_DIGEST" \
+            --arg runId "$EXACT_PACKAGE_RUN_ID" \
+            --arg revision "$EXACT_RELEASE_REVISION" '
+            [.artifacts[] | select(.name == $artifactName)] as $matches
+            | ($matches | length) == 1
+              and ($matches[0].id | tostring) == $artifactId
+              and $matches[0].digest == $artifactDigest
+              and $matches[0].expired == false
+              and ($matches[0].workflow_run.id | tostring) == $runId
+              and $matches[0].workflow_run.head_sha == $revision
+          ' "$evidence/package-artifacts.json" > /dev/null
+          gh run download "$EXACT_PACKAGE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$EXACT_SDK_ARTIFACT_NAME" --dir "$sdk_root"
+          expected_sdk_files=$(printf '%s\n' \
+            'oxhq-stasis-0.3.2.tgz' \
+            'stasis-0.3.2-typescript-act-settle-inspect.json' | LC_ALL=C sort)
+          actual_sdk_files=$(find "$sdk_root" -mindepth 1 -maxdepth 1 -type f \
+            -exec basename {} \; | LC_ALL=C sort)
+          test "$actual_sdk_files" = "$expected_sdk_files"
+          sdk_tarball="$sdk_root/oxhq-stasis-0.3.2.tgz"
+          sdk_proof="$sdk_root/stasis-0.3.2-typescript-act-settle-inspect.json"
+          test "$(shasum -a 256 "$sdk_tarball" | awk '{print $1}')" = "$EXACT_SDK_SHA256"
+          test "$(shasum -a 256 "$sdk_proof" | awk '{print $1}')" = "$EXACT_SDK_PROOF_SHA256"
+          sdk_integrity=$(node -e '
             const crypto = require("node:crypto");
             const fs = require("node:fs");
             process.stdout.write("sha512-" + crypto.createHash("sha512")
               .update(fs.readFileSync(process.argv[1])).digest("base64"));
-          ' "$npm_tarball")
-          test "$npm_integrity" = "$EXACT_NPM_INTEGRITY"
-          cp "$npm_tarball" "$evidence/oxhq-stasis-0.3.0.tgz"
+          ' "$sdk_tarball")
+          test "$sdk_integrity" = "$EXACT_SDK_INTEGRITY"
+          cp "$sdk_tarball" "$evidence/oxhq-stasis-0.3.2.tgz"
+          cp "$sdk_proof" "$evidence/stasis-0.3.2-typescript-act-settle-inspect.json"
           jq -n \
-            --arg schema 'stasis-v0.3-macos-public-diagnostic-identity-v1' \
+            --arg schema 'stasis-v0.3.2-macos-release-event-diagnostic-identity-v2' \
             --arg harnessRevision "$GITHUB_SHA" \
             --arg releaseRevision "$EXACT_RELEASE_REVISION" \
+            --arg releaseTag "$EXACT_RELEASE_TAG" \
             --arg archiveSha256 "$EXACT_ARCHIVE_SHA256" \
             --arg binarySha256 "$EXACT_BINARY_SHA256" \
-            --arg npmSha256 "$EXACT_NPM_SHA256" \
-            --arg npmIntegrity "$EXACT_NPM_INTEGRITY" \
+            --arg packageRunId "$EXACT_PACKAGE_RUN_ID" \
+            --argjson packageRunAttempt "$EXACT_PACKAGE_RUN_ATTEMPT" \
+            --arg sdkArtifactName "$EXACT_SDK_ARTIFACT_NAME" \
+            --arg sdkArtifactId "$EXACT_SDK_ARTIFACT_ID" \
+            --arg sdkArtifactDigest "$EXACT_SDK_ARTIFACT_DIGEST" \
+            --arg sdkSha256 "$EXACT_SDK_SHA256" \
+            --arg sdkIntegrity "$EXACT_SDK_INTEGRITY" \
+            --arg sdkProofSha256 "$EXACT_SDK_PROOF_SHA256" \
             --argjson sampleCount "$DIAGNOSTIC_SAMPLE_COUNT" \
-            --argjson outerSignalTimeoutMs "$DIAGNOSTIC_OUTER_SIGNAL_TIMEOUT_MS" \
-            --argjson sdkCommandTimeoutMs "$DIAGNOSTIC_SDK_TIMEOUT_MS" \
+            --argjson stackSampleDelayMs "$DIAGNOSTIC_STACK_SAMPLE_DELAY_MS" \
+            --argjson stackSampleDurationSeconds "$DIAGNOSTIC_STACK_SAMPLE_DURATION_SECONDS" \
+            --argjson stackSampleTimeoutMs "$DIAGNOSTIC_STACK_SAMPLE_TIMEOUT_MS" \
             '{schema: $schema, diagnosticHarnessRevision: $harnessRevision,
-              releaseRevision: $releaseRevision, archiveSha256: $archiveSha256,
-              binarySha256: $binarySha256, npmSha256: $npmSha256,
-              npmIntegrity: $npmIntegrity, sampleCount: $sampleCount,
-              outerSignalTimeoutMs: $outerSignalTimeoutMs,
-              sdkCommandTimeoutMs: $sdkCommandTimeoutMs,
-              nativeCommandTimeoutMs: 30000, nativeLifecycleTrace: true,
+              releaseRevision: $releaseRevision, releaseTag: $releaseTag,
+              archiveSha256: $archiveSha256, binarySha256: $binarySha256,
+              sdkSource: "github_actions_artifact", packageRunId: $packageRunId,
+              packageRunAttempt: $packageRunAttempt,
+              sdkArtifactName: $sdkArtifactName, sdkArtifactId: $sdkArtifactId,
+              sdkArtifactDigest: $sdkArtifactDigest, sdkSha256: $sdkSha256,
+              sdkIntegrity: $sdkIntegrity, sdkProofSha256: $sdkProofSha256,
+              sampleCount: $sampleCount, commandDeadlineMs: 30000,
+              sdkCommandTimeoutOverride: false, closeTimeoutMs: 30000,
+              exactVerifierTimeoutsPreserved: true, nativeLifecycleTrace: true,
+              stackSampleDelayMs: $stackSampleDelayMs,
+              stackSampleDurationSeconds: $stackSampleDurationSeconds,
+              stackSampleIntervalMilliseconds: 1,
+              stackSampleTimeoutMs: $stackSampleTimeoutMs,
               releaseGateAuthority: false}' > "$evidence/identity.json"
           {
             echo "binary=$binary"
             echo "evidence=$evidence"
-            echo "npm_tarball=$npm_tarball"
+            echo "sdk_tarball=$sdk_tarball"
           } >> "$GITHUB_OUTPUT"
 
       - name: Create a diagnostic copy of only the exact tagged verifier
@@ -169,7 +228,7 @@ jobs:
         env:
           BINARY: ${{ steps.identity.outputs.binary }}
           EVIDENCE: ${{ steps.identity.outputs.evidence }}
-          NPM_TARBALL: ${{ steps.identity.outputs.npm_tarball }}
+          SDK_TARBALL: ${{ steps.identity.outputs.sdk_tarball }}
           VERIFIER: ${{ steps.instrument.outputs.verifier }}
         run: |
           set -euo pipefail
@@ -183,10 +242,12 @@ jobs:
               unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_TOKEN
               cd "$consumer"
               npm init --yes > /dev/null
-              npm install --ignore-scripts "$NPM_TARBALL" \
-                --registry="$NPM_CONFIG_REGISTRY" > /dev/null
+              npm install --ignore-scripts --offline --no-audit --no-fund \
+                "$SDK_TARBALL" > /dev/null
               cd "$GITHUB_WORKSPACE/release-source"
-              STASIS_V03_DIAGNOSTIC_SAMPLE="$sample" node "$VERIFIER" \
+              STASIS_V03_DIAGNOSTIC_SAMPLE="$sample" \
+              STASIS_V03_DIAGNOSTIC_EVIDENCE="$EVIDENCE" \
+                node "$VERIFIER" \
                 --binary "$BINARY" \
                 --fixture ports/stasis/tests/fixtures/timer_10s.html \
                 --session-v2-fixture ports/stasis/tests/fixtures/message_channel_buffered.html \
@@ -201,9 +262,9 @@ jobs:
                 --session-v2-css-animation-event-fixture ports/stasis/tests/fixtures/controlled_v2_css_animation_event_timestamp.html \
                 --session-v2-cookie-fixture sdk/typescript/test/fixtures/controlled-v2-cookie-login.html \
                 --consumer-root "$consumer" \
-                --package "$NPM_TARBALL" \
+                --package "$SDK_TARBALL" \
                 --revision "$EXACT_RELEASE_REVISION" \
-                --version '0.3.0'
+                --version '0.3.2'
             ) > "$log" 2>&1
             status=$?
             set -e
@@ -213,7 +274,7 @@ jobs:
           done
           test "$(git -C release-source rev-parse HEAD)" = "$EXACT_RELEASE_REVISION"
           test "$(shasum -a 256 "$BINARY" | awk '{print $1}')" = "$EXACT_BINARY_SHA256"
-          test "$(shasum -a 256 "$NPM_TARBALL" | awk '{print $1}')" = "$EXACT_NPM_SHA256"
+          test "$(shasum -a 256 "$SDK_TARBALL" | awk '{print $1}')" = "$EXACT_SDK_SHA256"
 
       - name: Summarize diagnostic-only phase evidence
         if: always()
@@ -232,7 +293,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: stasis-v0.3.0-macos-public-diagnostic-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          name: stasis-v0.3.2-macos-release-event-diagnostic-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: diagnostic-evidence
           if-no-files-found: error
           retention-days: 90

@@ -1,13 +1,27 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
-const SCHEMA = "stasis-v0.3-macos-public-diagnostic-v1";
-const PHASES = new Set(["css-start-settle", "cookie-submit-settle"]);
+const SCHEMA = "stasis-v0.3.2-macos-release-event-diagnostic-v2";
+const TARGETS = Object.freeze({
+  "css-post-start-settle": Object.freeze({
+    processOrdinal: 3,
+  }),
+  "cookie-post-submit-settle": Object.freeze({
+    processOrdinal: 4,
+  }),
+});
+const PHASES = new Set(Object.keys(TARGETS));
+const STACK_SAMPLE_SCHEMA = "stasis-v0.3.2-macos-stack-sample-v1";
+const STACK_SAMPLE_DELAY_MS = 10_000;
+const STACK_SAMPLE_DURATION_SECONDS = 5;
+const STACK_SAMPLE_INTERVAL_MILLISECONDS = 1;
+const STACK_SAMPLE_TIMEOUT_MS = 15_000;
 
 function phaseRecords(log) {
   const records = [];
@@ -27,6 +41,9 @@ function isCandidateTimeout(record) {
   return (
     record?.kind === "error" &&
     PHASES.has(record.phase) &&
+    record.operation === "runtime.settle" &&
+    record.expectedMethod === "runtime.settle" &&
+    record.expectedRequestId === "5" &&
     record.code === "aborted" &&
     record.fatal === true &&
     record.stateEffect === "indeterminate" &&
@@ -34,6 +51,162 @@ function isCandidateTimeout(record) {
     record.requestId === "5" &&
     record.reasonName === "TimeoutError"
   );
+}
+
+function validProcessPid(value) {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+function isProcessIdentified(settleRecord) {
+  const target = TARGETS[settleRecord.phase];
+  if (target === undefined || settleRecord.processOrdinal !== target.processOrdinal) {
+    return false;
+  }
+  return validProcessPid(settleRecord.processPid) && settleRecord.releaseGateAuthority === false;
+}
+
+function sha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function hasExactRecordIdentity(record, sample, phase, processOrdinal, processPid) {
+  return (
+    record?.sample === String(sample) &&
+    record.phase === phase &&
+    record.operation === "runtime.settle" &&
+    record.processOrdinal === processOrdinal &&
+    record.processPid === processPid &&
+    record.releaseGateAuthority === false
+  );
+}
+
+async function hasValidatedStackCapture(directory, sample, records, settleError) {
+  if (records.length !== 3 || !isProcessIdentified(settleError)) return false;
+  const [begin, end, error] = records;
+  if (
+    error !== settleError ||
+    begin.kind !== "stack-sample-begin" ||
+    end.kind !== "stack-sample-end"
+  ) {
+    return false;
+  }
+  const { phase, processOrdinal, processPid } = settleError;
+  if (
+    !hasExactRecordIdentity(begin, sample, phase, processOrdinal, processPid) ||
+    !hasExactRecordIdentity(end, sample, phase, processOrdinal, processPid) ||
+    !hasExactRecordIdentity(error, sample, phase, processOrdinal, processPid)
+  ) {
+    return false;
+  }
+  const prefix =
+    `sample-${String(sample).padStart(3, "0")}-process-` +
+    `${String(processOrdinal).padStart(3, "0")}-${phase}`;
+  const artifacts = {
+    stack: `${prefix}.sample.txt`,
+    stdout: `${prefix}.sample.stdout.log`,
+    stderr: `${prefix}.sample.stderr.log`,
+    metadata: `${prefix}.sample.json`,
+  };
+  if (
+    begin.stackArtifact !== artifacts.stack ||
+    begin.stackStdoutArtifact !== artifacts.stdout ||
+    begin.stackStderrArtifact !== artifacts.stderr ||
+    begin.stackMetadataArtifact !== artifacts.metadata ||
+    end.stackArtifact !== artifacts.stack ||
+    end.stackStdoutArtifact !== artifacts.stdout ||
+    end.stackStderrArtifact !== artifacts.stderr ||
+    end.stackMetadataArtifact !== artifacts.metadata ||
+    end.samplerExitCode !== 0 ||
+    end.samplerSignal !== null ||
+    end.samplerErrorName !== null ||
+    end.samplerErrorCode !== null ||
+    !Number.isSafeInteger(end.stackArtifactBytes) ||
+    end.stackArtifactBytes <= 0
+  ) {
+    return false;
+  }
+  let stack;
+  let stdout;
+  let stderr;
+  let metadata;
+  try {
+    const [stackBytes, stdoutBytes, stderrBytes, metadataText] = await Promise.all([
+      readFile(resolve(directory, artifacts.stack)),
+      readFile(resolve(directory, artifacts.stdout)),
+      readFile(resolve(directory, artifacts.stderr)),
+      readFile(resolve(directory, artifacts.metadata), "utf8"),
+    ]);
+    stack = stackBytes;
+    stdout = stdoutBytes;
+    stderr = stderrBytes;
+    metadata = JSON.parse(metadataText);
+  } catch {
+    return false;
+  }
+  const stackSha256 = sha256(stack);
+  const stdoutSha256 = sha256(stdout);
+  const stderrSha256 = sha256(stderr);
+  return (
+    metadata?.schema === STACK_SAMPLE_SCHEMA &&
+    metadata.sample === String(sample) &&
+    metadata.phase === phase &&
+    metadata.processOrdinal === processOrdinal &&
+    metadata.processPid === processPid &&
+    metadata.delayMs === STACK_SAMPLE_DELAY_MS &&
+    metadata.durationSeconds === STACK_SAMPLE_DURATION_SECONDS &&
+    metadata.intervalMilliseconds === STACK_SAMPLE_INTERVAL_MILLISECONDS &&
+    metadata.samplerTimeoutMs === STACK_SAMPLE_TIMEOUT_MS &&
+    metadata.samplerExitCode === 0 &&
+    metadata.samplerSignal === null &&
+    metadata.samplerErrorName === null &&
+    metadata.samplerErrorCode === null &&
+    metadata.stackArtifact === artifacts.stack &&
+    metadata.stackArtifactBytes === stack.byteLength &&
+    metadata.stackArtifactSha256 === stackSha256 &&
+    metadata.stdoutArtifact === artifacts.stdout &&
+    metadata.stdoutBytes === stdout.byteLength &&
+    metadata.stdoutSha256 === stdoutSha256 &&
+    metadata.stderrArtifact === artifacts.stderr &&
+    metadata.stderrBytes === stderr.byteLength &&
+    metadata.stderrSha256 === stderrSha256 &&
+    metadata.releaseGateAuthority === false &&
+    end.stackArtifactBytes === stack.byteLength &&
+    end.stackArtifactSha256 === stackSha256
+  );
+}
+
+function compactRecord(record) {
+  const compact = {
+    kind: record.kind,
+    phase: record.phase,
+    operation: record.operation,
+    processOrdinal: record.processOrdinal,
+  };
+  for (const key of [
+    "processPid",
+    "expectedMethod",
+    "expectedRequestId",
+    "code",
+    "fatal",
+    "stateEffect",
+    "method",
+    "requestId",
+    "reasonName",
+    "stderrTailBytes",
+    "stackArtifact",
+    "stackStdoutArtifact",
+    "stackStderrArtifact",
+    "stackMetadataArtifact",
+    "samplerExitCode",
+    "samplerSignal",
+    "samplerErrorName",
+    "samplerErrorCode",
+    "stackArtifactBytes",
+    "stackArtifactSha256",
+  ]) {
+    if (Object.hasOwn(record, key)) compact[key] = record[key];
+  }
+  return compact;
 }
 
 export async function summarizeDiagnosticEvidence(directory, sampleCount) {
@@ -45,6 +218,12 @@ export async function summarizeDiagnosticEvidence(directory, sampleCount) {
     cookieRequest5Timeout: 0,
     otherFailure: 0,
   };
+  const stackSampleRecords = {
+    begin: 0,
+    end: 0,
+    error: 0,
+  };
+  let validatedTimeoutStackCaptures = 0;
   for (let sample = 1; sample <= sampleCount; sample += 1) {
     const sampleId = String(sample).padStart(3, "0");
     const [log, statusText] = await Promise.all([
@@ -54,40 +233,44 @@ export async function summarizeDiagnosticEvidence(directory, sampleCount) {
     const exitCode = Number(statusText.trim());
     assert.ok(Number.isSafeInteger(exitCode) && exitCode >= 0 && exitCode <= 255);
     const records = phaseRecords(log);
-    const compactRecords = records.map((record) => ({
-      kind: record.kind,
-      phase: record.phase,
-      processOrdinal: record.processOrdinal,
-      ...(record.kind === "error"
-        ? {
-            code: record.code,
-            fatal: record.fatal,
-            stateEffect: record.stateEffect,
-            method: record.method,
-            requestId: record.requestId,
-            reasonName: record.reasonName,
-            stderrTailBytes: record.stderrTailBytes,
-          }
-        : {}),
-    }));
-    const error = records.find((record) => record.kind === "error");
+    const compactRecords = records.map(compactRecord);
+    const stackSampleBegins = records.filter(
+      (record) => record.kind === "stack-sample-begin",
+    );
+    const stackSampleEnds = records.filter(
+      (record) => record.kind === "stack-sample-end",
+    );
+    const stackSampleErrors = records.filter(
+      (record) => record.kind === "stack-sample-error",
+    );
+    assert.ok(stackSampleBegins.length <= 1, "sample launched more than one stack sampler");
+    assert.ok(
+      stackSampleEnds.length + stackSampleErrors.length <= 1,
+      "sample recorded more than one stack sampler terminal",
+    );
+    stackSampleRecords.begin += stackSampleBegins.length;
+    stackSampleRecords.end += stackSampleEnds.length;
+    stackSampleRecords.error += stackSampleErrors.length;
+    const error = records.find((record) => isCandidateTimeout(record));
+    const attributedTimeout =
+      exitCode !== 0 &&
+      error !== undefined &&
+      (await hasValidatedStackCapture(directory, sample, records, error));
+    if (attributedTimeout) validatedTimeoutStackCaptures += 1;
     let classification;
-    if (
-      exitCode === 0 &&
-      JSON.stringify(compactRecords) ===
-        JSON.stringify([
-          { kind: "begin", phase: "css-start-settle", processOrdinal: 3 },
-          { kind: "end", phase: "css-start-settle", processOrdinal: 3 },
-          { kind: "begin", phase: "cookie-submit-settle", processOrdinal: 4 },
-          { kind: "end", phase: "cookie-submit-settle", processOrdinal: 4 },
-        ])
-    ) {
+    if (exitCode === 0 && records.length === 0) {
       classification = "completed";
       counts.completed += 1;
-    } else if (isCandidateTimeout(error) && error.phase === "css-start-settle") {
+    } else if (
+      attributedTimeout &&
+      error.phase === "css-post-start-settle"
+    ) {
       classification = "css_request_5_timeout";
       counts.cssRequest5Timeout += 1;
-    } else if (isCandidateTimeout(error) && error.phase === "cookie-submit-settle") {
+    } else if (
+      attributedTimeout &&
+      error.phase === "cookie-post-submit-settle"
+    ) {
       classification = "cookie_request_5_timeout";
       counts.cookieRequest5Timeout += 1;
     } else {
@@ -97,10 +280,12 @@ export async function summarizeDiagnosticEvidence(directory, sampleCount) {
     samples.push({ sample, exitCode, classification, phaseRecords: compactRecords });
   }
   return {
-    schema: "stasis-v0.3-macos-public-diagnostic-summary-v1",
+    schema: "stasis-v0.3.2-macos-release-event-diagnostic-summary-v2",
     releaseGateAuthority: false,
     predeclaredSampleCount: sampleCount,
     counts,
+    stackSampleRecords,
+    validatedTimeoutStackCaptures,
     samples,
   };
 }
