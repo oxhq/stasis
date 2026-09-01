@@ -179,72 +179,72 @@ jobs:
               "repos/$GITHUB_REPOSITORY/actions/runs/$publication_run_id/artifacts?per_page=100" \
               > publication-artifacts.json
             python3 - <<'PY'
-            import json
-            import pathlib
+          import json
+          import pathlib
 
-            pages = json.loads(
-                pathlib.Path("publication-job-pages.json").read_text(encoding="utf-8")
-            )
-            if not isinstance(pages, list) or any(not isinstance(page, dict) for page in pages):
-                raise SystemExit("original publication job census is malformed")
-            jobs = [job for page in pages for job in page.get("jobs", [])]
-            expected_names = {
-                "Verify immutable release and exact prepublication SDK proof",
-                "Publish the exact pre-gated SDK",
-                "Recover verification of the exact published SDK",
-                "Verify registry SDK on " + "$" + "{{ matrix.release_platform }}",
-            }
-            if (
-                len(jobs) != 4
-                or {job.get("name") for job in jobs} != expected_names
-                or len({job.get("id") for job in jobs}) != 4
-            ):
-                raise SystemExit("original publication job inventory changed")
-            verify = next(
-                job for job in jobs
-                if job.get("name") == "Verify immutable release and exact prepublication SDK proof"
-            )
-            expected_steps = [
-                (1, "Set up job", "success"),
-                (2, "Reject workflow reruns before release verification", "success"),
-                (3, "Check out the exact published tag", "success"),
-                (4, "Require space for bounded native archive verification", "success"),
-                (5, "Set up Node without publication credentials", "success"),
-                (6, "Verify exact release, tag, commit, and asset inventory", "success"),
-                (7, "Download and verify native and SDK package-run inputs", "success"),
-                (8, "Activate pinned npm and pnpm clients", "success"),
-                (9, "Install, typecheck, test, build, and reproduce the SDK pack", "success"),
-                (10, "Verify the exact prepublication gate preceded immutable publication", "failure"),
-                (11, "Stage only the exact attested and pre-gated npm inputs", "skipped"),
-                (21, "Post Set up Node without publication credentials", "skipped"),
-                (22, "Post Check out the exact published tag", "success"),
-                (23, "Complete job", "success"),
-            ]
-            actual_steps = [
-                (step.get("number"), step.get("name"), step.get("conclusion"))
-                for step in verify.get("steps", [])
-            ]
-            if (
-                verify.get("status") != "completed"
-                or verify.get("conclusion") != "failure"
-                or actual_steps != expected_steps
-            ):
-                raise SystemExit("original publication failure boundary changed")
-            for job in jobs:
-                if job is verify:
-                    continue
-                if (
-                    job.get("status") != "completed"
-                    or job.get("conclusion") != "skipped"
-                    or job.get("steps") != []
-                ):
-                    raise SystemExit("original publication crossed a skipped mutation boundary")
-            artifacts = json.loads(
-                pathlib.Path("publication-artifacts.json").read_text(encoding="utf-8")
-            )
-            if artifacts != {"total_count": 0, "artifacts": []}:
-                raise SystemExit("original failed publication unexpectedly retained artifacts")
-            PY
+          pages = json.loads(
+              pathlib.Path("publication-job-pages.json").read_text(encoding="utf-8")
+          )
+          if not isinstance(pages, list) or any(not isinstance(page, dict) for page in pages):
+              raise SystemExit("original publication job census is malformed")
+          jobs = [job for page in pages for job in page.get("jobs", [])]
+          expected_names = {
+              "Verify immutable release and exact prepublication SDK proof",
+              "Publish the exact pre-gated SDK",
+              "Recover verification of the exact published SDK",
+              "Verify registry SDK on " + "$" + "{{ matrix.release_platform }}",
+          }
+          if (
+              len(jobs) != 4
+              or {job.get("name") for job in jobs} != expected_names
+              or len({job.get("id") for job in jobs}) != 4
+          ):
+              raise SystemExit("original publication job inventory changed")
+          verify = next(
+              job for job in jobs
+              if job.get("name") == "Verify immutable release and exact prepublication SDK proof"
+          )
+          expected_steps = [
+              (1, "Set up job", "success"),
+              (2, "Reject workflow reruns before release verification", "success"),
+              (3, "Check out the exact published tag", "success"),
+              (4, "Require space for bounded native archive verification", "success"),
+              (5, "Set up Node without publication credentials", "success"),
+              (6, "Verify exact release, tag, commit, and asset inventory", "success"),
+              (7, "Download and verify native and SDK package-run inputs", "success"),
+              (8, "Activate pinned npm and pnpm clients", "success"),
+              (9, "Install, typecheck, test, build, and reproduce the SDK pack", "success"),
+              (10, "Verify the exact prepublication gate preceded immutable publication", "failure"),
+              (11, "Stage only the exact attested and pre-gated npm inputs", "skipped"),
+              (21, "Post Set up Node without publication credentials", "skipped"),
+              (22, "Post Check out the exact published tag", "success"),
+              (23, "Complete job", "success"),
+          ]
+          actual_steps = [
+              (step.get("number"), step.get("name"), step.get("conclusion"))
+              for step in verify.get("steps", [])
+          ]
+          if (
+              verify.get("status") != "completed"
+              or verify.get("conclusion") != "failure"
+              or actual_steps != expected_steps
+          ):
+              raise SystemExit("original publication failure boundary changed")
+          for job in jobs:
+              if job is verify:
+                  continue
+              if (
+                  job.get("status") != "completed"
+                  or job.get("conclusion") != "skipped"
+                  or job.get("steps") != []
+              ):
+                  raise SystemExit("original publication crossed a skipped mutation boundary")
+          artifacts = json.loads(
+              pathlib.Path("publication-artifacts.json").read_text(encoding="utf-8")
+          )
+          if artifacts != {"total_count": 0, "artifacts": []}:
+              raise SystemExit("original failed publication unexpectedly retained artifacts")
+          PY
 
             current_default_sha=$(gh api \
               "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq '.sha')
@@ -254,38 +254,58 @@ jobs:
             fi
             gh api "repos/$GITHUB_REPOSITORY/compare/$tag_sha...$GITHUB_SHA" \
               > recovery-workflow-diff.json
+            gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" \
+              > recovery-authority-commit.json
             RECOVERY_REVISION="$GITHUB_SHA" RELEASE_REVISION="$tag_sha" python3 - <<'PY'
-            import json
-            import os
-            import pathlib
+          import json
+          import os
+          import pathlib
 
-            comparison = json.loads(
-                pathlib.Path("recovery-workflow-diff.json").read_text(encoding="utf-8")
-            )
-            allowed = {
-                ".github/workflows/stasis-package.yml",
-                ".github/workflows/stasis-publish-npm.yml",
-                "etc/ci/stasis/release_archive.py",
-                "etc/ci/stasis/verify_build_provenance.py",
-            }
-            commits = comparison.get("commits")
-            files = comparison.get("files")
-            if (
-                comparison.get("status") != "ahead"
-                or comparison.get("merge_base_commit", {}).get("sha")
-                    != os.environ["RELEASE_REVISION"]
-                or comparison.get("ahead_by") != 1
-                or comparison.get("behind_by") != 0
-                or comparison.get("total_commits") != 1
-                or not isinstance(commits, list)
-                or len(commits) != 1
-                or commits[0].get("sha") != os.environ["RECOVERY_REVISION"]
-                or not isinstance(files, list)
-                or {item.get("filename") for item in files} != allowed
-                or any(item.get("status") != "modified" for item in files)
-            ):
-                raise SystemExit("recovery authority is not one exact workflow-only commit")
-            PY
+          comparison = json.loads(
+              pathlib.Path("recovery-workflow-diff.json").read_text(encoding="utf-8")
+          )
+          authority = json.loads(
+              pathlib.Path("recovery-authority-commit.json").read_text(encoding="utf-8")
+          )
+          prior_recovery_revision = "d152bf718d86b9c3938d71eee9dafcac8b12872d"
+          allowed = {
+              ".github/workflows/stasis-package.yml",
+              ".github/workflows/stasis-publish-npm.yml",
+              "etc/ci/stasis/release_archive.py",
+              "etc/ci/stasis/verify_build_provenance.py",
+          }
+          correction_files = {
+              ".github/workflows/stasis-publish-npm.yml",
+              "etc/ci/stasis/release_archive.py",
+          }
+          commits = comparison.get("commits")
+          files = comparison.get("files")
+          if (
+              comparison.get("status") != "ahead"
+              or comparison.get("merge_base_commit", {}).get("sha")
+                  != os.environ["RELEASE_REVISION"]
+              or comparison.get("ahead_by") != 2
+              or comparison.get("behind_by") != 0
+              or comparison.get("total_commits") != 2
+              or not isinstance(commits, list)
+              or len(commits) != 2
+              or [commit.get("sha") for commit in commits]
+                  != [prior_recovery_revision, os.environ["RECOVERY_REVISION"]]
+              or not isinstance(files, list)
+              or {item.get("filename") for item in files} != allowed
+              or any(item.get("status") != "modified" for item in files)
+              or authority.get("sha") != os.environ["RECOVERY_REVISION"]
+              or [parent.get("sha") for parent in authority.get("parents", [])]
+                  != [prior_recovery_revision]
+              or {item.get("filename") for item in authority.get("files", [])}
+                  != correction_files
+              or any(
+                  item.get("status") != "modified"
+                  for item in authority.get("files", [])
+              )
+          ):
+              raise SystemExit("recovery authority is not the exact two-commit CI-only chain")
+          PY
           fi
           test "$(git rev-parse HEAD)" = "$tag_sha"
 

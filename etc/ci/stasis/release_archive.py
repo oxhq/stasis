@@ -6781,10 +6781,48 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
         ("33517227843", "failed release-event publication run"),
         ("48c5a718a9ddd63f496e45307e1484974ccf8587", "immutable v0.3.3 tag revision"),
         ("380550511", "immutable v0.3.3 release"),
+        ("d152bf718d86b9c3938d71eee9dafcac8b12872d", "first recovery authority revision"),
     ):
         if public_npm_publish_workflow.count(fixed_recovery_identity) != 1:
             raise ReleaseError(
                 f"npm-publish recovery must bind exactly one fixed {description} identity"
+            )
+
+    recovery_heredoc_boundaries = (
+        (
+            "            python3 - <<'PY'\n"
+            "          import json\n"
+            "          import pathlib\n\n"
+            "          pages = json.loads(",
+            "original failed-run census heredoc opening",
+        ),
+        (
+            '          if artifacts != {"total_count": 0, "artifacts": []}:\n'
+            '              raise SystemExit("original failed publication unexpectedly retained artifacts")\n'
+            "          PY\n\n"
+            "            current_default_sha=$(gh api \\\n",
+            "original failed-run census heredoc closing",
+        ),
+        (
+            "            RECOVERY_REVISION=\"$GITHUB_SHA\" "
+            "RELEASE_REVISION=\"$tag_sha\" python3 - <<'PY'\n"
+            "          import json\n"
+            "          import os\n"
+            "          import pathlib",
+            "recovery ancestry heredoc opening",
+        ),
+        (
+            '              raise SystemExit("recovery authority is not the exact two-commit CI-only chain")\n'
+            "          PY\n"
+            "          fi\n"
+            '          test "$(git rev-parse HEAD)" = "$tag_sha"\n',
+            "recovery ancestry heredoc closing",
+        ),
+    )
+    for marker, description in recovery_heredoc_boundaries:
+        if publish_verify_job.count(marker) != 1:
+            raise ReleaseError(
+                f"npm-publish recovery must retain exactly one {description}"
             )
 
     require_source_fragments_in_order(
@@ -6815,88 +6853,112 @@ def verify_candidate_v2_profile(source_root: Path) -> dict[str, object]:
             '                and .name == "Publish @oxhq/stasis stable"\n',
             "              \"repos/$GITHUB_REPOSITORY/actions/runs/$publication_run_id/attempts/$publication_run_attempt/jobs?per_page=100\" \\\n",
             "              \"repos/$GITHUB_REPOSITORY/actions/runs/$publication_run_id/artifacts?per_page=100\" \\\n",
-            "            if not isinstance(pages, list) or any(not isinstance(page, dict) for page in pages):\n",
-            '            jobs = [job for page in pages for job in page.get("jobs", [])]\n',
-            "            actual_steps = [\n",
-            '                (step.get("number"), step.get("name"), step.get("conclusion"))\n',
-            '                or actual_steps != expected_steps\n',
-            '                raise SystemExit("original publication failure boundary changed")\n',
-            "            for job in jobs:\n",
-            '                    job.get("status") != "completed"\n',
-            '                    or job.get("conclusion") != "skipped"\n',
-            '                    or job.get("steps") != []\n',
-            '                raise SystemExit("original publication crossed a skipped mutation boundary")\n',
-            '            if artifacts != {"total_count": 0, "artifacts": []}:\n',
+            "            python3 - <<'PY'\n",
+            "          import json\n",
+            "          if not isinstance(pages, list) or any(not isinstance(page, dict) for page in pages):\n",
+            '          jobs = [job for page in pages for job in page.get("jobs", [])]\n',
+            "          actual_steps = [\n",
+            '              (step.get("number"), step.get("name"), step.get("conclusion"))\n',
+            '              or actual_steps != expected_steps\n',
+            '              raise SystemExit("original publication failure boundary changed")\n',
+            "          for job in jobs:\n",
+            '                  job.get("status") != "completed"\n',
+            '                  or job.get("conclusion") != "skipped"\n',
+            '                  or job.get("steps") != []\n',
+            '              raise SystemExit("original publication crossed a skipped mutation boundary")\n',
+            '          if artifacts != {"total_count": 0, "artifacts": []}:\n',
+            "          PY\n",
             "            current_default_sha=$(gh api \\\n",
             "            if [[ \"$current_default_sha\" != \"$GITHUB_SHA\" ]]; then\n",
             "            gh api \"repos/$GITHUB_REPOSITORY/compare/$tag_sha...$GITHUB_SHA\" \\\n",
-            '                comparison.get("status") != "ahead"\n',
-            '                or comparison.get("merge_base_commit", {}).get("sha")\n',
-            '                    != os.environ["RELEASE_REVISION"]\n',
-            '                or comparison.get("ahead_by") != 1\n',
-            '                or comparison.get("behind_by") != 0\n',
-            '                or comparison.get("total_commits") != 1\n',
-            "                or not isinstance(commits, list)\n",
-            "                or len(commits) != 1\n",
-            '                or commits[0].get("sha") != os.environ["RECOVERY_REVISION"]\n',
-            "                or not isinstance(files, list)\n",
-            '                or {item.get("filename") for item in files} != allowed\n',
-            '                or any(item.get("status") != "modified" for item in files)\n',
-            '                raise SystemExit("recovery authority is not one exact workflow-only commit")\n',
+            "            gh api \"repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA\" \\\n",
+            "            RECOVERY_REVISION=\"$GITHUB_SHA\" RELEASE_REVISION=\"$tag_sha\" python3 - <<'PY'\n",
+            "          import json\n",
+            '          prior_recovery_revision = "d152bf718d86b9c3938d71eee9dafcac8b12872d"\n',
+            '              comparison.get("status") != "ahead"\n',
+            '              or comparison.get("merge_base_commit", {}).get("sha")\n',
+            '                  != os.environ["RELEASE_REVISION"]\n',
+            '              or comparison.get("ahead_by") != 2\n',
+            '              or comparison.get("behind_by") != 0\n',
+            '              or comparison.get("total_commits") != 2\n',
+            "              or not isinstance(commits, list)\n",
+            "              or len(commits) != 2\n",
+            '              or [commit.get("sha") for commit in commits]\n',
+            '                  != [prior_recovery_revision, os.environ["RECOVERY_REVISION"]]\n',
+            "              or not isinstance(files, list)\n",
+            '              or {item.get("filename") for item in files} != allowed\n',
+            '              or any(item.get("status") != "modified" for item in files)\n',
+            '              or authority.get("sha") != os.environ["RECOVERY_REVISION"]\n',
+            '              or [parent.get("sha") for parent in authority.get("parents", [])]\n',
+            '                  != [prior_recovery_revision]\n',
+            '              or {item.get("filename") for item in authority.get("files", [])}\n',
+            '                  != correction_files\n',
+            '              raise SystemExit("recovery authority is not the exact two-commit CI-only chain")\n',
+            "          PY\n",
             '          test "$(git rev-parse HEAD)" = "$tag_sha"\n',
         ),
         "exact failed-publication and current-main recovery authority",
     )
     original_failed_job_census = (
-        "            expected_names = {\n"
-        '                "Verify immutable release and exact prepublication SDK proof",\n'
-        '                "Publish the exact pre-gated SDK",\n'
-        '                "Recover verification of the exact published SDK",\n'
-        '                "Verify registry SDK on " + "$" + "{{ matrix.release_platform }}",\n'
-        "            }\n"
-        "            if (\n"
-        "                len(jobs) != 4\n"
-        '                or {job.get("name") for job in jobs} != expected_names\n'
-        '                or len({job.get("id") for job in jobs}) != 4\n'
-        "            ):\n"
+        "          expected_names = {\n"
+        '              "Verify immutable release and exact prepublication SDK proof",\n'
+        '              "Publish the exact pre-gated SDK",\n'
+        '              "Recover verification of the exact published SDK",\n'
+        '              "Verify registry SDK on " + "$" + "{{ matrix.release_platform }}",\n'
+        "          }\n"
+        "          if (\n"
+        "              len(jobs) != 4\n"
+        '              or {job.get("name") for job in jobs} != expected_names\n'
+        '              or len({job.get("id") for job in jobs}) != 4\n'
+        "          ):\n"
     )
     if publish_verify_job.count(original_failed_job_census) != 1:
         raise ReleaseError(
             "npm-publish recovery must retain the exact original failed-run job census"
         )
     original_failed_step_census = (
-        "            expected_steps = [\n"
-        '                (1, "Set up job", "success"),\n'
-        '                (2, "Reject workflow reruns before release verification", "success"),\n'
-        '                (3, "Check out the exact published tag", "success"),\n'
-        '                (4, "Require space for bounded native archive verification", "success"),\n'
-        '                (5, "Set up Node without publication credentials", "success"),\n'
-        '                (6, "Verify exact release, tag, commit, and asset inventory", "success"),\n'
-        '                (7, "Download and verify native and SDK package-run inputs", "success"),\n'
-        '                (8, "Activate pinned npm and pnpm clients", "success"),\n'
-        '                (9, "Install, typecheck, test, build, and reproduce the SDK pack", "success"),\n'
-        '                (10, "Verify the exact prepublication gate preceded immutable publication", "failure"),\n'
-        '                (11, "Stage only the exact attested and pre-gated npm inputs", "skipped"),\n'
-        '                (21, "Post Set up Node without publication credentials", "skipped"),\n'
-        '                (22, "Post Check out the exact published tag", "success"),\n'
-        '                (23, "Complete job", "success"),\n'
-        "            ]\n"
+        "          expected_steps = [\n"
+        '              (1, "Set up job", "success"),\n'
+        '              (2, "Reject workflow reruns before release verification", "success"),\n'
+        '              (3, "Check out the exact published tag", "success"),\n'
+        '              (4, "Require space for bounded native archive verification", "success"),\n'
+        '              (5, "Set up Node without publication credentials", "success"),\n'
+        '              (6, "Verify exact release, tag, commit, and asset inventory", "success"),\n'
+        '              (7, "Download and verify native and SDK package-run inputs", "success"),\n'
+        '              (8, "Activate pinned npm and pnpm clients", "success"),\n'
+        '              (9, "Install, typecheck, test, build, and reproduce the SDK pack", "success"),\n'
+        '              (10, "Verify the exact prepublication gate preceded immutable publication", "failure"),\n'
+        '              (11, "Stage only the exact attested and pre-gated npm inputs", "skipped"),\n'
+        '              (21, "Post Set up Node without publication credentials", "skipped"),\n'
+        '              (22, "Post Check out the exact published tag", "success"),\n'
+        '              (23, "Complete job", "success"),\n'
+        "          ]\n"
     )
     if publish_verify_job.count(original_failed_step_census) != 1:
         raise ReleaseError(
             "npm-publish recovery must retain the exact original failed-run step census"
         )
     exact_recovery_allowlist = (
-        "            allowed = {\n"
-        '                ".github/workflows/stasis-package.yml",\n'
-        '                ".github/workflows/stasis-publish-npm.yml",\n'
-        '                "etc/ci/stasis/release_archive.py",\n'
-        '                "etc/ci/stasis/verify_build_provenance.py",\n'
-        "            }\n"
+        "          allowed = {\n"
+        '              ".github/workflows/stasis-package.yml",\n'
+        '              ".github/workflows/stasis-publish-npm.yml",\n'
+        '              "etc/ci/stasis/release_archive.py",\n'
+        '              "etc/ci/stasis/verify_build_provenance.py",\n'
+        "          }\n"
     )
     if publish_verify_job.count(exact_recovery_allowlist) != 1:
         raise ReleaseError(
             "npm-publish recovery must allow exactly the four verifier/workflow files"
+        )
+    exact_recovery_correction_files = (
+        "          correction_files = {\n"
+        '              ".github/workflows/stasis-publish-npm.yml",\n'
+        '              "etc/ci/stasis/release_archive.py",\n'
+        "          }\n"
+    )
+    if publish_verify_job.count(exact_recovery_correction_files) != 1:
+        raise ReleaseError(
+            "npm-publish recovery correction must modify only the workflow and its contract shield"
         )
 
     exact_checkout_action = (
@@ -8651,21 +8713,33 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
-            "                len(jobs) != 4",
-            "                len(jobs) < 4",
+            "              len(jobs) != 4",
+            "              len(jobs) < 4",
             "original failed publication job census",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
-            '                (10, "Verify the exact prepublication gate preceded immutable publication", "failure"),',
-            '                (10, "Verify the exact prepublication gate preceded immutable publication", "success"),',
+            '              (10, "Verify the exact prepublication gate preceded immutable publication", "failure"),',
+            '              (10, "Verify the exact prepublication gate preceded immutable publication", "success"),',
             "original failed publication step census",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
-            '            if artifacts != {"total_count": 0, "artifacts": []}:',
-            '            if artifacts.get("total_count") != 0:',
+            '          if artifacts != {"total_count": 0, "artifacts": []}:',
+            '          if artifacts.get("total_count") != 0:',
             "original failed publication empty-artifact census",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "            python3 - <<'PY'\n          import json\n          import pathlib\n\n          pages = json.loads(",
+            "            python3 - <<'PY'\n            import json\n          import pathlib\n\n          pages = json.loads(",
+            "original failed-run census heredoc shell boundary",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "            RECOVERY_REVISION=\"$GITHUB_SHA\" RELEASE_REVISION=\"$tag_sha\" python3 - <<'PY'\n          import json\n          import os\n          import pathlib",
+            "            RECOVERY_REVISION=\"$GITHUB_SHA\" RELEASE_REVISION=\"$tag_sha\" python3 - <<'PY'\n            import json\n          import os\n          import pathlib",
+            "recovery ancestry heredoc shell boundary",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
@@ -8681,15 +8755,27 @@ def self_test() -> None:
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
-            '                ".github/workflows/stasis-package.yml",',
-            '                "ports/stasis/Cargo.toml",',
+            '              ".github/workflows/stasis-package.yml",',
+            '              "ports/stasis/Cargo.toml",',
             "recovery exact four-file allowlist",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
-            '                or comparison.get("total_commits") != 1',
-            '                or comparison.get("total_commits") < 1',
-            "recovery exact one-commit ancestry",
+            '              or comparison.get("total_commits") != 2',
+            '              or comparison.get("total_commits") < 2',
+            "recovery exact two-commit ancestry",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            "d152bf718d86b9c3938d71eee9dafcac8b12872d",
+            "d152bf718d86b9c3938d71eee9dafcac8b12872e",
+            "first recovery authority revision",
+        )
+        require_public_marker_mutation_rejected(
+            PUBLIC_NPM_PUBLISH_WORKFLOW,
+            '              or {item.get("filename") for item in authority.get("files", [])}',
+            '              or {item.get("filename") for item in comparison.get("files", [])}',
+            "recovery correction commit exact file inventory",
         )
         require_public_marker_mutation_rejected(
             PUBLIC_NPM_PUBLISH_WORKFLOW,
