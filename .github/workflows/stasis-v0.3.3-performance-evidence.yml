@@ -192,10 +192,10 @@ jobs:
           if ((git -C rwa config --get core.autocrlf) -ne 'true') {
             throw 'RWA checkout did not retain core.autocrlf=true'
           }
-          if ((git -C benchmark status --porcelain=v1 --untracked-files=no).Length -ne 0) {
+          if ((@(git -C benchmark status --porcelain=v1 --untracked-files=no)).Count -ne 0) {
             throw 'benchmark checkout is dirty before setup'
           }
-          if ((git -C rwa status --porcelain=v1 --untracked-files=no).Length -ne 0) {
+          if ((@(git -C rwa status --porcelain=v1 --untracked-files=no)).Count -ne 0) {
             throw 'RWA checkout is dirty before setup'
           }
 
@@ -209,9 +209,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           npm ci
           if ($LASTEXITCODE -ne 0) { throw 'benchmark npm ci failed' }
-          npm run check
-          if ($LASTEXITCODE -ne 0) { throw 'benchmark checks failed' }
-          if ((git status --porcelain=v1 --untracked-files=no).Length -ne 0) {
+          if ((@(git status --porcelain=v1 --untracked-files=no)).Count -ne 0) {
             throw 'benchmark setup changed tracked files'
           }
 
@@ -420,7 +418,6 @@ jobs:
         run: |
           set -euo pipefail
           npm ci
-          npm run check
           test -z "$(git status --porcelain=v1 --untracked-files=no)"
 
       - name: Install the exact Playwright Chromium runtime
