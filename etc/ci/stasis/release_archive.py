@@ -137,11 +137,15 @@ PLATFORM_CONTRACTS: dict[str, dict[str, str]] = {
         "architecture": "x86_64",
         "abi": "GNU/Linux with glibc 2.35 or newer",
         "install_note": (
-            "This executable targets x86_64 GNU/Linux with glibc 2.35 or newer (the Ubuntu 22.04 compatibility floor)."
+            "This executable targets x86_64 GNU/Linux with glibc 2.35 or newer "
+            "(the Ubuntu 22.04 compatibility floor). Before launch, the system must "
+            "provide libEGL.so.1; on Ubuntu 22.04, install the libegl1 package."
         ),
         "dependency_note": (
             "External runtime baseline: Ubuntu 22.04-compatible x86_64 userspace with "
-            "glibc 2.35 or newer; system shared libraries are resolved by the GNU/Linux "
+            "glibc 2.35 or newer. The system must provide libEGL.so.1; on Ubuntu "
+            "22.04, install the libegl1 package, which installs the Mesa EGL provider "
+            "dependency. Other system shared libraries are resolved by the GNU/Linux "
             "dynamic loader."
         ),
     },
@@ -12671,6 +12675,14 @@ fn unreviewed_input_method_producer() -> InputMethodRequest {
                 raise ReleaseError(f"self-test generated platform-neutral {name}")
         if b"glibc 2.35" not in linux_generated["NATIVE-LIBRARIES.txt"]:
             raise ReleaseError("self-test Linux metadata lost the glibc compatibility floor")
+        for name in ("INSTALL.txt", "NATIVE-LIBRARIES.txt"):
+            if (
+                b"libEGL.so.1" not in linux_generated[name]
+                or b"libegl1" not in linux_generated[name]
+            ):
+                raise ReleaseError(f"self-test Linux {name} lost the EGL runtime prerequisite")
+            if b"libEGL.so.1" in mac_generated[name] or b"libegl1" in mac_generated[name]:
+                raise ReleaseError(f"self-test macOS {name} acquired the Linux EGL prerequisite")
         if (
             b"only an ad hoc linker signature" not in mac_generated["INSTALL.txt"]
             or b"not signed with Developer ID and is not Apple-notarized"

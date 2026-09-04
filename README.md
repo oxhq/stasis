@@ -19,6 +19,21 @@ stable successor only when its
 exact tag, release, registry package, provenance, and anonymous public-consumer evidence exist.
 Verify those public artifacts rather than inferring release status from this checkout.
 
+## Linux release prerequisite
+
+The immutable Stasis v0.3.3 Linux x86-64 runtime dynamically loads
+`libEGL.so.1` during graphics initialization. On Ubuntu 22.04, install it
+before using the release archive directly or through `@oxhq/stasis`:
+
+```sh
+sudo apt-get update
+sudo apt-get install --yes --no-install-recommends libegl1
+```
+
+The v0.3.3 archive's `INSTALL.txt` and `NATIVE-LIBRARIES.txt` omitted this
+dynamically loaded prerequisite. The archive and executable bytes are
+unchanged. Source builds that run `./mach bootstrap` already install it.
+
 Start with [STASIS.md](STASIS.md) for the product boundary,
 [the v0.3 controlled-session contract](docs/stasis/session-v0.3-candidate.md) for the explicit v2
 surface, [the frozen v0.2 session contract](docs/stasis/session-v0.2.md) for the default v1 session,
