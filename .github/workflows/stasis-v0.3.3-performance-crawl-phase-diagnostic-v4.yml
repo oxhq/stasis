@@ -1,0 +1,1255 @@
+name: Stasis v0.3.3 performance crawl phase diagnostic V4
+
+on:
+  push:
+    branches:
+      - codex/stasis-v033-crawl-phase-diagnostic-v4
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: stasis-v0.3.3-performance-crawl-phase-diagnostic-v4-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BENCHMARK_HARNESS_SHA: 58742c0f35939558b334eeb792cbf17ae8ab3426
+  BENCHMARK_HARNESS_PARENT_SHA: ff081f0defd22420e6928701ef4aefb52a3f8b11
+  DIAGNOSTIC_SCHEMA: stasis-v0.3.3-performance-crawl-phase-diagnostic-v2
+  DIAGNOSTIC_PROTOCOL: stasis-v0.3.3-performance-crawl-phase-diagnostic-v2
+  DIAGNOSTIC_EVIDENCE_SCHEMA: stasis-v0.3.3-performance-crawl-phase-localization-evidence-v2
+  DIAGNOSTIC_EVIDENCE_PROTOCOL: stasis-v0.3.3-performance-crawl-phase-localization-v2
+  STASIS_DIAGNOSTIC_DEPENDENCY_HOOK: sdk_frozen_plain_object_adapter_v2
+  COMPARISON_INPUT_VERIFICATION_SCHEMA: stasis-v0.3.3-performance-crawl-phase-comparison-input-verification-v2
+  DIAGNOSTIC_OUTCOME_SCHEMA: stasis-v0.3.3-performance-crawl-phase-diagnostic-outcome-v2
+  # S4 must execute frozen H4, so only H4's generated semantic and CLI receipts remain V1.
+  H4_DIAGNOSTIC_VERIFICATION_SCHEMA: stasis-v0.3.3-performance-crawl-phase-diagnostic-verification-v1
+  H4_DIAGNOSTIC_VERIFICATION_CLI_SCHEMA: stasis-v0.3.3-performance-crawl-phase-diagnostic-verification-cli-v1
+  V1_INVALID_SOURCE_SHA: 6c142d18631b910ab9e7ce842b52ed817b46ecc5
+  V1_INVALID_RUN_ID: "33878174891"
+  V1_INVALID_RUN_ATTEMPT: "1"
+  V1_INVALID_JOB_ID: "101040077123"
+  V1_INVALID_ARTIFACT_ID: "9938737579"
+  V1_INVALID_ARTIFACT_BYTES: "491"
+  V1_INVALID_ARTIFACT_SHA256: b512db23bd922943606f8c366c144fab99163a0bb2a4a606f53b24c63fb7b676
+  V1_INVALID_OUTCOME_SCHEMA: stasis-v0.3.3-performance-crawl-phase-diagnostic-outcome-v1
+  V1_INVALID_OUTCOME_BYTES: "612"
+  V1_INVALID_OUTCOME_SHA256: 27c81015c1e3e095f9148e71b4fd32039eda1dfc16b7c5be4aedc17caa82cc03
+  V1_HOSTED_PROVENANCE_BYTES: "15477"
+  V1_HOSTED_PROVENANCE_SHA256: 42ccfa01f80d8c791182d92010c803327af386b4fc08dc63515ccc843bfe10db
+  V1_EVIDENCE_RELEASE_ID: "382790743"
+  V1_EVIDENCE_RELEASE_TAG: stasis-v0.3.3-performance-crawl-phase-diagnostic-evidence-v1
+  V1_EVIDENCE_RELEASE_TARGET: 24242dcbcf652f07ca9ae62e8b48ce35949dda15
+  V1_PUBLIC_VERIFICATION_RELEASE_ID: "382795113"
+  V1_PUBLIC_VERIFICATION_RELEASE_TAG: stasis-v0.3.3-performance-crawl-phase-diagnostic-public-verification-v1
+  V1_PUBLIC_VERIFICATION_CREATED_AT: "2026-09-04T14:24:03Z"
+  V1_PUBLIC_VERIFICATION_PUBLISHED_AT: "2026-09-04T14:33:20Z"
+  V1_PUBLIC_VERIFICATION_TAG_TARGET: ff081f0defd22420e6928701ef4aefb52a3f8b11
+  V1_PUBLIC_VERIFICATION_RECEIPT_ASSET_ID: "544462676"
+  V1_PUBLIC_VERIFICATION_RECEIPT_BYTES: "7434"
+  V1_PUBLIC_VERIFICATION_RECEIPT_SHA256: 05299186edea4e770abc26900e55ce7fa485d7a84093a8ea240d3470e10a6343
+  WORKFLOW_PARENT_SHA: fc1dfca00b0f25d1da35cae23fa206d511aa876e
+  COMPARISON_RELEASE_ID: "382679391"
+  COMPARISON_RELEASE_TAG: stasis-v0.3.3-performance-replication-evidence-v1
+  COMPARISON_RELEASE_TARGET: 6c1a0066eb17425628293993fd7312d4cf26e0f5
+  COMPARISON_RELEASE_CREATED_AT: "2026-09-04T11:36:56Z"
+  COMPARISON_RELEASE_PUBLISHED_AT: "2026-09-04T11:37:42Z"
+  FRESH_CRAWL_RAW_ASSET_ID: "544250086"
+  FRESH_CRAWL_RAW_BYTES: "221543"
+  FRESH_CRAWL_RAW_SHA256: 52a76a4ebb726c6ab78b70356655e8abd7a5e84d9ce175a8e0d876f543c1a16b
+  ARTIFACT_BINDING_ASSET_ID: "544250114"
+  ARTIFACT_BINDING_BYTES: "5086"
+  ARTIFACT_BINDING_SHA256: 78d91f9c12f85d538dff1944e772614bf9b0adc9841d647c93ab8f608f1ba4ad
+  STASIS_PACKAGE_RUN_ID: "33506181780"
+  STASIS_PACKAGE_RUN_ATTEMPT: "1"
+  STASIS_REVISION: 48c5a718a9ddd63f496e45307e1484974ccf8587
+
+jobs:
+  crawl-phase-diagnostic-v4:
+    name: Native Ubuntu 22.04 crawl phase diagnostic V4
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Validate the one-shot workflow invocation
+        id: validate_invocation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'oxhq/stasis'
+          test "$GITHUB_EVENT_NAME" = 'push'
+          test "$GITHUB_REF" = 'refs/heads/codex/stasis-v033-crawl-phase-diagnostic-v4'
+          test "$GITHUB_RUN_ATTEMPT" = '1'
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BENCHMARK_HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$BENCHMARK_HARNESS_SHA" = '58742c0f35939558b334eeb792cbf17ae8ab3426'
+          test "$BENCHMARK_HARNESS_PARENT_SHA" = "$V1_PUBLIC_VERIFICATION_TAG_TARGET"
+          test "$COMPARISON_RELEASE_TARGET" = '6c1a0066eb17425628293993fd7312d4cf26e0f5'
+          test "$DIAGNOSTIC_SCHEMA" = 'stasis-v0.3.3-performance-crawl-phase-diagnostic-v2'
+          test "$DIAGNOSTIC_PROTOCOL" = "$DIAGNOSTIC_SCHEMA"
+          test "$DIAGNOSTIC_EVIDENCE_SCHEMA" = 'stasis-v0.3.3-performance-crawl-phase-localization-evidence-v2'
+          test "$DIAGNOSTIC_EVIDENCE_PROTOCOL" = 'stasis-v0.3.3-performance-crawl-phase-localization-v2'
+          test "$STASIS_DIAGNOSTIC_DEPENDENCY_HOOK" = 'sdk_frozen_plain_object_adapter_v2'
+          test "$COMPARISON_INPUT_VERIFICATION_SCHEMA" = 'stasis-v0.3.3-performance-crawl-phase-comparison-input-verification-v2'
+          test "$DIAGNOSTIC_OUTCOME_SCHEMA" = 'stasis-v0.3.3-performance-crawl-phase-diagnostic-outcome-v2'
+          test "$H4_DIAGNOSTIC_VERIFICATION_SCHEMA" = 'stasis-v0.3.3-performance-crawl-phase-diagnostic-verification-v1'
+          test "$H4_DIAGNOSTIC_VERIFICATION_CLI_SCHEMA" = 'stasis-v0.3.3-performance-crawl-phase-diagnostic-verification-cli-v1'
+          test "$STASIS_PACKAGE_RUN_ID" = '33506181780'
+          test "$STASIS_PACKAGE_RUN_ATTEMPT" = '1'
+          test "$STASIS_REVISION" = '48c5a718a9ddd63f496e45307e1484974ccf8587'
+
+          EVENT_PATH="$GITHUB_EVENT_PATH" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          event = json.loads(Path(os.environ["EVENT_PATH"]).read_text(encoding="utf-8"))
+          expected = {
+              "after": os.environ["GITHUB_SHA"],
+              "before": "0" * 40,
+              "created": True,
+              "deleted": False,
+              "forced": False,
+              "ref": "refs/heads/codex/stasis-v033-crawl-phase-diagnostic-v4",
+          }
+          for key, value in expected.items():
+              if event.get(key) != value:
+                  raise SystemExit(f"one-shot push identity mismatch: {key}")
+          PY
+
+          commit_record="$RUNNER_TEMP/diagnostic-workflow-commit.json"
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" > "$commit_record"
+          COMMIT_RECORD="$commit_record" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          commit = json.loads(Path(os.environ["COMMIT_RECORD"]).read_text(encoding="utf-8"))
+          if commit.get("sha") != os.environ["GITHUB_SHA"]:
+              raise SystemExit("workflow source commit identity mismatch")
+          parents = commit.get("parents") or []
+          if [parent.get("sha") for parent in parents] != [os.environ["WORKFLOW_PARENT_SHA"]]:
+              raise SystemExit("workflow source must have the frozen sole parent")
+          files = commit.get("files") or []
+          expected_path = ".github/workflows/stasis-v0.3.3-performance-crawl-phase-diagnostic-v4.yml"
+          if [(item.get("filename"), item.get("status")) for item in files] != [
+              (expected_path, "added")
+          ]:
+              raise SystemExit("workflow source commit changed files outside the frozen path")
+          PY
+
+      - name: Check out the exact diagnostic harness
+        id: checkout_harness
+        if: ${{ steps.validate_invocation.outcome == 'success' }}
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: oxhq/stasis-compat-bench
+          ref: ${{ env.BENCHMARK_HARNESS_SHA }}
+          path: benchmark
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up exact Node 22.20.0 x64
+        id: setup_node
+        if: ${{ steps.checkout_harness.outcome == 'success' }}
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.20.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Verify the exact harness and Node runtime
+        id: verify_runtime
+        if: ${{ steps.setup_node.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = 'v22.20.0'
+          test "$(node -p 'process.platform')" = 'linux'
+          test "$(node -p 'process.arch')" = 'x64'
+          test "$RUNNER_OS" = 'Linux'
+          test "$RUNNER_ARCH" = 'X64'
+          test "$(git -C benchmark rev-parse HEAD)" = "$BENCHMARK_HARNESS_SHA"
+          mapfile -t harness_parent_headers < <(
+            git -C benchmark cat-file -p HEAD | sed -n 's/^parent //p'
+          )
+          test "${#harness_parent_headers[@]}" = '1'
+          test "${harness_parent_headers[0]}" = "$BENCHMARK_HARNESS_PARENT_SHA"
+          test -z "$(git -C benchmark status --porcelain=v1 --untracked-files=all)"
+
+      - name: Verify the published V1 invalid motivation anonymously
+        id: verify_v1_motivation
+        if: ${{ steps.verify_runtime.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          motivation_root="$RUNNER_TEMP/stasis-crawl-phase-v1-invalid-motivation"
+          test ! -e "$motivation_root"
+          mkdir "$motivation_root"
+          release_api="$motivation_root/public-verification-release.json"
+          tag_api="$motivation_root/public-verification-tag-ref.json"
+          receipt="$motivation_root/public-verification-receipt.json"
+          hosted_provenance="$motivation_root/v1-hosted-provenance.json"
+          diagnostic_outcome="$motivation_root/v1-diagnostic-outcome.json"
+          release_url="https://api.github.com/repos/oxhq/stasis-compat-bench/releases/$V1_PUBLIC_VERIFICATION_RELEASE_ID"
+          tag_url="https://api.github.com/repos/oxhq/stasis-compat-bench/git/ref/tags/$V1_PUBLIC_VERIFICATION_RELEASE_TAG"
+          receipt_url="https://github.com/oxhq/stasis-compat-bench/releases/download/$V1_PUBLIC_VERIFICATION_RELEASE_TAG/stasis-diagnostic-public-receipt-ff081f0.json"
+          hosted_url="https://github.com/oxhq/stasis-compat-bench/releases/download/$V1_EVIDENCE_RELEASE_TAG/hosted-provenance.json"
+          outcome_url="https://github.com/oxhq/stasis-compat-bench/releases/download/$V1_EVIDENCE_RELEASE_TAG/diagnostic-outcome.json"
+
+          unset GH_TOKEN GITHUB_TOKEN
+          for specification in \
+            "$release_api|$release_url|1048576|application/vnd.github+json" \
+            "$tag_api|$tag_url|1048576|application/vnd.github+json" \
+            "$receipt|$receipt_url|65536|application/octet-stream" \
+            "$hosted_provenance|$hosted_url|65536|application/octet-stream" \
+            "$diagnostic_outcome|$outcome_url|65536|application/octet-stream"
+          do
+            IFS='|' read -r destination url maximum accept <<< "$specification"
+            curl -q --fail --silent --show-error --location --retry 0 \
+              --proto '=https' --proto-redir '=https' --tlsv1.2 --max-redirs 3 \
+              --max-filesize "$maximum" --connect-timeout 30 --max-time 300 \
+              --header "Accept: $accept" \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --header 'User-Agent: stasis-v0.3.3-crawl-phase-diagnostic-v2' \
+              --output "$destination" "$url"
+          done
+
+          RELEASE_API="$release_api" \
+          TAG_API="$tag_api" \
+          RECEIPT="$receipt" \
+          RECEIPT_URL="$receipt_url" \
+          HOSTED_PROVENANCE="$hosted_provenance" \
+          DIAGNOSTIC_OUTCOME="$diagnostic_outcome" \
+            node --input-type=module <<'NODE'
+          import { createHash } from "node:crypto";
+          import { readFile } from "node:fs/promises";
+
+          function fail(message) {
+            throw new Error(message);
+          }
+          function exact(value, expected, label) {
+            if (value !== expected) fail(`${label} mismatch`);
+          }
+          async function canonicalJson(filePath, expectedBytes, expectedSha256, label) {
+            const bytes = await readFile(filePath);
+            exact(bytes.byteLength, Number(expectedBytes), `${label} bytes`);
+            exact(
+              createHash("sha256").update(bytes).digest("hex"),
+              expectedSha256,
+              `${label} SHA-256`,
+            );
+            const value = JSON.parse(bytes.toString("utf8"));
+            const canonical = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+            if (!canonical.equals(bytes)) fail(`${label} is not canonical JSON`);
+            return value;
+          }
+
+          const release = JSON.parse(await readFile(process.env.RELEASE_API, "utf8"));
+          const releaseUrl = `https://api.github.com/repos/oxhq/stasis-compat-bench/releases/${process.env.V1_PUBLIC_VERIFICATION_RELEASE_ID}`;
+          const releaseWebUrl = `https://github.com/oxhq/stasis-compat-bench/releases/tag/${process.env.V1_PUBLIC_VERIFICATION_RELEASE_TAG}`;
+          const expectedRelease = {
+            id: Number(process.env.V1_PUBLIC_VERIFICATION_RELEASE_ID),
+            tag_name: process.env.V1_PUBLIC_VERIFICATION_RELEASE_TAG,
+            target_commitish: "main",
+            url: releaseUrl,
+            html_url: releaseWebUrl,
+            created_at: process.env.V1_PUBLIC_VERIFICATION_CREATED_AT,
+            published_at: process.env.V1_PUBLIC_VERIFICATION_PUBLISHED_AT,
+            immutable: true,
+            draft: false,
+            prerelease: false,
+          };
+          for (const [key, expected] of Object.entries(expectedRelease)) {
+            exact(release[key], expected, `public verification release ${key}`);
+          }
+          if (!Array.isArray(release.assets) || release.assets.length !== 1) {
+            fail("public verification release asset inventory mismatch");
+          }
+          const releaseAsset = release.assets[0];
+          const expectedAsset = {
+            id: Number(process.env.V1_PUBLIC_VERIFICATION_RECEIPT_ASSET_ID),
+            name: "stasis-diagnostic-public-receipt-ff081f0.json",
+            state: "uploaded",
+            size: Number(process.env.V1_PUBLIC_VERIFICATION_RECEIPT_BYTES),
+            digest: `sha256:${process.env.V1_PUBLIC_VERIFICATION_RECEIPT_SHA256}`,
+            browser_download_url: process.env.RECEIPT_URL,
+          };
+          for (const [key, expected] of Object.entries(expectedAsset)) {
+            exact(releaseAsset[key], expected, `public verification receipt asset ${key}`);
+          }
+
+          const tagReference = JSON.parse(await readFile(process.env.TAG_API, "utf8"));
+          exact(
+            tagReference.ref,
+            `refs/tags/${process.env.V1_PUBLIC_VERIFICATION_RELEASE_TAG}`,
+            "public verification tag ref",
+          );
+          exact(tagReference.object?.type, "commit", "public verification tag object type");
+          exact(
+            tagReference.object?.sha,
+            process.env.V1_PUBLIC_VERIFICATION_TAG_TARGET,
+            "public verification tag target",
+          );
+
+          const receipt = await canonicalJson(
+            process.env.RECEIPT,
+            process.env.V1_PUBLIC_VERIFICATION_RECEIPT_BYTES,
+            process.env.V1_PUBLIC_VERIFICATION_RECEIPT_SHA256,
+            "public verification receipt",
+          );
+          const hosted = await canonicalJson(
+            process.env.HOSTED_PROVENANCE,
+            process.env.V1_HOSTED_PROVENANCE_BYTES,
+            process.env.V1_HOSTED_PROVENANCE_SHA256,
+            "V1 hosted provenance",
+          );
+          const outcome = await canonicalJson(
+            process.env.DIAGNOSTIC_OUTCOME,
+            process.env.V1_INVALID_OUTCOME_BYTES,
+            process.env.V1_INVALID_OUTCOME_SHA256,
+            "V1 diagnostic outcome",
+          );
+
+          exact(receipt.status, "passed", "public verification receipt status");
+          exact(receipt.diagnosticStatus, "failed", "public verification diagnostic status");
+          exact(receipt.outcomeClass, "DIAGNOSTIC_INVALID_WITH_STATUS", "public verification outcome class");
+          exact(receipt.release?.releaseId, Number(process.env.V1_EVIDENCE_RELEASE_ID), "V1 evidence release id");
+          exact(receipt.release?.tag, process.env.V1_EVIDENCE_RELEASE_TAG, "V1 evidence release tag");
+          exact(receipt.release?.targetCommitSha, process.env.V1_EVIDENCE_RELEASE_TARGET, "V1 evidence release target");
+          exact(receipt.release?.immutable, true, "V1 evidence release immutability");
+          exact(receipt.release?.tagBindings?.evidence?.objectSha, process.env.V1_EVIDENCE_RELEASE_TARGET, "V1 evidence tag target");
+          exact(receipt.release?.tagBindings?.contract?.objectSha, process.env.V1_EVIDENCE_RELEASE_TARGET, "V1 contract tag target");
+          exact(receipt.release?.tagBindings?.comparison?.objectSha, process.env.COMPARISON_RELEASE_TARGET, "comparison evidence tag target");
+          exact(receipt.decisionState, "STAY_0_4_UNASSIGNED", "public verification decision state");
+
+          const retainedByteMap = new Map(
+            (receipt.assetByteMap ?? []).map((entry) => [entry.name, entry]),
+          );
+          const retainedFiles = [
+            ["actions-diagnostic-bundle.zip", Number(process.env.V1_INVALID_ARTIFACT_BYTES), process.env.V1_INVALID_ARTIFACT_SHA256],
+            ["diagnostic-outcome.json", Number(process.env.V1_INVALID_OUTCOME_BYTES), process.env.V1_INVALID_OUTCOME_SHA256],
+            ["hosted-provenance.json", Number(process.env.V1_HOSTED_PROVENANCE_BYTES), process.env.V1_HOSTED_PROVENANCE_SHA256],
+          ];
+          for (const [name, bytes, sha256] of retainedFiles) {
+            const entry = retainedByteMap.get(name);
+            exact(entry?.bytes, bytes, `${name} retained bytes`);
+            exact(entry?.sha256, sha256, `${name} retained SHA-256`);
+          }
+
+          exact(hosted.status, "passed", "V1 hosted provenance status");
+          exact(hosted.outcomeClass, "DIAGNOSTIC_INVALID_WITH_STATUS", "V1 hosted outcome class");
+          exact(hosted.producer?.headSha, process.env.V1_INVALID_SOURCE_SHA, "V1 source SHA");
+          exact(hosted.producer?.runId, Number(process.env.V1_INVALID_RUN_ID), "V1 run id");
+          exact(hosted.producer?.runAttempt, Number(process.env.V1_INVALID_RUN_ATTEMPT), "V1 run attempt");
+          exact(hosted.oneShot?.invocationCount, 1, "V1 invocation count");
+          exact(hosted.oneShot?.rerunCount, 0, "V1 rerun count");
+          exact(hosted.job?.id, Number(process.env.V1_INVALID_JOB_ID), "V1 job id");
+          exact(hosted.execution?.retries, false, "V1 retries");
+          exact(hosted.execution?.sleeps, false, "V1 sleeps");
+          exact(hosted.execution?.fallbacks, false, "V1 fallbacks");
+          exact(hosted.execution?.discardedObservations, false, "V1 discarded observations");
+          if (!Array.isArray(hosted.artifacts) || hosted.artifacts.length !== 1) {
+            fail("V1 invalid artifact inventory mismatch");
+          }
+          exact(hosted.artifacts[0].id, Number(process.env.V1_INVALID_ARTIFACT_ID), "V1 artifact id");
+          exact(hosted.artifacts[0].sizeInBytes, Number(process.env.V1_INVALID_ARTIFACT_BYTES), "V1 artifact bytes");
+          exact(hosted.artifacts[0].digest, `sha256:${process.env.V1_INVALID_ARTIFACT_SHA256}`, "V1 artifact digest");
+
+          const disabledClaims = [
+            "authorityEligible",
+            "timingEligible",
+            "statisticsEligible",
+            "comparisonEligible",
+            "optimizationEligible",
+            "generalizedSpeedClaimAuthorized",
+            "implementationWorkAuthorized",
+          ];
+          for (const name of disabledClaims) {
+            exact(receipt[name], false, `public verification ${name}`);
+            exact(outcome[name], false, `V1 diagnostic outcome ${name}`);
+          }
+          exact(outcome.schema, process.env.V1_INVALID_OUTCOME_SCHEMA, "V1 diagnostic outcome schema");
+          exact(outcome.status, "failed", "V1 diagnostic outcome status");
+          exact(outcome.outcomeClass, "DIAGNOSTIC_INVALID_WITH_STATUS", "V1 diagnostic outcome class");
+          exact(outcome.phase, "diagnostic_execution", "V1 diagnostic failure phase");
+          exact(outcome.runAttempt, 1, "V1 diagnostic outcome run attempt");
+          exact(outcome.evidenceArtifactEligible, false, "V1 diagnostic evidence eligibility");
+          exact(outcome.failure?.code, "DIAGNOSTIC_EXECUTION_FAILED", "V1 diagnostic failure code");
+          exact(outcome.decisionState, "STAY_0_4_UNASSIGNED", "V1 diagnostic decision state");
+          NODE
+
+      - name: Install the frozen diagnostic harness
+        id: install_harness
+        if: ${{ steps.verify_v1_motivation.outcome == 'success' }}
+        shell: bash
+        working-directory: benchmark
+        timeout-minutes: 15
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+          NPM_CONFIG_FETCH_RETRIES: "0"
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund --timing --registry=https://registry.npmjs.org/
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Install the exact Playwright Chromium runtime
+        id: install_browser
+        if: ${{ steps.install_harness.outcome == 'success' }}
+        shell: bash
+        working-directory: benchmark
+        timeout-minutes: 30
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/stasis-performance-playwright
+        run: |
+          set -euo pipefail
+          npx --no-install playwright install --with-deps chromium
+          browser_path=$(node -e 'import("playwright").then(({ chromium }) => process.stdout.write(chromium.executablePath()))')
+          test -x "$browser_path"
+          printf 'PLAYWRIGHT_BROWSERS_PATH=%s\n' \
+            "$PLAYWRIGHT_BROWSERS_PATH" >> "$GITHUB_ENV"
+
+      - name: Provision the exact Stasis EGL runtime prerequisite
+        id: provision_egl
+        if: ${{ steps.install_browser.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libegl1 \
+            libegl-mesa0 \
+            libglvnd0
+          python3 - <<'PY'
+          import ctypes
+          import os
+
+          library = ctypes.CDLL("libEGL.so.1", mode=os.RTLD_LAZY)
+          if not hasattr(library, "eglGetProcAddress"):
+              raise SystemExit("libEGL.so.1 does not export eglGetProcAddress")
+          PY
+
+      - name: Verify and download the immutable comparison inputs anonymously
+        id: verify_comparison_input
+        if: ${{ steps.provision_egl.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          authority_root="$RUNNER_TEMP/stasis-crawl-phase-authority-v2"
+          test ! -e "$authority_root"
+          mkdir "$authority_root"
+          release_api="$authority_root/release.json"
+          tag_api="$authority_root/tag-ref.json"
+          fresh_raw="$authority_root/fresh-crawl-raw.json"
+          artifact_binding="$authority_root/artifact-binding.json"
+          input_receipt="$authority_root/comparison-input-verification.json"
+          release_url="https://api.github.com/repos/oxhq/stasis-compat-bench/releases/$COMPARISON_RELEASE_ID"
+          tag_url="https://api.github.com/repos/oxhq/stasis-compat-bench/git/ref/tags/$COMPARISON_RELEASE_TAG"
+          fresh_url="https://github.com/oxhq/stasis-compat-bench/releases/download/$COMPARISON_RELEASE_TAG/fresh-crawl-raw.json"
+          binding_url="https://github.com/oxhq/stasis-compat-bench/releases/download/$COMPARISON_RELEASE_TAG/artifact-binding.json"
+
+          unset GH_TOKEN GITHUB_TOKEN
+          curl -q --fail --silent --show-error --location --retry 0 \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 --max-redirs 3 --max-filesize 1048576 \
+            --connect-timeout 30 --max-time 300 \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --header 'User-Agent: stasis-v0.3.3-crawl-phase-diagnostic-v2' \
+            --output "$release_api" "$release_url"
+          curl -q --fail --silent --show-error --location --retry 0 \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 --max-redirs 3 --max-filesize 1048576 \
+            --connect-timeout 30 --max-time 300 \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --header 'User-Agent: stasis-v0.3.3-crawl-phase-diagnostic-v2' \
+            --output "$tag_api" "$tag_url"
+          curl -q --fail --silent --show-error --location --retry 0 \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 --max-redirs 3 --max-filesize 1048576 \
+            --connect-timeout 30 --max-time 300 \
+            --header 'Accept: application/octet-stream' \
+            --header 'User-Agent: stasis-v0.3.3-crawl-phase-diagnostic-v2' \
+            --output "$fresh_raw" "$fresh_url"
+          curl -q --fail --silent --show-error --location --retry 0 \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 --max-redirs 3 --max-filesize 1048576 \
+            --connect-timeout 30 --max-time 300 \
+            --header 'Accept: application/octet-stream' \
+            --header 'User-Agent: stasis-v0.3.3-crawl-phase-diagnostic-v2' \
+            --output "$artifact_binding" "$binding_url"
+
+          RELEASE_API="$release_api" \
+          TAG_API="$tag_api" \
+          FRESH_RAW="$fresh_raw" \
+          ARTIFACT_BINDING="$artifact_binding" \
+          INPUT_RECEIPT="$input_receipt" \
+          FRESH_URL="$fresh_url" \
+          BINDING_URL="$binding_url" \
+            node --input-type=module <<'NODE'
+          import { createHash } from "node:crypto";
+          import { readFile, writeFile } from "node:fs/promises";
+
+          function fail(message) {
+            throw new Error(message);
+          }
+          function exactInteger(value, expected, label) {
+            if (value !== Number(expected)) fail(`${label} mismatch`);
+          }
+          async function canonicalJson(filePath, expectedBytes, expectedSha256, label) {
+            const bytes = await readFile(filePath);
+            exactInteger(bytes.byteLength, expectedBytes, `${label} bytes`);
+            const digest = createHash("sha256").update(bytes).digest("hex");
+            if (digest !== expectedSha256) fail(`${label} SHA-256 mismatch`);
+            let value;
+            try {
+              value = JSON.parse(bytes.toString("utf8"));
+            } catch {
+              fail(`${label} is not valid JSON`);
+            }
+            const canonical = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+            if (!canonical.equals(bytes)) fail(`${label} is not canonical JSON`);
+          }
+
+          const release = JSON.parse(await readFile(process.env.RELEASE_API, "utf8"));
+          const releaseApiUrl = `https://api.github.com/repos/oxhq/stasis-compat-bench/releases/${process.env.COMPARISON_RELEASE_ID}`;
+          const releaseWebUrl = `https://github.com/oxhq/stasis-compat-bench/releases/tag/${process.env.COMPARISON_RELEASE_TAG}`;
+          const releaseExpected = {
+            id: Number(process.env.COMPARISON_RELEASE_ID),
+            tag_name: process.env.COMPARISON_RELEASE_TAG,
+            target_commitish: process.env.COMPARISON_RELEASE_TARGET,
+            url: releaseApiUrl,
+            html_url: releaseWebUrl,
+            created_at: process.env.COMPARISON_RELEASE_CREATED_AT,
+            published_at: process.env.COMPARISON_RELEASE_PUBLISHED_AT,
+            immutable: true,
+            draft: false,
+            prerelease: false,
+          };
+          for (const [key, expected] of Object.entries(releaseExpected)) {
+            if (release[key] !== expected) fail(`comparison release ${key} mismatch`);
+          }
+          const tagReference = JSON.parse(await readFile(process.env.TAG_API, "utf8"));
+          const expectedTagRef = `refs/tags/${process.env.COMPARISON_RELEASE_TAG}`;
+          const expectedTagApiUrl = `https://api.github.com/repos/oxhq/stasis-compat-bench/git/refs/tags/${process.env.COMPARISON_RELEASE_TAG}`;
+          const expectedTagObjectUrl = `https://api.github.com/repos/oxhq/stasis-compat-bench/git/commits/${process.env.COMPARISON_RELEASE_TARGET}`;
+          if (
+            tagReference.ref !== expectedTagRef ||
+            tagReference.url !== expectedTagApiUrl ||
+            tagReference.object?.type !== "commit" ||
+            tagReference.object?.sha !== process.env.COMPARISON_RELEASE_TARGET ||
+            tagReference.object?.url !== expectedTagObjectUrl
+          ) {
+            fail("comparison release lightweight tag identity mismatch");
+          }
+          const expectedAssetNames = [
+            "SHA256SUMS.txt",
+            "actions-combined-logs.zip",
+            "actions-combined.zip",
+            "actions-crawl-logs.zip",
+            "actions-crawl-raw.zip",
+            "actions-rwa-logs.zip",
+            "actions-rwa-raw.zip",
+            "actions-source-metadata.zip",
+            "artifact-binding.json",
+            "contract-commit.json",
+            "contract-release.json",
+            "fresh-combined-evidence.json",
+            "fresh-combined-evidence.md",
+            "fresh-combined-verification.json",
+            "fresh-crawl-raw.json",
+            "fresh-independent-statistics-replay.json",
+            "fresh-rwa-raw.json",
+            "hosted-provenance.json",
+            "original-combined-evidence.json",
+            "original-crawl-raw.json",
+            "original-rwa-raw.json",
+            "privacy-scan.json",
+            "replication-report.md",
+            "replication-verification.json",
+            "workflow-artifacts.json",
+            "workflow-jobs.json",
+            "workflow-run.json",
+            "workflow-runs.json",
+          ];
+          const observedAssetNames = (release.assets ?? []).map(({ name }) => name).sort();
+          if (JSON.stringify(observedAssetNames) !== JSON.stringify(expectedAssetNames)) {
+            fail("comparison release 28-name asset inventory mismatch");
+          }
+          const expectedAssets = [
+            {
+              key: "freshCrawlRaw",
+              id: Number(process.env.FRESH_CRAWL_RAW_ASSET_ID),
+              name: "fresh-crawl-raw.json",
+              bytes: Number(process.env.FRESH_CRAWL_RAW_BYTES),
+              sha256: process.env.FRESH_CRAWL_RAW_SHA256,
+              browserDownloadUrl: process.env.FRESH_URL,
+              path: process.env.FRESH_RAW,
+            },
+            {
+              key: "artifactBinding",
+              id: Number(process.env.ARTIFACT_BINDING_ASSET_ID),
+              name: "artifact-binding.json",
+              bytes: Number(process.env.ARTIFACT_BINDING_BYTES),
+              sha256: process.env.ARTIFACT_BINDING_SHA256,
+              browserDownloadUrl: process.env.BINDING_URL,
+              path: process.env.ARTIFACT_BINDING,
+            },
+          ];
+          const retainedInputs = {};
+          for (const expected of expectedAssets) {
+            const matches = (release.assets ?? []).filter(({ name }) => name === expected.name);
+            if (matches.length !== 1) fail(`comparison release asset count mismatch: ${expected.name}`);
+            const asset = matches[0];
+            if (
+              asset.id !== expected.id ||
+              asset.state !== "uploaded" ||
+              asset.size !== expected.bytes ||
+              asset.digest !== `sha256:${expected.sha256}` ||
+              asset.browser_download_url !== expected.browserDownloadUrl
+            ) {
+              fail(`comparison release asset metadata mismatch: ${expected.name}`);
+            }
+            await canonicalJson(expected.path, expected.bytes, expected.sha256, expected.name);
+            retainedInputs[expected.key] = {
+              assetId: expected.id,
+              name: expected.name,
+              bytes: expected.bytes,
+              sha256: expected.sha256,
+              browserDownloadUrl: expected.browserDownloadUrl,
+            };
+          }
+          const receipt = {
+            schema: process.env.COMPARISON_INPUT_VERIFICATION_SCHEMA,
+            status: "passed",
+            mode: "anonymous_https",
+            retries: false,
+            credentialsUsed: false,
+            comparisonEvidenceRelease: {
+              repository: "oxhq/stasis-compat-bench",
+              releaseId: releaseExpected.id,
+              tag: releaseExpected.tag_name,
+              targetCommitish: releaseExpected.target_commitish,
+              apiUrl: releaseApiUrl,
+              webUrl: releaseWebUrl,
+              createdAt: releaseExpected.created_at,
+              publishedAt: releaseExpected.published_at,
+              immutable: true,
+              draft: false,
+              prerelease: false,
+              assetNames: expectedAssetNames,
+              tagReference: {
+                ref: expectedTagRef,
+                apiUrl: expectedTagApiUrl,
+                objectType: "commit",
+                objectSha: process.env.COMPARISON_RELEASE_TARGET,
+                objectUrl: expectedTagObjectUrl,
+              },
+            },
+            inputs: retainedInputs,
+            verification: {
+              releaseMetadataExact: true,
+              releaseChronologyExact: true,
+              exactTwentyEightNameAssetInventory: true,
+              lightweightTagReferenceExact: true,
+              selectedAssetMetadataExact: true,
+              anonymousDownloads: true,
+              downloadedBytesExact: true,
+              downloadedSha256Exact: true,
+              canonicalJsonExact: true,
+            },
+          };
+          await writeFile(
+            process.env.INPUT_RECEIPT,
+            `${JSON.stringify(receipt, null, 2)}\n`,
+            { encoding: "utf8", flag: "wx", mode: 0o600 },
+          );
+          NODE
+
+      - name: Verify the exact package source records
+        id: verify_package_source
+        if: ${{ steps.verify_comparison_input.outcome == 'success' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_record="$RUNNER_TEMP/stasis-package-run-$STASIS_PACKAGE_RUN_ID.json"
+          artifact_records="$RUNNER_TEMP/stasis-package-artifacts-$STASIS_PACKAGE_RUN_ID.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STASIS_PACKAGE_RUN_ID" > "$run_record"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STASIS_PACKAGE_RUN_ID/artifacts?per_page=100" \
+            > "$artifact_records"
+          RUN_RECORD="$run_record" ARTIFACT_RECORDS="$artifact_records" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          run = json.loads(Path(os.environ["RUN_RECORD"]).read_text(encoding="utf-8"))
+          expected_run = {
+              "id": 33506181780,
+              "run_attempt": 1,
+              "event": "push",
+              "status": "completed",
+              "conclusion": "success",
+              "head_branch": "main",
+              "head_sha": "48c5a718a9ddd63f496e45307e1484974ccf8587",
+              "path": ".github/workflows/stasis-package.yml",
+              "workflow_id": 340124521,
+          }
+          for key, expected in expected_run.items():
+              if run.get(key) != expected:
+                  raise SystemExit(f"package run {key} mismatch")
+
+          expected_artifacts = {
+              "stasis-runtime-manifest-attempt-1": (9803607695, 1070),
+              "stasis-typescript-attempt-1": (9803606920, 184329),
+              "stasis-linux-x86_64-act-settle-inspect-proof-attempt-1": (9803003770, 786),
+              "stasis-linux-x86_64-attempt-1": (9803003109, 34117650),
+          }
+          records = json.loads(
+              Path(os.environ["ARTIFACT_RECORDS"]).read_text(encoding="utf-8")
+          ).get("artifacts", [])
+          by_name = {record.get("name"): record for record in records}
+          for name, (artifact_id, compressed_bytes) in expected_artifacts.items():
+              record = by_name.get(name)
+              workflow_run = (record or {}).get("workflow_run") or {}
+              if (
+                  record is None
+                  or record.get("id") != artifact_id
+                  or record.get("size_in_bytes") != compressed_bytes
+                  or record.get("expired") is not False
+                  or workflow_run.get("id") != expected_run["id"]
+                  or workflow_run.get("head_sha") != expected_run["head_sha"]
+              ):
+                  raise SystemExit(f"package artifact metadata mismatch: {name}")
+          PY
+
+      - name: Download the exact Linux package artifact
+        id: download_linux
+        if: ${{ steps.verify_package_source.outcome == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-linux-x86_64-attempt-1
+          path: ${{ runner.temp }}/stasis-linux-input
+          repository: oxhq/stasis
+          run-id: 33506181780
+          github-token: ${{ github.token }}
+
+      - name: Download the exact Linux package proof
+        id: download_linux_proof
+        if: ${{ steps.download_linux.outcome == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-linux-x86_64-act-settle-inspect-proof-attempt-1
+          path: ${{ runner.temp }}/stasis-linux-proof-input
+          repository: oxhq/stasis
+          run-id: 33506181780
+          github-token: ${{ github.token }}
+
+      - name: Download the exact TypeScript package artifact
+        id: download_typescript
+        if: ${{ steps.download_linux_proof.outcome == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-typescript-attempt-1
+          path: ${{ runner.temp }}/stasis-typescript-input
+          repository: oxhq/stasis
+          run-id: 33506181780
+          github-token: ${{ github.token }}
+
+      - name: Download the exact runtime manifest
+        id: download_runtime_manifest
+        if: ${{ steps.download_typescript.outcome == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-runtime-manifest-attempt-1
+          path: ${{ runner.temp }}/stasis-runtime-manifest-input
+          repository: oxhq/stasis
+          run-id: 33506181780
+          github-token: ${{ github.token }}
+
+      - name: Verify and extract the exact Linux candidate inputs
+        id: verify_candidate
+        if: ${{ steps.download_runtime_manifest.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/stasis-linux-input/stasis-0.3.3-linux-x86_64.tar.gz"
+          proof="$RUNNER_TEMP/stasis-linux-proof-input/stasis-0.3.3-linux-x86_64-act-settle-inspect.json"
+          sdk="$RUNNER_TEMP/stasis-typescript-input/oxhq-stasis-0.3.3.tgz"
+          manifest="$RUNNER_TEMP/stasis-runtime-manifest-input/stasis-0.3.3-runtime-manifest.json"
+          linux_extract="$RUNNER_TEMP/stasis-linux-extracted"
+          sdk_extract="$RUNNER_TEMP/stasis-sdk-extracted"
+          test ! -e "$linux_extract"
+          test ! -e "$sdk_extract"
+          mkdir "$linux_extract" "$sdk_extract"
+          test "$(stat --format='%s' "$archive")" = '34279279'
+          test "$(sha256sum "$archive" | awk '{print $1}')" = '5965e932cab407aa75d3f283015bf5d5df92cf06ecbd5f1add03083937208e86'
+          test "$(stat --format='%s' "$proof")" = '1160'
+          test "$(sha256sum "$proof" | awk '{print $1}')" = '81e44c9dba85bc10cc67536388f11a9e251b7d4d29e3fc740c98afbfefba1cac'
+          test "$(stat --format='%s' "$sdk")" = '181292'
+          test "$(sha256sum "$sdk" | awk '{print $1}')" = '55063c0ab9fc802e101d792831c292f1a7b0b497a141603102eacbef9fc029ec'
+          test "$(stat --format='%s' "$manifest")" = '2503'
+          test "$(sha256sum "$manifest" | awk '{print $1}')" = '4e466dbd269fb08738c265133aa5bed2d139d2750db6a5060230e63527ee39a4'
+          tar -xzf "$archive" -C "$linux_extract"
+          tar -xzf "$sdk" -C "$sdk_extract"
+          executable="$linux_extract/stasis-0.3.3-linux-x86_64/stasis"
+          test -x "$executable"
+          test "$(stat --format='%s' "$executable")" = '83877352'
+          test "$(sha256sum "$executable" | awk '{print $1}')" = 'c6a37995cde25275454d7f1ee61c2803964b04bf0d35f8fde7c78e9575c74c37'
+          salt=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+          test "${#salt}" = '64'
+          echo "::add-mask::$salt"
+          printf 'STASIS_PERFORMANCE_BOOT_SALT=%s\n' "$salt" >> "$GITHUB_ENV"
+
+      - name: Run one Crawlee-then-Stasis phase diagnostic V2
+        id: diagnostic_execution
+        if: ${{ steps.verify_candidate.outcome == 'success' }}
+        shell: bash
+        working-directory: benchmark
+        env:
+          STASIS_COMPAT_ARTIFACT_DIR: ${{ github.workspace }}/benchmark/artifacts/runs/crawl-phase-diagnostic-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          STASIS_PERFORMANCE_AUTHORITY_CRAWL_RAW_PATH: ${{ runner.temp }}/stasis-crawl-phase-authority-v2/fresh-crawl-raw.json
+          STASIS_PERFORMANCE_AUTHORITY_CRAWL_RAW_SHA256: 52a76a4ebb726c6ab78b70356655e8abd7a5e84d9ce175a8e0d876f543c1a16b
+          STASIS_PERFORMANCE_ARTIFACT_BINDING_PATH: ${{ runner.temp }}/stasis-crawl-phase-authority-v2/artifact-binding.json
+          STASIS_PERFORMANCE_LINUX_ARCHIVE: ${{ runner.temp }}/stasis-linux-input/stasis-0.3.3-linux-x86_64.tar.gz
+          STASIS_PERFORMANCE_LINUX_EXECUTABLE: ${{ runner.temp }}/stasis-linux-extracted/stasis-0.3.3-linux-x86_64/stasis
+          STASIS_PERFORMANCE_LINUX_PROOF: ${{ runner.temp }}/stasis-linux-proof-input/stasis-0.3.3-linux-x86_64-act-settle-inspect.json
+          STASIS_PERFORMANCE_RUNTIME_MANIFEST: ${{ runner.temp }}/stasis-runtime-manifest-input/stasis-0.3.3-runtime-manifest.json
+          STASIS_PERFORMANCE_SDK_ARCHIVE: ${{ runner.temp }}/stasis-typescript-input/oxhq-stasis-0.3.3.tgz
+          STASIS_PERFORMANCE_SDK_PACKAGE_ROOT: ${{ runner.temp }}/stasis-sdk-extracted/package
+        run: |
+          set -euo pipefail
+          node src/performance/run-crawl-phase-diagnostic.mjs
+
+      - name: Verify the diagnostic V2 artifact set offline
+        id: offline_verification
+        if: ${{ steps.diagnostic_execution.outcome == 'success' }}
+        shell: bash
+        working-directory: benchmark
+        env:
+          DIAGNOSTIC_ROOT: ${{ github.workspace }}/benchmark/artifacts/runs/crawl-phase-diagnostic-v2-${{ github.run_id }}-${{ github.run_attempt }}/performance/diagnostics
+          AUTHORITY_ROOT: ${{ runner.temp }}/stasis-crawl-phase-authority-v2
+        run: |
+          set -euo pipefail
+          crawlee_raw="$DIAGNOSTIC_ROOT/crawl-phase-crawlee-raw.json"
+          stasis_raw="$DIAGNOSTIC_ROOT/crawl-phase-stasis-raw.json"
+          localization="$DIAGNOSTIC_ROOT/crawl-phase-localization-evidence.json"
+          fresh_authority="$AUTHORITY_ROOT/fresh-crawl-raw.json"
+          artifact_binding="$AUTHORITY_ROOT/artifact-binding.json"
+          verification="$DIAGNOSTIC_ROOT/diagnostic-verification.json"
+          cli_receipt="$RUNNER_TEMP/stasis-crawl-phase-diagnostic-v2-verification-cli.json"
+          test ! -e "$cli_receipt"
+          node src/performance/crawl-phase-diagnostic-verification-cli.mjs verify \
+            "$crawlee_raw" \
+            "$stasis_raw" \
+            "$localization" \
+            "$fresh_authority" \
+            "$artifact_binding" \
+            "$verification" > "$cli_receipt"
+          VERIFICATION="$verification" \
+          CLI_RECEIPT="$cli_receipt" \
+          CRAWLEE_RAW="$crawlee_raw" \
+          STASIS_RAW="$stasis_raw" \
+          LOCALIZATION="$localization" \
+            node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+
+          async function canonicalJson(filePath, label) {
+            const bytes = await readFile(filePath);
+            const value = JSON.parse(bytes.toString("utf8"));
+            const canonical = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+            if (!canonical.equals(bytes)) throw new Error(`${label} is not canonical`);
+            return value;
+          }
+
+          const receipt = await canonicalJson(
+            process.env.VERIFICATION,
+            "diagnostic verification",
+          );
+          const cliReceipt = await canonicalJson(
+            process.env.CLI_RECEIPT,
+            "diagnostic verification CLI receipt",
+          );
+          if (
+            receipt.schema !== process.env.H4_DIAGNOSTIC_VERIFICATION_SCHEMA
+            || cliReceipt.schema !== process.env.H4_DIAGNOSTIC_VERIFICATION_CLI_SCHEMA
+            || cliReceipt.status !== "passed"
+            || cliReceipt.command !== "verify"
+            || cliReceipt.receiptSchema !== process.env.H4_DIAGNOSTIC_VERIFICATION_SCHEMA
+            || cliReceipt.outputCreatedExclusively !== true
+            || cliReceipt.outputName !== "diagnostic-verification.json"
+          ) {
+            throw new Error("frozen H4 V1 verification receipt identity mismatch");
+          }
+          const crawlee = await canonicalJson(process.env.CRAWLEE_RAW, "Crawlee raw diagnostic");
+          const stasis = await canonicalJson(process.env.STASIS_RAW, "Stasis raw diagnostic");
+          const localization = await canonicalJson(
+            process.env.LOCALIZATION,
+            "localization evidence",
+          );
+          for (const [lane, artifact] of [["crawlee", crawlee], ["stasis", stasis]]) {
+            if (
+              artifact.schema !== process.env.DIAGNOSTIC_SCHEMA
+              || artifact.protocol !== process.env.DIAGNOSTIC_PROTOCOL
+              || artifact.lane !== lane
+              || artifact.purpose !== "phase_localization_diagnostic_only"
+              || artifact.settlement?.status !== "fulfilled"
+              || artifact.outerInterval?.settlement !== "fulfilled"
+            ) {
+              throw new Error(`${lane} V2 diagnostic identity mismatch`);
+            }
+          }
+          if (
+            stasis.runner?.sourceModule !== "src/performance/crawl.mjs"
+            || stasis.runner?.factory !== "createStasisPerformanceRunner"
+            || stasis.runner?.dependencyHook !== process.env.STASIS_DIAGNOSTIC_DEPENDENCY_HOOK
+            || stasis.runner?.substituted !== false
+          ) {
+            throw new Error("Stasis V2 frozen-SDK adapter identity mismatch");
+          }
+          if (
+            localization.schema !== process.env.DIAGNOSTIC_EVIDENCE_SCHEMA
+            || localization.protocol !== process.env.DIAGNOSTIC_EVIDENCE_PROTOCOL
+            || localization.purpose !== "phase_localization_diagnostic_only"
+          ) {
+            throw new Error("V2 localization evidence identity mismatch");
+          }
+          const expected = {
+            status: "passed",
+            authorityEligible: false,
+            timingEligible: false,
+            statisticsEligible: false,
+            comparisonEligible: false,
+            optimizationEligible: false,
+            generalizedSpeedClaimAuthorized: false,
+            implementationWorkAuthorized: false,
+            decisionState: "STAY_0_4_UNASSIGNED",
+          };
+          for (const [key, value] of Object.entries(expected)) {
+            if (receipt[key] !== value) throw new Error(`diagnostic verification ${key} mismatch`);
+          }
+          NODE
+
+      - name: Seal the exact five-file diagnostic V2 evidence inventory
+        id: seal_evidence
+        if: ${{ steps.offline_verification.outcome == 'success' }}
+        shell: bash
+        working-directory: benchmark
+        env:
+          DIAGNOSTIC_ROOT: ${{ github.workspace }}/benchmark/artifacts/runs/crawl-phase-diagnostic-v2-${{ github.run_id }}-${{ github.run_attempt }}/performance/diagnostics
+          INPUT_RECEIPT: ${{ runner.temp }}/stasis-crawl-phase-authority-v2/comparison-input-verification.json
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { readFile, readdir, lstat, writeFile } from "node:fs/promises";
+          import path from "node:path";
+
+          const root = path.resolve(process.env.DIAGNOSTIC_ROOT);
+          const before = [
+            "crawl-phase-crawlee-raw.json",
+            "crawl-phase-localization-evidence.json",
+            "crawl-phase-stasis-raw.json",
+            "diagnostic-verification.json",
+          ];
+          const after = [
+            "comparison-input-verification.json",
+            ...before,
+          ].sort();
+          const observedBefore = (await readdir(root)).sort();
+          if (JSON.stringify(observedBefore) !== JSON.stringify(before)) {
+            throw new Error("pre-seal diagnostic inventory mismatch");
+          }
+          const inputBytes = await readFile(process.env.INPUT_RECEIPT);
+          const input = JSON.parse(inputBytes.toString("utf8"));
+          const inputCanonical = Buffer.from(`${JSON.stringify(input, null, 2)}\n`, "utf8");
+          if (!inputCanonical.equals(inputBytes) || input.status !== "passed") {
+            throw new Error("comparison input verification receipt is invalid");
+          }
+          await writeFile(
+            path.join(root, "comparison-input-verification.json"),
+            inputBytes,
+            { flag: "wx", mode: 0o600 },
+          );
+          const observedAfter = (await readdir(root)).sort();
+          if (JSON.stringify(observedAfter) !== JSON.stringify(after)) {
+            throw new Error("sealed diagnostic inventory mismatch");
+          }
+          for (const name of observedAfter) {
+            const filePath = path.join(root, name);
+            const metadata = await lstat(filePath);
+            if (!metadata.isFile() || metadata.isSymbolicLink()) {
+              throw new Error(`sealed diagnostic member is not a regular file: ${name}`);
+            }
+            const bytes = await readFile(filePath);
+            const value = JSON.parse(bytes.toString("utf8"));
+            const canonical = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+            if (!canonical.equals(bytes)) {
+              throw new Error(`sealed diagnostic member is not canonical: ${name}`);
+            }
+          }
+          NODE
+
+      - name: Create the bounded diagnostic V2 outcome
+        id: create_outcome
+        if: always()
+        shell: bash
+        env:
+          VALIDATE_INVOCATION_OUTCOME: ${{ steps.validate_invocation.outcome }}
+          CHECKOUT_HARNESS_OUTCOME: ${{ steps.checkout_harness.outcome }}
+          SETUP_NODE_OUTCOME: ${{ steps.setup_node.outcome }}
+          VERIFY_RUNTIME_OUTCOME: ${{ steps.verify_runtime.outcome }}
+          VERIFY_V1_MOTIVATION_OUTCOME: ${{ steps.verify_v1_motivation.outcome }}
+          INSTALL_HARNESS_OUTCOME: ${{ steps.install_harness.outcome }}
+          INSTALL_BROWSER_OUTCOME: ${{ steps.install_browser.outcome }}
+          PROVISION_EGL_OUTCOME: ${{ steps.provision_egl.outcome }}
+          VERIFY_COMPARISON_INPUT_OUTCOME: ${{ steps.verify_comparison_input.outcome }}
+          VERIFY_PACKAGE_SOURCE_OUTCOME: ${{ steps.verify_package_source.outcome }}
+          DOWNLOAD_LINUX_OUTCOME: ${{ steps.download_linux.outcome }}
+          DOWNLOAD_LINUX_PROOF_OUTCOME: ${{ steps.download_linux_proof.outcome }}
+          DOWNLOAD_TYPESCRIPT_OUTCOME: ${{ steps.download_typescript.outcome }}
+          DOWNLOAD_RUNTIME_MANIFEST_OUTCOME: ${{ steps.download_runtime_manifest.outcome }}
+          VERIFY_CANDIDATE_OUTCOME: ${{ steps.verify_candidate.outcome }}
+          DIAGNOSTIC_EXECUTION_OUTCOME: ${{ steps.diagnostic_execution.outcome }}
+          OFFLINE_VERIFICATION_OUTCOME: ${{ steps.offline_verification.outcome }}
+          SEAL_EVIDENCE_OUTCOME: ${{ steps.seal_evidence.outcome }}
+        run: |
+          set -euo pipefail
+          status_root="$RUNNER_TEMP/stasis-crawl-phase-diagnostic-v2-status"
+          test ! -e "$status_root"
+          mkdir "$status_root"
+          STATUS_ROOT="$status_root" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          input_steps = [
+              "VALIDATE_INVOCATION_OUTCOME",
+              "CHECKOUT_HARNESS_OUTCOME",
+              "SETUP_NODE_OUTCOME",
+              "VERIFY_RUNTIME_OUTCOME",
+              "VERIFY_V1_MOTIVATION_OUTCOME",
+              "INSTALL_HARNESS_OUTCOME",
+              "INSTALL_BROWSER_OUTCOME",
+              "PROVISION_EGL_OUTCOME",
+              "VERIFY_COMPARISON_INPUT_OUTCOME",
+              "VERIFY_PACKAGE_SOURCE_OUTCOME",
+              "DOWNLOAD_LINUX_OUTCOME",
+              "DOWNLOAD_LINUX_PROOF_OUTCOME",
+              "DOWNLOAD_TYPESCRIPT_OUTCOME",
+              "DOWNLOAD_RUNTIME_MANIFEST_OUTCOME",
+              "VERIFY_CANDIDATE_OUTCOME",
+          ]
+          diagnostic_steps = ["DIAGNOSTIC_EXECUTION_OUTCOME"]
+          offline_steps = [
+              "OFFLINE_VERIFICATION_OUTCOME",
+              "SEAL_EVIDENCE_OUTCOME",
+          ]
+          if not all(os.environ.get(name) == "success" for name in input_steps):
+              phase = "input_verification"
+              failure_code = "INPUT_VERIFICATION_FAILED"
+          elif not all(os.environ.get(name) == "success" for name in diagnostic_steps):
+              phase = "diagnostic_execution"
+              failure_code = "DIAGNOSTIC_EXECUTION_FAILED"
+          elif not all(os.environ.get(name) == "success" for name in offline_steps):
+              phase = "offline_verification"
+              failure_code = "OFFLINE_VERIFICATION_FAILED"
+          else:
+              phase = "complete"
+              failure_code = None
+
+          passed = failure_code is None
+          outcome = {
+              "schema": os.environ["DIAGNOSTIC_OUTCOME_SCHEMA"],
+              "status": "passed" if passed else "failed",
+              "outcomeClass": (
+                  "VALID_NON_AUTHORITATIVE"
+                  if passed
+                  else "DIAGNOSTIC_INVALID_WITH_STATUS"
+              ),
+              "phase": phase,
+              "runAttempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "evidenceArtifactEligible": passed,
+              "authorityEligible": False,
+              "timingEligible": False,
+              "statisticsEligible": False,
+              "comparisonEligible": False,
+              "optimizationEligible": False,
+              "generalizedSpeedClaimAuthorized": False,
+              "implementationWorkAuthorized": False,
+              "decisionState": "STAY_0_4_UNASSIGNED",
+              "failure": (
+                  None
+                  if passed
+                  else {"code": failure_code, "messageOmitted": True}
+              ),
+          }
+          destination = Path(os.environ["STATUS_ROOT"]) / "diagnostic-outcome.json"
+          with destination.open("x", encoding="utf-8", newline="\n") as handle:
+              json.dump(outcome, handle, ensure_ascii=True, indent=2)
+              handle.write("\n")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8", newline="\n") as handle:
+              handle.write(f"diagnostic_v2_status={outcome['status']}\n")
+          PY
+
+      - name: Seal the outcome-specific diagnostic V2 bundle
+        id: seal_bundle
+        if: ${{ always() && steps.create_outcome.outcome == 'success' }}
+        shell: bash
+        env:
+          DIAGNOSTIC_ROOT: ${{ github.workspace }}/benchmark/artifacts/runs/crawl-phase-diagnostic-v2-${{ github.run_id }}-${{ github.run_attempt }}/performance/diagnostics
+          OUTCOME_PATH: ${{ runner.temp }}/stasis-crawl-phase-diagnostic-v2-status/diagnostic-outcome.json
+        run: |
+          set -euo pipefail
+          bundle_root="$RUNNER_TEMP/stasis-crawl-phase-diagnostic-v2-bundle"
+          test ! -e "$bundle_root"
+          mkdir "$bundle_root"
+          BUNDLE_ROOT="$bundle_root" node --input-type=module <<'NODE'
+          import { lstat, readFile, readdir, writeFile } from "node:fs/promises";
+          import path from "node:path";
+
+          const validEvidenceNames = [
+            "comparison-input-verification.json",
+            "crawl-phase-crawlee-raw.json",
+            "crawl-phase-localization-evidence.json",
+            "crawl-phase-stasis-raw.json",
+            "diagnostic-verification.json",
+          ];
+          const outcomeKeys = [
+            "schema",
+            "status",
+            "outcomeClass",
+            "phase",
+            "runAttempt",
+            "evidenceArtifactEligible",
+            "authorityEligible",
+            "timingEligible",
+            "statisticsEligible",
+            "comparisonEligible",
+            "optimizationEligible",
+            "generalizedSpeedClaimAuthorized",
+            "implementationWorkAuthorized",
+            "decisionState",
+            "failure",
+          ];
+          const disabledClaims = [
+            "authorityEligible",
+            "timingEligible",
+            "statisticsEligible",
+            "comparisonEligible",
+            "optimizationEligible",
+            "generalizedSpeedClaimAuthorized",
+            "implementationWorkAuthorized",
+          ];
+          const failedPhases = new Map([
+            ["input_verification", "INPUT_VERIFICATION_FAILED"],
+            ["diagnostic_execution", "DIAGNOSTIC_EXECUTION_FAILED"],
+            ["offline_verification", "OFFLINE_VERIFICATION_FAILED"],
+          ]);
+          const root = path.resolve(process.env.BUNDLE_ROOT);
+          const outcomeBytes = await canonicalJsonFile(process.env.OUTCOME_PATH, "diagnostic outcome");
+          const outcome = JSON.parse(outcomeBytes.toString("utf8"));
+          assertExactKeys(outcome, outcomeKeys, "diagnostic outcome");
+          if (
+            outcome.schema !== process.env.DIAGNOSTIC_OUTCOME_SCHEMA
+            || outcome.runAttempt !== 1
+            || outcome.decisionState !== "STAY_0_4_UNASSIGNED"
+            || disabledClaims.some((name) => outcome[name] !== false)
+          ) {
+            throw new Error("diagnostic outcome common invariants are invalid");
+          }
+          if (outcome.status === "passed") {
+            if (
+              outcome.outcomeClass !== "VALID_NON_AUTHORITATIVE"
+              || outcome.phase !== "complete"
+              || outcome.evidenceArtifactEligible !== true
+              || outcome.failure !== null
+            ) {
+              throw new Error("valid diagnostic outcome invariants are invalid");
+            }
+          } else if (outcome.status === "failed") {
+            assertExactKeys(outcome.failure, ["code", "messageOmitted"], "diagnostic failure");
+            if (
+              outcome.outcomeClass !== "DIAGNOSTIC_INVALID_WITH_STATUS"
+              || outcome.evidenceArtifactEligible !== false
+              || failedPhases.get(outcome.phase) !== outcome.failure.code
+              || outcome.failure.messageOmitted !== true
+            ) {
+              throw new Error("invalid diagnostic outcome invariants are invalid");
+            }
+          } else {
+            throw new Error("diagnostic outcome status is invalid");
+          }
+          await writeFile(path.join(root, "diagnostic-outcome.json"), outcomeBytes, {
+            flag: "wx",
+            mode: 0o600,
+          });
+          const expected = ["diagnostic-outcome.json"];
+          if (outcome.status === "passed") {
+            const evidenceRoot = path.resolve(process.env.DIAGNOSTIC_ROOT);
+            const observedEvidence = (await readdir(evidenceRoot)).sort();
+            if (JSON.stringify(observedEvidence) !== JSON.stringify(validEvidenceNames)) {
+              throw new Error("valid diagnostic evidence inventory changed before bundling");
+            }
+            for (const name of validEvidenceNames) {
+              const bytes = await canonicalJsonFile(path.join(evidenceRoot, name), name);
+              await writeFile(path.join(root, name), bytes, { flag: "wx", mode: 0o600 });
+              expected.push(name);
+            }
+          }
+          expected.sort();
+          const observed = (await readdir(root)).sort();
+          if (JSON.stringify(observed) !== JSON.stringify(expected)) {
+            throw new Error("outcome-specific diagnostic bundle inventory mismatch");
+          }
+          for (const name of observed) {
+            const metadata = await lstat(path.join(root, name));
+            if (!metadata.isFile() || metadata.isSymbolicLink()) {
+              throw new Error(`diagnostic bundle member is not a regular file: ${name}`);
+            }
+          }
+
+          async function canonicalJsonFile(filePath, label) {
+            const metadata = await lstat(filePath);
+            if (!metadata.isFile() || metadata.isSymbolicLink()) {
+              throw new Error(`${label} is not a regular file`);
+            }
+            const bytes = await readFile(filePath);
+            const value = JSON.parse(bytes.toString("utf8"));
+            const canonical = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+            if (!canonical.equals(bytes)) throw new Error(`${label} is not canonical JSON`);
+            return bytes;
+          }
+
+          function assertExactKeys(value, expected, label) {
+            if (value === null || Array.isArray(value) || typeof value !== "object") {
+              throw new Error(`${label} is not an object`);
+            }
+            const observed = Object.keys(value);
+            if (JSON.stringify(observed) !== JSON.stringify(expected)) {
+              throw new Error(`${label} keys are invalid`);
+            }
+          }
+          NODE
+
+      - name: Retain the outcome-specific diagnostic V2 bundle
+        id: upload_bundle
+        if: ${{ always() && steps.seal_bundle.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stasis-v0.3.3-crawl-phase-diagnostic-v4-bundle-attempt-1
+          path: ${{ runner.temp }}/stasis-crawl-phase-diagnostic-v2-bundle
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 9
+          include-hidden-files: false
+
+      - name: Propagate the terminal diagnostic V2 outcome
+        if: ${{ always() && (steps.create_outcome.outcome != 'success' || steps.seal_bundle.outcome != 'success' || steps.upload_bundle.outcome != 'success' || steps.create_outcome.outputs.diagnostic_v2_status != 'passed') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          exit 1
