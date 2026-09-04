@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BENCHMARK_HARNESS_SHA: 3fad7f3a9ab16bea7e0137fa4e84fe1593a7c843
+  BENCHMARK_HARNESS_SHA: 34787112cbdb1f638a8793eb173af992aae8e0ed
   RWA_REVISION: 28ca4d03e4c68d366ccdbb25d43e1f37b3c67a4d
   STASIS_PACKAGE_RUN_ID: "33506181780"
   STASIS_PACKAGE_RUN_ATTEMPT: "1"
@@ -202,12 +202,15 @@ jobs:
       - name: Install the frozen benchmark harness
         shell: pwsh
         working-directory: benchmark
+        timeout-minutes: 15
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+          NPM_CONFIG_LOGS_DIR: ${{ runner.temp }}\stasis-performance-rwa-logs\npm
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
-          npm ci
+          New-Item -ItemType Directory -Path $env:NPM_CONFIG_LOGS_DIR | Out-Null
+          npm ci --ignore-scripts --no-audit --no-fund --timing --registry=https://registry.npmjs.org/
           if ($LASTEXITCODE -ne 0) { throw 'benchmark npm ci failed' }
           if ((@(git status --porcelain=v1 --untracked-files=no)).Count -ne 0) {
             throw 'benchmark setup changed tracked files'
@@ -216,6 +219,7 @@ jobs:
       - name: Install and build the frozen Cypress Real World App
         shell: pwsh
         working-directory: rwa
+        timeout-minutes: 45
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
@@ -326,8 +330,15 @@ jobs:
           $artifact = Get-Content -LiteralPath $rawPath -Raw | ConvertFrom-Json -Depth 100
           if ($artifact.schema -ne 'stasis-v0.3.3-performance-rwa-artifact-v1') { throw 'RWA artifact schema mismatch' }
           if ($artifact.protocol -ne 'stasis-v0.3.3-performance-rwa-v1') { throw 'RWA artifact protocol mismatch' }
-          if ($artifact.provenance.harness.revision -ne $env:BENCHMARK_HARNESS_SHA) { throw 'RWA harness provenance mismatch' }
-          if ($artifact.provenance.workflowSource.revision -ne $env:GITHUB_SHA) { throw 'RWA workflow provenance mismatch' }
+          if ($artifact.provenance.harness.revision -cne $env:BENCHMARK_HARNESS_SHA) { throw 'RWA harness provenance mismatch' }
+          if ($artifact.provenance.workflowSource.provider -cne 'github-actions') { throw 'RWA workflow provider mismatch' }
+          if ($artifact.provenance.workflowSource.repository -cne $env:GITHUB_REPOSITORY) { throw 'RWA workflow repository mismatch' }
+          if ($artifact.provenance.workflowSource.workflow -cne $env:GITHUB_WORKFLOW) { throw 'RWA workflow name mismatch' }
+          if ($artifact.provenance.workflowSource.job -cne $env:GITHUB_JOB) { throw 'RWA workflow job mismatch' }
+          if ($artifact.provenance.workflowSource.revision -cne $env:GITHUB_SHA) { throw 'RWA workflow provenance mismatch' }
+          if ($artifact.provenance.workflowSource.ref -cne $env:GITHUB_REF) { throw 'RWA workflow ref mismatch' }
+          if ($artifact.provenance.workflowSource.runId -cne $env:GITHUB_RUN_ID) { throw 'RWA workflow run id mismatch' }
+          if ($artifact.provenance.workflowSource.runAttempt -cne $env:GITHUB_RUN_ATTEMPT) { throw 'RWA workflow run attempt mismatch' }
           if ($artifact.authorityRaw.authority.valid -ne $true) { throw 'RWA performance authority is invalid' }
           if ($artifact.sealedRuntime.continuity.immutableCheckoutIdentity -ne $true) { throw 'RWA checkout continuity failed' }
           if ($artifact.sealedRuntime.continuity.sameFrozenServerHostProcesses -ne $true) { throw 'RWA server continuity failed' }
@@ -413,16 +424,20 @@ jobs:
       - name: Install the frozen benchmark harness
         shell: bash
         working-directory: benchmark
+        timeout-minutes: 15
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+          NPM_CONFIG_LOGS_DIR: ${{ runner.temp }}/stasis-performance-crawl-logs/npm
         run: |
           set -euo pipefail
-          npm ci
+          mkdir "$NPM_CONFIG_LOGS_DIR"
+          npm ci --ignore-scripts --no-audit --no-fund --timing --registry=https://registry.npmjs.org/
           test -z "$(git status --porcelain=v1 --untracked-files=no)"
 
       - name: Install the exact Playwright Chromium runtime
         shell: bash
         working-directory: benchmark
+        timeout-minutes: 30
         run: |
           set -euo pipefail
           npx --no-install playwright install --with-deps chromium
@@ -537,10 +552,20 @@ jobs:
           if artifact.get("protocol") != "stasis-v0.3.3-performance-crawl-v1":
               raise SystemExit("crawl artifact protocol mismatch")
           provenance = (artifact.get("identity") or {}).get("provenance") or {}
-          if provenance.get("harnessCheckoutRevision") != os.environ["BENCHMARK_HARNESS_SHA"]:
-              raise SystemExit("crawl harness provenance mismatch")
-          if provenance.get("workflowSourceSha") != os.environ["GITHUB_SHA"]:
-              raise SystemExit("crawl workflow provenance mismatch")
+          expected_provenance = {
+              "provider": "github-actions",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "workflow": os.environ["GITHUB_WORKFLOW"],
+              "job": os.environ["GITHUB_JOB"],
+              "runId": os.environ["GITHUB_RUN_ID"],
+              "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "workflowSourceSha": os.environ["GITHUB_SHA"],
+              "workflowSourceRef": os.environ["GITHUB_REF"],
+              "harnessCheckoutRevision": os.environ["BENCHMARK_HARNESS_SHA"],
+          }
+          for key, expected in expected_provenance.items():
+              if provenance.get(key) != expected:
+                  raise SystemExit(f"crawl provenance mismatch: {key}")
           if (artifact.get("authority") or {}).get("valid") is not True:
               raise SystemExit("crawl performance authority is invalid")
           PY
@@ -600,6 +625,20 @@ jobs:
           test "$(git -C benchmark rev-parse HEAD)" = "$BENCHMARK_HARNESS_SHA"
           test -z "$(git -C benchmark status --porcelain=v1 --untracked-files=no)"
 
+      - name: Install the frozen benchmark harness for verification
+        shell: bash
+        working-directory: benchmark
+        timeout-minutes: 15
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+          NPM_CONFIG_LOGS_DIR: ${{ runner.temp }}/stasis-performance-combined-npm-logs
+        run: |
+          set -euo pipefail
+          test ! -e "$NPM_CONFIG_LOGS_DIR"
+          mkdir "$NPM_CONFIG_LOGS_DIR"
+          npm ci --ignore-scripts --no-audit --no-fund --timing --registry=https://registry.npmjs.org/
+          test -z "$(git status --porcelain=v1 --untracked-files=no)"
+
       - name: Download exact RWA raw performance evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -637,11 +676,52 @@ jobs:
 
           rwa_raw_path="$RUNNER_TEMP/stasis-performance-rwa-raw/rwa-raw.json"
           crawl_raw_path="$RUNNER_TEMP/stasis-performance-crawl-raw/crawl-raw.json"
-          combined_artifact_root="$RUNNER_TEMP/stasis-performance-combined"
+          combined_artifact_root="$GITHUB_WORKSPACE/benchmark/artifacts/runs/combined-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           test -f "$rwa_raw_path"
           test -f "$crawl_raw_path"
           test ! -e "$combined_artifact_root/performance/combined-evidence.json"
           test ! -e "$combined_artifact_root/performance/combined-evidence.md"
+
+          RWA_RAW_PATH="$rwa_raw_path" CRAWL_RAW_PATH="$crawl_raw_path" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          rwa = json.loads(Path(os.environ["RWA_RAW_PATH"]).read_text(encoding="utf-8"))
+          crawl = json.loads(Path(os.environ["CRAWL_RAW_PATH"]).read_text(encoding="utf-8"))
+          rwa_provenance = (rwa.get("provenance") or {}).get("workflowSource") or {}
+          expected_rwa = {
+              "provider": "github-actions",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "workflow": os.environ["GITHUB_WORKFLOW"],
+              "job": "windows-rwa",
+              "revision": os.environ["GITHUB_SHA"],
+              "ref": os.environ["GITHUB_REF"],
+              "runId": os.environ["GITHUB_RUN_ID"],
+              "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"],
+          }
+          if rwa_provenance != expected_rwa:
+              raise SystemExit("downloaded RWA evidence provenance differs from this run")
+          if (rwa.get("provenance") or {}).get("harness", {}).get("revision") != os.environ["BENCHMARK_HARNESS_SHA"]:
+              raise SystemExit("downloaded RWA evidence harness differs from this run")
+
+          crawl_provenance = (crawl.get("identity") or {}).get("provenance") or {}
+          expected_crawl = {
+              "provider": "github-actions",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "workflow": os.environ["GITHUB_WORKFLOW"],
+              "job": "ubuntu-crawl",
+              "runId": os.environ["GITHUB_RUN_ID"],
+              "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "workflowSourceSha": os.environ["GITHUB_SHA"],
+              "workflowSourceRef": os.environ["GITHUB_REF"],
+              "harnessCheckoutRevision": os.environ["BENCHMARK_HARNESS_SHA"],
+              "harnessCheckoutTree": crawl_provenance.get("harnessCheckoutTree"),
+              "harnessCheckoutWorktree": crawl_provenance.get("harnessCheckoutWorktree"),
+          }
+          if crawl_provenance != expected_crawl:
+              raise SystemExit("downloaded crawl evidence provenance differs from this run")
+          PY
 
           printf 'rwa_raw_path=%s\ncrawl_raw_path=%s\ncombined_artifact_root=%s\n' \
             "$rwa_raw_path" \
@@ -650,6 +730,7 @@ jobs:
 
           combine_log="$log_root/combine.log"
           verify_log="$log_root/verify.log"
+          verification_receipt="$combined_artifact_root/performance/combined-verification.json"
           STASIS_COMPAT_ARTIFACT_DIR="$combined_artifact_root" \
             node src/performance/evidence-cli.mjs combine "$rwa_raw_path" "$crawl_raw_path" "$combined_artifact_root" \
             2>&1 | tee "$combine_log"
@@ -659,7 +740,105 @@ jobs:
             "$crawl_raw_path" \
             "$combined_artifact_root/performance/combined-evidence.json" \
             "$combined_artifact_root/performance/combined-evidence.md" \
-            2>&1 | tee "$verify_log"
+            2>&1 | tee "$verify_log" "$verification_receipt"
+
+          VERIFICATION_RECEIPT="$verification_receipt" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          receipt = json.loads(
+              Path(os.environ["VERIFICATION_RECEIPT"]).read_text(encoding="utf-8")
+          )
+          expected = {
+              "schema": "stasis-v0.3.3-combined-performance-verification-v1",
+              "status": "passed",
+              "combinedEvidenceSchema": "stasis-v0.3.3-combined-performance-evidence-v1",
+              "rwaArtifactSchema": "stasis-v0.3.3-performance-rwa-artifact-v1",
+              "rwaRawSchema": "stasis-v0.3.3-performance-rwa-raw-v1",
+              "crawlRawSchema": "stasis-v0.3.3-performance-crawl-raw-v1",
+              "markdownReplayVerified": True,
+          }
+          if receipt != expected:
+              raise SystemExit("combined verification receipt mismatch")
+          PY
+
+          python3 --version >> "$log_root/invocation.txt"
+          python3 -B src/performance/independent_statistics_replay.py \
+            "$rwa_raw_path" \
+            "$crawl_raw_path" \
+            "$combined_artifact_root/performance/combined-evidence.json" \
+            > "$combined_artifact_root/performance/independent-statistics-replay.json"
+
+          INDEPENDENT_RECEIPT="$combined_artifact_root/performance/independent-statistics-replay.json" \
+          VERIFICATION_RECEIPT="$verification_receipt" \
+          RWA_RAW_PATH="$rwa_raw_path" \
+          CRAWL_RAW_PATH="$crawl_raw_path" \
+          COMBINED_PATH="$combined_artifact_root/performance/combined-evidence.json" \
+            python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          receipt = json.loads(
+              Path(os.environ["INDEPENDENT_RECEIPT"]).read_text(encoding="utf-8")
+          )
+          verification_receipt = json.loads(
+              Path(os.environ["VERIFICATION_RECEIPT"]).read_text(encoding="utf-8")
+          )
+          expected_scope = {
+              "behavioralAuthorityReverification": "not_performed",
+              "name": "statistics_only",
+              "requiredPriorVerificationSchema":
+                  verification_receipt["schema"],
+          }
+          def sha256(path_name):
+              return hashlib.sha256(Path(os.environ[path_name]).read_bytes()).hexdigest()
+
+          expected = {
+              "schema": "stasis-v0.3.3-independent-statistics-replay-v1",
+              "status": "passed",
+              "scope": expected_scope,
+              "inputs": {
+                  "combinedEvidence": {"sha256": sha256("COMBINED_PATH")},
+                  "crawlRaw": {"sha256": sha256("CRAWL_RAW_PATH")},
+                  "rwaHostedWrapper": {"sha256": sha256("RWA_RAW_PATH")},
+              },
+              "verification": {
+                  "combinedProjectionAndStatisticsExact": True,
+                  "declaredAuthorityPrerequisites": {
+                      "crawl": "valid",
+                      "rwa": "valid",
+                  },
+                  "crawl": {"pairCount": 10},
+                  "rwa": {"pairCount": 10},
+                  "statistics": {
+                      "arithmetic": "integer_and_reduced_fraction",
+                      "decimal": "fixed_6_half_up",
+                      "quartiles": "median_of_halves_excluding_odd_center",
+                      "ratio": "median_of_paired_baseline_over_stasis_ratios",
+                  },
+              },
+          }
+          if receipt != expected:
+              raise SystemExit("independent statistics receipt mismatch")
+          PY
+
+          cp "$rwa_raw_path" "$combined_artifact_root/performance/rwa-raw.json"
+          cp "$crawl_raw_path" "$combined_artifact_root/performance/crawl-raw.json"
+          (
+            cd "$combined_artifact_root/performance"
+            sha256sum \
+              combined-evidence.json \
+              combined-evidence.md \
+              combined-verification.json \
+              crawl-raw.json \
+              independent-statistics-replay.json \
+              rwa-raw.json \
+              > SHA256SUMS.txt
+            sha256sum --check SHA256SUMS.txt
+          )
 
           if [[ ! -s "$combined_artifact_root/performance/combined-evidence.json" ]]; then
             exit 1
@@ -667,13 +846,35 @@ jobs:
           if [[ ! -s "$combined_artifact_root/performance/combined-evidence.md" ]]; then
             exit 1
           fi
+          if [[ ! -s "$combined_artifact_root/performance/combined-verification.json" ]]; then
+            exit 1
+          fi
+          if [[ ! -s "$combined_artifact_root/performance/independent-statistics-replay.json" ]]; then
+            exit 1
+          fi
+          if [[ ! -s "$combined_artifact_root/performance/rwa-raw.json" ||
+                ! -s "$combined_artifact_root/performance/crawl-raw.json" ||
+                ! -s "$combined_artifact_root/performance/SHA256SUMS.txt" ]]; then
+            exit 1
+          fi
 
       - name: Retain combined performance evidence
-        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: stasis-v0.3.3-performance-combined-attempt-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/stasis-performance-combined
+          path: ${{ github.workspace }}/benchmark/artifacts/runs/combined-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 9
+
+      - name: Retain combined verification logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stasis-v0.3.3-performance-combined-logs-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/stasis-performance-combined-logs
+            ${{ runner.temp }}/stasis-performance-combined-npm-logs
           if-no-files-found: warn
           retention-days: 90
           compression-level: 9
