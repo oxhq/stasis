@@ -19,6 +19,31 @@ stable successor only when its
 exact tag, release, registry package, provenance, and anonymous public-consumer evidence exist.
 Verify those public artifacts rather than inferring release status from this checkout.
 
+## Bounded performance evidence
+
+A [separate immutable benchmark release](https://github.com/oxhq/stasis-compat-bench/releases/tag/stasis-v0.3.3-performance-replication-evidence-v1)
+measured the exact Stasis `v0.3.3` product at source revision
+[`48c5a718a9ddd63f496e45307e1484974ccf8587`](https://github.com/oxhq/stasis/commit/48c5a718a9ddd63f496e45307e1484974ccf8587)
+on two frozen, correctness-gated workloads. Each result below is one
+single-host observation using ten alternating `AB/BA` pairs after one untimed
+warm-up per implementation.
+
+| Frozen workload | Published observation | Fresh-host replication |
+| --- | --- | --- |
+| Cypress RWA authentication, Windows 2022 CI-only bundle | Median duration: Cypress `17499.546000 ms` vs Stasis `3890.592700 ms`; median paired Cypress/Stasis ratio `4.479108x` ([raw](https://github.com/oxhq/stasis-compat-bench/releases/download/stasis-v0.3.3-performance-replication-evidence-v1/original-rwa-raw.json)) | Median duration: Cypress `20974.414150 ms` vs Stasis `5553.314200 ms`; median paired Cypress/Stasis ratio `3.761166x` ([raw](https://github.com/oxhq/stasis-compat-bench/releases/download/stasis-v0.3.3-performance-replication-evidence-v1/fresh-rwa-raw.json)) |
+| Crawlee deterministic 20-page crawl, Ubuntu 22.04 | Median duration: Crawlee `2195.796579 ms` vs Stasis `2378.866899 ms`; median paired Crawlee/Stasis ratio `0.929559x` ([raw](https://github.com/oxhq/stasis-compat-bench/releases/download/stasis-v0.3.3-performance-replication-evidence-v1/original-crawl-raw.json)) | Median duration: Crawlee `2272.683301 ms` vs Stasis `2409.138217 ms`; median paired Crawlee/Stasis ratio `0.948109x` ([raw](https://github.com/oxhq/stasis-compat-bench/releases/download/stasis-v0.3.3-performance-replication-evidence-v1/fresh-crawl-raw.json)) |
+
+In each run, all 20 timed RWA observations completed the complete frozen
+`8/8` authentication intents. That is not all 45 RWA tests, Cypress API
+equivalence, or exact browser-semantic equivalence. All `10/10` crawl pairs
+were exact-equivalent at `20/20` pages, and no timed failure was discarded.
+Original and replication hosts and the Windows/Ubuntu tracks are not pooled;
+these workload-specific exploratory observations do not support a general
+speed claim. The Windows result used a qualification-only bundle and does not
+add Windows to the managed release platforms. See the
+[replication report](https://github.com/oxhq/stasis-compat-bench/releases/download/stasis-v0.3.3-performance-replication-evidence-v1/replication-report.md)
+and [checksums](https://github.com/oxhq/stasis-compat-bench/releases/download/stasis-v0.3.3-performance-replication-evidence-v1/SHA256SUMS.txt).
+
 ## Linux release prerequisite
 
 The immutable Stasis v0.3.3 Linux x86-64 runtime dynamically loads
