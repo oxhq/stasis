@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BENCHMARK_HARNESS_SHA: 77edfe019a7f3c95cd3ec96f0539b4c66277fc2f
+  BENCHMARK_HARNESS_SHA: 097ecfeb2aed6ed952d37a530a54e079ba4fc9a7
   RWA_REVISION: 28ca4d03e4c68d366ccdbb25d43e1f37b3c67a4d
   STASIS_PACKAGE_RUN_ID: "33506181780"
   STASIS_PACKAGE_RUN_ATTEMPT: "1"
@@ -443,6 +443,25 @@ jobs:
           npx --no-install playwright install --with-deps chromium
           browser_path=$(node -e 'import("playwright").then(({ chromium }) => process.stdout.write(chromium.executablePath()))')
           test -x "$browser_path"
+
+      - name: Provision the Stasis EGL runtime prerequisite
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libegl1 \
+            libegl-mesa0 \
+            libglvnd0
+          python3 - <<'PY'
+          import ctypes
+          import os
+
+          library = ctypes.CDLL("libEGL.so.1", mode=os.RTLD_LAZY)
+          if not hasattr(library, "eglGetProcAddress"):
+              raise SystemExit("libEGL.so.1 does not export eglGetProcAddress")
+          PY
 
       - name: Download the exact Linux package artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
