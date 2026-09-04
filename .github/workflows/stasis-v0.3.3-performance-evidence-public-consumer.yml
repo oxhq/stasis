@@ -1,0 +1,784 @@
+name: Stasis v0.3.3 public performance evidence consumer
+
+on:
+  push:
+    branches:
+      - verify/stasis-v0.3.3-performance-evidence
+
+permissions: {}
+
+concurrency:
+  group: stasis-v0.3.3-performance-evidence-public-consumer-${{ github.ref }}
+  cancel-in-progress: false
+
+# Replace every __REPLACE_AFTER_*__ value from the successful attempt-1 producer
+# and the immutable public release before this verifier branch is pushed.
+env:
+  EVIDENCE_RELEASE_REPOSITORY: oxhq/stasis-compat-bench
+  EVIDENCE_RELEASE_TAG: stasis-v0.3.3-performance-evidence
+  HARNESS_ROOT_SHA: c5678b045852a29b89ed4b853da0aa39e6e3bf06
+  HARNESS_ROOT_TREE: 4e491acd7d781878a5e84f57ac769e863ee58ac2
+  PRODUCER_BRANCH: codex/stasis-v033-performance-evidence
+  PRODUCER_REPOSITORY: oxhq/stasis
+  PRODUCER_RUN_ATTEMPT: "1"
+  PRODUCER_RUN_ID: "33851425108"
+  PRODUCER_SHA: 54dde177fe63c34ca1c5059a1381fd7434585f77
+  PRODUCER_WORKFLOW_ID: "348709993"
+  PRODUCER_WORKFLOW_NAME: Stasis v0.3.3 performance evidence
+  PRODUCER_WORKFLOW_PATH: .github/workflows/stasis-v0.3.3-performance-evidence.yml
+  EXPECTED_COMBINE_JOB_ID: "100957175132"
+  EXPECTED_COMBINED_EVIDENCE_JSON_ASSET_ID: "544011241"
+  EXPECTED_COMBINED_EVIDENCE_JSON_BYTES: "11473"
+  EXPECTED_COMBINED_EVIDENCE_JSON_SHA256: 088c8a7b3f536be2790dbe339b303a7b8276d2ad70678138dac4e64e5fbbbf70
+  EXPECTED_COMBINED_EVIDENCE_MD_ASSET_ID: "544011242"
+  EXPECTED_COMBINED_EVIDENCE_MD_BYTES: "2621"
+  EXPECTED_COMBINED_EVIDENCE_MD_SHA256: dfb639adf7a999f7d497f107bed1b7b6fce4f667f14b763f70555b02c2c88dbf
+  EXPECTED_COMBINED_VERIFICATION_JSON_ASSET_ID: "544011235"
+  EXPECTED_COMBINED_VERIFICATION_JSON_BYTES: "391"
+  EXPECTED_COMBINED_VERIFICATION_JSON_SHA256: be090aade7806bff3eb8f16e6655b05124c1eeb36ff5ac82369ba94b9b685ea8
+  EXPECTED_CRAWL_RAW_JSON_ASSET_ID: "544011237"
+  EXPECTED_CRAWL_RAW_JSON_BYTES: "221536"
+  EXPECTED_CRAWL_RAW_JSON_SHA256: 7db718346d73e3acf3b6919f20318929e60e2a15d5c5f954f849a6b46fa054db
+  EXPECTED_INDEPENDENT_STATISTICS_REPLAY_JSON_ASSET_ID: "544011240"
+  EXPECTED_INDEPENDENT_STATISTICS_REPLAY_JSON_BYTES: "1133"
+  EXPECTED_INDEPENDENT_STATISTICS_REPLAY_JSON_SHA256: b6ec7777bf0e7fe6f339ca376f3219f19e6a9bd27b49d2e7925e06145690d799
+  EXPECTED_RWA_RAW_JSON_ASSET_ID: "544011257"
+  EXPECTED_RWA_RAW_JSON_BYTES: "332659"
+  EXPECTED_RWA_RAW_JSON_SHA256: 98c938f7070c6f45d1e2b2d37632eb5180d7c1b1d48d2eb84db9e26b6c22092d
+  EXPECTED_SHA256SUMS_TXT_ASSET_ID: "544011258"
+  EXPECTED_SHA256SUMS_TXT_BYTES: "530"
+  EXPECTED_SHA256SUMS_TXT_SHA256: c06faf17e677d33e458d7854d2d40e4fe2d055521adcc587d4c253a8f3bd3193
+  GH_TOKEN: ""
+  NODE_AUTH_TOKEN: ""
+  NPM_AUTH_TOKEN: ""
+  NPM_CONFIG_CACHE: ${{ github.workspace }}/.stasis-public-consumer-home/npm-cache
+  NPM_CONFIG_FETCH_RETRIES: "0"
+  NPM_CONFIG_GLOBALCONFIG: ${{ github.workspace }}/.stasis-public-consumer-home/npm-globalrc
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+  NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/.stasis-public-consumer-home/npmrc
+  NPM_TOKEN: ""
+  GIT_ASKPASS: /bin/false
+  GIT_CONFIG_GLOBAL: ${{ github.workspace }}/.stasis-public-consumer-home/gitconfig
+  GIT_CONFIG_NOSYSTEM: "1"
+  GIT_TERMINAL_PROMPT: "0"
+  PUBLIC_CONSUMER_HOME: ${{ github.workspace }}/.stasis-public-consumer-home
+  SSH_ASKPASS: /bin/false
+
+jobs:
+  verify-public-performance-evidence:
+    name: Verify anonymous public performance evidence
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Reject mutable, retried, credentialed, or unresolved invocation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'oxhq/stasis'
+          test "$GITHUB_EVENT_NAME" = 'push'
+          test "$GITHUB_REF" = 'refs/heads/verify/stasis-v0.3.3-performance-evidence'
+          test "$GITHUB_RUN_ATTEMPT" = '1'
+          test "$GITHUB_WORKFLOW" = 'Stasis v0.3.3 public performance evidence consumer'
+          test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/.github/workflows/stasis-v0.3.3-performance-evidence-public-consumer.yml@$GITHUB_REF"
+
+          unresolved=0
+          while IFS= read -r variable_name; do
+            variable_value=${!variable_name}
+            if [[ "$variable_value" == __REPLACE_AFTER_* ]]; then
+              printf 'unresolved publication binding: %s\n' "$variable_name" >&2
+              unresolved=1
+            fi
+          done < <(compgen -e | LC_ALL=C sort | grep '^EXPECTED_')
+          test "$unresolved" = '0'
+
+          unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_AUTH_TOKEN NPM_TOKEN
+          for variable_name in GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_AUTH_TOKEN NPM_TOKEN; do
+            test -z "${!variable_name-}"
+          done
+
+          umask 077
+          test ! -e "$PUBLIC_CONSUMER_HOME"
+          mkdir -p "$PUBLIC_CONSUMER_HOME" "$NPM_CONFIG_CACHE"
+          : > "$GIT_CONFIG_GLOBAL"
+          : > "$NPM_CONFIG_GLOBALCONFIG"
+          printf '%s\n' \
+            'registry=https://registry.npmjs.org/' \
+            'fetch-retries=0' \
+            'audit=false' \
+            'fund=false' \
+            > "$NPM_CONFIG_USERCONFIG"
+          test ! -e "$HOME/.netrc"
+          test -z "$(git config --global --list --show-origin)"
+
+      - name: Set up exact credential-free Node 22.20.0 x64
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.20.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+          token: ''
+
+      - name: Verify exact runtime and empty GitHub and npm credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_AUTH_TOKEN NPM_TOKEN
+          for variable_name in GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_AUTH_TOKEN NPM_TOKEN; do
+            test -z "${!variable_name-}"
+          done
+          test "$(node --version)" = 'v22.20.0'
+          test "$(node -p 'process.platform')" = 'linux'
+          test "$(node -p 'process.arch')" = 'x64'
+          test "$(npm --version)" = '10.9.3'
+          test -z "$(git config --global --list --show-origin)"
+          test ! -s "$GIT_CONFIG_GLOBAL"
+          test ! -s "$NPM_CONFIG_GLOBALCONFIG"
+          if grep -Eiq '(^|[[:space:]])(_auth|.*token|password|username)[[:space:]]*=' \
+            "$NPM_CONFIG_USERCONFIG"; then
+            echo 'npm user configuration contains credentials' >&2
+            exit 1
+          fi
+
+      - name: Fetch exact public release and producer records anonymously
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_AUTH_TOKEN NPM_TOKEN
+          records="$RUNNER_TEMP/stasis-public-performance-records"
+          test ! -e "$records"
+          mkdir "$records"
+
+          anonymous_api_curl() {
+            curl --disable --fail-with-body --silent --show-error --location \
+              --retry 0 \
+              --proto '=https' \
+              --proto-redir '=https' \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'Authorization:' \
+              --header 'User-Agent: stasis-v0.3.3-public-performance-consumer' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "$@"
+          }
+
+          anonymous_api_curl \
+            --output "$records/release.json" \
+            "https://api.github.com/repos/$EVIDENCE_RELEASE_REPOSITORY/releases/tags/$EVIDENCE_RELEASE_TAG"
+          anonymous_api_curl \
+            --output "$records/tag-ref.json" \
+            "https://api.github.com/repos/$EVIDENCE_RELEASE_REPOSITORY/git/ref/tags/$EVIDENCE_RELEASE_TAG"
+          anonymous_api_curl \
+            --output "$records/producer-run.json" \
+            "https://api.github.com/repos/$PRODUCER_REPOSITORY/actions/runs/$PRODUCER_RUN_ID/attempts/$PRODUCER_RUN_ATTEMPT"
+          anonymous_api_curl \
+            --output "$records/producer-jobs.json" \
+            "https://api.github.com/repos/$PRODUCER_REPOSITORY/actions/runs/$PRODUCER_RUN_ID/jobs?filter=all&per_page=100"
+
+      - name: Verify exact immutable release, asset inventory, producer run, and jobs
+        shell: bash
+        env:
+          RECORDS: ${{ runner.temp }}/stasis-public-performance-records
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import math
+          import os
+          import re
+          from pathlib import Path
+
+          records = Path(os.environ["RECORDS"])
+
+          def strict_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate object key {key!r}")
+                  value[key] = item
+              return value
+
+          def strict_float(value):
+              parsed = float(value)
+              if not math.isfinite(parsed):
+                  raise ValueError(f"non-finite number {value!r}")
+              return parsed
+
+          def strict_constant(value):
+              raise ValueError(f"non-finite number {value!r}")
+
+          def load_record(name):
+              path = records / name
+              size = path.stat().st_size
+              if size <= 0 or size > 16 * 1024 * 1024:
+                  raise SystemExit(f"{name} is outside the metadata size limit")
+              try:
+                  return json.loads(
+                      path.read_text(encoding="utf-8"),
+                      object_pairs_hook=strict_object,
+                      parse_float=strict_float,
+                      parse_constant=strict_constant,
+                  )
+              except (UnicodeError, ValueError, RecursionError) as error:
+                  raise SystemExit(f"{name} is not strict JSON: {error}") from error
+
+          def positive_integer(variable):
+              value = os.environ[variable]
+              if re.fullmatch(r"[1-9][0-9]*", value) is None:
+                  raise SystemExit(f"{variable} is not a resolved positive integer")
+              return int(value)
+
+          def sha256(variable):
+              value = os.environ[variable]
+              if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                  raise SystemExit(f"{variable} is not a resolved lowercase SHA-256")
+              return value
+
+          release = load_record("release.json")
+          tag_ref = load_record("tag-ref.json")
+          producer_run = load_record("producer-run.json")
+          producer_jobs = load_record("producer-jobs.json")
+
+          release_repository = os.environ["EVIDENCE_RELEASE_REPOSITORY"]
+          release_tag = os.environ["EVIDENCE_RELEASE_TAG"]
+          root_sha = os.environ["HARNESS_ROOT_SHA"]
+          if (
+              not isinstance(release, dict)
+              or release.get("tag_name") != release_tag
+              or release.get("target_commitish") != root_sha
+              or release.get("draft") is not False
+              or release.get("prerelease") is not False
+              or release.get("immutable") is not True
+          ):
+              raise SystemExit("public evidence release identity is not exact and immutable")
+          tag_object = tag_ref.get("object") if isinstance(tag_ref, dict) else None
+          if (
+              not isinstance(tag_ref, dict)
+              or tag_ref.get("ref") != f"refs/tags/{release_tag}"
+              or not isinstance(tag_object, dict)
+              or tag_object.get("type") not in {"commit", "tag"}
+              or re.fullmatch(r"[0-9a-f]{40}", tag_object.get("sha", "")) is None
+              or (tag_object.get("type") == "commit" and tag_object.get("sha") != root_sha)
+          ):
+              raise SystemExit("public evidence tag ref is not an exact commit or annotated tag")
+
+          asset_specs = {
+              "combined-evidence.json": "COMBINED_EVIDENCE_JSON",
+              "combined-evidence.md": "COMBINED_EVIDENCE_MD",
+              "combined-verification.json": "COMBINED_VERIFICATION_JSON",
+              "crawl-raw.json": "CRAWL_RAW_JSON",
+              "independent-statistics-replay.json": "INDEPENDENT_STATISTICS_REPLAY_JSON",
+              "rwa-raw.json": "RWA_RAW_JSON",
+              "SHA256SUMS.txt": "SHA256SUMS_TXT",
+          }
+          expected_assets = {}
+          for name, variable_stem in asset_specs.items():
+              expected_assets[name] = {
+                  "id": positive_integer(f"EXPECTED_{variable_stem}_ASSET_ID"),
+                  "size": positive_integer(f"EXPECTED_{variable_stem}_BYTES"),
+                  "sha256": sha256(f"EXPECTED_{variable_stem}_SHA256"),
+              }
+          if len({spec["id"] for spec in expected_assets.values()}) != 7:
+              raise SystemExit("expected public release asset IDs are not unique")
+
+          assets = release.get("assets")
+          if not isinstance(assets, list) or len(assets) != 7:
+              raise SystemExit("public evidence release does not have exactly seven assets")
+          if any(not isinstance(asset, dict) for asset in assets):
+              raise SystemExit("public evidence release asset record is malformed")
+          if len({asset.get("name") for asset in assets}) != 7:
+              raise SystemExit("public evidence release asset names are not unique")
+          if {asset.get("name") for asset in assets} != set(expected_assets):
+              raise SystemExit("public evidence release asset names changed")
+
+          assets_by_name = {asset["name"]: asset for asset in assets}
+          for name, expected in expected_assets.items():
+              asset = assets_by_name[name]
+              expected_url = (
+                  f"https://github.com/{release_repository}/releases/download/"
+                  f"{release_tag}/{name}"
+              )
+              if (
+                  asset.get("id") != expected["id"]
+                  or asset.get("name") != name
+                  or asset.get("state") != "uploaded"
+                  or asset.get("size") != expected["size"]
+                  or asset.get("digest") != f"sha256:{expected['sha256']}"
+                  or asset.get("browser_download_url") != expected_url
+              ):
+                  raise SystemExit(f"public evidence asset metadata mismatch: {name}")
+
+          expected_run = {
+              "id": int(os.environ["PRODUCER_RUN_ID"]),
+              "run_attempt": int(os.environ["PRODUCER_RUN_ATTEMPT"]),
+              "event": "push",
+              "status": "completed",
+              "conclusion": "success",
+              "head_branch": os.environ["PRODUCER_BRANCH"],
+              "head_sha": os.environ["PRODUCER_SHA"],
+              "path": os.environ["PRODUCER_WORKFLOW_PATH"],
+              "workflow_id": int(os.environ["PRODUCER_WORKFLOW_ID"]),
+              "name": os.environ["PRODUCER_WORKFLOW_NAME"],
+          }
+          if not isinstance(producer_run, dict):
+              raise SystemExit("producer run response is not an object")
+          for key, expected in expected_run.items():
+              if producer_run.get(key) != expected:
+                  raise SystemExit(
+                      f"producer run {key} mismatch: {producer_run.get(key)!r} != {expected!r}"
+                  )
+          if (
+              (producer_run.get("repository") or {}).get("full_name")
+                  != os.environ["PRODUCER_REPOSITORY"]
+              or (producer_run.get("head_repository") or {}).get("full_name")
+                  != os.environ["PRODUCER_REPOSITORY"]
+          ):
+              raise SystemExit("producer run repository identity changed")
+
+          combine_job_id = positive_integer("EXPECTED_COMBINE_JOB_ID")
+          expected_jobs = {
+              100954874545: "Validate exact performance inputs",
+              100954904056: "Windows 2022 RWA Cypress vs Stasis",
+              100954904065: "Ubuntu 22.04 Crawlee vs Stasis",
+              combine_job_id: "Combine and verify performance evidence",
+          }
+          jobs = producer_jobs.get("jobs") if isinstance(producer_jobs, dict) else None
+          if (
+              producer_jobs.get("total_count") != 4
+              or not isinstance(jobs, list)
+              or len(jobs) != 4
+              or any(not isinstance(job, dict) for job in jobs)
+          ):
+              raise SystemExit("producer jobs API did not return exactly four jobs")
+          if len({job.get("id") for job in jobs}) != 4:
+              raise SystemExit("producer job IDs are not unique")
+          if {job.get("id") for job in jobs} != set(expected_jobs):
+              raise SystemExit("producer job ID inventory changed")
+          for job in jobs:
+              expected_job = {
+                  "id": job["id"],
+                  "run_id": int(os.environ["PRODUCER_RUN_ID"]),
+                  "workflow_name": os.environ["PRODUCER_WORKFLOW_NAME"],
+                  "head_sha": os.environ["PRODUCER_SHA"],
+                  "run_attempt": int(os.environ["PRODUCER_RUN_ATTEMPT"]),
+                  "status": "completed",
+                  "conclusion": "success",
+                  "name": expected_jobs[job["id"]],
+              }
+              for key, expected in expected_job.items():
+                  if job.get(key) != expected:
+                      raise SystemExit(
+                          f"producer job {job['id']} {key} mismatch: "
+                          f"{job.get(key)!r} != {expected!r}"
+                      )
+
+          manifest = {
+              "releaseId": release.get("id"),
+              "releaseRepository": release_repository,
+              "releaseTag": release_tag,
+              "rootSha": root_sha,
+              "assets": expected_assets,
+          }
+          (records / "verified-release-assets.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Fetch the exact evidence tag anonymously with full root history
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_AUTH_TOKEN NPM_TOKEN
+          benchmark="$GITHUB_WORKSPACE/benchmark"
+          test ! -e "$benchmark"
+          git init --quiet "$benchmark"
+          git -C "$benchmark" remote add origin \
+            "https://github.com/$EVIDENCE_RELEASE_REPOSITORY.git"
+          git -C "$benchmark" \
+            -c credential.helper= \
+            -c http.https://github.com/.extraheader= \
+            fetch --no-tags --force origin \
+              "refs/tags/$EVIDENCE_RELEASE_TAG:refs/tags/$EVIDENCE_RELEASE_TAG"
+          git -C "$benchmark" checkout --quiet --detach \
+            "refs/tags/$EVIDENCE_RELEASE_TAG^{commit}"
+
+          test "$(git -C "$benchmark" remote get-url origin)" = \
+            "https://github.com/$EVIDENCE_RELEASE_REPOSITORY.git"
+          git -C "$benchmark" show-ref --verify --quiet \
+            "refs/tags/$EVIDENCE_RELEASE_TAG"
+          tag_api_type=$(python3 -c \
+            'import json, os, pathlib; print(json.loads((pathlib.Path(os.environ["RUNNER_TEMP"]) / "stasis-public-performance-records/tag-ref.json").read_text(encoding="utf-8"))["object"]["type"])')
+          tag_api_sha=$(python3 -c \
+            'import json, os, pathlib; print(json.loads((pathlib.Path(os.environ["RUNNER_TEMP"]) / "stasis-public-performance-records/tag-ref.json").read_text(encoding="utf-8"))["object"]["sha"])')
+          test "$(git -C "$benchmark" cat-file -t "refs/tags/$EVIDENCE_RELEASE_TAG")" = \
+            "$tag_api_type"
+          test "$(git -C "$benchmark" rev-parse "refs/tags/$EVIDENCE_RELEASE_TAG")" = \
+            "$tag_api_sha"
+          test "$(git -C "$benchmark" rev-parse "refs/tags/$EVIDENCE_RELEASE_TAG^{commit}")" = \
+            "$HARNESS_ROOT_SHA"
+          test "$(git -C "$benchmark" rev-parse HEAD)" = "$HARNESS_ROOT_SHA"
+          test "$(git -C "$benchmark" rev-parse 'HEAD^{tree}')" = "$HARNESS_ROOT_TREE"
+          test "$(git -C "$benchmark" rev-parse --is-shallow-repository)" = 'false'
+          test "$(git -C "$benchmark" rev-list --parents -n 1 HEAD)" = "$HARNESS_ROOT_SHA"
+          test "$(git -C "$benchmark" rev-list --count HEAD)" = '1'
+          test -z "$(git -C "$benchmark" status --porcelain=v1 --untracked-files=no)"
+          test -z "$(git -C "$benchmark" config --local --get-regexp '(^credential\.|^http\..*\.extraheader$)' || true)"
+
+      - name: Install the frozen harness anonymously
+        shell: bash
+        working-directory: benchmark
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: |
+          set -euo pipefail
+          unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_AUTH_TOKEN NPM_TOKEN
+          test "$(node --version)" = 'v22.20.0'
+          test "$(npm --version)" = '10.9.3'
+          test -f package-lock.json
+          npm ci \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund \
+            --fetch-retries=0 \
+            --registry=https://registry.npmjs.org/
+          test -z "$(git status --porcelain=v1 --untracked-files=no)"
+
+      - name: Download the seven exact public release assets anonymously
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset GH_TOKEN GITHUB_TOKEN NODE_AUTH_TOKEN NPM_AUTH_TOKEN NPM_TOKEN
+          asset_root="$GITHUB_WORKSPACE/public-release-assets"
+          test ! -e "$asset_root"
+          mkdir "$asset_root"
+          asset_names=(
+            combined-evidence.json
+            combined-evidence.md
+            combined-verification.json
+            crawl-raw.json
+            independent-statistics-replay.json
+            rwa-raw.json
+            SHA256SUMS.txt
+          )
+          for asset_name in "${asset_names[@]}"; do
+            target="$asset_root/$asset_name"
+            test ! -e "$target"
+            curl --disable --fail-with-body --silent --show-error --location \
+              --retry 0 \
+              --proto '=https' \
+              --proto-redir '=https' \
+              --header 'Accept: application/octet-stream' \
+              --header 'Authorization:' \
+              --header 'User-Agent: stasis-v0.3.3-public-performance-consumer' \
+              --output "$target" \
+              "https://github.com/$EVIDENCE_RELEASE_REPOSITORY/releases/download/$EVIDENCE_RELEASE_TAG/$asset_name"
+          done
+          test "$(find "$asset_root" -maxdepth 1 -type f | wc -l)" = '7'
+          test "$(find "$asset_root" -mindepth 1 -maxdepth 1 ! -type f | wc -l)" = '0'
+
+      - name: Verify exact asset bytes, digests, checksum manifest, and raw provenance
+        shell: bash
+        env:
+          ASSET_ROOT: ${{ github.workspace }}/public-release-assets
+          RECORDS: ${{ runner.temp }}/stasis-public-performance-records
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import math
+          import os
+          import re
+          from pathlib import Path
+
+          asset_root = Path(os.environ["ASSET_ROOT"])
+          records = Path(os.environ["RECORDS"])
+
+          def strict_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate object key {key!r}")
+                  value[key] = item
+              return value
+
+          def strict_float(value):
+              parsed = float(value)
+              if not math.isfinite(parsed):
+                  raise ValueError(f"non-finite number {value!r}")
+              return parsed
+
+          def strict_constant(value):
+              raise ValueError(f"non-finite number {value!r}")
+
+          def strict_load(path, context):
+              try:
+                  return json.loads(
+                      path.read_text(encoding="utf-8"),
+                      object_pairs_hook=strict_object,
+                      parse_float=strict_float,
+                      parse_constant=strict_constant,
+                  )
+              except (UnicodeError, ValueError, RecursionError) as error:
+                  raise SystemExit(f"{context} is not strict JSON: {error}") from error
+
+          manifest = strict_load(
+              records / "verified-release-assets.json", "verified release asset manifest"
+          )
+          expected_assets = manifest.get("assets")
+          if not isinstance(expected_assets, dict) or len(expected_assets) != 7:
+              raise SystemExit("verified release asset manifest is malformed")
+          if {path.name for path in asset_root.iterdir()} != set(expected_assets):
+              raise SystemExit("downloaded release asset inventory changed")
+          for name, expected in expected_assets.items():
+              path = asset_root / name
+              if not path.is_file() or path.is_symlink():
+                  raise SystemExit(f"downloaded release asset is not a regular file: {name}")
+              if path.stat().st_size != expected["size"]:
+                  raise SystemExit(f"downloaded release asset byte length mismatch: {name}")
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if digest != expected["sha256"]:
+                  raise SystemExit(f"downloaded release asset SHA-256 mismatch: {name}")
+
+          rwa = strict_load(asset_root / "rwa-raw.json", "RWA raw evidence")
+          rwa_provenance = (rwa.get("provenance") or {}).get("workflowSource") or {}
+          expected_rwa_provenance = {
+              "provider": "github-actions",
+              "repository": os.environ["PRODUCER_REPOSITORY"],
+              "workflow": os.environ["PRODUCER_WORKFLOW_NAME"],
+              "job": "windows-rwa",
+              "revision": os.environ["PRODUCER_SHA"],
+              "ref": f"refs/heads/{os.environ['PRODUCER_BRANCH']}",
+              "runId": os.environ["PRODUCER_RUN_ID"],
+              "runAttempt": os.environ["PRODUCER_RUN_ATTEMPT"],
+          }
+          if rwa_provenance != expected_rwa_provenance:
+              raise SystemExit("RWA raw evidence provenance is not the exact windows-rwa producer")
+          rwa_harness = (rwa.get("provenance") or {}).get("harness") or {}
+          if (
+              rwa_harness.get("revision") != os.environ["HARNESS_ROOT_SHA"]
+              or rwa_harness.get("tree") != os.environ["HARNESS_ROOT_TREE"]
+          ):
+              raise SystemExit("RWA raw evidence harness commit or tree provenance changed")
+          if (rwa.get("authorityRaw") or {}).get("authority", {}).get("valid") is not True:
+              raise SystemExit("RWA raw evidence authority is invalid")
+
+          crawl = strict_load(asset_root / "crawl-raw.json", "crawl raw evidence")
+          crawl_provenance = (crawl.get("identity") or {}).get("provenance") or {}
+          expected_crawl_provenance = {
+              "provider": "github-actions",
+              "repository": os.environ["PRODUCER_REPOSITORY"],
+              "workflow": os.environ["PRODUCER_WORKFLOW_NAME"],
+              "job": "ubuntu-crawl",
+              "runId": os.environ["PRODUCER_RUN_ID"],
+              "runAttempt": os.environ["PRODUCER_RUN_ATTEMPT"],
+              "workflowSourceSha": os.environ["PRODUCER_SHA"],
+              "workflowSourceRef": f"refs/heads/{os.environ['PRODUCER_BRANCH']}",
+              "harnessCheckoutRevision": os.environ["HARNESS_ROOT_SHA"],
+              "harnessCheckoutTree": os.environ["HARNESS_ROOT_TREE"],
+              "harnessCheckoutWorktree": crawl_provenance.get("harnessCheckoutWorktree"),
+          }
+          if crawl_provenance != expected_crawl_provenance:
+              raise SystemExit("crawl raw evidence provenance is not the exact ubuntu-crawl producer")
+          if (crawl.get("authority") or {}).get("valid") is not True:
+              raise SystemExit("crawl raw evidence authority is invalid")
+          PY
+
+          (
+            cd "$ASSET_ROOT"
+            sha256sum --check --strict SHA256SUMS.txt
+            sha256sum \
+              combined-evidence.json \
+              combined-evidence.md \
+              combined-verification.json \
+              crawl-raw.json \
+              independent-statistics-replay.json \
+              rwa-raw.json \
+              > "$RUNNER_TEMP/recomputed-SHA256SUMS.txt"
+            cmp SHA256SUMS.txt "$RUNNER_TEMP/recomputed-SHA256SUMS.txt"
+          )
+
+      - name: Re-run exact JavaScript combined verification and compare the receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_root="$GITHUB_WORKSPACE/public-release-assets"
+          replay_root="$RUNNER_TEMP/stasis-public-performance-replay"
+          test ! -e "$replay_root"
+          mkdir "$replay_root"
+          node benchmark/src/performance/evidence-cli.mjs verify \
+            "$asset_root/rwa-raw.json" \
+            "$asset_root/crawl-raw.json" \
+            "$asset_root/combined-evidence.json" \
+            "$asset_root/combined-evidence.md" \
+            > "$replay_root/combined-verification.json"
+          cmp \
+            "$asset_root/combined-verification.json" \
+            "$replay_root/combined-verification.json"
+          node - "$replay_root/combined-verification.json" <<'JS'
+          const assert = require("node:assert/strict");
+          const fs = require("node:fs");
+          const receipt = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          assert.deepEqual(receipt, {
+            schema: "stasis-v0.3.3-combined-performance-verification-v1",
+            status: "passed",
+            combinedEvidenceSchema: "stasis-v0.3.3-combined-performance-evidence-v1",
+            rwaArtifactSchema: "stasis-v0.3.3-performance-rwa-artifact-v1",
+            rwaRawSchema: "stasis-v0.3.3-performance-rwa-raw-v1",
+            crawlRawSchema: "stasis-v0.3.3-performance-crawl-raw-v1",
+            markdownReplayVerified: true,
+          });
+          JS
+
+      - name: Re-run independent Python statistics replay and compare the receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_root="$GITHUB_WORKSPACE/public-release-assets"
+          replay_root="$RUNNER_TEMP/stasis-public-performance-replay"
+          python3 -B benchmark/src/performance/independent_statistics_replay.py \
+            "$asset_root/rwa-raw.json" \
+            "$asset_root/crawl-raw.json" \
+            "$asset_root/combined-evidence.json" \
+            > "$replay_root/independent-statistics-replay.json"
+          cmp \
+            "$asset_root/independent-statistics-replay.json" \
+            "$replay_root/independent-statistics-replay.json"
+
+          INDEPENDENT_RECEIPT="$replay_root/independent-statistics-replay.json" \
+          VERIFICATION_RECEIPT="$replay_root/combined-verification.json" \
+          RWA_RAW_PATH="$asset_root/rwa-raw.json" \
+          CRAWL_RAW_PATH="$asset_root/crawl-raw.json" \
+          COMBINED_PATH="$asset_root/combined-evidence.json" \
+            python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          receipt = json.loads(
+              Path(os.environ["INDEPENDENT_RECEIPT"]).read_text(encoding="utf-8")
+          )
+          verification_receipt = json.loads(
+              Path(os.environ["VERIFICATION_RECEIPT"]).read_text(encoding="utf-8")
+          )
+
+          def sha256(path_name):
+              return hashlib.sha256(Path(os.environ[path_name]).read_bytes()).hexdigest()
+
+          expected = {
+              "schema": "stasis-v0.3.3-independent-statistics-replay-v1",
+              "status": "passed",
+              "scope": {
+                  "behavioralAuthorityReverification": "not_performed",
+                  "name": "statistics_only",
+                  "requiredPriorVerificationSchema": verification_receipt["schema"],
+              },
+              "inputs": {
+                  "combinedEvidence": {"sha256": sha256("COMBINED_PATH")},
+                  "crawlRaw": {"sha256": sha256("CRAWL_RAW_PATH")},
+                  "rwaHostedWrapper": {"sha256": sha256("RWA_RAW_PATH")},
+              },
+              "verification": {
+                  "combinedProjectionAndStatisticsExact": True,
+                  "declaredAuthorityPrerequisites": {
+                      "crawl": "valid",
+                      "rwa": "valid",
+                  },
+                  "crawl": {"pairCount": 10},
+                  "rwa": {"pairCount": 10},
+                  "statistics": {
+                      "arithmetic": "integer_and_reduced_fraction",
+                      "decimal": "fixed_6_half_up",
+                      "quartiles": "median_of_halves_excluding_odd_center",
+                      "ratio": "median_of_paired_baseline_over_stasis_ratios",
+                  },
+              },
+          }
+          if receipt != expected:
+              raise SystemExit("independent public statistics replay receipt mismatch")
+          PY
+
+      - name: Create the bounded public verification receipt
+        shell: bash
+        env:
+          ASSET_ROOT: ${{ github.workspace }}/public-release-assets
+          RECEIPT_ROOT: ${{ runner.temp }}/stasis-public-performance-receipt
+          RECORDS: ${{ runner.temp }}/stasis-public-performance-records
+        run: |
+          set -euo pipefail
+          test ! -e "$RECEIPT_ROOT"
+          mkdir "$RECEIPT_ROOT"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          asset_root = Path(os.environ["ASSET_ROOT"])
+          records = Path(os.environ["RECORDS"])
+          release = json.loads((records / "release.json").read_text(encoding="utf-8"))
+          manifest = json.loads(
+              (records / "verified-release-assets.json").read_text(encoding="utf-8")
+          )
+          assets = {}
+          for name, expected in sorted(manifest["assets"].items()):
+              path = asset_root / name
+              assets[name] = {
+                  "id": expected["id"],
+                  "size": path.stat().st_size,
+                  "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+              }
+          receipt = {
+              "schema": "stasis-v0.3.3-public-performance-evidence-verification-v1",
+              "status": "passed",
+              "verifier": {
+                  "repository": os.environ["GITHUB_REPOSITORY"],
+                  "workflow": os.environ["GITHUB_WORKFLOW"],
+                  "revision": os.environ["GITHUB_SHA"],
+                  "ref": os.environ["GITHUB_REF"],
+                  "runId": os.environ["GITHUB_RUN_ID"],
+                  "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              },
+              "producer": {
+                  "repository": os.environ["PRODUCER_REPOSITORY"],
+                  "workflowId": int(os.environ["PRODUCER_WORKFLOW_ID"]),
+                  "workflowPath": os.environ["PRODUCER_WORKFLOW_PATH"],
+                  "revision": os.environ["PRODUCER_SHA"],
+                  "branch": os.environ["PRODUCER_BRANCH"],
+                  "runId": int(os.environ["PRODUCER_RUN_ID"]),
+                  "runAttempt": int(os.environ["PRODUCER_RUN_ATTEMPT"]),
+              },
+              "release": {
+                  "repository": os.environ["EVIDENCE_RELEASE_REPOSITORY"],
+                  "releaseId": release["id"],
+                  "tag": os.environ["EVIDENCE_RELEASE_TAG"],
+                  "target": os.environ["HARNESS_ROOT_SHA"],
+                  "immutable": True,
+                  "assets": assets,
+              },
+              "verification": {
+                  "anonymousPublicApiAndAssetDownload": True,
+                  "exactProducerRunAndFourJobs": True,
+                  "fullHistoryParentlessHarnessTag": True,
+                  "sha256SumsExact": True,
+                  "javascriptCombinedVerificationExact": True,
+                  "pythonStatisticsReplayExact": True,
+              },
+          }
+          output = Path(os.environ["RECEIPT_ROOT"]) / "public-verification-receipt.json"
+          output.write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          if output.stat().st_size <= 0 or output.stat().st_size > 16 * 1024:
+              raise SystemExit("public verification receipt is outside the bounded size")
+          PY
+
+      - name: Retain only the public verification receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stasis-v0.3.3-performance-public-verification-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stasis-public-performance-receipt/public-verification-receipt.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 9
