@@ -1,0 +1,831 @@
+name: Stasis v0.3.3 navigation causal experiment V3
+
+on:
+  push:
+    branches:
+      - codex/stasis-v033-navigation-causal-source-v3
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: stasis-v0.3.3-navigation-causal-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BENCHMARK_HARNESS_SHA: 84efe2bbc7e41a7b01e4feae12db7a7e7344c539
+  BENCHMARK_HARNESS_PARENT_SHA: 11948d347204e3392fb960ed2966fcc63d769271
+  BENCHMARK_HARNESS_TREE: 4a2b5ec6364b2d24f95166883db23e03293d2e43
+  WORKFLOW_PARENT_SHA: cb5bba41cda038fce82d2a5da6e4f853f1e97440
+  NAVIGATION_CAUSAL_SCHEMA: stasis-v0.3.3-navigation-causal-host-raw-v1
+  NAVIGATION_CAUSAL_PROTOCOL: stasis-v0.3.3-navigation-causal-experiment-v1
+  NAVIGATION_CAUSAL_OUTCOME_SCHEMA: stasis-v0.3.3-navigation-causal-host-outcome-v1
+  STASIS_PACKAGE_RUN_ID: "33506181780"
+  STASIS_PACKAGE_RUN_ATTEMPT: "1"
+  STASIS_REVISION: 48c5a718a9ddd63f496e45307e1484974ccf8587
+
+jobs:
+  navigation-causal-host-a:
+    name: Native Ubuntu 22.04 navigation causal host A
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Validate the one-shot host A invocation
+        id: validate_invocation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'oxhq/stasis'
+          test "$GITHUB_WORKFLOW" = 'Stasis v0.3.3 navigation causal experiment V3'
+          test "$GITHUB_JOB" = 'navigation-causal-host-a'
+          test "$GITHUB_EVENT_NAME" = 'push'
+          test "$GITHUB_REF" = 'refs/heads/codex/stasis-v033-navigation-causal-source-v3'
+          test "$GITHUB_RUN_ATTEMPT" = '1'
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BENCHMARK_HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$BENCHMARK_HARNESS_SHA" = '84efe2bbc7e41a7b01e4feae12db7a7e7344c539'
+          test "$BENCHMARK_HARNESS_PARENT_SHA" = '11948d347204e3392fb960ed2966fcc63d769271'
+          test "$BENCHMARK_HARNESS_TREE" = '4a2b5ec6364b2d24f95166883db23e03293d2e43'
+          test "$WORKFLOW_PARENT_SHA" = 'cb5bba41cda038fce82d2a5da6e4f853f1e97440'
+          test "$NAVIGATION_CAUSAL_SCHEMA" = 'stasis-v0.3.3-navigation-causal-host-raw-v1'
+          test "$NAVIGATION_CAUSAL_PROTOCOL" = 'stasis-v0.3.3-navigation-causal-experiment-v1'
+          test "$NAVIGATION_CAUSAL_OUTCOME_SCHEMA" = 'stasis-v0.3.3-navigation-causal-host-outcome-v1'
+          test "$STASIS_PACKAGE_RUN_ID" = '33506181780'
+          test "$STASIS_PACKAGE_RUN_ATTEMPT" = '1'
+          test "$STASIS_REVISION" = '48c5a718a9ddd63f496e45307e1484974ccf8587'
+
+          EVENT_PATH="$GITHUB_EVENT_PATH" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          event = json.loads(Path(os.environ["EVENT_PATH"]).read_text(encoding="utf-8"))
+          expected = {
+              "after": os.environ["GITHUB_SHA"],
+              "before": "0" * 40,
+              "created": True,
+              "deleted": False,
+              "forced": False,
+              "ref": "refs/heads/codex/stasis-v033-navigation-causal-source-v3",
+          }
+          for key, value in expected.items():
+              if event.get(key) != value:
+                  raise SystemExit(f"one-shot push identity mismatch: {key}")
+          PY
+
+          commit_record="$RUNNER_TEMP/navigation-causal-source-commit.json"
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" > "$commit_record"
+          COMMIT_RECORD="$commit_record" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          commit = json.loads(Path(os.environ["COMMIT_RECORD"]).read_text(encoding="utf-8"))
+          if commit.get("sha") != os.environ["GITHUB_SHA"]:
+              raise SystemExit("workflow source commit identity mismatch")
+          parents = commit.get("parents") or []
+          if [parent.get("sha") for parent in parents] != [os.environ["WORKFLOW_PARENT_SHA"]]:
+              raise SystemExit("workflow source must have the frozen sole parent")
+          expected_path = ".github/workflows/stasis-v0.3.3-performance-navigation-causal-v3.yml"
+          files = commit.get("files") or []
+          if [(item.get("filename"), item.get("status")) for item in files] != [
+              (expected_path, "added")
+          ]:
+              raise SystemExit("workflow source commit changed files outside the frozen path")
+          PY
+
+      - name: Check out the exact navigation causal runner
+        id: checkout_harness
+        if: ${{ steps.validate_invocation.outcome == 'success' }}
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: oxhq/stasis-compat-bench
+          ref: ${{ env.BENCHMARK_HARNESS_SHA }}
+          path: benchmark
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up exact Node 22.20.0 x64
+        id: setup_node
+        if: ${{ steps.checkout_harness.outcome == 'success' }}
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.20.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Verify the exact host A harness and Node runtime
+        id: verify_runtime
+        if: ${{ steps.setup_node.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = 'v22.20.0'
+          test "$(node -p 'process.platform')" = 'linux'
+          test "$(node -p 'process.arch')" = 'x64'
+          test "$RUNNER_OS" = 'Linux'
+          test "$RUNNER_ARCH" = 'X64'
+          test "$(git -C benchmark rev-parse HEAD)" = "$BENCHMARK_HARNESS_SHA"
+          test "$(git -C benchmark rev-parse 'HEAD^{tree}')" = "$BENCHMARK_HARNESS_TREE"
+          mapfile -t harness_parent_headers < <(
+            git -C benchmark cat-file -p HEAD | sed -n 's/^parent //p'
+          )
+          test "${#harness_parent_headers[@]}" = '1'
+          test "${harness_parent_headers[0]}" = "$BENCHMARK_HARNESS_PARENT_SHA"
+          test -z "$(git -C benchmark status --porcelain=v1 --untracked-files=all)"
+
+      - name: Install the frozen navigation causal runner for host A
+        id: install_harness
+        if: ${{ steps.verify_runtime.outcome == 'success' }}
+        shell: bash
+        working-directory: benchmark
+        timeout-minutes: 15
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+          NPM_CONFIG_FETCH_RETRIES: "0"
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/stasis-navigation-causal-host-a-npm-cache
+        run: |
+          set -euo pipefail
+          test ! -e "$NPM_CONFIG_CACHE"
+          npm ci --ignore-scripts --no-audit --no-fund --timing --registry=https://registry.npmjs.org/
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Provision the exact Stasis EGL runtime prerequisite for host A
+        id: provision_egl
+        if: ${{ steps.install_harness.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libegl1 \
+            libegl-mesa0 \
+            libglvnd0
+          python3 - <<'PY'
+          import ctypes
+          import os
+
+          library = ctypes.CDLL("libEGL.so.1", mode=os.RTLD_LAZY)
+          if not hasattr(library, "eglGetProcAddress"):
+              raise SystemExit("libEGL.so.1 does not export eglGetProcAddress")
+          PY
+
+      - name: Verify the exact package source records for host A
+        id: verify_package_source
+        if: ${{ steps.provision_egl.outcome == 'success' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_record="$RUNNER_TEMP/stasis-package-run-$STASIS_PACKAGE_RUN_ID.json"
+          artifact_records="$RUNNER_TEMP/stasis-package-artifacts-$STASIS_PACKAGE_RUN_ID.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STASIS_PACKAGE_RUN_ID" > "$run_record"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STASIS_PACKAGE_RUN_ID/artifacts?per_page=100" \
+            > "$artifact_records"
+          RUN_RECORD="$run_record" ARTIFACT_RECORDS="$artifact_records" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          expected_run = {
+              "id": 33506181780,
+              "run_attempt": 1,
+              "event": "push",
+              "status": "completed",
+              "conclusion": "success",
+              "head_branch": "main",
+              "head_sha": "48c5a718a9ddd63f496e45307e1484974ccf8587",
+              "path": ".github/workflows/stasis-package.yml",
+              "workflow_id": 340124521,
+          }
+          run = json.loads(Path(os.environ["RUN_RECORD"]).read_text(encoding="utf-8"))
+          for key, expected in expected_run.items():
+              if run.get(key) != expected:
+                  raise SystemExit(f"package run {key} mismatch")
+          expected_artifacts = {
+              "stasis-runtime-manifest-attempt-1": (9803607695, 1070),
+              "stasis-typescript-attempt-1": (9803606920, 184329),
+              "stasis-linux-x86_64-act-settle-inspect-proof-attempt-1": (9803003770, 786),
+              "stasis-linux-x86_64-attempt-1": (9803003109, 34117650),
+          }
+          records = json.loads(
+              Path(os.environ["ARTIFACT_RECORDS"]).read_text(encoding="utf-8")
+          ).get("artifacts", [])
+          by_name = {record.get("name"): record for record in records}
+          for name, (artifact_id, compressed_bytes) in expected_artifacts.items():
+              record = by_name.get(name)
+              workflow_run = (record or {}).get("workflow_run") or {}
+              if (
+                  record is None
+                  or record.get("id") != artifact_id
+                  or record.get("size_in_bytes") != compressed_bytes
+                  or record.get("expired") is not False
+                  or workflow_run.get("id") != expected_run["id"]
+                  or workflow_run.get("head_sha") != expected_run["head_sha"]
+              ):
+                  raise SystemExit(f"package artifact metadata mismatch: {name}")
+          PY
+
+      - name: Download the exact Linux package artifact for host A
+        id: download_linux
+        if: ${{ steps.verify_package_source.outcome == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-linux-x86_64-attempt-1
+          path: ${{ runner.temp }}/stasis-linux-input
+          repository: oxhq/stasis
+          run-id: 33506181780
+          github-token: ${{ github.token }}
+
+      - name: Download the exact Linux package proof for host A
+        id: download_linux_proof
+        if: ${{ steps.download_linux.outcome == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-linux-x86_64-act-settle-inspect-proof-attempt-1
+          path: ${{ runner.temp }}/stasis-linux-proof-input
+          repository: oxhq/stasis
+          run-id: 33506181780
+          github-token: ${{ github.token }}
+
+      - name: Download the exact TypeScript package artifact for host A
+        id: download_typescript
+        if: ${{ steps.download_linux_proof.outcome == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-typescript-attempt-1
+          path: ${{ runner.temp }}/stasis-typescript-input
+          repository: oxhq/stasis
+          run-id: 33506181780
+          github-token: ${{ github.token }}
+
+      - name: Download the exact runtime manifest for host A
+        id: download_runtime_manifest
+        if: ${{ steps.download_typescript.outcome == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-runtime-manifest-attempt-1
+          path: ${{ runner.temp }}/stasis-runtime-manifest-input
+          repository: oxhq/stasis
+          run-id: 33506181780
+          github-token: ${{ github.token }}
+
+      - name: Verify and extract the exact Linux candidate inputs for host A
+        id: verify_candidate
+        if: ${{ steps.download_runtime_manifest.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/stasis-linux-input/stasis-0.3.3-linux-x86_64.tar.gz"
+          proof="$RUNNER_TEMP/stasis-linux-proof-input/stasis-0.3.3-linux-x86_64-act-settle-inspect.json"
+          sdk="$RUNNER_TEMP/stasis-typescript-input/oxhq-stasis-0.3.3.tgz"
+          manifest="$RUNNER_TEMP/stasis-runtime-manifest-input/stasis-0.3.3-runtime-manifest.json"
+          linux_extract="$RUNNER_TEMP/stasis-linux-extracted"
+          sdk_extract="$RUNNER_TEMP/stasis-sdk-extracted"
+          test ! -e "$linux_extract"
+          test ! -e "$sdk_extract"
+          mkdir "$linux_extract" "$sdk_extract"
+          test "$(stat --format='%s' "$archive")" = '34279279'
+          test "$(sha256sum "$archive" | awk '{print $1}')" = '5965e932cab407aa75d3f283015bf5d5df92cf06ecbd5f1add03083937208e86'
+          test "$(stat --format='%s' "$proof")" = '1160'
+          test "$(sha256sum "$proof" | awk '{print $1}')" = '81e44c9dba85bc10cc67536388f11a9e251b7d4d29e3fc740c98afbfefba1cac'
+          test "$(stat --format='%s' "$sdk")" = '181292'
+          test "$(sha256sum "$sdk" | awk '{print $1}')" = '55063c0ab9fc802e101d792831c292f1a7b0b497a141603102eacbef9fc029ec'
+          test "$(stat --format='%s' "$manifest")" = '2503'
+          test "$(sha256sum "$manifest" | awk '{print $1}')" = '4e466dbd269fb08738c265133aa5bed2d139d2750db6a5060230e63527ee39a4'
+          tar -xzf "$archive" -C "$linux_extract"
+          tar -xzf "$sdk" -C "$sdk_extract"
+          executable="$linux_extract/stasis-0.3.3-linux-x86_64/stasis"
+          test -x "$executable"
+          test "$(stat --format='%s' "$executable")" = '83877352'
+          test "$(sha256sum "$executable" | awk '{print $1}')" = 'c6a37995cde25275454d7f1ee61c2803964b04bf0d35f8fde7c78e9575c74c37'
+          salt=$(
+            printf '%s\0%s\0%s' \
+              'stasis-v0.3.3-navigation-causal-boot-salt-v1' \
+              "$GITHUB_RUN_ID" \
+              "$GITHUB_SHA" \
+              | sha256sum | awk '{print $1}'
+          )
+          [[ "$salt" =~ ^[0-9a-f]{64}$ ]]
+          echo "::add-mask::$salt"
+          printf 'STASIS_PERFORMANCE_BOOT_SALT=%s\n' "$salt" >> "$GITHUB_ENV"
+
+      - name: Run the sealed navigation causal experiment on host A
+        id: run_experiment
+        if: ${{ steps.verify_candidate.outcome == 'success' }}
+        shell: bash
+        working-directory: benchmark
+        env:
+          STASIS_COMPAT_ARTIFACT_DIR: ${{ github.workspace }}/benchmark/artifacts/runs/navigation-causal-host-a-${{ github.run_id }}-${{ github.run_attempt }}
+          STASIS_PERFORMANCE_LINUX_ARCHIVE: ${{ runner.temp }}/stasis-linux-input/stasis-0.3.3-linux-x86_64.tar.gz
+          STASIS_PERFORMANCE_LINUX_EXECUTABLE: ${{ runner.temp }}/stasis-linux-extracted/stasis-0.3.3-linux-x86_64/stasis
+          STASIS_PERFORMANCE_LINUX_PROOF: ${{ runner.temp }}/stasis-linux-proof-input/stasis-0.3.3-linux-x86_64-act-settle-inspect.json
+          STASIS_PERFORMANCE_RUNTIME_MANIFEST: ${{ runner.temp }}/stasis-runtime-manifest-input/stasis-0.3.3-runtime-manifest.json
+          STASIS_PERFORMANCE_SDK_ARCHIVE: ${{ runner.temp }}/stasis-typescript-input/oxhq-stasis-0.3.3.tgz
+          STASIS_PERFORMANCE_SDK_PACKAGE_ROOT: ${{ runner.temp }}/stasis-sdk-extracted/package
+          STASIS_NAVIGATION_CAUSAL_HOST: host-a
+        run: |
+          set -euo pipefail
+          node --test test/performance-navigation-causal-environment-v3.test.mjs
+          node src/performance/run-navigation-causal.mjs
+
+      - name: Verify the exact host A correctness and clean-exit gates
+        id: verify_experiment
+        if: ${{ always() && steps.verify_candidate.outcome == 'success' }}
+        shell: bash
+        working-directory: benchmark
+        env:
+          RAW_PATH: ${{ github.workspace }}/benchmark/artifacts/runs/navigation-causal-host-a-${{ github.run_id }}-${{ github.run_attempt }}/performance/navigation-causal/navigation-causal-host-a-raw.json
+          OUTCOME_PATH: ${{ github.workspace }}/benchmark/artifacts/runs/navigation-causal-host-a-${{ github.run_id }}-${{ github.run_attempt }}/performance/navigation-causal/navigation-causal-host-a-outcome.json
+          EXPECTED_HOST_LANE: host-a
+          EXPECTED_JOB: navigation-causal-host-a
+        run: |
+          set -euo pipefail
+          evidence_root=$(dirname "$RAW_PATH")
+          mapfile -t observed < <(find "$evidence_root" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          expected=(
+            navigation-causal-host-a-outcome.json
+            navigation-causal-host-a-raw.json
+          )
+          test "${observed[*]}" = "${expected[*]}"
+          test -f "$RAW_PATH" && test ! -L "$RAW_PATH"
+          test -f "$OUTCOME_PATH" && test ! -L "$OUTCOME_PATH"
+          node src/performance/run-navigation-causal.mjs verify "$RAW_PATH" "$OUTCOME_PATH"
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+
+          const raw = JSON.parse(await readFile(process.env.RAW_PATH, "utf8"));
+          const outcome = JSON.parse(await readFile(process.env.OUTCOME_PATH, "utf8"));
+          const provenance = raw?.identity?.provenance ?? {};
+          const expected = {
+            provider: "github-actions",
+            repository: process.env.GITHUB_REPOSITORY,
+            workflow: process.env.GITHUB_WORKFLOW,
+            job: process.env.EXPECTED_JOB,
+            hostLane: process.env.EXPECTED_HOST_LANE,
+            runId: process.env.GITHUB_RUN_ID,
+            runAttempt: process.env.GITHUB_RUN_ATTEMPT,
+            workflowSourceSha: process.env.GITHUB_SHA,
+            workflowSourceRef: process.env.GITHUB_REF,
+            harnessCheckoutRevision: process.env.BENCHMARK_HARNESS_SHA,
+            harnessCheckoutTree: process.env.BENCHMARK_HARNESS_TREE,
+          };
+          for (const [key, value] of Object.entries(expected)) {
+            if (provenance[key] !== value) throw new Error(`host A provenance ${key} mismatch`);
+          }
+          if (
+            raw.schema !== process.env.NAVIGATION_CAUSAL_SCHEMA
+            || raw.protocol !== process.env.NAVIGATION_CAUSAL_PROTOCOL
+            || outcome.schema !== process.env.NAVIGATION_CAUSAL_OUTCOME_SCHEMA
+            || outcome.protocol !== process.env.NAVIGATION_CAUSAL_PROTOCOL
+            || outcome.hostLane !== process.env.EXPECTED_HOST_LANE
+          ) {
+            throw new Error("host A causal schema or lane mismatch");
+          }
+          NODE
+
+      - name: Retain the exact host A causal evidence
+        id: upload_evidence
+        if: ${{ always() && steps.verify_experiment.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stasis-v0.3.3-navigation-causal-host-a-attempt-1
+          path: ${{ github.workspace }}/benchmark/artifacts/runs/navigation-causal-host-a-${{ github.run_id }}-${{ github.run_attempt }}/performance/navigation-causal
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 9
+          include-hidden-files: false
+
+      - name: Propagate the terminal host A outcome after retention
+        if: ${{ always() }}
+        shell: bash
+        working-directory: benchmark
+        env:
+          RUN_EXPERIMENT_OUTCOME: ${{ steps.run_experiment.outcome }}
+          VERIFY_EXPERIMENT_OUTCOME: ${{ steps.verify_experiment.outcome }}
+          UPLOAD_EVIDENCE_OUTCOME: ${{ steps.upload_evidence.outcome }}
+          OUTCOME_PATH: ${{ github.workspace }}/benchmark/artifacts/runs/navigation-causal-host-a-${{ github.run_id }}-${{ github.run_attempt }}/performance/navigation-causal/navigation-causal-host-a-outcome.json
+        run: |
+          set -euo pipefail
+          test "$RUN_EXPERIMENT_OUTCOME" = 'success'
+          test "$VERIFY_EXPERIMENT_OUTCOME" = 'success'
+          test "$UPLOAD_EVIDENCE_OUTCOME" = 'success'
+          OUTCOME_PATH="$OUTCOME_PATH" node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+
+          const bytes = await readFile(process.env.OUTCOME_PATH);
+          const outcome = JSON.parse(bytes.toString("utf8"));
+          const canonical = Buffer.from(`${JSON.stringify(outcome, null, 2)}\n`, "utf8");
+          if (!canonical.equals(bytes)) throw new Error("host A outcome is not canonical JSON");
+          if (outcome.workflowSuccess !== true) {
+            throw new Error(`host A terminal outcome is ${outcome.status}`);
+          }
+          NODE
+
+  navigation-causal-host-b:
+    name: Native Ubuntu 22.04 navigation causal host B
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Validate the one-shot host B invocation
+        id: validate_invocation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'oxhq/stasis'
+          test "$GITHUB_WORKFLOW" = 'Stasis v0.3.3 navigation causal experiment V3'
+          test "$GITHUB_JOB" = 'navigation-causal-host-b'
+          test "$GITHUB_EVENT_NAME" = 'push'
+          test "$GITHUB_REF" = 'refs/heads/codex/stasis-v033-navigation-causal-source-v3'
+          test "$GITHUB_RUN_ATTEMPT" = '1'
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BENCHMARK_HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$BENCHMARK_HARNESS_SHA" = '84efe2bbc7e41a7b01e4feae12db7a7e7344c539'
+          test "$BENCHMARK_HARNESS_PARENT_SHA" = '11948d347204e3392fb960ed2966fcc63d769271'
+          test "$BENCHMARK_HARNESS_TREE" = '4a2b5ec6364b2d24f95166883db23e03293d2e43'
+          test "$WORKFLOW_PARENT_SHA" = 'cb5bba41cda038fce82d2a5da6e4f853f1e97440'
+          test "$NAVIGATION_CAUSAL_SCHEMA" = 'stasis-v0.3.3-navigation-causal-host-raw-v1'
+          test "$NAVIGATION_CAUSAL_PROTOCOL" = 'stasis-v0.3.3-navigation-causal-experiment-v1'
+          test "$NAVIGATION_CAUSAL_OUTCOME_SCHEMA" = 'stasis-v0.3.3-navigation-causal-host-outcome-v1'
+          test "$STASIS_PACKAGE_RUN_ID" = '33506181780'
+          test "$STASIS_PACKAGE_RUN_ATTEMPT" = '1'
+          test "$STASIS_REVISION" = '48c5a718a9ddd63f496e45307e1484974ccf8587'
+
+          EVENT_PATH="$GITHUB_EVENT_PATH" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          event = json.loads(Path(os.environ["EVENT_PATH"]).read_text(encoding="utf-8"))
+          expected = {
+              "after": os.environ["GITHUB_SHA"],
+              "before": "0" * 40,
+              "created": True,
+              "deleted": False,
+              "forced": False,
+              "ref": "refs/heads/codex/stasis-v033-navigation-causal-source-v3",
+          }
+          for key, value in expected.items():
+              if event.get(key) != value:
+                  raise SystemExit(f"one-shot push identity mismatch: {key}")
+          PY
+
+          commit_record="$RUNNER_TEMP/navigation-causal-source-commit.json"
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" > "$commit_record"
+          COMMIT_RECORD="$commit_record" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          commit = json.loads(Path(os.environ["COMMIT_RECORD"]).read_text(encoding="utf-8"))
+          if commit.get("sha") != os.environ["GITHUB_SHA"]:
+              raise SystemExit("workflow source commit identity mismatch")
+          parents = commit.get("parents") or []
+          if [parent.get("sha") for parent in parents] != [os.environ["WORKFLOW_PARENT_SHA"]]:
+              raise SystemExit("workflow source must have the frozen sole parent")
+          expected_path = ".github/workflows/stasis-v0.3.3-performance-navigation-causal-v3.yml"
+          files = commit.get("files") or []
+          if [(item.get("filename"), item.get("status")) for item in files] != [
+              (expected_path, "added")
+          ]:
+              raise SystemExit("workflow source commit changed files outside the frozen path")
+          PY
+
+      - name: Check out the exact navigation causal runner
+        id: checkout_harness
+        if: ${{ steps.validate_invocation.outcome == 'success' }}
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: oxhq/stasis-compat-bench
+          ref: ${{ env.BENCHMARK_HARNESS_SHA }}
+          path: benchmark
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up exact Node 22.20.0 x64
+        id: setup_node
+        if: ${{ steps.checkout_harness.outcome == 'success' }}
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.20.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Verify the exact host B harness and Node runtime
+        id: verify_runtime
+        if: ${{ steps.setup_node.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = 'v22.20.0'
+          test "$(node -p 'process.platform')" = 'linux'
+          test "$(node -p 'process.arch')" = 'x64'
+          test "$RUNNER_OS" = 'Linux'
+          test "$RUNNER_ARCH" = 'X64'
+          test "$(git -C benchmark rev-parse HEAD)" = "$BENCHMARK_HARNESS_SHA"
+          test "$(git -C benchmark rev-parse 'HEAD^{tree}')" = "$BENCHMARK_HARNESS_TREE"
+          mapfile -t harness_parent_headers < <(
+            git -C benchmark cat-file -p HEAD | sed -n 's/^parent //p'
+          )
+          test "${#harness_parent_headers[@]}" = '1'
+          test "${harness_parent_headers[0]}" = "$BENCHMARK_HARNESS_PARENT_SHA"
+          test -z "$(git -C benchmark status --porcelain=v1 --untracked-files=all)"
+
+      - name: Install the frozen navigation causal runner for host B
+        id: install_harness
+        if: ${{ steps.verify_runtime.outcome == 'success' }}
+        shell: bash
+        working-directory: benchmark
+        timeout-minutes: 15
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+          NPM_CONFIG_FETCH_RETRIES: "0"
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/stasis-navigation-causal-host-b-npm-cache
+        run: |
+          set -euo pipefail
+          test ! -e "$NPM_CONFIG_CACHE"
+          npm ci --ignore-scripts --no-audit --no-fund --timing --registry=https://registry.npmjs.org/
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Provision the exact Stasis EGL runtime prerequisite for host B
+        id: provision_egl
+        if: ${{ steps.install_harness.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libegl1 \
+            libegl-mesa0 \
+            libglvnd0
+          python3 - <<'PY'
+          import ctypes
+          import os
+
+          library = ctypes.CDLL("libEGL.so.1", mode=os.RTLD_LAZY)
+          if not hasattr(library, "eglGetProcAddress"):
+              raise SystemExit("libEGL.so.1 does not export eglGetProcAddress")
+          PY
+
+      - name: Verify the exact package source records for host B
+        id: verify_package_source
+        if: ${{ steps.provision_egl.outcome == 'success' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_record="$RUNNER_TEMP/stasis-package-run-$STASIS_PACKAGE_RUN_ID.json"
+          artifact_records="$RUNNER_TEMP/stasis-package-artifacts-$STASIS_PACKAGE_RUN_ID.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STASIS_PACKAGE_RUN_ID" > "$run_record"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STASIS_PACKAGE_RUN_ID/artifacts?per_page=100" \
+            > "$artifact_records"
+          RUN_RECORD="$run_record" ARTIFACT_RECORDS="$artifact_records" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          expected_run = {
+              "id": 33506181780,
+              "run_attempt": 1,
+              "event": "push",
+              "status": "completed",
+              "conclusion": "success",
+              "head_branch": "main",
+              "head_sha": "48c5a718a9ddd63f496e45307e1484974ccf8587",
+              "path": ".github/workflows/stasis-package.yml",
+              "workflow_id": 340124521,
+          }
+          run = json.loads(Path(os.environ["RUN_RECORD"]).read_text(encoding="utf-8"))
+          for key, expected in expected_run.items():
+              if run.get(key) != expected:
+                  raise SystemExit(f"package run {key} mismatch")
+          expected_artifacts = {
+              "stasis-runtime-manifest-attempt-1": (9803607695, 1070),
+              "stasis-typescript-attempt-1": (9803606920, 184329),
+              "stasis-linux-x86_64-act-settle-inspect-proof-attempt-1": (9803003770, 786),
+              "stasis-linux-x86_64-attempt-1": (9803003109, 34117650),
+          }
+          records = json.loads(
+              Path(os.environ["ARTIFACT_RECORDS"]).read_text(encoding="utf-8")
+          ).get("artifacts", [])
+          by_name = {record.get("name"): record for record in records}
+          for name, (artifact_id, compressed_bytes) in expected_artifacts.items():
+              record = by_name.get(name)
+              workflow_run = (record or {}).get("workflow_run") or {}
+              if (
+                  record is None
+                  or record.get("id") != artifact_id
+                  or record.get("size_in_bytes") != compressed_bytes
+                  or record.get("expired") is not False
+                  or workflow_run.get("id") != expected_run["id"]
+                  or workflow_run.get("head_sha") != expected_run["head_sha"]
+              ):
+                  raise SystemExit(f"package artifact metadata mismatch: {name}")
+          PY
+
+      - name: Download the exact Linux package artifact for host B
+        id: download_linux
+        if: ${{ steps.verify_package_source.outcome == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-linux-x86_64-attempt-1
+          path: ${{ runner.temp }}/stasis-linux-input
+          repository: oxhq/stasis
+          run-id: 33506181780
+          github-token: ${{ github.token }}
+
+      - name: Download the exact Linux package proof for host B
+        id: download_linux_proof
+        if: ${{ steps.download_linux.outcome == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-linux-x86_64-act-settle-inspect-proof-attempt-1
+          path: ${{ runner.temp }}/stasis-linux-proof-input
+          repository: oxhq/stasis
+          run-id: 33506181780
+          github-token: ${{ github.token }}
+
+      - name: Download the exact TypeScript package artifact for host B
+        id: download_typescript
+        if: ${{ steps.download_linux_proof.outcome == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-typescript-attempt-1
+          path: ${{ runner.temp }}/stasis-typescript-input
+          repository: oxhq/stasis
+          run-id: 33506181780
+          github-token: ${{ github.token }}
+
+      - name: Download the exact runtime manifest for host B
+        id: download_runtime_manifest
+        if: ${{ steps.download_typescript.outcome == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stasis-runtime-manifest-attempt-1
+          path: ${{ runner.temp }}/stasis-runtime-manifest-input
+          repository: oxhq/stasis
+          run-id: 33506181780
+          github-token: ${{ github.token }}
+
+      - name: Verify and extract the exact Linux candidate inputs for host B
+        id: verify_candidate
+        if: ${{ steps.download_runtime_manifest.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/stasis-linux-input/stasis-0.3.3-linux-x86_64.tar.gz"
+          proof="$RUNNER_TEMP/stasis-linux-proof-input/stasis-0.3.3-linux-x86_64-act-settle-inspect.json"
+          sdk="$RUNNER_TEMP/stasis-typescript-input/oxhq-stasis-0.3.3.tgz"
+          manifest="$RUNNER_TEMP/stasis-runtime-manifest-input/stasis-0.3.3-runtime-manifest.json"
+          linux_extract="$RUNNER_TEMP/stasis-linux-extracted"
+          sdk_extract="$RUNNER_TEMP/stasis-sdk-extracted"
+          test ! -e "$linux_extract"
+          test ! -e "$sdk_extract"
+          mkdir "$linux_extract" "$sdk_extract"
+          test "$(stat --format='%s' "$archive")" = '34279279'
+          test "$(sha256sum "$archive" | awk '{print $1}')" = '5965e932cab407aa75d3f283015bf5d5df92cf06ecbd5f1add03083937208e86'
+          test "$(stat --format='%s' "$proof")" = '1160'
+          test "$(sha256sum "$proof" | awk '{print $1}')" = '81e44c9dba85bc10cc67536388f11a9e251b7d4d29e3fc740c98afbfefba1cac'
+          test "$(stat --format='%s' "$sdk")" = '181292'
+          test "$(sha256sum "$sdk" | awk '{print $1}')" = '55063c0ab9fc802e101d792831c292f1a7b0b497a141603102eacbef9fc029ec'
+          test "$(stat --format='%s' "$manifest")" = '2503'
+          test "$(sha256sum "$manifest" | awk '{print $1}')" = '4e466dbd269fb08738c265133aa5bed2d139d2750db6a5060230e63527ee39a4'
+          tar -xzf "$archive" -C "$linux_extract"
+          tar -xzf "$sdk" -C "$sdk_extract"
+          executable="$linux_extract/stasis-0.3.3-linux-x86_64/stasis"
+          test -x "$executable"
+          test "$(stat --format='%s' "$executable")" = '83877352'
+          test "$(sha256sum "$executable" | awk '{print $1}')" = 'c6a37995cde25275454d7f1ee61c2803964b04bf0d35f8fde7c78e9575c74c37'
+          salt=$(
+            printf '%s\0%s\0%s' \
+              'stasis-v0.3.3-navigation-causal-boot-salt-v1' \
+              "$GITHUB_RUN_ID" \
+              "$GITHUB_SHA" \
+              | sha256sum | awk '{print $1}'
+          )
+          [[ "$salt" =~ ^[0-9a-f]{64}$ ]]
+          echo "::add-mask::$salt"
+          printf 'STASIS_PERFORMANCE_BOOT_SALT=%s\n' "$salt" >> "$GITHUB_ENV"
+
+      - name: Run the sealed navigation causal experiment on host B
+        id: run_experiment
+        if: ${{ steps.verify_candidate.outcome == 'success' }}
+        shell: bash
+        working-directory: benchmark
+        env:
+          STASIS_COMPAT_ARTIFACT_DIR: ${{ github.workspace }}/benchmark/artifacts/runs/navigation-causal-host-b-${{ github.run_id }}-${{ github.run_attempt }}
+          STASIS_PERFORMANCE_LINUX_ARCHIVE: ${{ runner.temp }}/stasis-linux-input/stasis-0.3.3-linux-x86_64.tar.gz
+          STASIS_PERFORMANCE_LINUX_EXECUTABLE: ${{ runner.temp }}/stasis-linux-extracted/stasis-0.3.3-linux-x86_64/stasis
+          STASIS_PERFORMANCE_LINUX_PROOF: ${{ runner.temp }}/stasis-linux-proof-input/stasis-0.3.3-linux-x86_64-act-settle-inspect.json
+          STASIS_PERFORMANCE_RUNTIME_MANIFEST: ${{ runner.temp }}/stasis-runtime-manifest-input/stasis-0.3.3-runtime-manifest.json
+          STASIS_PERFORMANCE_SDK_ARCHIVE: ${{ runner.temp }}/stasis-typescript-input/oxhq-stasis-0.3.3.tgz
+          STASIS_PERFORMANCE_SDK_PACKAGE_ROOT: ${{ runner.temp }}/stasis-sdk-extracted/package
+          STASIS_NAVIGATION_CAUSAL_HOST: host-b
+        run: |
+          set -euo pipefail
+          node --test test/performance-navigation-causal-environment-v3.test.mjs
+          node src/performance/run-navigation-causal.mjs
+
+      - name: Verify the exact host B correctness and clean-exit gates
+        id: verify_experiment
+        if: ${{ always() && steps.verify_candidate.outcome == 'success' }}
+        shell: bash
+        working-directory: benchmark
+        env:
+          RAW_PATH: ${{ github.workspace }}/benchmark/artifacts/runs/navigation-causal-host-b-${{ github.run_id }}-${{ github.run_attempt }}/performance/navigation-causal/navigation-causal-host-b-raw.json
+          OUTCOME_PATH: ${{ github.workspace }}/benchmark/artifacts/runs/navigation-causal-host-b-${{ github.run_id }}-${{ github.run_attempt }}/performance/navigation-causal/navigation-causal-host-b-outcome.json
+          EXPECTED_HOST_LANE: host-b
+          EXPECTED_JOB: navigation-causal-host-b
+        run: |
+          set -euo pipefail
+          evidence_root=$(dirname "$RAW_PATH")
+          mapfile -t observed < <(find "$evidence_root" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          expected=(
+            navigation-causal-host-b-outcome.json
+            navigation-causal-host-b-raw.json
+          )
+          test "${observed[*]}" = "${expected[*]}"
+          test -f "$RAW_PATH" && test ! -L "$RAW_PATH"
+          test -f "$OUTCOME_PATH" && test ! -L "$OUTCOME_PATH"
+          node src/performance/run-navigation-causal.mjs verify "$RAW_PATH" "$OUTCOME_PATH"
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+
+          const raw = JSON.parse(await readFile(process.env.RAW_PATH, "utf8"));
+          const outcome = JSON.parse(await readFile(process.env.OUTCOME_PATH, "utf8"));
+          const provenance = raw?.identity?.provenance ?? {};
+          const expected = {
+            provider: "github-actions",
+            repository: process.env.GITHUB_REPOSITORY,
+            workflow: process.env.GITHUB_WORKFLOW,
+            job: process.env.EXPECTED_JOB,
+            hostLane: process.env.EXPECTED_HOST_LANE,
+            runId: process.env.GITHUB_RUN_ID,
+            runAttempt: process.env.GITHUB_RUN_ATTEMPT,
+            workflowSourceSha: process.env.GITHUB_SHA,
+            workflowSourceRef: process.env.GITHUB_REF,
+            harnessCheckoutRevision: process.env.BENCHMARK_HARNESS_SHA,
+            harnessCheckoutTree: process.env.BENCHMARK_HARNESS_TREE,
+          };
+          for (const [key, value] of Object.entries(expected)) {
+            if (provenance[key] !== value) throw new Error(`host B provenance ${key} mismatch`);
+          }
+          if (
+            raw.schema !== process.env.NAVIGATION_CAUSAL_SCHEMA
+            || raw.protocol !== process.env.NAVIGATION_CAUSAL_PROTOCOL
+            || outcome.schema !== process.env.NAVIGATION_CAUSAL_OUTCOME_SCHEMA
+            || outcome.protocol !== process.env.NAVIGATION_CAUSAL_PROTOCOL
+            || outcome.hostLane !== process.env.EXPECTED_HOST_LANE
+          ) {
+            throw new Error("host B causal schema or lane mismatch");
+          }
+          NODE
+
+      - name: Retain the exact host B causal evidence
+        id: upload_evidence
+        if: ${{ always() && steps.verify_experiment.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stasis-v0.3.3-navigation-causal-host-b-attempt-1
+          path: ${{ github.workspace }}/benchmark/artifacts/runs/navigation-causal-host-b-${{ github.run_id }}-${{ github.run_attempt }}/performance/navigation-causal
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 9
+          include-hidden-files: false
+
+      - name: Propagate the terminal host B outcome after retention
+        if: ${{ always() }}
+        shell: bash
+        working-directory: benchmark
+        env:
+          RUN_EXPERIMENT_OUTCOME: ${{ steps.run_experiment.outcome }}
+          VERIFY_EXPERIMENT_OUTCOME: ${{ steps.verify_experiment.outcome }}
+          UPLOAD_EVIDENCE_OUTCOME: ${{ steps.upload_evidence.outcome }}
+          OUTCOME_PATH: ${{ github.workspace }}/benchmark/artifacts/runs/navigation-causal-host-b-${{ github.run_id }}-${{ github.run_attempt }}/performance/navigation-causal/navigation-causal-host-b-outcome.json
+        run: |
+          set -euo pipefail
+          test "$RUN_EXPERIMENT_OUTCOME" = 'success'
+          test "$VERIFY_EXPERIMENT_OUTCOME" = 'success'
+          test "$UPLOAD_EVIDENCE_OUTCOME" = 'success'
+          OUTCOME_PATH="$OUTCOME_PATH" node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+
+          const bytes = await readFile(process.env.OUTCOME_PATH);
+          const outcome = JSON.parse(bytes.toString("utf8"));
+          const canonical = Buffer.from(`${JSON.stringify(outcome, null, 2)}\n`, "utf8");
+          if (!canonical.equals(bytes)) throw new Error("host B outcome is not canonical JSON");
+          if (outcome.workflowSuccess !== true) {
+            throw new Error(`host B terminal outcome is ${outcome.status}`);
+          }
+          NODE
